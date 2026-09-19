@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+.vcbackend_store.json
+.vcbackend_store.json.tmp.*
