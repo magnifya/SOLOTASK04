@@ -12,19 +12,26 @@
   POST /v1/credentials/{credential_id}/verify  以存储记录为锚验签
   POST /v1/credentials/{credential_id}/present 生成选择性披露演示
   POST /v1/presentations/{presentation_id}/verify  以存储记录为锚校验演示
+  GET  /v1/audit                          查询本租户审计事件
+
+多租户：所有 /v1 请求取 X-Tenant-ID 头，缺省为 "default"；显式
+提供时须非空，否则 400。DID、凭证、演示、key_handle 均按租户隔离，
+跨租户访问一律按不存在处理（沿用 404/400 协议）。
 
 错误映射：ValidationError -> 400，NotFoundError -> 404，ConflictError -> 409。
-例外：凭证验签端点对一切失败都返回 200 + {"valid": false, "reason": ...}。
+例外：凭证与演示验签端点对一切“验签失败”都返回 200 +
+{"valid": false, "reason": ...}；非法租户头在进入验签流程前判 400。
 """
 
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from .store import (
     CHALLENGE_UNSET,
     ConflictError,
+    DEFAULT_TENANT,
     NotFoundError,
     REASON_UNSET,
     ValidationError,
@@ -34,6 +41,20 @@ from .store import (
 
 def _json_dumps(payload: Any) -> bytes:
     return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def _parse_nonneg_int(raw: str, field: str) -> int:
+    """解析非负整数字符串：仅接受 ASCII 十进制数字。
+
+    拒绝符号/小数/空白/布尔词，也拒绝 Unicode 数字（如阿拉伯-印度数字）。
+    """
+    if (
+        not isinstance(raw, str)
+        or not raw
+        or any(ch < "0" or ch > "9" for ch in raw)
+    ):
+        raise ValidationError(f"查询参数 {field} 必须为非负整数")
+    return int(raw)
 
 
 def build_handler(store: VCStore) -> type:
@@ -59,6 +80,15 @@ def build_handler(store: VCStore) -> type:
         def _send_invalid(self, reason: str) -> None:
             """verify 端点统一失败响应：HTTP 200 + valid:false + 中文原因。"""
             self._send_json(200, {"valid": False, "reason": reason})
+
+        def _tenant_id(self) -> str:
+            """解析 X-Tenant-ID：缺省 default；显式空串 400。"""
+            raw = self.headers.get("X-Tenant-ID")
+            if raw is None:
+                return DEFAULT_TENANT
+            if raw == "":
+                raise ValidationError("X-Tenant-ID 不能为空")
+            return raw
 
         def _read_json(self) -> Dict[str, Any]:
             length = int(self.headers.get("Content-Length") or 0)
@@ -91,45 +121,54 @@ def build_handler(store: VCStore) -> type:
         def do_POST(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
             try:
                 path = urlparse(self.path).path.rstrip("/") or "/"
+                # 仅 /v1 路由受租户头约束；其余路径沿用原协议
+                if not path.startswith("/v1"):
+                    self._send_error(404, f"无此路径: {path}")
+                    return
+                tenant = self._tenant_id()
                 if path == "/v1/dids":
-                    self._post_dids()
+                    self._post_dids(tenant)
                 elif path == "/v1/credentials":
-                    self._post_credentials()
+                    self._post_credentials(tenant)
                 elif path.startswith("/v1/dids/") and path.endswith(
                     "/keys/rotate"
                 ):
                     did = unquote(
                         path[len("/v1/dids/") : -len("/keys/rotate")]
                     )
-                    self._post_rotate_key(did)
+                    self._post_rotate_key(tenant, did)
                 elif path.startswith("/v1/credentials/") and path.endswith(
                     "/revoke"
                 ):
                     credential_id = unquote(
                         path[len("/v1/credentials/") : -len("/revoke")]
                     )
-                    self._post_revoke_credential(credential_id)
+                    self._post_revoke_credential(tenant, credential_id)
                 elif path.startswith("/v1/credentials/") and path.endswith(
                     "/verify"
                 ):
                     credential_id = unquote(
                         path[len("/v1/credentials/") : -len("/verify")]
                     )
-                    self._post_verify_credential(credential_id)
+                    self._post_verify_credential(
+                        tenant, credential_id
+                    )
                 elif path.startswith("/v1/credentials/") and path.endswith(
                     "/present"
                 ):
                     credential_id = unquote(
                         path[len("/v1/credentials/") : -len("/present")]
                     )
-                    self._post_present(credential_id)
+                    self._post_present(tenant, credential_id)
                 elif path.startswith("/v1/presentations/") and path.endswith(
                     "/verify"
                 ):
                     presentation_id = unquote(
                         path[len("/v1/presentations/") : -len("/verify")]
                     )
-                    self._post_verify_presentation(presentation_id)
+                    self._post_verify_presentation(
+                        tenant, presentation_id
+                    )
                 else:
                     self._send_error(404, f"无此路径: {path}")
             except ValidationError as exc:
@@ -144,13 +183,17 @@ def build_handler(store: VCStore) -> type:
         def do_PUT(self) -> None:  # noqa: N802
             try:
                 path = urlparse(self.path).path.rstrip("/") or "/"
+                if not path.startswith("/v1"):
+                    self._send_error(404, f"无此路径: {path}")
+                    return
+                tenant = self._tenant_id()
                 if path.startswith("/v1/credentials/") and path.endswith(
                     "/status"
                 ):
                     credential_id = unquote(
                         path[len("/v1/credentials/") : -len("/status")]
                     )
-                    self._put_credential_status(credential_id)
+                    self._put_credential_status(tenant, credential_id)
                 else:
                     self._send_error(404, f"无此路径: {path}")
             except ValidationError as exc:
@@ -164,24 +207,35 @@ def build_handler(store: VCStore) -> type:
 
         def do_GET(self) -> None:  # noqa: N802
             try:
-                path = urlparse(self.path).path.rstrip("/") or "/"
-                if path.startswith("/v1/dids/"):
-                    self._get_did(unquote(path[len("/v1/dids/") :]))
+                parsed = urlparse(self.path)
+                path = parsed.path.rstrip("/") or "/"
+                if path in ("/health", "/healthz"):
+                    self._send_json(200, {"status": "ok"})
+                    return
+                if not path.startswith("/v1"):
+                    self._send_error(404, f"无此路径: {path}")
+                    return
+                # 仅 /v1 路由受租户头约束
+                tenant = self._tenant_id()
+                if path == "/v1/audit":
+                    self._get_audit(tenant, parsed.query)
+                elif path.startswith("/v1/dids/"):
+                    self._get_did(tenant, unquote(path[len("/v1/dids/") :]))
                 elif path.startswith("/v1/credentials/") and path.endswith(
                     "/status"
                 ):
                     credential_id = unquote(
                         path[len("/v1/credentials/") : -len("/status")]
                     )
-                    self._get_credential_status(credential_id)
+                    self._get_credential_status(tenant, credential_id)
                 elif path.startswith("/v1/credentials/"):
                     self._get_credential(
-                        unquote(path[len("/v1/credentials/") :])
+                        tenant, unquote(path[len("/v1/credentials/") :])
                     )
-                elif path in ("/health", "/healthz"):
-                    self._send_json(200, {"status": "ok"})
                 else:
                     self._send_error(404, f"无此路径: {path}")
+            except ValidationError as exc:
+                self._send_error(400, str(exc))
             except NotFoundError as exc:
                 self._send_error(404, str(exc))
             except Exception as exc:  # noqa: BLE001
@@ -212,28 +266,28 @@ def build_handler(store: VCStore) -> type:
                 "key_version": record.key_version,
             }
 
-        def _post_dids(self) -> None:
+        def _post_dids(self, tenant: str) -> None:
             data = self._read_json()
             self._require_fields(data, ("method", "public_key"))
             key_mode = data.get("key_mode", "server")
             record = store.create_did(
-                data["method"], data["public_key"], key_mode=key_mode
+                tenant, data["method"], data["public_key"], key_mode=key_mode
             )
             self._send_json(201, self._did_payload(record))
 
-        def _get_did(self, did: str) -> None:
-            record = store.get_did(did)
+        def _get_did(self, tenant: str, did: str) -> None:
+            record = store.get_did(tenant, did)
             payload = self._did_payload(record)
             payload["created_at"] = record.created_at
             self._send_json(200, payload)
 
-        def _post_rotate_key(self, did: str) -> None:
+        def _post_rotate_key(self, tenant: str, did: str) -> None:
             data = self._read_json()
             self._require_fields(data, ("key_handle",))
-            record = store.rotate_key(did, data["key_handle"])
+            record = store.rotate_key(tenant, did, data["key_handle"])
             self._send_json(200, self._did_payload(record))
 
-        def _post_credentials(self) -> None:
+        def _post_credentials(self, tenant: str) -> None:
             data = self._read_json()
             self._require_fields(data, ("issuer_did", "subject_did"))
             if "claims" not in data:
@@ -241,7 +295,10 @@ def build_handler(store: VCStore) -> type:
             if not isinstance(data["claims"], dict):
                 raise ValidationError("字段 claims 必须为 JSON 对象")
             record = store.create_credential(
-                data["issuer_did"], data["subject_did"], data["claims"]
+                tenant,
+                data["issuer_did"],
+                data["subject_did"],
+                data["claims"],
             )
             self._send_json(
                 201,
@@ -252,8 +309,8 @@ def build_handler(store: VCStore) -> type:
                 },
             )
 
-        def _get_credential(self, credential_id: str) -> None:
-            record = store.get_credential(credential_id)
+        def _get_credential(self, tenant: str, credential_id: str) -> None:
+            record = store.get_credential(tenant, credential_id)
             self._send_json(
                 200,
                 {
@@ -271,7 +328,9 @@ def build_handler(store: VCStore) -> type:
                 "updated_at": record.updated_at,
             }
 
-        def _put_credential_status(self, credential_id: str) -> None:
+        def _put_credential_status(
+            self, tenant: str, credential_id: str
+        ) -> None:
             # 请求体必须恰为 {"status": "active"}：缺字段、取值非法、
             # 多余字段一律 400。
             data = self._read_json()
@@ -284,18 +343,24 @@ def build_handler(store: VCStore) -> type:
                 raise ValidationError(
                     f"字段 status 非法: {data['status']!r}（仅支持 active）"
                 )
-            record, created = store.set_credential_active(credential_id)
+            record, created = store.set_credential_active(
+                tenant, credential_id
+            )
             # 无状态登记 201；重复登记 200，保持首次 updated_at
             self._send_json(
                 201 if created else 200, self._status_payload(record)
             )
 
-        def _get_credential_status(self, credential_id: str) -> None:
+        def _get_credential_status(
+            self, tenant: str, credential_id: str
+        ) -> None:
             # 历史无状态按 active 返回，updated_at 为 null
-            record = store.get_credential_status(credential_id)
+            record = store.get_credential_status(tenant, credential_id)
             self._send_json(200, self._status_payload(record))
 
-        def _post_revoke_credential(self, credential_id: str) -> None:
+        def _post_revoke_credential(
+            self, tenant: str, credential_id: str
+        ) -> None:
             # reason 可省略（请求体亦可整个缺省）；已吊销时任何 reason
             # 均忽略并返回首次结果，非法 reason 仅首次请求 400。
             data = self._read_optional_json()
@@ -303,7 +368,7 @@ def build_handler(store: VCStore) -> type:
             # reason 的 400 判定由 store 在确认非重复吊销后做出
             # （已吊销时任何 reason 均忽略，含非法值）。
             reason = data["reason"] if "reason" in data else REASON_UNSET
-            record = store.revoke_credential(credential_id, reason)
+            record = store.revoke_credential(tenant, credential_id, reason)
             self._send_json(
                 200,
                 {
@@ -315,10 +380,12 @@ def build_handler(store: VCStore) -> type:
                 },
             )
 
-        def _post_verify_credential(self, credential_id: str) -> None:
-            # verify 端点的公开错误协议：任何失败都返回 200 +
+        def _post_verify_credential(
+            self, tenant: str, credential_id: str
+        ) -> None:
+            # verify 端点的公开错误协议：任何“验签失败”都返回 200 +
             # {"valid": false, "reason": "<非空中文原因>"}，绝不返回
-            # 400/404/500，也不泄露私钥或堆栈。reason 按类别措辞：
+            # 404/500，也不泄露私钥或堆栈。reason 按类别措辞：
             # 请求层（请求*）、资源（凭证不存在）、锚定、签名、密钥。
             try:
                 length = int(self.headers.get("Content-Length") or 0)
@@ -358,14 +425,8 @@ def build_handler(store: VCStore) -> type:
 
             try:
                 valid, reason = store.verify_credential(
-                    credential_id, data["body"], data["signature"]
+                    tenant, credential_id, data["body"], data["signature"]
                 )
-            except NotFoundError:
-                self._send_invalid(f"凭证不存在: {credential_id}")
-                return
-            except ValidationError as exc:
-                self._send_invalid(f"请求不合法: {exc}")
-                return
             except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
                 self._send_invalid("验签过程发生内部错误")
                 return
@@ -374,7 +435,7 @@ def build_handler(store: VCStore) -> type:
                 payload["reason"] = reason or "验签失败"
             self._send_json(200, payload)
 
-        def _post_present(self, credential_id: str) -> None:
+        def _post_present(self, tenant: str, credential_id: str) -> None:
             # 请求体必须恰为 {"disclose": [...]} 加可选 challenge、
             # expires_in：缺失 disclose、类型非法、重复路径或祖先重叠、
             # 多余字段一律 400；未知凭证 404；空列表表示零披露。
@@ -408,6 +469,7 @@ def build_handler(store: VCStore) -> type:
                         "字段 expires_in 须在 1 到 86400 之间"
                     )
             record = store.create_presentation(
+                tenant,
                 credential_id,
                 data["disclose"],
                 challenge=challenge,
@@ -428,10 +490,12 @@ def build_handler(store: VCStore) -> type:
                 },
             )
 
-        def _post_verify_presentation(self, presentation_id: str) -> None:
-            # 与凭证 verify 相同的公开错误协议：任何失败都返回 200 +
-            # {"valid": false, "reason": "<非空中文原因>"}，绝不返回
-            # 400/404/500。
+        def _post_verify_presentation(
+            self, tenant: str, presentation_id: str
+        ) -> None:
+            # 与凭证 verify 相同的公开错误协议：任何“验签失败”都返回
+            # 200 + {"valid": false, "reason": "<非空中文原因>"}，绝不
+            # 返回 404/500。
             try:
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length) if length > 0 else b""
@@ -473,7 +537,7 @@ def build_handler(store: VCStore) -> type:
 
             try:
                 valid, reason = store.verify_presentation(
-                    presentation_id, data["presentation"], challenge
+                    tenant, presentation_id, data["presentation"], challenge
                 )
             except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
                 self._send_invalid("验签过程发生内部错误")
@@ -482,6 +546,48 @@ def build_handler(store: VCStore) -> type:
             if not valid:
                 payload["reason"] = reason or "验签失败"
             self._send_json(200, payload)
+
+        def _get_audit(self, tenant: str, query: str) -> None:
+            # GET /v1/audit?limit=&after=：租户内按 seq 升序。
+            # limit 缺省 50，须为 1..200 的整数；after 缺省 0，须为
+            # 非负整数；非法一律 400。返回 events 与 next_after，
+            # 空页 next_after 保持 after。
+            params = parse_qs(query, keep_blank_values=True)
+            limit_values = params.get("limit")
+            after_values = params.get("after")
+            if limit_values is not None:
+                if len(limit_values) != 1:
+                    raise ValidationError("查询参数 limit 只能提供一次")
+                limit = _parse_nonneg_int(limit_values[0], "limit")
+                if not 1 <= limit <= 200:
+                    raise ValidationError("查询参数 limit 须在 1 到 200 之间")
+            else:
+                limit = 50
+            if after_values is not None:
+                if len(after_values) != 1:
+                    raise ValidationError("查询参数 after 只能提供一次")
+                after = _parse_nonneg_int(after_values[0], "after")
+            else:
+                after = 0
+
+            events, next_after = store.list_audit(tenant, after, limit)
+            self._send_json(
+                200,
+                {
+                    "events": [
+                        {
+                            "seq": event.seq,
+                            "timestamp": event.timestamp,
+                            "tenant_id": event.tenant_id,
+                            "action": event.action,
+                            "resource_type": event.resource_type,
+                            "resource_id": event.resource_id,
+                        }
+                        for event in events
+                    ],
+                    "next_after": next_after,
+                },
+            )
 
     return Handler
 

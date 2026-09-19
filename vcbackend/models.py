@@ -68,3 +68,20 @@ class PresentationRecord:
     proof: str
     challenge: Optional[str] = None
     expires_at: Optional[str] = None
+
+
+@dataclass
+class AuditEvent:
+    """一条审计事件。
+
+    seq 为存储内全局连续序号（自 1 起，跨租户）；timestamp 为 UTC
+    秒级时间戳（整数 Unix 秒）；tenant_id 为事件所属租户；action 为
+    点分事件名；resource_type/resource_id 标识被操作资源。
+    """
+
+    seq: int
+    timestamp: int
+    tenant_id: str
+    action: str
+    resource_type: str
+    resource_id: str

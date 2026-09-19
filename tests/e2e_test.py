@@ -513,7 +513,8 @@ def main():
         # 22. 旧状态文件迁移 + 旧凭证（无 issuer_key_version）按 1 验签
         with open(store, encoding="utf-8") as fh:
             state = json.load(fh)
-        issuer_row = state["dids"][issuer]
+        # 新格式按租户分桶：默认租户资源位于 tenants["default"]
+        issuer_row = state["tenants"]["default"]["dids"][issuer]
         old_body = {
             "credential_id": "vc_old",
             "issuer_did": issuer,
