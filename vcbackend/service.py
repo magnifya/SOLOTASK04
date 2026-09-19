@@ -9,6 +9,7 @@
   POST /v1/credentials/{credential_id}/verify  以存储记录为锚验签
 
 错误映射：ValidationError -> 400，NotFoundError -> 404。
+例外：凭证验签端点对一切失败都返回 200 + {"valid": false, "reason": ...}。
 """
 
 import json
@@ -42,6 +43,10 @@ def build_handler(store: VCStore) -> type:
 
         def _send_error(self, status: int, message: str) -> None:
             self._send_json(status, {"error": message})
+
+        def _send_invalid(self, reason: str) -> None:
+            """verify 端点统一失败响应：HTTP 200 + valid:false + 中文原因。"""
+            self._send_json(200, {"valid": False, "reason": reason})
 
         def _read_json(self) -> Dict[str, Any]:
             length = int(self.headers.get("Content-Length") or 0)
@@ -182,21 +187,62 @@ def build_handler(store: VCStore) -> type:
             )
 
         def _post_verify_credential(self, credential_id: str) -> None:
-            data = self._read_json()
+            # verify 端点的公开错误协议：任何失败都返回 200 +
+            # {"valid": false, "reason": "<非空中文原因>"}，绝不返回
+            # 400/404/500，也不泄露私钥或堆栈。reason 按类别措辞：
+            # 请求层（请求*）、资源（凭证不存在）、锚定、签名、密钥。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                self._send_invalid("请求体缺失或长度声明非法")
+                return
+            except Exception:  # noqa: BLE001
+                self._send_invalid("请求体读取失败")
+                return
+            if not raw:
+                self._send_invalid("请求体缺失")
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                self._send_invalid("请求体不是合法 UTF-8 文本")
+                return
+            except json.JSONDecodeError:
+                self._send_invalid("请求体不是合法 JSON")
+                return
+            if not isinstance(data, dict):
+                self._send_invalid("请求体必须为 JSON 对象")
+                return
             if "body" not in data:
-                raise ValidationError("缺少字段: body")
+                self._send_invalid("请求缺少字段: body")
+                return
             if not isinstance(data["body"], dict):
-                raise ValidationError("字段 body 必须为 JSON 对象")
+                self._send_invalid("请求字段 body 必须为 JSON 对象")
+                return
             if "signature" not in data:
-                raise ValidationError("缺少字段: signature")
+                self._send_invalid("请求缺少字段: signature")
+                return
             if not isinstance(data["signature"], str) or not data["signature"]:
-                raise ValidationError("字段 signature 必须为非空字符串")
-            valid, reason = store.verify_credential(
-                credential_id, data["body"], data["signature"]
-            )
+                self._send_invalid("请求字段 signature 必须为非空字符串")
+                return
+
+            try:
+                valid, reason = store.verify_credential(
+                    credential_id, data["body"], data["signature"]
+                )
+            except NotFoundError:
+                self._send_invalid(f"凭证不存在: {credential_id}")
+                return
+            except ValidationError as exc:
+                self._send_invalid(f"请求不合法: {exc}")
+                return
+            except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
+                self._send_invalid("验签过程发生内部错误")
+                return
             payload: Dict[str, Any] = {"valid": valid}
             if not valid:
-                payload["reason"] = reason
+                payload["reason"] = reason or "验签失败"
             self._send_json(200, payload)
 
     return Handler

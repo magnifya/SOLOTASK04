@@ -29,7 +29,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/dids/{did}/keys/rotate` | 轮换密钥，请求体 `{"key_handle"}`，返回 200 与 `did`、`public_key`、`key_handle`、`key_version` |
 | POST | `/v1/credentials` | 签发凭证，请求体 `{"issuer_did","subject_did","claims"}`，返回 201 与 `credential_id`、`signature`、`issuer_key_version` |
 | GET | `/v1/credentials/{credential_id}` | 返回 `credential_id`、`body`、`signature`；不存在 404 |
-| POST | `/v1/credentials/{credential_id}/verify` | 验签，请求体 `{"body","signature"}`，返回 200 与 `valid`（失败时附中文 `reason`） |
+| POST | `/v1/credentials/{credential_id}/verify` | 验签，请求体 `{"body","signature"}`；**任何失败一律 HTTP 200**，返回 `valid`（失败时附分类中文 `reason`） |
 
 - DID 形如 `did:example:<32 位 hex>`。
 - `public_key` 为**句柄**：非空且不能是 PEM 文本；同一句柄再次提交返回其既有 DID（按提交原文去重）。
@@ -64,7 +64,8 @@ python3 -m vcbackend.cli did-show  did:example:<id>
 python3 -m vcbackend.cli issue --issuer did:example:<a> --subject did:example:<b> \
     --claims '{"role":"admin"}'
 python3 -m vcbackend.cli verify vc_<id>     # 成功输出 true（退出码 0）
-                                           # 正文被改动输出 false，并在 stderr 说明原因（退出码 1）
+                                           # 正文被改动或 GET 凭证失败均输出 false，
+                                           # stderr 说明原因（退出码 1）
 ```
 
 ## 签名与验真
@@ -76,8 +77,17 @@ python3 -m vcbackend.cli verify vc_<id>     # 成功输出 true（退出码 0）
   对其任一字段（含 claims 内部）的改动都会使验签失败。
 - `POST /v1/credentials/{credential_id}/verify` 以**存储的** `credential_id`、
   `issuer_did`、`issuer_key_version` 为锚：正文锚定字段与存储不一致即判失败；
-  验签公钥按 `issuer_key_version` 从签发者公钥历史中取出。失败返回 200
-  `{"valid": false, "reason": "<中文原因>"}`，不会返回 500，也不会泄露私钥。
+  验签公钥按 `issuer_key_version` 从签发者公钥历史中取出。
+- verify 端点采用统一公开错误协议：无论请求体缺失、不是合法 JSON 或不是对象，
+  缺少 `body`/`signature`、`body` 不是对象、`signature` 不是非空字符串，
+  `credential_id` 不存在，正文 `credential_id`/`issuer_did`/`issuer_key_version`
+  与存储锚不一致，签名格式错误、签名校验失败还是历史公钥不可用，**都返回
+  HTTP 200** 与 `{"valid": false, "reason": "<非空中文原因>"}`，绝不返回
+  400/404/500，也不泄露私钥或堆栈。`reason` 按类别措辞以区分
+  请求（`请求…`）、资源（`凭证不存在`）、锚定（`锚定校验失败…`）、
+  签名格式（`签名格式错误…`）、签名校验（`签名校验失败…`）与
+  密钥（`历史公钥不可用…`）。验签成功返回 200 `{"valid": true}`。
+- 其他路径仍沿用原状态码协议：字段问题 400、资源不存在 404。
 - 旧凭证正文缺 `issuer_key_version` 时按版本 1 验签，签名本身不受影响。
 
 ### 密钥模型与轮换

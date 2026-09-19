@@ -19,13 +19,19 @@ from cryptography.hazmat.primitives.asymmetric.utils import (
 
 __all__ = [
     "InvalidSignature",
+    "MalformedSignature",
     "canonicalize",
     "generate_private_key_pem",
     "public_key_pem_from_private",
     "validate_public_key_pem",
+    "validate_signature_format",
     "sign",
     "verify",
 ]
+
+
+class MalformedSignature(ValueError):
+    """签名编码格式非法（无法解码或不是 64 字节裸 R||S）。"""
 
 
 def _b64url(data: bytes) -> str:
@@ -113,12 +119,24 @@ def sign(body: Dict[str, Any], private_pem: str) -> str:
     return _b64url(raw)
 
 
+def validate_signature_format(signature_b64: str) -> None:
+    """校验签名编码格式：须为可解码的 base64url 且裸 R||S 恰为 64 字节。
+
+    仅检查格式，不做密码学验签。格式非法抛 MalformedSignature。
+    """
+    try:
+        raw = _b64url_decode(signature_b64)
+    except Exception as exc:  # noqa: BLE001 解码异常（含 binascii）均属格式问题
+        raise MalformedSignature("签名不是合法的 base64url 编码") from exc
+    if len(raw) != 64:
+        raise MalformedSignature("签名长度不是 64 字节，非合法 ES256 签名")
+
+
 def verify(body: Dict[str, Any], signature_b64: str, public_pem: str) -> None:
-    """校验签名，失败抛 InvalidSignature。"""
+    """校验签名：格式非法抛 MalformedSignature，验签失败抛 InvalidSignature。"""
+    validate_signature_format(signature_b64)
     public_key = _load_public_key(public_pem)
     raw = _b64url_decode(signature_b64)
-    if len(raw) != 64:
-        raise InvalidSignature("签名长度不是 64 字节，非合法 ES256 签名")
     r = int.from_bytes(raw[:32], "big")
     s = int.from_bytes(raw[32:], "big")
     der = encode_dss_signature(r, s)

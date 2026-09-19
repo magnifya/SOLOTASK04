@@ -106,16 +106,43 @@ def _cmd_issue(args: argparse.Namespace) -> int:
 
 
 def _cmd_verify(args: argparse.Namespace) -> int:
-    # 现取凭证正文与签名，交由服务端以存储记录为锚验签
-    vc = _request(
-        args.base_url, "GET", f"/v1/credentials/{args.credential_id}"
-    )
-    result = _request(
-        args.base_url,
-        "POST",
-        f"/v1/credentials/{args.credential_id}/verify",
-        {"body": vc["body"], "signature": vc["signature"]},
-    )
+    # 现取凭证正文与签名，交由服务端以存储记录为锚验签。
+    # 无论 GET 凭证失败（不存在/连不上）还是验签失败，都输出 false、
+    # 在 stderr 说明原因并以退出码 1 结束；成功输出 true 并退出 0。
+    try:
+        vc = _request(
+            args.base_url, "GET", f"/v1/credentials/{args.credential_id}"
+        )
+    except ClientError as exc:
+        print("false")
+        if exc.status == 0:
+            print(f"原因: {exc.message}", file=sys.stderr)
+        else:
+            print(
+                f"原因: 获取凭证失败 (HTTP {exc.status}): {exc.message}",
+                file=sys.stderr,
+            )
+        return 1
+    body = vc.get("body")
+    signature = vc.get("signature")
+    if not isinstance(body, dict) or not isinstance(signature, str) or not signature:
+        print("false")
+        print("原因: 服务端返回的凭证正文或签名缺失", file=sys.stderr)
+        return 1
+    try:
+        result = _request(
+            args.base_url,
+            "POST",
+            f"/v1/credentials/{args.credential_id}/verify",
+            {"body": body, "signature": signature},
+        )
+    except ClientError as exc:
+        print("false")
+        if exc.status == 0:
+            print(f"原因: {exc.message}", file=sys.stderr)
+        else:
+            print(f"原因: 验签请求失败 (HTTP {exc.status})", file=sys.stderr)
+        return 1
     if result.get("valid"):
         print("true")
         return 0

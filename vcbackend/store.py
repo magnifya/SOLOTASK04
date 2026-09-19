@@ -331,43 +331,56 @@ class VCStore:
         锚定字段为存储的 credential_id、issuer_did、issuer_key_version；
         验签公钥按 issuer_key_version 从签发者公钥历史中取出（旧凭证
         缺版本按 1 处理）。任何失败都返回非空中文原因，绝不抛异常、
-        绝不泄露私钥。
+        绝不泄露私钥。reason 按类别区分：请求 / 资源 / 锚定 / 签名格式 /
+        签名校验 / 密钥。
         """
         if not isinstance(body, dict):
-            raise ValidationError("字段 body 必须为 JSON 对象")
+            return False, "请求不合法: 字段 body 必须为 JSON 对象"
         if not isinstance(signature, str) or not signature:
-            raise ValidationError("字段 signature 必须为非空字符串")
+            return False, "请求不合法: 字段 signature 必须为非空字符串"
 
         with self._lock:
             rec = self._credentials.get(credential_id)
             if rec is None:
-                raise NotFoundError(f"凭证不存在: {credential_id}")
+                return False, f"凭证不存在: {credential_id}"
             stored_body = rec["body"]
 
             if body.get("credential_id") != stored_body.get("credential_id"):
-                return False, "正文 credential_id 与存储记录不一致"
+                return False, (
+                    "锚定校验失败: 正文 credential_id 与存储记录不一致"
+                )
             if body.get("issuer_did") != stored_body.get("issuer_did"):
-                return False, "正文 issuer_did 与存储记录不一致"
+                return False, "锚定校验失败: 正文 issuer_did 与存储记录不一致"
             stored_version = stored_body.get("issuer_key_version", 1)
             if body.get("issuer_key_version", 1) != stored_version:
-                return False, "正文 issuer_key_version 与存储记录不一致"
+                return False, (
+                    "锚定校验失败: 正文 issuer_key_version 与存储记录不一致"
+                )
 
             issuer_did = stored_body.get("issuer_did")
             public_pem = self._public_key_for_version_locked(
                 issuer_did, stored_version
             )
-            if public_pem is None:
-                return False, (
-                    f"签发者 {issuer_did} 密钥版本 {stored_version} "
-                    "的公钥不存在"
-                )
+
+        if not public_pem:
+            return False, (
+                "历史公钥不可用: 签发者 "
+                f"{issuer_did} 密钥版本 {stored_version} 的公钥不存在"
+            )
+        try:
+            crypto.validate_public_key_pem(public_pem)
+        except (ValueError, TypeError):
+            return False, (
+                "历史公钥不可用: 签发者 "
+                f"{issuer_did} 密钥版本 {stored_version} 的公钥无法解析"
+            )
 
         try:
             crypto.verify(body, signature, public_pem)
+        except crypto.MalformedSignature:
+            return False, "签名格式错误: 不是合法的 ES256 签名编码"
         except crypto.InvalidSignature:
             return False, "签名校验失败，正文或签名可能被改动"
-        except (ValueError, TypeError) as exc:
-            return False, f"验签数据非法: {exc}"
-        except Exception:  # noqa: BLE001 验签绝不向上抛错
+        except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
             return False, "验签过程发生内部错误"
         return True, ""

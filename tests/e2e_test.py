@@ -244,13 +244,90 @@ def main():
         check("verify 端点: 锚定版本不一致 valid=false",
               st == 200 and r.get("valid") is False and r.get("reason"))
 
-        # 19. verify 端点：缺字段 400 / 未知凭证 404
-        st, _ = _http("POST", f"{base}/v1/credentials/{cid2}/verify",
-                      {"body": {}})
-        check("verify 缺 signature -> 400", st == 400)
-        st, _ = _http("POST", f"{base}/v1/credentials/vc_nope/verify",
-                      {"body": {}, "signature": "x"})
-        check("verify 未知凭证 -> 404", st == 404)
+        # 19. verify 端点公开错误协议：任何失败都 200 + valid:false + 非空中文 reason
+        def verify_raw(cid, raw_bytes, ctype="application/json"):
+            req = urllib.request.Request(
+                f"{base}/v1/credentials/{cid}/verify",
+                data=raw_bytes, method="POST")
+            req.add_header("Content-Type", ctype)
+            try:
+                with urllib.request.urlopen(req) as resp:
+                    return resp.status, json.loads(resp.read().decode() or "{}")
+            except urllib.error.HTTPError as exc:
+                return exc.code, json.loads(exc.read().decode() or "{}")
+
+        def check_invalid(name, cid, payload=None, raw=None):
+            if raw is None:
+                raw = json.dumps(payload).encode("utf-8")
+            st, rr = verify_raw(cid, raw)
+            ok = (
+                st == 200
+                and rr.get("valid") is False
+                and isinstance(rr.get("reason"), str)
+                and rr["reason"].strip()
+            )
+            check(name, ok)
+            return rr
+
+        # 请求类：缺失请求体 / 非法 JSON / 非对象
+        check_invalid("verify 缺失请求体 -> 200 valid:false", cid2, raw=b"")
+        check_invalid("verify 非法 JSON -> 200 valid:false", cid2,
+                      raw=b"{not json")
+        check_invalid("verify 请求体非对象(JSON 数组) -> 200 valid:false",
+                      cid2, raw=b"[1,2]")
+        # 请求类：缺 body / 缺 signature / body 非对象 / signature 空串与非字符串
+        check_invalid("verify 缺 body -> 200 valid:false", cid2,
+                      {"signature": vc2["signature"]})
+        check_invalid("verify 缺 signature -> 200 valid:false", cid2,
+                      {"body": vc2["body"]})
+        check_invalid("verify body 非对象 -> 200 valid:false", cid2,
+                      {"body": "x", "signature": vc2["signature"]})
+        check_invalid("verify 空 signature -> 200 valid:false", cid2,
+                      {"body": vc2["body"], "signature": ""})
+        check_invalid("verify signature 非字符串 -> 200 valid:false", cid2,
+                      {"body": vc2["body"], "signature": 123})
+        # 资源类：未知 credential_id
+        rr = check_invalid("verify 未知凭证 -> 200 valid:false", "vc_nope",
+                           {"body": {}, "signature": "x"})
+        check("verify 未知凭证 reason 指向资源类别",
+              "凭证不存在" in rr.get("reason", ""))
+        # 锚定类：credential_id / issuer_did / issuer_key_version 不一致
+        anchor_bad2 = json.loads(json.dumps(vc2["body"]))
+        anchor_bad2["credential_id"] = "vc_other"
+        rr = check_invalid("verify 正文 credential_id 不一致", cid2,
+                           {"body": anchor_bad2, "signature": vc2["signature"]})
+        check("verify credential_id 不一致 reason 指向锚定",
+              "锚定" in rr["reason"])
+        anchor_bad3 = json.loads(json.dumps(vc2["body"]))
+        anchor_bad3["issuer_did"] = alice
+        rr = check_invalid("verify 正文 issuer_did 不一致", cid2,
+                           {"body": anchor_bad3, "signature": vc2["signature"]})
+        check("verify issuer_did 不一致 reason 指向锚定",
+              "锚定" in rr["reason"])
+        rr = check_invalid("verify 锚定版本不一致 valid=false", cid2,
+                           {"body": anchor_bad, "signature": vc2["signature"]})
+        check("verify issuer_key_version 不一致 reason 指向锚定",
+              "锚定" in rr["reason"])
+        # 签名格式类：合法 body 但签名编码/长度非法（先通过锚定再判格式）
+        rr = check_invalid("verify 签名非 base64url -> 200 valid:false", cid2,
+                           {"body": vc2["body"], "signature": "@@@"})
+        check("verify 非法编码 reason 指向签名格式",
+              "签名格式" in rr["reason"])
+        rr = check_invalid("verify 签名长度错误 -> 200 valid:false", cid2,
+                           {"body": vc2["body"], "signature": "AAAA"})
+        check("verify 错误长度 reason 指向签名格式",
+              "签名格式" in rr["reason"])
+        # 签名校验类：合法格式、错误签名
+        wrong_sig = crypto.sign(vc2["body"], crypto.generate_private_key_pem())
+        rr = check_invalid("verify 他人密钥签名 -> 200 valid:false", cid2,
+                           {"body": vc2["body"], "signature": wrong_sig})
+        check("verify 错误签名 reason 指向签名校验",
+              "签名校验" in rr["reason"])
+        # 成功路径不受影响
+        st, r = _http("POST", f"{base}/v1/credentials/{cid2}/verify",
+                      {"body": vc2["body"], "signature": vc2["signature"]})
+        check("verify 合法凭证仍 valid=true/200",
+              st == 200 and r.get("valid") is True and "reason" not in r)
 
         # 20. CLI verify：成功 true/0；未知凭证非 0
         env_cli = dict(env, VCBACKEND_URL=base)
