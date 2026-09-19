@@ -24,13 +24,16 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/v1/dids` | 注册 DID，请求体 `{"method","public_key"}`，返回 201 与 `did`、`public_key` |
-| GET | `/v1/dids/{did}` | 返回 `did`、`public_key`、`created_at`；不存在 404 |
-| POST | `/v1/credentials` | 签发凭证，请求体 `{"issuer_did","subject_did","claims"}`，返回 201 与 `credential_id`、`signature` |
+| POST | `/v1/dids` | 注册 DID，请求体 `{"method","public_key","key_mode"?}`，返回 201 与 `did`、`public_key`、`key_mode`、`key_handle`、`key_version` |
+| GET | `/v1/dids/{did}` | 返回 `did`、`public_key`、`key_mode`、`key_handle`、`key_version`、`created_at`；不存在 404 |
+| POST | `/v1/dids/{did}/keys/rotate` | 轮换密钥，请求体 `{"key_handle"}`，返回 200 与 `did`、`public_key`、`key_handle`、`key_version` |
+| POST | `/v1/credentials` | 签发凭证，请求体 `{"issuer_did","subject_did","claims"}`，返回 201 与 `credential_id`、`signature`、`issuer_key_version` |
 | GET | `/v1/credentials/{credential_id}` | 返回 `credential_id`、`body`、`signature`；不存在 404 |
+| POST | `/v1/credentials/{credential_id}/verify` | 验签，请求体 `{"body","signature"}`，返回 200 与 `valid`（失败时附中文 `reason`） |
 
 - DID 形如 `did:example:<32 位 hex>`。
-- 同一 `public_key` 再次提交返回其既有 DID（按提交原文去重）。
+- `public_key` 为**句柄**：非空且不能是 PEM 文本；同一句柄再次提交返回其既有 DID（按提交原文去重）。
+- `key_mode` 缺省为 `server`（服务端托管密钥），其余取值一律 400。
 - 缺少/非法字段返回 400 并在 `error` 中说明原因；任一 DID 不存在时 400 并指明是 `issuer_did` 还是 `subject_did`。
 
 ### curl 示例
@@ -38,14 +41,19 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 ```bash
 curl -X POST localhost:8080/v1/dids -d '{"method":"example","public_key":"alice-key"}'
 curl localhost:8080/v1/dids/did:example:<id>
+curl -X POST localhost:8080/v1/dids/did:example:<id>/keys/rotate \
+  -d '{"key_handle":"alice-key-v2"}'
 curl -X POST localhost:8080/v1/credentials \
   -d '{"issuer_did":"did:example:<a>","subject_did":"did:example:<b>","claims":{"role":"admin"}}'
 curl localhost:8080/v1/credentials/vc_<id>
+curl -X POST localhost:8080/v1/credentials/vc_<id>/verify \
+  -d '{"body":{...},"signature":"..."}'
 ```
 
 ## 命令行
 
-CLI 通过 HTTP 与服务通信（因此 `verify` 使用的是从服务**现取**的签发者公钥）。
+CLI 通过 HTTP 与服务通信（`verify` 调用服务端验签端点，由服务端按
+`issuer_key_version` 从签发者公钥历史中取公钥验签）。
 用 `--base-url` 或环境变量 `VCBACKEND_URL` 指定服务地址（默认 `http://127.0.0.1:8080`）。
 
 ```bash
@@ -63,14 +71,28 @@ python3 -m vcbackend.cli verify vc_<id>     # 成功输出 true（退出码 0）
 
 - 算法为 **ES256**：ECDSA over P-256 与 SHA-256，签名编码为 64 字节裸 `R||S` 的 base64url（无填充）。
 - 签名覆盖凭证**正文按 key 升序的规范化 JSON**（紧凑序列化、UTF-8、嵌套对象同样递归排序）。
-- 凭证正文包含 `credential_id`、`issuer_did`、`subject_did`、`claims`、`issued_at`，
+- 凭证正文包含 `credential_id`、`issuer_did`、`subject_did`、`claims`、`issued_at`
+  与整数 `issuer_key_version`（签发时签发者的当前密钥版本，随正文一起签名），
   对其任一字段（含 claims 内部）的改动都会使验签失败。
+- `POST /v1/credentials/{credential_id}/verify` 以**存储的** `credential_id`、
+  `issuer_did`、`issuer_key_version` 为锚：正文锚定字段与存储不一致即判失败；
+  验签公钥按 `issuer_key_version` 从签发者公钥历史中取出。失败返回 200
+  `{"valid": false, "reason": "<中文原因>"}`，不会返回 500，也不会泄露私钥。
+- 旧凭证正文缺 `issuer_key_version` 时按版本 1 验签，签名本身不受影响。
 
-### 密钥模型
+### 密钥模型与轮换
 
 为保证「服务端签发的签名能用注册时返回的公钥验真」，注册时由系统为该
 `public_key` 句柄铸造 P-256 密钥对：接口返回并登记真实公钥 PEM，私钥由服务端内部持有
 （随状态文件保存，仅用于本演示）。`public_key` 提交串作为幂等去重的句柄。
+
+- 每个 DID 维护 `key_history`：`[{version, key_handle, public_key, ...}]`，版本自 1 起。
+- `POST /v1/dids/{did}/keys/rotate` 生成新 P-256 密钥对，原子递增 `key_version`
+  并登记历史；新句柄须非空、非 PEM 且未被任何 DID 使用过。未知 DID 404，非法句柄 400。
+- 轮换后**新签发用当前版本私钥**，**验签按 `issuer_key_version` 取历史公钥**，
+  因此旧凭证在轮换后仍可验真。
+- 旧状态文件中缺少密钥元数据的 DID 在加载时自动迁移为 `server`/版本 1：
+  历史即原 `public_key`，句柄取 `submitted_public_key`（缺省为原 `public_key`）。
 
 ## 测试
 
@@ -79,7 +101,9 @@ python3 tests/e2e_test.py
 ```
 
 脚本会临时在本地端口启动服务，覆盖：201/200/400/404 各路径、同 key 去重、
-缺失字段原因、不存在 DID 指明、现取公钥验签成功、篡改 claims/顶层字段验签失败。
+PEM 句柄与非法 key_mode 拒绝、密钥轮换（含 404/400 路径）、轮换前后
+`issuer_key_version` 验签、verify 端点 valid=true/false、CLI verify 成功与失败、
+旧状态文件迁移与旧凭证按版本 1 验签。
 
 ## 代码结构
 
@@ -87,7 +111,7 @@ python3 tests/e2e_test.py
 vcbackend/
   crypto.py    ES256 签名/验签、规范化 JSON、P-256 密钥
   models.py    DIDRecord / CredentialRecord 数据模型
-  store.py     文件持久化存储、DID 去重与凭证签发业务逻辑
+  store.py     文件持久化存储、DID 去重、密钥轮换与凭证签发/验签业务逻辑
   service.py   标准库 HTTP 路由与错误映射
   cli.py       did-create / did-show / issue / verify / serve
 tests/e2e_test.py  端到端测试

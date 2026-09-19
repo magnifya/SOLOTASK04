@@ -1,10 +1,12 @@
 """HTTP 服务：基于标准库 http.server。
 
 路由：
-  POST /v1/dids                       注册 DID
-  GET  /v1/dids/{did}                 查询 DID
-  POST /v1/credentials                签发凭证
-  GET  /v1/credentials/{credential_id} 查询凭证
+  POST /v1/dids                           注册 DID
+  GET  /v1/dids/{did}                     查询 DID
+  POST /v1/dids/{did}/keys/rotate         轮换 DID 密钥
+  POST /v1/credentials                    签发凭证
+  GET  /v1/credentials/{credential_id}    查询凭证
+  POST /v1/credentials/{credential_id}/verify  以存储记录为锚验签
 
 错误映射：ValidationError -> 400，NotFoundError -> 404。
 """
@@ -62,10 +64,26 @@ def build_handler(store: VCStore) -> type:
                     self._post_dids()
                 elif path == "/v1/credentials":
                     self._post_credentials()
+                elif path.startswith("/v1/dids/") and path.endswith(
+                    "/keys/rotate"
+                ):
+                    did = unquote(
+                        path[len("/v1/dids/") : -len("/keys/rotate")]
+                    )
+                    self._post_rotate_key(did)
+                elif path.startswith("/v1/credentials/") and path.endswith(
+                    "/verify"
+                ):
+                    credential_id = unquote(
+                        path[len("/v1/credentials/") : -len("/verify")]
+                    )
+                    self._post_verify_credential(credential_id)
                 else:
                     self._send_error(404, f"无此路径: {path}")
             except ValidationError as exc:
                 self._send_error(400, str(exc))
+            except NotFoundError as exc:
+                self._send_error(404, str(exc))
             except Exception as exc:  # noqa: BLE001
                 self._send_error(500, f"服务器内部错误: {exc}")
 
@@ -102,28 +120,36 @@ def build_handler(store: VCStore) -> type:
                         f"字段 {field} 必须为非空字符串"
                     )
 
+        @staticmethod
+        def _did_payload(record: Any) -> Dict[str, Any]:
+            return {
+                "did": record.did,
+                "public_key": record.public_key,
+                "key_mode": record.key_mode,
+                "key_handle": record.key_handle,
+                "key_version": record.key_version,
+            }
+
         def _post_dids(self) -> None:
             data = self._read_json()
             self._require_fields(data, ("method", "public_key"))
-            record = store.create_did(data["method"], data["public_key"])
-            self._send_json(
-                201,
-                {
-                    "did": record.did,
-                    "public_key": record.public_key,
-                },
+            key_mode = data.get("key_mode", "server")
+            record = store.create_did(
+                data["method"], data["public_key"], key_mode=key_mode
             )
+            self._send_json(201, self._did_payload(record))
 
         def _get_did(self, did: str) -> None:
             record = store.get_did(did)
-            self._send_json(
-                200,
-                {
-                    "did": record.did,
-                    "public_key": record.public_key,
-                    "created_at": record.created_at,
-                },
-            )
+            payload = self._did_payload(record)
+            payload["created_at"] = record.created_at
+            self._send_json(200, payload)
+
+        def _post_rotate_key(self, did: str) -> None:
+            data = self._read_json()
+            self._require_fields(data, ("key_handle",))
+            record = store.rotate_key(did, data["key_handle"])
+            self._send_json(200, self._did_payload(record))
 
         def _post_credentials(self) -> None:
             data = self._read_json()
@@ -140,6 +166,7 @@ def build_handler(store: VCStore) -> type:
                 {
                     "credential_id": record.credential_id,
                     "signature": record.signature,
+                    "issuer_key_version": record.body["issuer_key_version"],
                 },
             )
 
@@ -153,6 +180,24 @@ def build_handler(store: VCStore) -> type:
                     "signature": record.signature,
                 },
             )
+
+        def _post_verify_credential(self, credential_id: str) -> None:
+            data = self._read_json()
+            if "body" not in data:
+                raise ValidationError("缺少字段: body")
+            if not isinstance(data["body"], dict):
+                raise ValidationError("字段 body 必须为 JSON 对象")
+            if "signature" not in data:
+                raise ValidationError("缺少字段: signature")
+            if not isinstance(data["signature"], str) or not data["signature"]:
+                raise ValidationError("字段 signature 必须为非空字符串")
+            valid, reason = store.verify_credential(
+                credential_id, data["body"], data["signature"]
+            )
+            payload: Dict[str, Any] = {"valid": valid}
+            if not valid:
+                payload["reason"] = reason
+            self._send_json(200, payload)
 
     return Handler
 

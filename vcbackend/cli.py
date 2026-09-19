@@ -4,10 +4,11 @@
   did-create --method M --public-key K   注册 DID
   did-show DID                           查询 DID
   issue --issuer DID --subject DID --claims JSON   签发凭证
-  verify CREDENTIAL_ID                   现取签发者公钥验签，输出 true/false
+  verify CREDENTIAL_ID                   调用服务端验签端点，输出 true/false
   serve [--host H] [--port P]            启动 HTTP 服务
 
-CLI 通过 HTTP 与服务通信，因此 verify 拿到的是签发者"现取"的公钥。
+CLI 通过 HTTP 与服务通信；verify 由服务端以存储记录为锚、按
+issuer_key_version 从签发者公钥历史中取公钥验签。
 可用 --base-url 或环境变量 VCBACKEND_URL 指定服务地址。
 """
 
@@ -18,7 +19,6 @@ from typing import Any, Dict, List, Optional
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
-from . import crypto
 from .service import run as serve_run
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8080"
@@ -106,27 +106,23 @@ def _cmd_issue(args: argparse.Namespace) -> int:
 
 
 def _cmd_verify(args: argparse.Namespace) -> int:
-    # 现取凭证正文与签名
+    # 现取凭证正文与签名，交由服务端以存储记录为锚验签
     vc = _request(
         args.base_url, "GET", f"/v1/credentials/{args.credential_id}"
     )
-    body = vc["body"]
-    # 用签发者现取的公钥校验
-    issuer = _request(args.base_url, "GET", f"/v1/dids/{body['issuer_did']}")
-    public_pem = issuer["public_key"]
-    try:
-        crypto.verify(body, vc["signature"], public_pem)
-    except crypto.InvalidSignature as exc:
-        detail = str(exc) or "签名与按 key 升序规范化后的正文不匹配"
-        print("false")
-        print(f"原因: 签名校验失败，正文可能被改动（{detail}）", file=sys.stderr)
-        return 1
-    except ValueError as exc:
-        print("false")
-        print(f"原因: 签发者公钥不可用（{exc}）", file=sys.stderr)
-        return 1
-    print("true")
-    return 0
+    result = _request(
+        args.base_url,
+        "POST",
+        f"/v1/credentials/{args.credential_id}/verify",
+        {"body": vc["body"], "signature": vc["signature"]},
+    )
+    if result.get("valid"):
+        print("true")
+        return 0
+    reason = result.get("reason") or "验签失败"
+    print("false")
+    print(f"原因: {reason}", file=sys.stderr)
+    return 1
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
