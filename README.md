@@ -35,6 +35,37 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/credentials/{credential_id}/verify` | 验签，请求体 `{"body","signature"}`；**任何失败一律 HTTP 200**，返回 `valid`（失败时附分类中文 `reason`） |
 | POST | `/v1/credentials/{credential_id}/present` | 生成选择性披露演示，请求体恰为 `{"disclose":[路径...]}` 加可选 `challenge`、`expires_in`；成功 201 返回演示对象；字段问题 400、未知凭证 404 |
 | POST | `/v1/presentations/{presentation_id}/verify` | 校验演示，新演示请求体恰为 `{"presentation":对象,"challenge":串}`（旧演示恰为 `{"presentation":对象}`）；**任何失败一律 HTTP 200**，成功 `{"valid":true}`，失败附非空中文 `reason` |
+| GET | `/v1/audit?limit=&after=` | 查询本租户审计事件（seq 升序分页），返回 `events`、`next_after`；参数非法 400 |
+
+### 租户隔离
+
+- `/v1` 请求取请求头 `X-Tenant-ID` 作为租户标识：缺省归入 `default`
+  租户；显式提供但为空（或纯空白）一律 400。
+- DID、凭证、演示与 `key_handle` 均仅本租户可见：跨租户访问一律按
+  资源不存在处理（路径资源 404；验签/验演示按“凭证不存在”/
+  “演示不存在”的 `valid:false` 原因返回）。
+- 同一 `key_handle` 可在不同租户各自注册；句柄去重与轮换时的句柄
+  唯一性均按租户作用域判定。
+- 旧状态文件中缺少租户字段的记录在加载时自动归入 `default` 租户。
+
+### 审计
+
+- 成功的变更操作在同一锁内追加审计事件并随状态文件**原子落盘**；
+  失败操作（400/404/409、验签失败、已消费、已过期、已吊销）不记。
+- 事件字段：`seq`（**全局连续、自 1 起**，跨租户共享同一序列）、
+  `timestamp`（UTC、Z 结尾、秒精度）、`tenant_id`、`action`、
+  `resource_type`、`resource_id`。
+- 动作映射：DID 注册/幂等重试 → `did.created`；签发 →
+  `credential.issued`；轮换 → `key.rotated`；active 登记/重复登记 →
+  `status.updated`；吊销/重复吊销 → `credential.revoked`；创建演示 →
+  `presentation.created`；演示消费成功 → `presentation.consumed`
+  （幂等成功每次都记）。
+- `GET /v1/audit?limit=&after=` 返回本租户 `seq > after` 的事件，
+  seq 升序：`limit` 缺省 50，须为 1–200 的整数；`after` 缺省 0，
+  须为非负整数；非法一律 400。响应为
+  `{"events": [...], "next_after": n}`：`next_after` 为本页末条
+  事件的 `seq`（作为下一页的 `after` 游标），空页保持传入的
+  `after`。审计记录跨重启保留。
 
 - DID 形如 `did:example:<32 位 hex>`。
 - `public_key` 为**句柄**：非空且不能是 PEM 文本；同一句柄再次提交返回其既有 DID（按提交原文去重）。
@@ -177,8 +208,9 @@ python3 -m vcbackend.cli verify vc_<id>     # 成功输出 true（退出码 0）
   `expires_at`，`演示已过期`）-> 按存储凭证 `claims` 与存储 `disclose`
   **重算投影**并核对对象 `claims` -> `proof` 格式与签名 -> 吊销。
   未过期、未吊销且验签成功才返回 200 `{"valid":true}`（无其他字段）
-  并**原子标记已消费**：并发验证仅一次成功，过期或失败不消费，消费
-  记录跨重启保留，重复验证返回 `演示已消费`。
+  并**原子标记已消费**：验签后在消费锁内**复查 `expires_at`**，
+  到期返回 `演示已过期` 且不消费；并发验证仅一次成功，过期或
+  失败不消费，消费记录跨重启保留，重复验证返回 `演示已消费`。
 - 凭证已吊销时，演示在签名与锚定全部通过后返回 200、
   `{"valid":false,"reason":"凭证已吊销：<保存的 reason>"}`，且**不消费**；
   签名失败仍优先返回签名类原因。
@@ -193,7 +225,8 @@ curl -X POST localhost:8080/v1/presentations/vp_<id>/verify \
 ## 测试
 
 ```bash
-python3 tests/e2e_test.py
+python3 tests/e2e_test.py          # 既有功能回归
+python3 tests/tenant_audit_test.py # 租户隔离 / 审计 / 消费竞态
 ```
 
 脚本会临时在本地端口启动服务，覆盖：201/200/400/404/409 各路径、同 key 去重、

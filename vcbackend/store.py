@@ -14,6 +14,14 @@
 
 凭证状态（active/revoked）登记在凭证行内，随状态文件持久化；
 历史无状态凭证查询时按 active 呈现（updated_at 为空）。
+
+租户隔离：每条 DID/凭证/演示记录都带 tenant_id（旧状态文件迁移为
+"default"）；句柄去重与句柄唯一性均按租户作用域判定，跨租户访问
+一律按资源不存在处理。
+
+审计：成功的变更操作在同一锁内追加审计事件并与状态一起原子落盘，
+失败操作不记。事件含 seq（全局连续，自 1 起）、UTC 秒精度
+timestamp、tenant_id、action、resource_type、resource_id。
 """
 
 import json
@@ -67,6 +75,9 @@ CHALLENGE_UNSET = object()
 # 演示默认有效期（秒）与允许范围
 DEFAULT_EXPIRES_IN = 300
 MAX_EXPIRES_IN = 86400
+
+# 缺省租户：请求未显式携带 X-Tenant-ID 时归入该租户
+DEFAULT_TENANT = "default"
 
 
 def _utc_now() -> str:
@@ -228,6 +239,7 @@ class VCStore:
         self._dids: Dict[str, Dict[str, Any]] = {}
         self._credentials: Dict[str, Dict[str, Any]] = {}
         self._presentations: Dict[str, Dict[str, Any]] = {}
+        self._audit: List[Dict[str, Any]] = []
         self._load()
 
     # ------------------------------------------------------------------ #
@@ -240,8 +252,17 @@ class VCStore:
             self._dids = data.get("dids", {})
             self._credentials = data.get("credentials", {})
             self._presentations = data.get("presentations", {})
+            self._audit = data.get("audit", [])
             for rec in self._dids.values():
                 _migrate_did_row(rec)
+            # 旧状态文件缺少租户字段的记录归入缺省租户
+            for rows in (
+                self._dids,
+                self._credentials,
+                self._presentations,
+            ):
+                for rec in rows.values():
+                    rec.setdefault("tenant_id", DEFAULT_TENANT)
 
     def _save_locked(self) -> None:
         directory = os.path.dirname(os.path.abspath(self.path))
@@ -251,10 +272,63 @@ class VCStore:
             "dids": self._dids,
             "credentials": self._credentials,
             "presentations": self._presentations,
+            "audit": self._audit,
         }
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
         os.replace(tmp, self.path)
+
+    # ------------------------------------------------------------------ #
+    # 租户与审计
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _normalize_tenant(tenant_id: Optional[str]) -> str:
+        """租户标识归一化：缺省归入 default；显式空白一律拒绝。"""
+        if tenant_id is None:
+            return DEFAULT_TENANT
+        if not isinstance(tenant_id, str) or not tenant_id.strip():
+            raise ValidationError("租户标识不能为空")
+        return tenant_id.strip()
+
+    def _append_audit_locked(
+        self,
+        tenant_id: str,
+        action: str,
+        resource_type: str,
+        resource_id: str,
+    ) -> None:
+        """在锁内追加一条审计事件（与状态变更同一次原子落盘）。
+
+        seq 全局连续、自 1 起；timestamp 为 UTC 秒精度。
+        """
+        seq = self._audit[-1]["seq"] + 1 if self._audit else 1
+        self._audit.append(
+            {
+                "seq": seq,
+                "timestamp": _utc_now(),
+                "tenant_id": tenant_id,
+                "action": action,
+                "resource_type": resource_type,
+                "resource_id": resource_id,
+            }
+        )
+
+    def list_audit(
+        self, tenant_id: Optional[str], limit: int, after: int
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """按租户列出审计事件：seq 升序、仅含 seq > after 的前 limit 条。
+
+        返回 (事件列表, next_after)；空页时 next_after 保持传入的 after。
+        """
+        tenant = self._normalize_tenant(tenant_id)
+        with self._lock:
+            events = [
+                dict(event)
+                for event in self._audit
+                if event["tenant_id"] == tenant and event["seq"] > after
+            ][:limit]
+        next_after = events[-1]["seq"] if events else after
+        return events, next_after
 
     # ------------------------------------------------------------------ #
     # DID
@@ -277,14 +351,18 @@ class VCStore:
         public_key: str,
         key_mode: str = "server",
         private_pem: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> DIDRecord:
         """注册 DID。
 
         - method 须合法；public_key 为句柄：非空且非 PEM 文本；
         - key_mode 缺省为 "server"，其余取值一律 ValidationError；
-        - 同一句柄再次提交返回既有记录（按提交原文去重）；
-        - 新注册使用系统生成的 P-256 密钥对，版本自 1 起并登记公钥历史。
+        - 同一句柄在同一租户内再次提交返回既有记录（按提交原文去重），
+          不同租户可用同一句柄各自注册；
+        - 新注册使用系统生成的 P-256 密钥对，版本自 1 起并登记公钥历史；
+        - 注册与幂等重试均记 did.created 审计事件。
         """
+        tenant = self._normalize_tenant(tenant_id)
         if not isinstance(method, str) or not method:
             raise ValidationError("缺少字段或字段为空: method")
         if not _METHOD_RE.match(method):
@@ -298,8 +376,13 @@ class VCStore:
         handle = _validate_key_handle(public_key, "public_key")
 
         with self._lock:
-            existing = self._find_did_by_handle_locked(handle)
+            existing = self._find_did_by_handle_locked(handle, tenant)
             if existing is not None:
+                # 幂等重试：每次成功都记审计
+                self._append_audit_locked(
+                    tenant, "did.created", "did", existing.did
+                )
+                self._save_locked()
                 return existing
 
             if private_pem is not None:
@@ -321,6 +404,7 @@ class VCStore:
                 "key_mode": "server",
                 "key_handle": handle,
                 "key_version": 1,
+                "tenant_id": tenant,
                 "key_history": [
                     {
                         "version": 1,
@@ -330,11 +414,16 @@ class VCStore:
                     }
                 ],
             }
+            self._append_audit_locked(tenant, "did.created", "did", did)
             self._save_locked()
             return self._did_record(did, self._dids[did])
 
-    def _find_did_by_handle_locked(self, handle: str) -> Optional[DIDRecord]:
+    def _find_did_by_handle_locked(
+        self, handle: str, tenant: str
+    ) -> Optional[DIDRecord]:
         for did, rec in self._dids.items():
+            if rec.get("tenant_id", DEFAULT_TENANT) != tenant:
+                continue
             if handle in (rec.get("public_key"), rec.get("submitted_public_key"),
                           rec.get("key_handle")):
                 return self._did_record(did, rec)
@@ -343,38 +432,45 @@ class VCStore:
                     return self._did_record(did, rec)
         return None
 
-    def _handle_in_use_locked(self, handle: str) -> bool:
-        return self._find_did_by_handle_locked(handle) is not None
+    def _handle_in_use_locked(self, handle: str, tenant: str) -> bool:
+        return self._find_did_by_handle_locked(handle, tenant) is not None
 
-    def get_did(self, did: str) -> DIDRecord:
-        """查询 DID；不存在抛 NotFoundError。"""
+    def get_did(
+        self, did: str, tenant_id: Optional[str] = None
+    ) -> DIDRecord:
+        """查询 DID；不存在或不属于本租户抛 NotFoundError。"""
+        tenant = self._normalize_tenant(tenant_id)
         with self._lock:
             rec = self._dids.get(did)
-            if rec is None:
+            if rec is None or rec.get("tenant_id", DEFAULT_TENANT) != tenant:
                 raise NotFoundError(f"DID 不存在: {did}")
             return self._did_record(did, rec)
 
-    def _get_did_row_locked(self, did: str) -> Dict[str, Any]:
+    def _get_did_row_locked(self, did: str, tenant: str) -> Dict[str, Any]:
         rec = self._dids.get(did)
-        if rec is None:
+        if rec is None or rec.get("tenant_id", DEFAULT_TENANT) != tenant:
             raise NotFoundError(f"DID 不存在: {did}")
         return rec
 
     # ------------------------------------------------------------------ #
     # 密钥轮换
     # ------------------------------------------------------------------ #
-    def rotate_key(self, did: str, key_handle: str) -> DIDRecord:
+    def rotate_key(
+        self, did: str, key_handle: str, tenant_id: Optional[str] = None
+    ) -> DIDRecord:
         """轮换 DID 密钥：生成新 P-256 密钥对，原子递增版本并登记历史。
 
-        - DID 不存在抛 NotFoundError；
-        - key_handle 须为非空、非 PEM 且未被任何 DID 使用过的句柄。
+        - DID 不存在或不属于本租户抛 NotFoundError；
+        - key_handle 须为非空、非 PEM 且未被本租户任何 DID 使用过的句柄；
+        - 成功记 key.rotated 审计事件。
         """
+        tenant = self._normalize_tenant(tenant_id)
         handle = _validate_key_handle(key_handle, "key_handle")
         with self._lock:
             rec = self._dids.get(did)
-            if rec is None:
+            if rec is None or rec.get("tenant_id", DEFAULT_TENANT) != tenant:
                 raise NotFoundError(f"DID 不存在: {did}")
-            if self._handle_in_use_locked(handle):
+            if self._handle_in_use_locked(handle, tenant):
                 raise ValidationError(f"key_handle 已被使用: {handle}")
 
             priv_pem = crypto.generate_private_key_pem()
@@ -393,6 +489,7 @@ class VCStore:
             rec["key_handle"] = handle
             rec["public_key"] = pub_pem
             rec["private_key_pem"] = priv_pem
+            self._append_audit_locked(tenant, "key.rotated", "did", did)
             self._save_locked()
             return self._did_record(did, rec)
 
@@ -415,8 +512,13 @@ class VCStore:
         issuer_did: str,
         subject_did: str,
         claims: Dict[str, Any],
+        tenant_id: Optional[str] = None,
     ) -> CredentialRecord:
-        """校验签发者/持有者 DID，构造正文（含 issuer_key_version）并签名。"""
+        """校验签发者/持有者 DID，构造正文（含 issuer_key_version）并签名。
+
+        两个 DID 都须存在于本租户；成功记 credential.issued 审计事件。
+        """
+        tenant = self._normalize_tenant(tenant_id)
         if not isinstance(issuer_did, str) or not issuer_did:
             raise ValidationError("缺少字段或字段为空: issuer_did")
         if not isinstance(subject_did, str) or not subject_did:
@@ -425,12 +527,16 @@ class VCStore:
             raise ValidationError("字段 claims 必须为 JSON 对象")
 
         with self._lock:
-            # 逐个指明不存在的是哪一个 DID
+            # 逐个指明不存在的是哪一个 DID（跨租户视同不存在）
             issuer = self._dids.get(issuer_did)
-            if issuer is None:
+            if issuer is None or issuer.get(
+                "tenant_id", DEFAULT_TENANT
+            ) != tenant:
                 raise ValidationError(f"issuer_did 不存在: {issuer_did}")
             subject = self._dids.get(subject_did)
-            if subject is None:
+            if subject is None or subject.get(
+                "tenant_id", DEFAULT_TENANT
+            ) != tenant:
                 raise ValidationError(f"subject_did 不存在: {subject_did}")
 
             credential_id = f"vc_{uuid.uuid4().hex}"
@@ -446,17 +552,24 @@ class VCStore:
             self._credentials[credential_id] = {
                 "body": body,
                 "signature": signature,
+                "tenant_id": tenant,
             }
+            self._append_audit_locked(
+                tenant, "credential.issued", "credential", credential_id
+            )
             self._save_locked()
             return CredentialRecord(
                 credential_id=credential_id, body=body, signature=signature
             )
 
-    def get_credential(self, credential_id: str) -> CredentialRecord:
-        """查询凭证；不存在抛 NotFoundError。"""
+    def get_credential(
+        self, credential_id: str, tenant_id: Optional[str] = None
+    ) -> CredentialRecord:
+        """查询凭证；不存在或不属于本租户抛 NotFoundError。"""
+        tenant = self._normalize_tenant(tenant_id)
         with self._lock:
             rec = self._credentials.get(credential_id)
-            if rec is None:
+            if rec is None or rec.get("tenant_id", DEFAULT_TENANT) != tenant:
                 raise NotFoundError(f"凭证不存在: {credential_id}")
             return CredentialRecord(
                 credential_id=credential_id,
@@ -498,18 +611,22 @@ class VCStore:
         disclose: Any,
         challenge: Optional[str] = None,
         expires_in: Optional[int] = None,
+        tenant_id: Optional[str] = None,
     ) -> PresentationRecord:
         """对已签发凭证生成选择性披露演示并持久化。
 
-        - 凭证不存在抛 NotFoundError；disclose 非法（非数组、路径语法/
-          越界/重复/祖先重叠）抛 ValidationError；空列表表示零披露；
+        - 凭证不存在或不属于本租户抛 NotFoundError；disclose 非法
+          （非数组、路径语法/越界/重复/祖先重叠）抛 ValidationError；
+          空列表表示零披露；
         - challenge 缺省时生成 32 位小写 hex；expires_in 缺省 300 秒，
           expires_at 为当前 UTC 时间加 expires_in 秒（Z 结尾秒精度）；
         - challenge 与 expires_at 均写入被签名的演示正文并持久化；
         - proof 为 ES256 签名，覆盖除 proof 外按 key 升序规范化 JSON，
           使用凭证 issuer_key_version（旧凭证缺省按 1）对应的历史私钥；
-        - presentation_id 为 vp_ 加 32 位小写 hex。
+        - presentation_id 为 vp_ 加 32 位小写 hex；
+        - 成功记 presentation.created 审计事件。
         """
+        tenant = self._normalize_tenant(tenant_id)
         if challenge is None:
             challenge = uuid.uuid4().hex
         if expires_in is None:
@@ -517,7 +634,7 @@ class VCStore:
         expires_at = _utc_after(expires_in)
         with self._lock:
             cred = self._credentials.get(credential_id)
-            if cred is None:
+            if cred is None or cred.get("tenant_id", DEFAULT_TENANT) != tenant:
                 raise NotFoundError(f"凭证不存在: {credential_id}")
             stored_body = cred["body"]
             claims = stored_body.get("claims", {})
@@ -553,15 +670,22 @@ class VCStore:
             proof = crypto.sign(unsigned, private_pem)
             row = dict(unsigned)
             row["proof"] = proof
+            row["tenant_id"] = tenant
             self._presentations[presentation_id] = row
+            self._append_audit_locked(
+                tenant, "presentation.created", "presentation", presentation_id
+            )
             self._save_locked()
             return self._presentation_record(row)
 
-    def get_presentation(self, presentation_id: str) -> PresentationRecord:
-        """查询演示记录；不存在抛 NotFoundError。"""
+    def get_presentation(
+        self, presentation_id: str, tenant_id: Optional[str] = None
+    ) -> PresentationRecord:
+        """查询演示记录；不存在或不属于本租户抛 NotFoundError。"""
+        tenant = self._normalize_tenant(tenant_id)
         with self._lock:
             row = self._presentations.get(presentation_id)
-            if row is None:
+            if row is None or row.get("tenant_id", DEFAULT_TENANT) != tenant:
                 raise NotFoundError(f"演示不存在: {presentation_id}")
             return self._presentation_record(row)
 
@@ -570,6 +694,7 @@ class VCStore:
         presentation_id: str,
         presentation: Any,
         challenge: Any = CHALLENGE_UNSET,
+        tenant_id: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """以存储记录为锚校验选择性披露演示，返回 (是否有效, 失败原因)。
 
@@ -581,15 +706,19 @@ class VCStore:
         presentation 的请求，不做挑战、过期与消费检查。验签成功且未
         过期、未吊销时原子标记已消费（并发仅一次成功，跨重启保留）；
         已消费优先于过期与吊销；签名成功但已吊销返回“凭证已吊销：
-        <原因>”且不消费。任何失败均返回非空中文原因，绝不抛异常、
-        不泄露私钥。
+        <原因>”且不消费。验签通过后在消费锁内复查 expires_at：到期
+        返回“演示已过期”且不消费；未到期则原子标记已消费并记
+        presentation.consumed 审计事件（并发仅一次 valid:true）。
+        任何失败均返回非空中文原因，绝不抛异常、不泄露私钥，失败
+        与已消费/过期/吊销均不记审计。
         """
+        tenant = self._normalize_tenant(tenant_id)
         if not isinstance(presentation, dict):
             return False, "请求不合法: 字段 presentation 必须为 JSON 对象"
 
         with self._lock:
             row = self._presentations.get(presentation_id)
-            if row is None:
+            if row is None or row.get("tenant_id", DEFAULT_TENANT) != tenant:
                 return False, f"演示不存在: {presentation_id}"
 
             # 新/旧演示按存储记录是否含 challenge 判定
@@ -739,10 +868,13 @@ class VCStore:
 
         if is_replay_protected:
             # 原子标记已消费：并发仅一次成功，跨重启保留；过期或
-            # 已吊销不消费
+            # 已吊销不消费。验签后在消费锁内复查 expires_at，消除
+            # “验签时未到期、消费前已到期”的竞态窗口。
             with self._lock:
                 row = self._presentations.get(presentation_id)
-                if row is None:
+                if row is None or row.get(
+                    "tenant_id", DEFAULT_TENANT
+                ) != tenant:
                     return False, f"演示不存在: {presentation_id}"
                 if row.get("consumed"):
                     return False, "演示已消费"
@@ -752,8 +884,20 @@ class VCStore:
                         cred.get("revoke_reason") or DEFAULT_REVOKE_REASON
                     )
                     return False, f"凭证已吊销：{saved_reason}"
+                try:
+                    expires_at = _parse_utc_z(row["expires_at"])
+                except (KeyError, TypeError, ValueError):
+                    return False, "验签过程发生内部错误"
+                if datetime.now(timezone.utc) >= expires_at:
+                    return False, "演示已过期"
                 row["consumed"] = True
                 row["consumed_at"] = _utc_now()
+                self._append_audit_locked(
+                    tenant,
+                    "presentation.consumed",
+                    "presentation",
+                    presentation_id,
+                )
                 self._save_locked()
         return True, ""
 
@@ -761,16 +905,18 @@ class VCStore:
     # 凭证状态与吊销
     # ------------------------------------------------------------------ #
     def set_credential_active(
-        self, credential_id: str
+        self, credential_id: str, tenant_id: Optional[str] = None
     ) -> Tuple[CredentialStatusRecord, bool]:
         """登记凭证状态为 active，返回 (状态记录, 是否首次登记)。
 
         首次登记 201（created=True），重复登记 200（created=False）且
         保持首次 updated_at；已 revoked 返回 ConflictError(409)。
+        首次与重复登记均记 status.updated 审计事件。
         """
+        tenant = self._normalize_tenant(tenant_id)
         with self._lock:
             rec = self._credentials.get(credential_id)
-            if rec is None:
+            if rec is None or rec.get("tenant_id", DEFAULT_TENANT) != tenant:
                 raise NotFoundError(f"凭证不存在: {credential_id}")
             current = rec.get("status")
             if current == "revoked":
@@ -781,7 +927,10 @@ class VCStore:
             if created:
                 rec["status"] = "active"
                 rec["status_updated_at"] = _utc_now()
-                self._save_locked()
+            self._append_audit_locked(
+                tenant, "status.updated", "credential", credential_id
+            )
+            self._save_locked()
             return (
                 CredentialStatusRecord(
                     credential_id=credential_id,
@@ -792,15 +941,16 @@ class VCStore:
             )
 
     def get_credential_status(
-        self, credential_id: str
+        self, credential_id: str, tenant_id: Optional[str] = None
     ) -> CredentialStatusRecord:
         """查询凭证状态；历史无状态按 active 返回，updated_at 为 None。
 
-        凭证不存在抛 NotFoundError。
+        凭证不存在或不属于本租户抛 NotFoundError。
         """
+        tenant = self._normalize_tenant(tenant_id)
         with self._lock:
             rec = self._credentials.get(credential_id)
-            if rec is None:
+            if rec is None or rec.get("tenant_id", DEFAULT_TENANT) != tenant:
                 raise NotFoundError(f"凭证不存在: {credential_id}")
             status = rec.get("status")
             if status is None:
@@ -818,21 +968,31 @@ class VCStore:
             )
 
     def revoke_credential(
-        self, credential_id: str, reason: Any = REASON_UNSET
+        self,
+        credential_id: str,
+        reason: Any = REASON_UNSET,
+        tenant_id: Optional[str] = None,
     ) -> CredentialStatusRecord:
         """吊销凭证；reason 省略（REASON_UNSET）时用默认原因。
 
-        - 凭证不存在抛 NotFoundError；
+        - 凭证不存在或不属于本租户抛 NotFoundError；
         - 重复吊销时任何 reason（含非法值）均忽略，返回首次吊销结果；
         - 非法 reason（非字符串或裁剪后为空，含显式 null）仅在首次
           吊销时抛 ValidationError；
-        - 保存并返回首尾裁剪后的 reason。
+        - 保存并返回首尾裁剪后的 reason；
+        - 首次与重复吊销均记 credential.revoked 审计事件。
         """
+        tenant = self._normalize_tenant(tenant_id)
         with self._lock:
             rec = self._credentials.get(credential_id)
-            if rec is None:
+            if rec is None or rec.get("tenant_id", DEFAULT_TENANT) != tenant:
                 raise NotFoundError(f"凭证不存在: {credential_id}")
             if rec.get("status") == "revoked":
+                # 幂等重试：每次成功都记审计
+                self._append_audit_locked(
+                    tenant, "credential.revoked", "credential", credential_id
+                )
+                self._save_locked()
                 return CredentialStatusRecord(
                     credential_id=credential_id,
                     status="revoked",
@@ -855,6 +1015,9 @@ class VCStore:
             rec["status_updated_at"] = now
             rec["revoked_at"] = now
             rec["revoke_reason"] = final_reason
+            self._append_audit_locked(
+                tenant, "credential.revoked", "credential", credential_id
+            )
             self._save_locked()
             return CredentialStatusRecord(
                 credential_id=credential_id,
@@ -869,6 +1032,7 @@ class VCStore:
         credential_id: str,
         body: Dict[str, Any],
         signature: str,
+        tenant_id: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """以存储记录为锚验签：返回 (是否有效, 失败原因)。
 
@@ -883,9 +1047,10 @@ class VCStore:
         if not isinstance(signature, str) or not signature:
             return False, "请求不合法: 字段 signature 必须为非空字符串"
 
+        tenant = self._normalize_tenant(tenant_id)
         with self._lock:
             rec = self._credentials.get(credential_id)
-            if rec is None:
+            if rec is None or rec.get("tenant_id", DEFAULT_TENANT) != tenant:
                 return False, f"凭证不存在: {credential_id}"
             stored_body = rec["body"]
 
