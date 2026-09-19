@@ -35,6 +35,10 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/credentials/{credential_id}/verify` | 验签，请求体 `{"body","signature"}`；**任何失败一律 HTTP 200**，返回 `valid`（失败时附分类中文 `reason`） |
 | POST | `/v1/credentials/{credential_id}/present` | 生成选择性披露演示，请求体恰为 `{"disclose":[路径...]}` 加可选 `challenge`、`expires_in`；成功 201 返回演示对象；字段问题 400、未知凭证 404 |
 | POST | `/v1/presentations/{presentation_id}/verify` | 校验演示，新演示请求体恰为 `{"presentation":对象,"challenge":串}`（旧演示恰为 `{"presentation":对象}`）；**任何失败一律 HTTP 200**，成功 `{"valid":true}`，失败附非空中文 `reason` |
+| POST | `/v1/trust/anchors` | 注册信任锚点，请求体 `{"did","public_key","key_version"}`；新建 201，同 DID/版本同 PEM 幂等 200，同 DID/版本不同 PEM 409 |
+| GET | `/v1/trust/anchors/{did}` | 返回该 DID 的全部锚点版本数组；未知 DID（含他租户）404 |
+| PUT | `/v1/trust/anchors/{did}/{key_version}/status` | 吊销锚点，请求体须恰为 `{"status":"revoked"}`；首次与重复均 200，`updated_at` 首次设定后固定；未知锚点 404 |
+| POST | `/v1/trust/verify` | 用 active 锚点公钥验签，请求体含字符串 `issuer_did`、非布尔正整数 `issuer_key_version`、非空 `signature`；**缺失、吊销、验签失败均 HTTP 200**，成功 `{"valid":true}`，失败附非空中文 `reason` |
 | GET | `/v1/audit?limit=&after=` | 查询本租户审计事件，按 seq 升序；返回 `events`、`next_after`，参数校验见下文 |
 
 - 所有 `/v1` 请求读取 `X-Tenant-ID` 头确定租户：**缺省为 `default`**；显式提供时必须非空，否则 400。
@@ -196,6 +200,53 @@ curl -X POST localhost:8080/v1/presentations/vp_<id>/verify \
   -d '{"presentation":{ ...上一步返回的整个演示对象... },"challenge":"abc"}'
 ```
 
+### 信任锚点注册表
+
+信任锚点登记外部签发者 DID 与其 P-256 公钥版本的绑定，供
+`/v1/trust/verify` 不依赖本地 DID 记录直接验签。锚点按租户隔离并随
+状态文件原子持久化。
+
+- `POST /v1/trust/anchors` 请求体含：
+  - `did`：非空字符串；
+  - `public_key`：P-256 **SubjectPublicKeyInfo PEM**，且必须为 P-256
+    （P-384、私钥 PEM、非 PEM 文本均 400）；服务端解析后按规范 PEM
+    归一化存储，因此同一公钥的不同换行/空白写法视为同一 PEM；
+  - `key_version`：非布尔正整数（`bool`、小数、字符串、0、负数均 400）。
+- 成功新建返回 201：
+  `{did, public_key, key_version, status:"active", updated_at:null}`。
+- 同 `did` + `key_version` 再次提交：PEM 相同返回 **200**（幂等重试，
+  字段同新建）；PEM 不同返回 **409**，不记审计。不同 `key_version`
+  作为新版本追加到同一 DID 下。
+- `GET /v1/trust/anchors/{did}` 返回该 DID **全部版本**的数组（按
+  `key_version` 升序，字段与注册响应一致）；DID 未知或属他租户返回 404。
+- `PUT /v1/trust/anchors/{did}/{key_version}/status` 请求体须**恰为**
+  `{"status":"revoked"}`（其他取值、多余字段、缺字段均 400；路径版本
+  非正整数 400）。首次与重复吊销均返回 200；首次把 `updated_at` 设为
+  **UTC 秒级 Unix 时间戳（整数）**，重复吊销保持该值不变。锚点未知
+  （含他租户）返回 404。
+- `POST /v1/trust/verify` 采用公开错误协议：请求体必须为 JSON 对象，
+  含字符串 `issuer_did`、非布尔正整数 `issuer_key_version`、非空字符串
+  `signature`。**缺失字段/类型非法/锚点不存在/锚点已吊销/签名格式错误/
+  验签失败全部返回 HTTP 200** 与 `{"valid":false,"reason":"<非空中文原因>"}`，
+  成功返回 `{"valid":true}`。验签内容为**请求体去掉 `signature` 字段后
+  按 key 升序的规范化 JSON**，用匹配的 **active** 锚点公钥做 ES256 验签
+  （64 字节裸 `R||S` 的无填充 base64url）。显式空 `X-Tenant-ID` 仍在
+  进入验签前返回 400。验签（无论成败）不记审计。
+
+```bash
+curl -X POST localhost:8080/v1/trust/anchors -d '{
+  "did":"did:web:example.com:issuer",
+  "public_key":"-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----\n",
+  "key_version":1}'
+curl localhost:8080/v1/trust/anchors/did:web:example.com:issuer
+curl -X PUT localhost:8080/v1/trust/anchors/did:web:example.com:issuer/1/status \
+  -d '{"status":"revoked"}'
+curl -X POST localhost:8080/v1/trust/verify -d '{
+  "issuer_did":"did:web:example.com:issuer",
+  "issuer_key_version":2, "payload":{"k":"v"},
+  "signature":"<base64url 裸 R||S>"}'
+```
+
 ### 多租户与审计日志
 
 - 所有 `/v1` 请求以 `X-Tenant-ID` 头标识租户，缺省 `default`；显式
@@ -219,6 +270,11 @@ curl -X POST localhost:8080/v1/presentations/vp_<id>/verify \
   | 吊销凭证（首次与幂等重试均记） | `credential.revoked` | `credential` |
   | 创建演示 | `presentation.created` | `presentation` |
   | 演示消费成功（并发仅一次） | `presentation.consumed` | `presentation` |
+  | 信任锚点注册（含同 DID/版本同 PEM 幂等重试，每次都记） | `trust.anchor.registered` | `trust_anchor` |
+  | 信任锚点吊销（首次与幂等重试均记） | `trust.anchor.revoked` | `trust_anchor` |
+
+  锚点审计 `resource_id` 为 `<did>#<key_version>`。锚点注册冲突（409）、
+  字段校验失败与信任验签（成功或失败）等只读或失败路径**不记审计**。
 
   验签失败、演示已消费、演示过期、凭证/演示吊销判定等**只读或失败
   路径不记审计**。
@@ -240,6 +296,7 @@ curl -H 'X-Tenant-ID: acme' 'localhost:8080/v1/audit?limit=50&after=0'
 ```bash
 python3 tests/e2e_test.py
 python3 tests/tenant_audit_test.py
+python3 tests/trust_anchor_test.py
 ```
 
 脚本会临时在本地端口启动服务。`e2e_test.py` 覆盖：201/200/400/404/409 各路径、同 key 去重、
@@ -261,6 +318,12 @@ reason、重复吊销忽略 reason、非法 reason 仅首次 400）、verify 对
 全局连续 seq 与租户内分页（limit/after 边界与各类非法参数 400、空页
 保持游标）、过期演示锁内复查不消费、并发仅一次消费且仅一条审计、
 seq 跨重启接续，以及落盘失败时内存回滚（变更不生效、审计不记录）。
+`trust_anchor_test.py` 覆盖：注册字段校验（非空 did、P-256 PEM 含 P-384
+拒绝、非布尔正整数 key_version）、201/200 幂等（PEM 空白归一化）/409
+冲突、GET 全数组与 404、租户隔离、吊销首/重 200 与 updated_at 固定、
+verify 公开错误协议（缺失/吊销/篡改/签名格式/请求层错误均 200
+valid:false）、规范化 JSON ES256 验签、字段顺序无关、注册/吊销审计与
+冲突/验签不记、跨重启持久化。
 
 ## 代码结构
 
@@ -268,12 +331,13 @@ seq 跨重启接续，以及落盘失败时内存回滚（变更不生效、审�
 vcbackend/
   crypto.py    ES256 签名/验签、规范化 JSON、P-256 密钥
   models.py    DIDRecord / CredentialRecord / CredentialStatusRecord /
-               PresentationRecord / AuditEvent 数据模型
+               PresentationRecord / TrustAnchorRecord / AuditEvent 数据模型
   store.py     多租户文件存储（租户分桶、旧格式迁移）、DID 去重、密钥
                轮换、凭证签发/验签、选择性披露演示（RFC6901 路径校验、
-               claims 投影）、消费锁内复查过期，以及全局连续审计事件与
-               状态变更的同一次原子写（失败回滚）
-  service.py   标准库 HTTP 路由、X-Tenant-ID 租户解析、/v1/audit 与错误映射
+               claims 投影）、消费锁内复查过期、信任锚点注册/吊销/验签，
+               以及全局连续审计事件与状态变更的同一次原子写（失败回滚）
+  service.py   标准库 HTTP 路由、X-Tenant-ID 租户解析、信任锚点端点、
+               /v1/audit 与错误映射
   cli.py       did-create / did-show / issue / verify / serve
 tests/e2e_test.py          端到端测试（默认租户，全协议兼容）
 tests/tenant_audit_test.py 租户隔离 / 审计 / 过期竞态测试

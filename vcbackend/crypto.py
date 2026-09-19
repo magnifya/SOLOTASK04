@@ -21,6 +21,7 @@ __all__ = [
     "InvalidSignature",
     "MalformedSignature",
     "canonicalize",
+    "canonical_public_key_pem",
     "generate_private_key_pem",
     "public_key_pem_from_private",
     "validate_public_key_pem",
@@ -48,6 +49,19 @@ def canonicalize(body: Dict[str, Any]) -> bytes:
     return json.dumps(
         body, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     ).encode("utf-8")
+
+
+def canonical_public_key_pem(public_pem: str) -> str:
+    """解析 P-256 公钥 PEM 后重新序列化，得到可比较的规范 PEM 文本。
+
+    同一公钥的不同换行/空白写法归一化为同一串；不是合法 P-256 公钥时
+    抛 ValueError。
+    """
+    key = _load_public_key(public_pem)
+    return key.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode("utf-8").strip()
 
 
 def generate_private_key_pem() -> str:

@@ -12,6 +12,10 @@
   POST /v1/credentials/{credential_id}/verify  以存储记录为锚验签
   POST /v1/credentials/{credential_id}/present 生成选择性披露演示
   POST /v1/presentations/{presentation_id}/verify  以存储记录为锚校验演示
+  POST /v1/trust/anchors                          注册信任锚点
+  GET  /v1/trust/anchors/{did}                    查询锚点全部版本
+  PUT  /v1/trust/anchors/{did}/{key_version}/status  吊销锚点
+  POST /v1/trust/verify                           以 active 锚点验签
   GET  /v1/audit                          查询本租户审计事件
 
 多租户：所有 /v1 请求取 X-Tenant-ID 头，缺省为 "default"；显式
@@ -28,6 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
+from . import crypto
 from .store import (
     CHALLENGE_UNSET,
     ConflictError,
@@ -169,6 +174,10 @@ def build_handler(store: VCStore) -> type:
                     self._post_verify_presentation(
                         tenant, presentation_id
                     )
+                elif path == "/v1/trust/anchors":
+                    self._post_trust_anchor(tenant)
+                elif path == "/v1/trust/verify":
+                    self._post_trust_verify(tenant)
                 else:
                     self._send_error(404, f"无此路径: {path}")
             except ValidationError as exc:
@@ -194,6 +203,13 @@ def build_handler(store: VCStore) -> type:
                         path[len("/v1/credentials/") : -len("/status")]
                     )
                     self._put_credential_status(tenant, credential_id)
+                elif path.startswith("/v1/trust/anchors/") and path.endswith(
+                    "/status"
+                ):
+                    middle = unquote(
+                        path[len("/v1/trust/anchors/") : -len("/status")]
+                    )
+                    self._put_trust_anchor_status(tenant, middle)
                 else:
                     self._send_error(404, f"无此路径: {path}")
             except ValidationError as exc:
@@ -232,6 +248,9 @@ def build_handler(store: VCStore) -> type:
                     self._get_credential(
                         tenant, unquote(path[len("/v1/credentials/") :])
                     )
+                elif path.startswith("/v1/trust/anchors/"):
+                    did = unquote(path[len("/v1/trust/anchors/") :])
+                    self._get_trust_anchors(tenant, did)
                 else:
                     self._send_error(404, f"无此路径: {path}")
             except ValidationError as exc:
@@ -546,6 +565,164 @@ def build_handler(store: VCStore) -> type:
             if not valid:
                 payload["reason"] = reason or "验签失败"
             self._send_json(200, payload)
+
+        @staticmethod
+        def _anchor_payload(record: Any) -> Dict[str, Any]:
+            return {
+                "did": record.did,
+                "public_key": record.public_key,
+                "key_version": record.key_version,
+                "status": record.status,
+                "updated_at": record.updated_at,
+            }
+
+        def _post_trust_anchor(self, tenant: str) -> None:
+            # 字段依次为：非空字符串 did、P-256 公钥 PEM、非布尔正整数
+            # key_version。同 DID/版本且 PEM 相同 -> 200（幂等）；同
+            # DID/版本但 PEM 不同 -> 409；新建 -> 201。
+            data = self._read_json()
+            if "did" not in data:
+                raise ValidationError("缺少字段: did")
+            did = data["did"]
+            if not isinstance(did, str) or not did:
+                raise ValidationError("字段 did 必须为非空字符串")
+            if "public_key" not in data:
+                raise ValidationError("缺少字段: public_key")
+            raw_pem = data["public_key"]
+            if not isinstance(raw_pem, str) or not raw_pem:
+                raise ValidationError("字段 public_key 必须为 P-256 公钥 PEM")
+            try:
+                public_pem = crypto.canonical_public_key_pem(raw_pem)
+            except (ValueError, TypeError) as exc:
+                raise ValidationError(
+                    f"字段 public_key 不是合法的 P-256 公钥 PEM: {exc}"
+                ) from exc
+            if "key_version" not in data:
+                raise ValidationError("缺少字段: key_version")
+            key_version = data["key_version"]
+            if (
+                not isinstance(key_version, int)
+                or isinstance(key_version, bool)
+                or key_version <= 0
+            ):
+                raise ValidationError(
+                    "字段 key_version 必须为非布尔正整数"
+                )
+            record, created = store.register_trust_anchor(
+                tenant, did, public_pem, key_version
+            )
+            self._send_json(
+                201 if created else 200, self._anchor_payload(record)
+            )
+
+        def _get_trust_anchors(self, tenant: str, did: str) -> None:
+            # 返回该 DID 的全部锚点版本；未知 DID（含他租户）404。
+            records = store.list_trust_anchors(tenant, did)
+            self._send_json(
+                200, [self._anchor_payload(record) for record in records]
+            )
+
+        def _put_trust_anchor_status(self, tenant: str, middle: str) -> None:
+            # 路径 /v1/trust/anchors/{did}/{key_version}/status；DID 自身
+            # 可含 "/"，故版本号取最后一段。请求体必须恰为
+            # {"status": "revoked"}；首次与重复吊销均 200，updated_at
+            # 首次设定为 UTC 秒、重复保持不变；未知锚点 404。
+            did, sep, raw_version = middle.rpartition("/")
+            if not sep or not raw_version:
+                raise ValidationError("路径缺少 key_version")
+            if any(ch < "0" or ch > "9" for ch in raw_version):
+                raise ValidationError("路径 key_version 必须为正整数")
+            key_version = int(raw_version)
+            if key_version <= 0:
+                raise ValidationError("路径 key_version 必须为正整数")
+            data = self._read_json()
+            if "status" not in data:
+                raise ValidationError("缺少字段: status")
+            extra = sorted(set(data) - {"status"})
+            if extra:
+                raise ValidationError(f"多余字段: {', '.join(extra)}")
+            if data["status"] != "revoked":
+                raise ValidationError(
+                    f"字段 status 非法: {data['status']!r}（仅支持 revoked）"
+                )
+            record = store.revoke_trust_anchor(tenant, did, key_version)
+            self._send_json(200, self._anchor_payload(record))
+
+        def _post_trust_verify(self, tenant: str) -> None:
+            # 公开错误协议：任何失败都返回 200 +
+            # {"valid": false, "reason": "<非空中文原因>"}，绝不返回
+            # 400/404/500。请求体为 JSON 对象，含字符串 issuer_did、
+            # 非布尔正整数 issuer_key_version、非空字符串 signature；
+            # 验签内容为请求体去掉 signature 字段后的规范化 JSON，
+            # 公钥取匹配的 active 锚点。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                self._send_invalid("请求体缺失或长度声明非法")
+                return
+            except Exception:  # noqa: BLE001
+                self._send_invalid("请求体读取失败")
+                return
+            if not raw:
+                self._send_invalid("请求体缺失")
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                self._send_invalid("请求体不是合法 UTF-8 文本")
+                return
+            except json.JSONDecodeError:
+                self._send_invalid("请求体不是合法 JSON")
+                return
+            if not isinstance(data, dict):
+                self._send_invalid("请求体必须为 JSON 对象")
+                return
+            if "issuer_did" not in data:
+                self._send_invalid("请求缺少字段: issuer_did")
+                return
+            issuer_did = data["issuer_did"]
+            if not isinstance(issuer_did, str) or not issuer_did:
+                self._send_invalid(
+                    "请求字段 issuer_did 必须为非空字符串"
+                )
+                return
+            if "issuer_key_version" not in data:
+                self._send_invalid("请求缺少字段: issuer_key_version")
+                return
+            issuer_key_version = data["issuer_key_version"]
+            if (
+                not isinstance(issuer_key_version, int)
+                or isinstance(issuer_key_version, bool)
+                or issuer_key_version <= 0
+            ):
+                self._send_invalid(
+                    "请求字段 issuer_key_version 必须为非布尔正整数"
+                )
+                return
+            if "signature" not in data:
+                self._send_invalid("请求缺少字段: signature")
+                return
+            signature = data["signature"]
+            if not isinstance(signature, str) or not signature:
+                self._send_invalid(
+                    "请求字段 signature 必须为非空字符串"
+                )
+                return
+
+            # 验签内容：请求体去掉 signature 后按 key 升序规范化
+            payload = {k: v for k, v in data.items() if k != "signature"}
+            try:
+                valid, reason = store.verify_trust_anchor(
+                    tenant, issuer_did, issuer_key_version, payload, signature
+                )
+            except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
+                self._send_invalid("验签过程发生内部错误")
+                return
+            result: Dict[str, Any] = {"valid": valid}
+            if not valid:
+                result["reason"] = reason or "验签失败"
+            self._send_json(200, result)
 
         def _get_audit(self, tenant: str, query: str) -> None:
             # GET /v1/audit?limit=&after=：租户内按 seq 升序。

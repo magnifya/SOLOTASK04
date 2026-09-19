@@ -26,6 +26,12 @@
 
 凭证状态（active/revoked）登记在凭证行内，随状态文件持久化；
 历史无状态凭证查询时按 active 呈现（updated_at 为空）。
+
+信任锚点（trust_anchors）按租户分桶：每个 DID 保存其全部公钥版本
+（key_version 由注册方提供），active/revoked 状态与首次吊销的 UTC 秒
+updated_at 随状态文件持久化；注册幂等（同 DID/版本/公钥 200，公钥不同
+409），verify 仅用 active 锚点公钥做 ES256 验签。注册与吊销与审计事件
+同一次原子写，失败回滚；验签只读、不记审计。
 """
 
 import copy
@@ -45,6 +51,7 @@ from .models import (
     CredentialStatusRecord,
     DIDRecord,
     PresentationRecord,
+    TrustAnchorRecord,
 )
 
 # DID method 标识：小写字母开头，仅含小写字母数字与下划线/连字符
@@ -94,6 +101,8 @@ AUDIT_STATUS_UPDATED = "status.updated"
 AUDIT_CREDENTIAL_REVOKED = "credential.revoked"
 AUDIT_PRESENTATION_CREATED = "presentation.created"
 AUDIT_PRESENTATION_CONSUMED = "presentation.consumed"
+AUDIT_TRUST_ANCHOR_REGISTERED = "trust.anchor.registered"
+AUDIT_TRUST_ANCHOR_REVOKED = "trust.anchor.revoked"
 
 
 def _utc_now() -> str:
@@ -288,6 +297,7 @@ class VCStore:
             bucket.setdefault("dids", {})
             bucket.setdefault("credentials", {})
             bucket.setdefault("presentations", {})
+            bucket.setdefault("trust_anchors", {})
             for rec in bucket["dids"].values():
                 _migrate_did_row(rec)
 
@@ -323,7 +333,12 @@ class VCStore:
     def _ensure_bucket_locked(self, tenant_id: str) -> Dict[str, Any]:
         bucket = self._tenants.get(tenant_id)
         if bucket is None:
-            bucket = {"dids": {}, "credentials": {}, "presentations": {}}
+            bucket = {
+                "dids": {},
+                "credentials": {},
+                "presentations": {},
+                "trust_anchors": {},
+            }
             self._tenants[tenant_id] = bucket
         return bucket
 
@@ -1210,4 +1225,202 @@ class VCStore:
         if credential_status == "revoked":
             saved_reason = revoke_reason or DEFAULT_REVOKE_REASON
             return False, f"凭证已吊销：{saved_reason}"
+        return True, ""
+
+    # ------------------------------------------------------------------ #
+    # 信任锚点
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _anchor_record(did: str, entry: Dict[str, Any]) -> TrustAnchorRecord:
+        return TrustAnchorRecord(
+            did=did,
+            public_key=entry["public_key"],
+            key_version=int(entry["key_version"]),
+            status=entry.get("status", "active"),
+            updated_at=entry.get("updated_at"),
+        )
+
+    def _anchor_entry_locked(
+        self, bucket: Dict[str, Any], did: str, key_version: int
+    ) -> Optional[Dict[str, Any]]:
+        row = bucket["trust_anchors"].get(did)
+        if row is None:
+            return None
+        for entry in row.get("versions", []):
+            if int(entry.get("key_version")) == key_version:
+                return entry
+        return None
+
+    def register_trust_anchor(
+        self,
+        tenant_id: str,
+        did: str,
+        public_key: str,
+        key_version: int,
+    ) -> Tuple[TrustAnchorRecord, bool]:
+        """注册（或幂等重试）信任锚点。
+
+        - public_key 应为已校验/规范化的 P-256 PEM；
+        - 同 DID + key_version 且公钥相同：幂等成功（created=False，200），
+          每次重试均记 trust.anchor.registered；
+        - 同 DID + key_version 但公钥不同：ConflictError(409)，不记审计；
+        - 新版本随注册追加；新注册 status=active、updated_at=None。
+
+        状态变更与审计在同一次原子写落盘，失败回滚。
+        """
+        with self._lock:
+            bucket = self._ensure_bucket_locked(tenant_id)
+            row = bucket["trust_anchors"].setdefault(did, {"versions": []})
+            existing = self._anchor_entry_locked(bucket, did, key_version)
+            if existing is not None:
+                if existing.get("public_key") != public_key:
+                    raise ConflictError(
+                        f"信任锚点公钥冲突: {did} 版本 {key_version} "
+                        "已登记不同公钥"
+                    )
+                snapshot = self._snapshot_locked()
+                try:
+                    # 幂等重试同样每次记录审计
+                    self._append_audit_locked(
+                        tenant_id,
+                        AUDIT_TRUST_ANCHOR_REGISTERED,
+                        "trust_anchor",
+                        f"{did}#{key_version}",
+                    )
+                    self._save_locked()
+                except Exception:
+                    self._restore_locked(snapshot)
+                    raise
+                return self._anchor_record(did, existing), False
+
+            snapshot = self._snapshot_locked()
+            try:
+                entry = {
+                    "key_version": key_version,
+                    "public_key": public_key,
+                    "status": "active",
+                    "updated_at": None,
+                }
+                row["versions"].append(entry)
+                row["versions"].sort(key=lambda e: int(e["key_version"]))
+                self._append_audit_locked(
+                    tenant_id,
+                    AUDIT_TRUST_ANCHOR_REGISTERED,
+                    "trust_anchor",
+                    f"{did}#{key_version}",
+                )
+                self._save_locked()
+            except Exception:
+                self._restore_locked(snapshot)
+                raise
+            return self._anchor_record(did, entry), True
+
+    def list_trust_anchors(
+        self, tenant_id: str, did: str
+    ) -> List[TrustAnchorRecord]:
+        """返回本租户某 DID 的全部锚点版本（按 key_version 升序）。
+
+        DID 未知（含他租户）抛 NotFoundError。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            row = (
+                bucket["trust_anchors"].get(did)
+                if bucket is not None else None
+            )
+            if row is None or not row.get("versions"):
+                raise NotFoundError(f"信任锚点不存在: {did}")
+            return [
+                self._anchor_record(did, entry)
+                for entry in sorted(
+                    row["versions"], key=lambda e: int(e["key_version"])
+                )
+            ]
+
+    def revoke_trust_anchor(
+        self, tenant_id: str, did: str, key_version: int
+    ) -> TrustAnchorRecord:
+        """吊销锚点：首次与重复均成功（200）。
+
+        - 锚点不存在（含他租户）抛 NotFoundError；
+        - 首次吊销置 status=revoked、updated_at=当前 UTC 秒；重复吊销
+          保持首次 updated_at 不变；两种情况均记 trust.anchor.revoked；
+        - 状态变更与审计同一次原子写，失败回滚。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            entry = (
+                self._anchor_entry_locked(bucket, did, key_version)
+                if bucket is not None else None
+            )
+            if entry is None:
+                raise NotFoundError(
+                    f"信任锚点不存在: {did} 版本 {key_version}"
+                )
+            snapshot = self._snapshot_locked()
+            try:
+                if entry.get("status") != "revoked":
+                    entry["status"] = "revoked"
+                    entry["updated_at"] = int(time.time())
+                # 首次吊销与幂等重试均记审计，updated_at 保持首次值
+                self._append_audit_locked(
+                    tenant_id,
+                    AUDIT_TRUST_ANCHOR_REVOKED,
+                    "trust_anchor",
+                    f"{did}#{key_version}",
+                )
+                self._save_locked()
+            except Exception:
+                self._restore_locked(snapshot)
+                raise
+            return self._anchor_record(did, entry)
+
+    def verify_trust_anchor(
+        self,
+        tenant_id: str,
+        issuer_did: str,
+        issuer_key_version: int,
+        payload: Any,
+        signature: str,
+    ) -> Tuple[bool, str]:
+        """以 active 锚点公钥对 payload 做 ES256 裸 R||S base64url 验签。
+
+        - payload 为请求中提交的 JSON 对象，按规范化 JSON（key 升序、
+          紧凑、UTF-8）验签；
+        - 锚点缺失/他租户不可见、已吊销、签名格式错误、验签失败均返回
+          (False, 非空中文原因)；成功返回 (True, "")；
+        - 验签不记审计，绝不抛异常、不泄露私钥。
+        """
+        if not isinstance(payload, dict):
+            return False, "请求不合法: 待验签内容必须为 JSON 对象"
+        if not isinstance(signature, str) or not signature:
+            return False, "请求不合法: 字段 signature 必须为非空字符串"
+
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            entry = (
+                self._anchor_entry_locked(
+                    bucket, issuer_did, issuer_key_version
+                )
+                if bucket is not None else None
+            )
+            if entry is None:
+                return False, (
+                    "信任锚点不存在: "
+                    f"{issuer_did} 密钥版本 {issuer_key_version}"
+                )
+            if entry.get("status") == "revoked":
+                return False, (
+                    f"信任锚点已吊销: {issuer_did} 版本 {issuer_key_version}"
+                )
+            public_pem = entry.get("public_key", "")
+
+        try:
+            crypto.verify(payload, signature, public_pem)
+        except crypto.MalformedSignature:
+            return False, "签名格式错误: 不是合法的 ES256 签名编码"
+        except crypto.InvalidSignature:
+            return False, "签名校验失败，内容或签名可能被改动"
+        except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
+            return False, "验签过程发生内部错误"
         return True, ""

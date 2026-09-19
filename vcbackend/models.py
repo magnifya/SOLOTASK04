@@ -71,6 +71,22 @@ class PresentationRecord:
 
 
 @dataclass
+class TrustAnchorRecord:
+    """一条信任锚点记录（外部 DID 与 P-256 公钥的绑定）。
+
+    key_version 为正整数（自 1 起，由注册方提供）；status 为 "active"
+    或 "revoked"；updated_at 为状态变更时间（UTC 秒级 Unix 时间戳，
+    整数），新注册未吊销时为 None，首次吊销后固定，重复吊销不变。
+    """
+
+    did: str
+    public_key: str
+    key_version: int
+    status: str = "active"
+    updated_at: Optional[int] = None
+
+
+@dataclass
 class AuditEvent:
     """一条审计事件。
 
