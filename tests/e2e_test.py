@@ -586,6 +586,156 @@ def main():
             if os.path.exists(old_store):
                 os.remove(old_store)
 
+        # 23. 选择性披露展示（presentations）
+        import re as _re
+        # cid2 为轮换后 v2、未吊销凭证；零披露
+        st, r = _http("POST", f"{base}/v1/credentials/{cid2}/present",
+                      {"disclose": []})
+        check("present 零披露 -> 201 空投影",
+              st == 201 and bool(_re.fullmatch(r"vp_[0-9a-f]{32}",
+                                               r.get("presentation_id", "")))
+              and r.get("credential_id") == cid2
+              and r.get("issuer_did") == issuer
+              and r.get("issuer_key_version") == 2
+              and r.get("disclose") == [] and r.get("claims") == {}
+              and isinstance(r.get("proof"), str) and r["proof"])
+        vp_empty = r["presentation_id"]
+
+        # 零披露对象验真：重新取一份完整零披露展示
+        _, empty_resp = _http("POST", f"{base}/v1/credentials/{cid2}/present",
+                              {"disclose": []})
+        vp_empty = empty_resp["presentation_id"]
+        empty_obj = {k: empty_resp[k] for k in (
+            "presentation_id", "credential_id", "issuer_did",
+            "issuer_key_version", "disclose", "claims", "proof")}
+        st, r = _http("POST", f"{base}/v1/presentations/{vp_empty}/verify",
+                      {"presentation": empty_obj})
+        check("零披露 presentation verify -> 200 {valid:true}",
+              st == 200 and r == {"valid": True})
+
+        # 部分披露（cid2 的 claims 为 {"role":"user"}）
+        st, r = _http("POST", f"{base}/v1/credentials/{cid2}/present",
+                      {"disclose": ["/role"]})
+        check("present 部分披露 -> 201 投影仅含所选值",
+              st == 201 and r.get("claims") == {"role": "user"}
+              and r.get("disclose") == ["/role"]
+              and r.get("issuer_key_version") == 2)
+        vp_id = r["presentation_id"]
+        vp_obj = {k: r[k] for k in (
+            "presentation_id", "credential_id", "issuer_did",
+            "issuer_key_version", "disclose", "claims", "proof")}
+        st, r = _http("POST", f"{base}/v1/presentations/{vp_id}/verify",
+                      {"presentation": vp_obj})
+        check("presentation verify 成功 -> 200 {valid:true}",
+              st == 200 and r == {"valid": True})
+
+        # present 请求体严格性 / 路径合法性 -> 400
+        for bad in ({}, {"disclose": [], "x": 1},
+                    {"disclose": "/role"}, {"disclose": None},
+                    {"disclose": ["/nope"]}, {"disclose": ["/role", "/role"]},
+                    {"disclose": [""]}):
+            stx, rr = _http("POST", f"{base}/v1/credentials/{cid2}/present",
+                            bad)
+            check(f"present 非法请求体 {bad} -> 400",
+                  stx == 400 and rr.get("error"))
+        check("present 未知凭证 -> 404",
+              _http("POST", f"{base}/v1/credentials/vc_nope/present",
+                    {"disclose": []})[0] == 404)
+
+        # verify 公开错误协议：任何失败都 200 + valid:false + 非空中文 reason
+        def check_pv_invalid(name, path_id, payload=None, raw_bytes=None):
+            if raw_bytes is None:
+                raw_bytes = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                f"{base}/v1/presentations/{path_id}/verify",
+                data=raw_bytes, method="POST")
+            req.add_header("Content-Type", "application/json")
+            try:
+                with urllib.request.urlopen(req) as resp:
+                    rr = json.loads(resp.read().decode() or "{}")
+                    stx = resp.status
+            except urllib.error.HTTPError as exc:
+                stx = exc.code
+                rr = json.loads(exc.read().decode() or "{}")
+            ok = (stx == 200 and rr.get("valid") is False
+                  and isinstance(rr.get("reason"), str)
+                  and rr["reason"].strip())
+            check(name, ok)
+            return rr
+
+        check_pv_invalid("pv verify 空体 -> 200 invalid", vp_id, raw_bytes=b"")
+        check_pv_invalid("pv verify 非法 JSON -> 200 invalid", vp_id,
+                         raw_bytes=b"{x")
+        check_pv_invalid("pv verify 非对象 -> 200 invalid", vp_id,
+                         raw_bytes=b"[1]")
+        check_pv_invalid("pv verify 缺 presentation -> 200 invalid", vp_id,
+                         {"x": 1})
+        check_pv_invalid("pv verify 多余字段 -> 200 invalid", vp_id,
+                         {"presentation": vp_obj, "y": 1})
+        check_pv_invalid("pv verify presentation 非对象 -> 200 invalid",
+                         vp_id, {"presentation": "x"})
+        rr = check_pv_invalid("pv verify 未持久化 ID -> 200 invalid",
+                              "vp_" + "0" * 32, {"presentation": vp_obj})
+        check("pv verify 未持久化 reason 指向不存在", "不存在" in rr["reason"])
+        rr = check_pv_invalid(
+            "pv verify 对象 id 与路径不符 -> 200 invalid", vp_id,
+            {"presentation": {**vp_obj, "presentation_id": "vp_" + "1" * 32}})
+        check("pv verify id 不符 reason 指向 presentation_id",
+              "presentation_id" in rr["reason"])
+        check_pv_invalid(
+            "pv verify 篡改 disclose -> 200 invalid", vp_id,
+            {"presentation": {**vp_obj, "disclose": []}})
+        check_pv_invalid(
+            "pv verify 篡改投影 -> 200 invalid", vp_id,
+            {"presentation": {**vp_obj, "claims": {"role": "admin"}}})
+        check_pv_invalid(
+            "pv verify 篡改绑定字段 -> 200 invalid", vp_id,
+            {"presentation": {**vp_obj, "credential_id": "vc_x"}})
+        check_pv_invalid(
+            "pv verify 多余展示字段 -> 200 invalid", vp_id,
+            {"presentation": {**vp_obj, "extra": 1}})
+        rr = check_pv_invalid(
+            "pv verify 篡改 proof -> 200 invalid", vp_id,
+            {"presentation": {**vp_obj, "proof": "A" * 43}})
+        check("pv verify proof 错误 reason 指向签名/proof",
+              "签名" in rr["reason"] or "proof" in rr["reason"])
+
+        # 已吊销凭证：proof 验签成功后返回“凭证已吊销：<保存原因>”
+        _, rev_vp = _http("POST", f"{base}/v1/credentials/{cid4}/present",
+                          {"disclose": []})
+        rev_obj = {k: rev_vp[k] for k in (
+            "presentation_id", "credential_id", "issuer_did",
+            "issuer_key_version", "disclose", "claims", "proof")}
+        st, r = _http(
+            "POST", f"{base}/v1/presentations/{rev_vp['presentation_id']}/verify",
+            {"presentation": rev_obj})
+        check("pv verify 已吊销 -> 凭证已吊销：默认原因",
+              st == 200 and r == {"valid": False,
+                                  "reason": "凭证已吊销：持证人主动吊销"})
+
+        # 展示记录跨重启保留且可验签
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "vcbackend.cli", "serve",
+             "--port", str(port), "--host", "127.0.0.1"],
+            cwd=ROOT, env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        assert wait_up(port), "主服务第三次重启超时"
+        st, r = _http("POST", f"{base}/v1/presentations/{vp_id}/verify",
+                      {"presentation": vp_obj})
+        check("重启后 presentation 仍可验签",
+              st == 200 and r == {"valid": True})
+        st, r = _http(
+            "POST", f"{base}/v1/presentations/{rev_vp['presentation_id']}/verify",
+            {"presentation": rev_obj})
+        check("重启后已吊销 presentation 仍判吊销",
+              st == 200 and r == {"valid": False,
+                                  "reason": "凭证已吊销：持证人主动吊销"})
+
     finally:
         proc.terminate()
         try:

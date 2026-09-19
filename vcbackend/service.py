@@ -10,9 +10,11 @@
   GET  /v1/credentials/{credential_id}/status   查询状态（无状态按 active）
   POST /v1/credentials/{credential_id}/revoke   吊销凭证
   POST /v1/credentials/{credential_id}/verify  以存储记录为锚验签
+  POST /v1/credentials/{credential_id}/present 创建选择性披露展示（201）
+  POST /v1/presentations/{presentation_id}/verify  以存储记录为锚验真展示
 
 错误映射：ValidationError -> 400，NotFoundError -> 404，ConflictError -> 409。
-例外：凭证验签端点对一切失败都返回 200 + {"valid": false, "reason": ...}。
+例外：凭证验签与展示验真端点对一切失败都返回 200 + {"valid": false, "reason": ...}。
 """
 
 import json
@@ -113,6 +115,20 @@ def build_handler(store: VCStore) -> type:
                         path[len("/v1/credentials/") : -len("/verify")]
                     )
                     self._post_verify_credential(credential_id)
+                elif path.startswith("/v1/credentials/") and path.endswith(
+                    "/present"
+                ):
+                    credential_id = unquote(
+                        path[len("/v1/credentials/") : -len("/present")]
+                    )
+                    self._post_present_credential(credential_id)
+                elif path.startswith("/v1/presentations/") and path.endswith(
+                    "/verify"
+                ):
+                    presentation_id = unquote(
+                        path[len("/v1/presentations/") : -len("/verify")]
+                    )
+                    self._post_verify_presentation(presentation_id)
                 else:
                     self._send_error(404, f"无此路径: {path}")
             except ValidationError as exc:
@@ -355,6 +371,82 @@ def build_handler(store: VCStore) -> type:
             payload: Dict[str, Any] = {"valid": valid}
             if not valid:
                 payload["reason"] = reason or "验签失败"
+            self._send_json(200, payload)
+
+        def _post_present_credential(self, credential_id: str) -> None:
+            # 请求体必须恰为 {"disclose": [...]}：缺字段、多余字段一律 400；
+            # disclose 的类型与各路径合法性（根/数组索引/越界/重复/重叠）
+            # 由 store 校验，同样映射为 400；未知凭证 404。
+            data = self._read_json()
+            if "disclose" not in data:
+                raise ValidationError("缺少字段: disclose")
+            extra = sorted(set(data) - {"disclose"})
+            if extra:
+                raise ValidationError(f"多余字段: {', '.join(extra)}")
+            record = store.create_presentation(credential_id, data["disclose"])
+            self._send_json(
+                201,
+                {
+                    "presentation_id": record.presentation_id,
+                    "credential_id": record.credential_id,
+                    "issuer_did": record.issuer_did,
+                    "issuer_key_version": record.issuer_key_version,
+                    "disclose": record.disclose,
+                    "claims": record.claims,
+                    "proof": record.proof,
+                },
+            )
+
+        def _post_verify_presentation(self, presentation_id: str) -> None:
+            # 与凭证 verify 相同的公开错误协议：任何失败（请求体缺失/非法、
+            # presentation 非对象、展示记录不存在、绑定/投影不符、proof
+            # 失败、凭证已吊销）都返回 200 + valid:false + 非空中文 reason。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                self._send_invalid("请求体缺失或长度声明非法")
+                return
+            except Exception:  # noqa: BLE001
+                self._send_invalid("请求体读取失败")
+                return
+            if not raw:
+                self._send_invalid("请求体缺失")
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                self._send_invalid("请求体不是合法 UTF-8 文本")
+                return
+            except json.JSONDecodeError:
+                self._send_invalid("请求体不是合法 JSON")
+                return
+            if not isinstance(data, dict):
+                self._send_invalid("请求体必须为 JSON 对象")
+                return
+            if "presentation" not in data:
+                self._send_invalid("请求缺少字段: presentation")
+                return
+            extra = sorted(set(data) - {"presentation"})
+            if extra:
+                self._send_invalid(
+                    f"请求含多余字段: {', '.join(extra)}"
+                )
+                return
+            presentation = data["presentation"]
+            if not isinstance(presentation, dict):
+                self._send_invalid("请求字段 presentation 必须为 JSON 对象")
+                return
+            try:
+                valid, reason = store.verify_presentation(
+                    presentation_id, presentation
+                )
+            except Exception:  # noqa: BLE001 验真失败绝不暴露内部细节
+                self._send_invalid("验真过程发生内部错误")
+                return
+            payload: Dict[str, Any] = {"valid": valid}
+            if not valid:
+                payload["reason"] = reason or "验真失败"
             self._send_json(200, payload)
 
     return Handler

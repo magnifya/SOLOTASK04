@@ -33,6 +33,8 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | GET | `/v1/credentials/{credential_id}/status` | 返回 `credential_id`、`status`、`updated_at`；历史无状态按 `active` 返回且 `updated_at` 为 `null`；不存在 404 |
 | POST | `/v1/credentials/{credential_id}/revoke` | 吊销凭证；`reason` 可省略（默认“持证人主动吊销”），否则须为字符串且首尾裁剪后非空；返回 200 与 `credential_id`、`status:"revoked"`、`reason`、`revoked_at`、`updated_at`；不存在 404 |
 | POST | `/v1/credentials/{credential_id}/verify` | 验签，请求体 `{"body","signature"}`；**任何失败一律 HTTP 200**，返回 `valid`（失败时附分类中文 `reason`） |
+| POST | `/v1/credentials/{credential_id}/present` | 选择性披露，请求体**恰为** `{"disclose":[路径...]}`；返回 201 与 `presentation_id`、`credential_id`、`issuer_did`、`issuer_key_version`、`disclose`、`claims` 投影、`proof`；请求体问题 400，未知凭证 404 |
+| POST | `/v1/presentations/{presentation_id}/verify` | 验真展示，请求体恰为 `{"presentation":对象}`；**任何失败一律 HTTP 200**，成功 `{"valid":true}`，失败附非空中文 `reason`（已吊销凭证返回“凭证已吊销：<原因>”） |
 
 - DID 形如 `did:example:<32 位 hex>`。
 - `public_key` 为**句柄**：非空且不能是 PEM 文本；同一句柄再次提交返回其既有 DID（按提交原文去重）。
@@ -56,6 +58,10 @@ curl -X POST localhost:8080/v1/credentials/vc_<id>/revoke \
   -d '{"reason":"持证人造假"}'   # reason 可省略
 curl -X POST localhost:8080/v1/credentials/vc_<id>/verify \
   -d '{"body":{...},"signature":"..."}'
+curl -X POST localhost:8080/v1/credentials/vc_<id>/present \
+  -d '{"disclose":["/role","/addr/city"]}'   # [] 为零披露
+curl -X POST localhost:8080/v1/presentations/vp_<id>/verify \
+  -d '{"presentation":{...}}'
 ```
 
 ## 命令行
@@ -120,6 +126,34 @@ python3 -m vcbackend.cli verify vc_<id>     # 成功输出 true（退出码 0）
   `{"valid":false,"reason":"凭证已吊销：<保存的 reason>"}`；`active` 或
   无状态维持原结果（签名失败仍优先返回签名类原因）。
 
+### 选择性披露展示
+
+- `POST /v1/credentials/{credential_id}/present` 请求体必须**恰为**
+  `{"disclose":[路径...]}`：缺失 `disclose`、含多余字段、请求体缺失/非法
+  JSON/非对象一律 400；未知凭证 404。
+- 路径按 [RFC 6901](https://www.rfc-editor.org/rfc/rfc6901) JSON Pointer
+  书写（`~1`/`~0` 转义），必须为字符串、非空且以 `/` 开头并命中凭证
+  `claims` 内属性。禁止根路径（`""`）、数组索引（进入数组）与越界键；
+  同一语义路径不得重复，任意两条路径不得构成祖先/后代重叠。
+  `disclose: []` 为**零披露**，投影为 `{}`。
+- 成功返回 201：`presentation_id`（`vp_` 加 32 位小写 hex）、
+  `credential_id`、`issuer_did`、`issuer_key_version`（旧凭证缺版本按
+  1）、回显的 `disclose`、仅含所选值的 `claims` 投影、`proof`。
+- `proof` 为 ES256（64 字节裸 `R||S` 的无填充 base64url），签名覆盖
+  **除 `proof` 外按 key 升序规范化的 JSON**，使用签发者
+  `issuer_key_version` 对应的历史版本私钥。
+- 展示记录随状态文件**持久化，跨重启可验签**。
+- `POST /v1/presentations/{presentation_id}/verify` 请求体必须恰为
+  `{"presentation":对象}`，任何失败都返回 **HTTP 200** 与
+  `{"valid":false,"reason":"<非空中文原因>"}`，绝不返回 400/404/500。
+  服务端以**存储记录**为锚：路径 ID 必须已持久化且等于对象
+  `presentation_id`；按凭证 `claims` 与存储 `disclose` 重算投影，逐字段
+  核对 `credential_id`、`issuer_did`、`issuer_key_version`、`disclose`、
+  `claims`（且除 `proof` 外无多余/缺失字段），再用历史版本公钥验
+  `proof`。成功返回 `{"valid":true}`。
+- 验真在所有校验与 `proof` 验签成功后检查凭证状态：已吊销返回
+  `{"valid":false,"reason":"凭证已吊销：<保存原因>"}`。
+
 ### 密钥模型与轮换
 
 为保证「服务端签发的签名能用注册时返回的公钥验真」，注册时由系统为该
@@ -145,15 +179,20 @@ PEM 句柄与非法 key_mode 拒绝、密钥轮换（含 404/400 路径）、轮
 `issuer_key_version` 验签、verify 端点 valid=true/false、CLI verify 成功与失败、
 状态登记（201/200 幂等、严格 400、未知 404、已吊销 409）、吊销（默认/裁剪
 reason、重复吊销忽略 reason、非法 reason 仅首次 400）、verify 对已吊销凭证
-返回 valid:false、状态跨重启保留，以及旧状态文件迁移与旧凭证按版本 1 验签。
+返回 valid:false、状态跨重启保留，以及旧状态文件迁移与旧凭证按版本 1 验签；
+还覆盖选择性披露：零披露/部分披露投影、present 严格 400/未知 404、路径
+（根/越界/数组索引/重复/祖先重叠）拒绝、presentation verify 的 valid:true 与
+公开错误协议（未持久化 ID、ID 不符、绑定字段/disclose/投影/proof 被改、
+多余字段）、已吊销返回“凭证已吊销：”原因、以及展示记录跨重启验签。
 
 ## 代码结构
 
 ```
 vcbackend/
   crypto.py    ES256 签名/验签、规范化 JSON、P-256 密钥
-  models.py    DIDRecord / CredentialRecord 数据模型
-  store.py     文件持久化存储、DID 去重、密钥轮换与凭证签发/验签业务逻辑
+  jsonptr.py   RFC6901 指针解析、路径校验与选择性披露投影
+  models.py    DIDRecord / CredentialRecord / PresentationRecord 数据模型
+  store.py     文件持久化存储、DID 去重、密钥轮换与凭证/展示签发验签业务逻辑
   service.py   标准库 HTTP 路由与错误映射
   cli.py       did-create / did-show / issue / verify / serve
 tests/e2e_test.py  端到端测试

@@ -1,7 +1,7 @@
 """数据模型定义。"""
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -44,3 +44,16 @@ class CredentialStatusRecord:
     updated_at: Optional[str]
     reason: Optional[str] = None
     revoked_at: Optional[str] = None
+
+
+@dataclass
+class PresentationRecord:
+    """一条选择性披露展示：所基于的凭证、披露路径、投影与 ES256 proof。"""
+
+    presentation_id: str
+    credential_id: str
+    issuer_did: str
+    issuer_key_version: int
+    disclose: List[str]
+    claims: Dict[str, Any]
+    proof: str
