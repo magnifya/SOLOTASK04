@@ -7,8 +7,11 @@
   POST /v1/credentials                    签发凭证
   GET  /v1/credentials/{credential_id}    查询凭证
   POST /v1/credentials/{credential_id}/verify  以存储记录为锚验签
+  PUT  /v1/credentials/{credential_id}/status  登记凭证状态（幂等）
+  GET  /v1/credentials/{credential_id}/status  查询凭证状态
+  POST /v1/credentials/{credential_id}/revoke  吊销凭证（幂等）
 
-错误映射：ValidationError -> 400，NotFoundError -> 404。
+错误映射：ValidationError -> 400，NotFoundError -> 404，ConflictError -> 409。
 例外：凭证验签端点对一切失败都返回 200 + {"valid": false, "reason": ...}。
 """
 
@@ -17,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
-from .store import NotFoundError, ValidationError, VCStore
+from .store import ConflictError, NotFoundError, ValidationError, VCStore
 
 
 def _json_dumps(payload: Any) -> bytes:
@@ -83,12 +86,21 @@ def build_handler(store: VCStore) -> type:
                         path[len("/v1/credentials/") : -len("/verify")]
                     )
                     self._post_verify_credential(credential_id)
+                elif path.startswith("/v1/credentials/") and path.endswith(
+                    "/revoke"
+                ):
+                    credential_id = unquote(
+                        path[len("/v1/credentials/") : -len("/revoke")]
+                    )
+                    self._post_revoke_credential(credential_id)
                 else:
                     self._send_error(404, f"无此路径: {path}")
             except ValidationError as exc:
                 self._send_error(400, str(exc))
             except NotFoundError as exc:
                 self._send_error(404, str(exc))
+            except ConflictError as exc:
+                self._send_error(409, str(exc))
             except Exception as exc:  # noqa: BLE001
                 self._send_error(500, f"服务器内部错误: {exc}")
 
@@ -97,6 +109,13 @@ def build_handler(store: VCStore) -> type:
                 path = urlparse(self.path).path.rstrip("/") or "/"
                 if path.startswith("/v1/dids/"):
                     self._get_did(unquote(path[len("/v1/dids/") :]))
+                elif path.startswith("/v1/credentials/") and path.endswith(
+                    "/status"
+                ):
+                    credential_id = unquote(
+                        path[len("/v1/credentials/") : -len("/status")]
+                    )
+                    self._get_credential_status(credential_id)
                 elif path.startswith("/v1/credentials/"):
                     self._get_credential(
                         unquote(path[len("/v1/credentials/") :])
@@ -107,6 +126,27 @@ def build_handler(store: VCStore) -> type:
                     self._send_error(404, f"无此路径: {path}")
             except NotFoundError as exc:
                 self._send_error(404, str(exc))
+            except Exception as exc:  # noqa: BLE001
+                self._send_error(500, f"服务器内部错误: {exc}")
+
+        def do_PUT(self) -> None:  # noqa: N802
+            try:
+                path = urlparse(self.path).path.rstrip("/") or "/"
+                if path.startswith("/v1/credentials/") and path.endswith(
+                    "/status"
+                ):
+                    credential_id = unquote(
+                        path[len("/v1/credentials/") : -len("/status")]
+                    )
+                    self._put_credential_status(credential_id)
+                else:
+                    self._send_error(404, f"无此路径: {path}")
+            except ValidationError as exc:
+                self._send_error(400, str(exc))
+            except NotFoundError as exc:
+                self._send_error(404, str(exc))
+            except ConflictError as exc:
+                self._send_error(409, str(exc))
             except Exception as exc:  # noqa: BLE001
                 self._send_error(500, f"服务器内部错误: {exc}")
 
@@ -185,6 +225,44 @@ def build_handler(store: VCStore) -> type:
                     "signature": record.signature,
                 },
             )
+
+        def _put_credential_status(self, credential_id: str) -> None:
+            # 请求体必须恰为 {"status": "active"}：缺失、非法或多余字段均 400
+            data = self._read_json()
+            extra = set(data) - {"status"}
+            if extra:
+                raise ValidationError(
+                    f"存在多余字段: {', '.join(sorted(extra))}"
+                )
+            if "status" not in data:
+                raise ValidationError("缺少字段: status")
+            if data["status"] != "active":
+                raise ValidationError(
+                    f"字段 status 取值非法: {data['status']!r}（仅支持 active）"
+                )
+            payload, created = store.set_credential_status(
+                credential_id, data["status"]
+            )
+            self._send_json(201 if created else 200, payload)
+
+        def _get_credential_status(self, credential_id: str) -> None:
+            self._send_json(200, store.get_credential_status(credential_id))
+
+        def _post_revoke_credential(self, credential_id: str) -> None:
+            # reason 可省略；提供时须为字符串且裁剪后非空（仅首次吊销校验，
+            # 已吊销时任何 reason 均被忽略并返回首次结果）。空请求体视为 {}。
+            length = int(self.headers.get("Content-Length") or 0)
+            if length:
+                data = self._read_json()
+            else:
+                data = {}
+            extra = set(data) - {"reason"}
+            if extra:
+                raise ValidationError(
+                    f"存在多余字段: {', '.join(sorted(extra))}"
+                )
+            payload = store.revoke_credential(credential_id, data.get("reason"))
+            self._send_json(200, payload)
 
         def _post_verify_credential(self, credential_id: str) -> None:
             # verify 端点的公开错误协议：任何失败都返回 200 +

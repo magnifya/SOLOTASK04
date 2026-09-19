@@ -30,6 +30,13 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/credentials` | 签发凭证，请求体 `{"issuer_did","subject_did","claims"}`，返回 201 与 `credential_id`、`signature`、`issuer_key_version` |
 | GET | `/v1/credentials/{credential_id}` | 返回 `credential_id`、`body`、`signature`；不存在 404 |
 | POST | `/v1/credentials/{credential_id}/verify` | 验签，请求体 `{"body","signature"}`；**任何失败一律 HTTP 200**，返回 `valid`（失败时附分类中文 `reason`） |
+| PUT | `/v1/credentials/{credential_id}/status` | 登记状态，请求体必须恰为 `{"status":"active"}`；首次 201、重复 200（保持首次 `updated_at` 与状态不变），均含 `credential_id`、`status`、`updated_at`；已吊销 409；未知凭证 404；缺失/非法/多余字段 400 |
+| GET | `/v1/credentials/{credential_id}/status` | 返回 `credential_id`、`status`、`updated_at`；历史无状态按 `active` 返回且 `updated_at` 为 `null`；未知凭证 404 |
+| POST | `/v1/credentials/{credential_id}/revoke` | 吊销凭证；`reason` 可省略（默认“持证人主动吊销”），提供时须为字符串且首尾裁剪后非空（保存并返回裁剪值）；成功 200 返回 `credential_id`、`status:"revoked"`、`reason`、`revoked_at`、`updated_at`；已吊销时任何 `reason` 均忽略并返回首次结果，非法 `reason` 仅首次请求 400；未知凭证 404 |
+
+- 状态与吊销记录随状态文件持久化，跨重启保留。
+- verify 在签名、锚定成功后检查状态：已吊销返回 200、`valid:false`，
+  `reason` 为“凭证已吊销：”加保存的吊销原因；`active` 或无状态登记不影响验签结果。
 
 - DID 形如 `did:example:<32 位 hex>`。
 - `public_key` 为**句柄**：非空且不能是 PEM 文本；同一句柄再次提交返回其既有 DID（按提交原文去重）。

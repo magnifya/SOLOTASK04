@@ -43,6 +43,13 @@ class NotFoundError(LookupError):
     """资源不存在（映射为 HTTP 404）。"""
 
 
+class ConflictError(RuntimeError):
+    """状态冲突（映射为 HTTP 409），如对已吊销凭证重复登记状态。"""
+
+
+DEFAULT_REVOKE_REASON = "持证人主动吊销"
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace(
         "+00:00", "Z"
@@ -86,6 +93,7 @@ class VCStore:
         self._lock = threading.Lock()
         self._dids: Dict[str, Dict[str, Any]] = {}
         self._credentials: Dict[str, Dict[str, Any]] = {}
+        self._statuses: Dict[str, Dict[str, Any]] = {}
         self._load()
 
     # ------------------------------------------------------------------ #
@@ -97,6 +105,7 @@ class VCStore:
                 data = json.load(fh)
             self._dids = data.get("dids", {})
             self._credentials = data.get("credentials", {})
+            self._statuses = data.get("statuses", {})
             for rec in self._dids.values():
                 _migrate_did_row(rec)
 
@@ -107,6 +116,7 @@ class VCStore:
         payload = {
             "dids": self._dids,
             "credentials": self._credentials,
+            "statuses": self._statuses,
         }
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
@@ -383,4 +393,104 @@ class VCStore:
             return False, "签名校验失败，正文或签名可能被改动"
         except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
             return False, "验签过程发生内部错误"
+
+        # 签名与锚定均通过后检查吊销状态
+        with self._lock:
+            status_rec = self._statuses.get(credential_id)
+        if status_rec is not None and status_rec.get("status") == "revoked":
+            reason = status_rec.get("reason") or DEFAULT_REVOKE_REASON
+            return False, f"凭证已吊销：{reason}"
         return True, ""
+
+    # ------------------------------------------------------------------ #
+    # 凭证状态与吊销
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _status_payload(credential_id: str, rec: Dict[str, Any]) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "credential_id": credential_id,
+            "status": rec["status"],
+            "updated_at": rec.get("updated_at"),
+        }
+        if rec["status"] == "revoked":
+            payload["reason"] = rec.get("reason")
+            payload["revoked_at"] = rec.get("revoked_at")
+        return payload
+
+    def set_credential_status(
+        self, credential_id: str, status: str
+    ) -> Tuple[Dict[str, Any], bool]:
+        """登记凭证状态（幂等）。
+
+        返回 (状态载荷, 是否新建)。未知凭证抛 NotFoundError；
+        已吊销的凭证抛 ConflictError 且保持原记录不变；
+        重复登记返回首次记录（updated_at 与状态不变）。
+        """
+        with self._lock:
+            if credential_id not in self._credentials:
+                raise NotFoundError(f"凭证不存在: {credential_id}")
+            existing = self._statuses.get(credential_id)
+            if existing is not None:
+                if existing.get("status") == "revoked":
+                    raise ConflictError(
+                        f"凭证已吊销，不能登记状态: {credential_id}"
+                    )
+                return self._status_payload(credential_id, existing), False
+            rec = {"status": status, "updated_at": _utc_now()}
+            self._statuses[credential_id] = rec
+            self._save_locked()
+            return self._status_payload(credential_id, rec), True
+
+    def get_credential_status(self, credential_id: str) -> Dict[str, Any]:
+        """查询凭证状态；未知凭证抛 NotFoundError。
+
+        历史无状态登记的凭证按 active 返回，updated_at 为 None。
+        """
+        with self._lock:
+            if credential_id not in self._credentials:
+                raise NotFoundError(f"凭证不存在: {credential_id}")
+            rec = self._statuses.get(credential_id)
+            if rec is None:
+                return {
+                    "credential_id": credential_id,
+                    "status": "active",
+                    "updated_at": None,
+                }
+            return self._status_payload(credential_id, rec)
+
+    def revoke_credential(
+        self, credential_id: str, reason: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """吊销凭证（幂等）。
+
+        - 未知凭证抛 NotFoundError；
+        - reason 可省略，默认“持证人主动吊销”；提供时须为字符串且
+          首尾裁剪后非空，保存并返回裁剪值；
+        - 已吊销时忽略任何 reason，直接返回首次吊销结果（不再校验）。
+        """
+        with self._lock:
+            if credential_id not in self._credentials:
+                raise NotFoundError(f"凭证不存在: {credential_id}")
+            existing = self._statuses.get(credential_id)
+            if existing is not None and existing.get("status") == "revoked":
+                return self._status_payload(credential_id, existing)
+
+            if reason is None:
+                trimmed = DEFAULT_REVOKE_REASON
+            else:
+                if not isinstance(reason, str):
+                    raise ValidationError("字段 reason 必须为字符串")
+                trimmed = reason.strip()
+                if not trimmed:
+                    raise ValidationError("字段 reason 裁剪后不能为空")
+
+            now = _utc_now()
+            rec = {
+                "status": "revoked",
+                "reason": trimmed,
+                "revoked_at": now,
+                "updated_at": now,
+            }
+            self._statuses[credential_id] = rec
+            self._save_locked()
+            return self._status_payload(credential_id, rec)
