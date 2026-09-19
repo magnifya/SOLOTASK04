@@ -7,6 +7,7 @@
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -585,6 +586,266 @@ def main():
                 proc2.kill()
             if os.path.exists(old_store):
                 os.remove(old_store)
+
+        # 23. 选择性披露演示
+        _, r = _http("POST", f"{base}/v1/dids",
+                     {"method": "example", "public_key": "sd-issuer"})
+        sd_issuer = r["did"]
+        _, r = _http("POST", f"{base}/v1/dids",
+                     {"method": "example", "public_key": "sd-subject"})
+        sd_subject = r["did"]
+        sd_claims = {
+            "role": "admin",
+            "level": 3,
+            "addr": {"city": "BJ", "zip": "100000"},
+            "tags": ["a", "b"],
+            "a/b": 1,
+            "m~n": 2,
+        }
+        st, r = _http("POST", f"{base}/v1/credentials", {
+            "issuer_did": sd_issuer, "subject_did": sd_subject,
+            "claims": sd_claims})
+        sd_cid = r["credential_id"]
+
+        def post_raw(url, raw_bytes):
+            req = urllib.request.Request(url, data=raw_bytes, method="POST")
+            req.add_header("Content-Type", "application/json")
+            try:
+                with urllib.request.urlopen(req) as resp:
+                    return resp.status, json.loads(resp.read().decode() or "{}")
+            except urllib.error.HTTPError as exc:
+                return exc.code, json.loads(exc.read().decode() or "{}")
+
+        # 23.1 present 成功：201 与全部字段；投影仅含所选值
+        st, r = _http("POST", f"{base}/v1/credentials/{sd_cid}/present",
+                      {"disclose": ["/role", "/addr/city"]})
+        check("present -> 201", st == 201)
+        check("presentation_id 为 vp_ 加 32 位小写 hex",
+              bool(re.fullmatch(r"vp_[0-9a-f]{32}", r.get("presentation_id", ""))))
+        check("present 回显 credential_id/issuer_did",
+              r.get("credential_id") == sd_cid and r.get("issuer_did") == sd_issuer)
+        check("present issuer_key_version=1",
+              r.get("issuer_key_version") == 1)
+        check("present disclose 原样回显",
+              r.get("disclose") == ["/role", "/addr/city"])
+        check("present claims 仅含投影（嵌套仅保留所选叶子）",
+              r.get("claims") == {"role": "admin", "addr": {"city": "BJ"}})
+        check("present proof 为非空无填充 base64url",
+              isinstance(r.get("proof"), str) and r["proof"]
+              and "=" not in r["proof"])
+        check("present 响应恰为七个字段",
+              set(r) == {"presentation_id", "credential_id", "issuer_did",
+                         "issuer_key_version", "disclose", "claims", "proof"})
+        vp1 = r
+        pid1 = vp1["presentation_id"]
+
+        # 23.2 verify 成功：200 且响应恰为 {"valid": true}
+        st, r = _http("POST", f"{base}/v1/presentations/{pid1}/verify",
+                      {"presentation": vp1})
+        check("presentation verify valid=true 且无多余字段",
+              st == 200 and r == {"valid": True})
+
+        # 23.3 零披露：disclose [] / claims {}
+        st, r = _http("POST", f"{base}/v1/credentials/{sd_cid}/present",
+                      {"disclose": []})
+        check("零披露 present -> 201", st == 201 and r.get("disclose") == []
+              and r.get("claims") == {})
+        pid0 = r["presentation_id"]
+        st, r = _http("POST", f"{base}/v1/presentations/{pid0}/verify",
+                      {"presentation": r})
+        check("零披露 verify valid=true", st == 200 and r == {"valid": True})
+
+        # 23.4 数组整值可披露、数组索引禁止
+        st, r = _http("POST", f"{base}/v1/credentials/{sd_cid}/present",
+                      {"disclose": ["/tags"]})
+        check("数组整值披露 -> 201 且投影保留完整数组",
+              st == 201 and r.get("claims") == {"tags": ["a", "b"]})
+        st, rr = _http("POST", f"{base}/v1/credentials/{sd_cid}/present",
+                       {"disclose": ["/tags/0"]})
+        check("数组索引 -> 400", st == 400 and rr.get("error"))
+
+        # 23.5 RFC6901 转义路径
+        st, r = _http("POST", f"{base}/v1/credentials/{sd_cid}/present",
+                      {"disclose": ["/a~1b", "/m~0n"]})
+        check("~0/~1 转义路径 -> 201 且投影正确",
+              st == 201 and r.get("claims") == {"a/b": 1, "m~n": 2})
+
+        # 23.6 present 各类 400
+        def present_400(name, payload=None, raw=None):
+            if raw is None:
+                raw = json.dumps(payload).encode("utf-8")
+            stx, rr2 = post_raw(
+                f"{base}/v1/credentials/{sd_cid}/present", raw)
+            check(name, stx == 400 and isinstance(rr2.get("error"), str)
+                  and rr2["error"])
+
+        present_400("present 缺 disclose -> 400", {})
+        present_400("present disclose 非数组 -> 400", {"disclose": {}})
+        present_400("present 多余字段 -> 400",
+                    {"disclose": [], "x": 1})
+        present_400("present 元素非字符串 -> 400", {"disclose": [1]})
+        present_400("present 路径不以 / 开头 -> 400",
+                    {"disclose": ["role"]})
+        present_400("present 根路径 -> 400", {"disclose": [""]})
+        present_400("present 路径重复 -> 400",
+                    {"disclose": ["/role", "/role"]})
+        present_400("present 祖先重叠 -> 400",
+                    {"disclose": ["/addr", "/addr/city"]})
+        present_400("present 后代祖先重叠(逆序) -> 400",
+                    {"disclose": ["/addr/city", "/addr"]})
+        present_400("present 越界 -> 400", {"disclose": ["/nope"]})
+        present_400("present 深层越界 -> 400",
+                    {"disclose": ["/addr/nope"]})
+        present_400("present 非法 JSON -> 400", raw=b"{not json")
+        present_400("present 空请求体 -> 400", raw=b"")
+        present_400("present 非对象 -> 400", raw=b"[1]")
+
+        # 23.7 未知凭证 present -> 404
+        st, _ = _http("POST", f"{base}/v1/credentials/vc_nope/present",
+                      {"disclose": []})
+        check("present 未知凭证 -> 404", st == 404)
+
+        # 23.8 verify 统一 200 + valid:false + 非空中文 reason
+        def vp_invalid(name, pid, payload=None, raw=None, needle=""):
+            if raw is None:
+                raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            stx, rr2 = post_raw(
+                f"{base}/v1/presentations/{pid}/verify", raw)
+            ok = (stx == 200 and rr2.get("valid") is False
+                  and isinstance(rr2.get("reason"), str)
+                  and rr2["reason"].strip()
+                  and any("一" <= ch <= "鿿" for ch in rr2["reason"]))
+            if needle:
+                ok = ok and needle in rr2["reason"]
+            check(name, ok)
+            return rr2
+
+        vp_invalid("vp verify 空请求体", pid1, raw=b"")
+        vp_invalid("vp verify 非法 JSON", pid1, raw=b"{not json")
+        vp_invalid("vp verify 非对象", pid1, raw=b"[1]")
+        vp_invalid("vp verify 缺 presentation", pid1, {"x": 1})
+        vp_invalid("vp verify 多余顶层字段", pid1,
+                   {"presentation": vp1, "x": 1})
+        vp_invalid("vp verify presentation 非对象", pid1,
+                   {"presentation": []})
+        vp_invalid("vp verify 路径 ID 未持久化", "vp_nope",
+                   {"presentation": {}})
+        bad = json.loads(json.dumps(vp1))
+        bad["presentation_id"] = "vp_other"
+        vp_invalid("vp verify 对象 ID 与路径不一致", pid1,
+                   {"presentation": bad}, needle="presentation_id")
+        bad = json.loads(json.dumps(vp1))
+        bad["credential_id"] = "vc_other"
+        vp_invalid("vp verify credential_id 被改", pid1,
+                   {"presentation": bad}, needle="锚定")
+        bad = json.loads(json.dumps(vp1))
+        bad["issuer_did"] = sd_subject
+        vp_invalid("vp verify issuer_did 被改", pid1,
+                   {"presentation": bad}, needle="锚定")
+        bad = json.loads(json.dumps(vp1))
+        bad["issuer_key_version"] = 2
+        vp_invalid("vp verify issuer_key_version 被改", pid1,
+                   {"presentation": bad}, needle="锚定")
+        bad = json.loads(json.dumps(vp1))
+        bad["disclose"] = ["/addr/city", "/role"]
+        vp_invalid("vp verify disclose 顺序调换", pid1,
+                   {"presentation": bad}, needle="disclose")
+        bad = json.loads(json.dumps(vp1))
+        bad["disclose"] = []
+        bad["claims"] = {}
+        vp_invalid("vp verify disclose 被替换", pid1,
+                   {"presentation": bad}, needle="disclose")
+        # claims 投影篡改：加未披露字段 / 改值 / 删键
+        bad = json.loads(json.dumps(vp1))
+        bad["claims"]["secret"] = "leak"
+        vp_invalid("vp verify claims 加未披露字段", pid1,
+                   {"presentation": bad}, needle="claims")
+        bad = json.loads(json.dumps(vp1))
+        bad["claims"]["role"] = "root"
+        vp_invalid("vp verify claims 值被改", pid1,
+                   {"presentation": bad}, needle="claims")
+        bad = json.loads(json.dumps(vp1))
+        del bad["claims"]["role"]
+        vp_invalid("vp verify claims 缺所选值", pid1,
+                   {"presentation": bad}, needle="claims")
+        bad = json.loads(json.dumps(vp1))
+        bad["proof"] = bad["proof"][:-2] + ("ab" if bad["proof"][-2:] != "ab"
+                                            else "cd")
+        vp_invalid("vp verify proof 被改", pid1,
+                   {"presentation": bad}, needle="签名校验")
+        bad = json.loads(json.dumps(vp1))
+        bad["proof"] = "@@@"
+        vp_invalid("vp verify proof 编码非法", pid1,
+                   {"presentation": bad}, needle="签名格式")
+        bad = json.loads(json.dumps(vp1))
+        bad["extra"] = 1
+        vp_invalid("vp verify presentation 多字段", pid1,
+                   {"presentation": bad})
+        bad = json.loads(json.dumps(vp1))
+        del bad["claims"]
+        vp_invalid("vp verify presentation 缺字段", pid1,
+                   {"presentation": bad})
+
+        # 23.9 轮换后旧演示仍按历史版本验真
+        st, r = _http("POST", f"{base}/v1/dids/{sd_issuer}/keys/rotate",
+                      {"key_handle": "sd-issuer-v2"})
+        check("SD 签发者轮换 -> 200 key_version=2",
+              st == 200 and r.get("key_version") == 2)
+        st, r = _http("POST", f"{base}/v1/presentations/{pid1}/verify",
+                      {"presentation": vp1})
+        check("轮换后旧演示仍 valid=true（历史版本公钥）",
+              st == 200 and r == {"valid": True})
+        # 轮换后新凭证演示用 v2 密钥
+        st, r = _http("POST", f"{base}/v1/credentials", {
+            "issuer_did": sd_issuer, "subject_did": sd_subject,
+            "claims": {"role": "user"}})
+        sd_cid2 = r["credential_id"]
+        st, r = _http("POST", f"{base}/v1/credentials/{sd_cid2}/present",
+                      {"disclose": ["/role"]})
+        check("轮换后演示 issuer_key_version=2",
+              st == 201 and r.get("issuer_key_version") == 2)
+        pid2 = r["presentation_id"]
+        st, r = _http("POST", f"{base}/v1/presentations/{pid2}/verify",
+                      {"presentation": r})
+        check("v2 演示 valid=true", st == 200 and r == {"valid": True})
+
+        # 23.10 已吊销凭证：验签成功后返回“凭证已吊销：<原因>”
+        st, r = _http("POST", f"{base}/v1/credentials", {
+            "issuer_did": sd_issuer, "subject_did": sd_subject,
+            "claims": {"kind": "revoke-vp"}})
+        sd_cid3 = r["credential_id"]
+        st, r = _http("POST", f"{base}/v1/credentials/{sd_cid3}/present",
+                      {"disclose": ["/kind"]})
+        pid3, vp3 = r["presentation_id"], r
+        _http("POST", f"{base}/v1/credentials/{sd_cid3}/revoke",
+              {"reason": "演示吊销测试"})
+        st, r = _http("POST", f"{base}/v1/presentations/{pid3}/verify",
+                      {"presentation": vp3})
+        check("已吊销凭证演示 valid:false 且附保存原因",
+              st == 200 and r.get("valid") is False
+              and r.get("reason") == "凭证已吊销：演示吊销测试")
+
+        # 23.11 演示记录跨重启持久化，重启后可验签/吊销结论保留
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "vcbackend.cli", "serve",
+             "--port", str(port), "--host", "127.0.0.1"],
+            cwd=ROOT, env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        assert wait_up(port), "主服务（SD 用例）重启超时"
+        st, r = _http("POST", f"{base}/v1/presentations/{pid1}/verify",
+                      {"presentation": vp1})
+        check("重启后旧演示仍 valid=true",
+              st == 200 and r == {"valid": True})
+        st, r = _http("POST", f"{base}/v1/presentations/{pid3}/verify",
+                      {"presentation": vp3})
+        check("重启后吊销演示仍返回吊销原因",
+              st == 200 and r.get("valid") is False
+              and r.get("reason") == "凭证已吊销：演示吊销测试")
 
     finally:
         proc.terminate()

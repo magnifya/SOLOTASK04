@@ -10,6 +10,8 @@
   GET  /v1/credentials/{credential_id}/status   查询状态（无状态按 active）
   POST /v1/credentials/{credential_id}/revoke   吊销凭证
   POST /v1/credentials/{credential_id}/verify  以存储记录为锚验签
+  POST /v1/credentials/{credential_id}/present 生成选择性披露演示
+  POST /v1/presentations/{presentation_id}/verify  以存储记录为锚校验演示
 
 错误映射：ValidationError -> 400，NotFoundError -> 404，ConflictError -> 409。
 例外：凭证验签端点对一切失败都返回 200 + {"valid": false, "reason": ...}。
@@ -113,6 +115,20 @@ def build_handler(store: VCStore) -> type:
                         path[len("/v1/credentials/") : -len("/verify")]
                     )
                     self._post_verify_credential(credential_id)
+                elif path.startswith("/v1/credentials/") and path.endswith(
+                    "/present"
+                ):
+                    credential_id = unquote(
+                        path[len("/v1/credentials/") : -len("/present")]
+                    )
+                    self._post_present(credential_id)
+                elif path.startswith("/v1/presentations/") and path.endswith(
+                    "/verify"
+                ):
+                    presentation_id = unquote(
+                        path[len("/v1/presentations/") : -len("/verify")]
+                    )
+                    self._post_verify_presentation(presentation_id)
                 else:
                     self._send_error(404, f"无此路径: {path}")
             except ValidationError as exc:
@@ -349,6 +365,77 @@ def build_handler(store: VCStore) -> type:
             except ValidationError as exc:
                 self._send_invalid(f"请求不合法: {exc}")
                 return
+            except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
+                self._send_invalid("验签过程发生内部错误")
+                return
+            payload: Dict[str, Any] = {"valid": valid}
+            if not valid:
+                payload["reason"] = reason or "验签失败"
+            self._send_json(200, payload)
+
+        def _post_present(self, credential_id: str) -> None:
+            # 请求体必须恰为 {"disclose": [路径...]}：缺失、类型非法、
+            # 重复路径或祖先重叠、多余字段一律 400；未知凭证 404；
+            # 空列表表示零披露。成功 201 返回演示记录。
+            data = self._read_json()
+            if "disclose" not in data:
+                raise ValidationError("缺少字段: disclose")
+            extra = sorted(set(data) - {"disclose"})
+            if extra:
+                raise ValidationError(f"多余字段: {', '.join(extra)}")
+            record = store.create_presentation(credential_id, data["disclose"])
+            self._send_json(
+                201,
+                {
+                    "presentation_id": record.presentation_id,
+                    "credential_id": record.credential_id,
+                    "issuer_did": record.issuer_did,
+                    "issuer_key_version": record.issuer_key_version,
+                    "disclose": record.disclose,
+                    "claims": record.projection,
+                    "proof": record.proof,
+                },
+            )
+
+        def _post_verify_presentation(self, presentation_id: str) -> None:
+            # 与凭证 verify 相同的公开错误协议：任何失败都返回 200 +
+            # {"valid": false, "reason": "<非空中文原因>"}，绝不返回
+            # 400/404/500。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                self._send_invalid("请求体缺失或长度声明非法")
+                return
+            except Exception:  # noqa: BLE001
+                self._send_invalid("请求体读取失败")
+                return
+            if not raw:
+                self._send_invalid("请求体缺失")
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                self._send_invalid("请求体不是合法 UTF-8 文本")
+                return
+            except json.JSONDecodeError:
+                self._send_invalid("请求体不是合法 JSON")
+                return
+            if not isinstance(data, dict):
+                self._send_invalid("请求体必须为 JSON 对象")
+                return
+            if "presentation" not in data:
+                self._send_invalid("请求缺少字段: presentation")
+                return
+            extra = sorted(set(data) - {"presentation"})
+            if extra:
+                self._send_invalid(f"请求含多余字段: {', '.join(extra)}")
+                return
+
+            try:
+                valid, reason = store.verify_presentation(
+                    presentation_id, data["presentation"]
+                )
             except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
                 self._send_invalid("验签过程发生内部错误")
                 return

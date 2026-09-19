@@ -25,7 +25,12 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import crypto
-from .models import CredentialRecord, CredentialStatusRecord, DIDRecord
+from .models import (
+    CredentialRecord,
+    CredentialStatusRecord,
+    DIDRecord,
+    PresentationRecord,
+)
 
 # DID method 标识：小写字母开头，仅含小写字母数字与下划线/连字符
 _METHOD_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
@@ -73,6 +78,108 @@ def _validate_key_handle(value: Any, field: str) -> str:
     return handle
 
 
+def _parse_pointer(pointer: str) -> Tuple[str, ...]:
+    """解析相对 claims 的 RFC6901 JSON Pointer 为 token 元组。
+
+    仅做语法解析：必须为以 "/" 开头的字符串，按 "/" 分段并对
+    "~1"/"~0" 反转义（顺序不可颠倒）；根指针 "" 与数组索引语义在
+    _resolve_pointer 中按业务规则拒绝。
+    """
+    if not isinstance(pointer, str):
+        raise ValidationError("disclose 路径必须为字符串")
+    if not pointer.startswith("/"):
+        raise ValidationError(
+            f"disclose 路径非法（须以 / 开头）: {pointer!r}"
+        )
+    tokens: List[str] = []
+    for raw in pointer.split("/")[1:]:
+        if "~" in raw:
+            # RFC6901：~ 后只能跟 0 或 1，且先还原 ~1 再还原 ~0
+            idx = 0
+            while idx < len(raw):
+                if raw[idx] == "~" and (
+                    idx + 1 >= len(raw) or raw[idx + 1] not in "01"
+                ):
+                    raise ValidationError(
+                        f"disclose 路径含非法转义（~ 后须为 0 或 1）: {pointer!r}"
+                    )
+                idx += 1
+        tokens.append(raw.replace("~1", "/").replace("~0", "~"))
+    return tuple(tokens)
+
+
+def _resolve_pointer(
+    claims: Dict[str, Any], tokens: Tuple[str, ...], pointer: str
+) -> Any:
+    """沿 token 导航 claims 并返回目标值。
+
+    禁根（空 token）、禁数组索引（任一步进入数组）、键不存在或
+    经过非对象叶子均按越界/未命中拒绝。
+    """
+    if not tokens:
+        raise ValidationError("disclose 不允许根路径（零披露请传空列表）")
+    current: Any = claims
+    for token in tokens:
+        if isinstance(current, list):
+            raise ValidationError(
+                f"disclose 路径不允许数组索引: {pointer!r}"
+            )
+        if not isinstance(current, dict) or token not in current:
+            raise ValidationError(
+                f"disclose 路径越界或未命中 claims 属性: {pointer!r}"
+            )
+        current = current[token]
+    return current
+
+
+def _validate_disclose(
+    claims: Dict[str, Any], disclose: Any
+) -> List[Tuple[str, Tuple[str, ...]]]:
+    """校验 disclose 列表并返回 (原路径, token 元组) 列表。
+
+    - disclose 必须为列表；元素须为以 / 开头的合法 RFC6901 指针字符串；
+    - 路径须命中 claims 属性：禁根、禁数组索引、禁越界；
+    - 路径不得重复、不得存在祖先/后代重叠（含已覆盖的深层路径）。
+    """
+    if not isinstance(disclose, list):
+        raise ValidationError("字段 disclose 必须为数组")
+    parsed: List[Tuple[str, Tuple[str, ...]]] = []
+    seen_tokens: List[Tuple[str, ...]] = []
+    for pointer in disclose:
+        tokens = _parse_pointer(pointer)
+        if tokens in seen_tokens:
+            raise ValidationError(f"disclose 路径重复: {pointer!r}")
+        for existing in seen_tokens:
+            if tokens[: len(existing)] == existing:
+                raise ValidationError(
+                    f"disclose 路径存在祖先重叠: {pointer!r} 被已选路径覆盖"
+                )
+            if existing[: len(tokens)] == tokens:
+                raise ValidationError(
+                    f"disclose 路径存在祖先重叠: 已选路径被 {pointer!r} 覆盖"
+                )
+        _resolve_pointer(claims, tokens, pointer)
+        parsed.append((pointer, tokens))
+        seen_tokens.append(tokens)
+    return parsed
+
+
+def _project_claims(
+    claims: Dict[str, Any],
+    parsed: List[Tuple[str, Tuple[str, ...]]],
+) -> Dict[str, Any]:
+    """按解析后的路径从 claims 提取投影；路径值整体保留（数组作叶子）。"""
+    projection: Dict[str, Any] = {}
+    for pointer, tokens in parsed:
+        value = _resolve_pointer(claims, tokens, pointer)
+        target = projection
+        for key in tokens[:-1]:
+            target = target.setdefault(key, {})
+        target[tokens[-1]] = value
+    return projection
+
+
+
 def _migrate_did_row(rec: Dict[str, Any]) -> Dict[str, Any]:
     """为缺少密钥元数据的旧 DID 记录补齐 server/1 与公钥历史。"""
     if rec.get("key_mode"):
@@ -100,6 +207,7 @@ class VCStore:
         self._lock = threading.Lock()
         self._dids: Dict[str, Dict[str, Any]] = {}
         self._credentials: Dict[str, Dict[str, Any]] = {}
+        self._presentations: Dict[str, Dict[str, Any]] = {}
         self._load()
 
     # ------------------------------------------------------------------ #
@@ -111,6 +219,7 @@ class VCStore:
                 data = json.load(fh)
             self._dids = data.get("dids", {})
             self._credentials = data.get("credentials", {})
+            self._presentations = data.get("presentations", {})
             for rec in self._dids.values():
                 _migrate_did_row(rec)
 
@@ -121,6 +230,7 @@ class VCStore:
         payload = {
             "dids": self._dids,
             "credentials": self._credentials,
+            "presentations": self._presentations,
         }
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
@@ -333,6 +443,217 @@ class VCStore:
                 body=rec["body"],
                 signature=rec["signature"],
             )
+
+    # ------------------------------------------------------------------ #
+    # 选择性披露演示
+    # ------------------------------------------------------------------ #
+    def _private_key_for_version_locked(
+        self, did: str, version: int
+    ) -> Optional[str]:
+        rec = self._dids.get(did)
+        if rec is None:
+            return None
+        for entry in rec.get("key_history", []):
+            if entry.get("version") == version:
+                return entry.get("private_key_pem")
+        return None
+
+    @staticmethod
+    def _presentation_record(row: Dict[str, Any]) -> PresentationRecord:
+        return PresentationRecord(
+            presentation_id=row["presentation_id"],
+            credential_id=row["credential_id"],
+            issuer_did=row["issuer_did"],
+            issuer_key_version=int(row["issuer_key_version"]),
+            disclose=list(row.get("disclose", [])),
+            projection=row.get("claims", {}),
+            proof=row["proof"],
+        )
+
+    def create_presentation(
+        self, credential_id: str, disclose: Any
+    ) -> PresentationRecord:
+        """对已签发凭证生成选择性披露演示并持久化。
+
+        - 凭证不存在抛 NotFoundError；disclose 非法（非数组、路径语法/
+          越界/重复/祖先重叠）抛 ValidationError；空列表表示零披露；
+        - proof 为 ES256 签名，覆盖除 proof 外按 key 升序规范化 JSON，
+          使用凭证 issuer_key_version（旧凭证缺省按 1）对应的历史私钥；
+        - presentation_id 为 vp_ 加 32 位小写 hex。
+        """
+        with self._lock:
+            cred = self._credentials.get(credential_id)
+            if cred is None:
+                raise NotFoundError(f"凭证不存在: {credential_id}")
+            stored_body = cred["body"]
+            claims = stored_body.get("claims", {})
+            if not isinstance(claims, dict):
+                raise ValidationError("凭证 claims 不是 JSON 对象，无法披露")
+
+            parsed = _validate_disclose(claims, disclose)
+            projection = _project_claims(claims, parsed)
+
+            issuer_did = stored_body["issuer_did"]
+            version = int(stored_body.get("issuer_key_version", 1))
+            private_pem = self._private_key_for_version_locked(
+                issuer_did, version
+            )
+            if not private_pem:
+                raise ValidationError(
+                    "历史私钥不可用: 签发者 "
+                    f"{issuer_did} 密钥版本 {version} 的私钥不存在"
+                )
+
+            presentation_id = f"vp_{uuid.uuid4().hex}"
+            disclose_paths = [pointer for pointer, _ in parsed]
+            unsigned: Dict[str, Any] = {
+                "presentation_id": presentation_id,
+                "credential_id": credential_id,
+                "issuer_did": issuer_did,
+                "issuer_key_version": version,
+                "disclose": disclose_paths,
+                "claims": projection,
+            }
+            proof = crypto.sign(unsigned, private_pem)
+            row = dict(unsigned)
+            row["proof"] = proof
+            self._presentations[presentation_id] = row
+            self._save_locked()
+            return self._presentation_record(row)
+
+    def get_presentation(self, presentation_id: str) -> PresentationRecord:
+        """查询演示记录；不存在抛 NotFoundError。"""
+        with self._lock:
+            row = self._presentations.get(presentation_id)
+            if row is None:
+                raise NotFoundError(f"演示不存在: {presentation_id}")
+            return self._presentation_record(row)
+
+    def verify_presentation(
+        self, presentation_id: str, presentation: Any
+    ) -> Tuple[bool, str]:
+        """以存储记录为锚校验选择性披露演示，返回 (是否有效, 失败原因)。
+
+        顺序：路径 ID 须已持久化；对象 presentation_id 须与路径一致；
+        核对 credential_id/issuer_did/issuer_key_version 绑定字段、disclose；
+        按存储凭证 claims 重算投影并核对 claims；再按历史公钥验 proof。
+        签名成功后若凭证已 revoked，返回“凭证已吊销：<保存原因>”。
+        任何失败均返回非空中文原因，绝不抛异常、不泄露私钥。
+        """
+        if not isinstance(presentation, dict):
+            return False, "请求不合法: 字段 presentation 必须为 JSON 对象"
+
+        with self._lock:
+            row = self._presentations.get(presentation_id)
+            if row is None:
+                return False, f"演示不存在: {presentation_id}"
+
+            expected_keys = {
+                "presentation_id",
+                "credential_id",
+                "issuer_did",
+                "issuer_key_version",
+                "disclose",
+                "claims",
+                "proof",
+            }
+            if set(presentation) != expected_keys:
+                return False, (
+                    "锚定校验失败: presentation 字段集合与存储记录不一致"
+                )
+            proof = presentation.get("proof")
+            if not isinstance(proof, str) or not proof:
+                return False, "请求不合法: 字段 proof 必须为非空字符串"
+            if presentation.get("presentation_id") != presentation_id:
+                return False, (
+                    "锚定校验失败: presentation_id 与路径或存储记录不一致"
+                )
+            if presentation.get("credential_id") != row.get("credential_id"):
+                return False, (
+                    "锚定校验失败: credential_id 与存储记录不一致"
+                )
+            if presentation.get("issuer_did") != row.get("issuer_did"):
+                return False, "锚定校验失败: issuer_did 与存储记录不一致"
+            stored_version = int(row.get("issuer_key_version", 1))
+            version_obj = presentation.get("issuer_key_version")
+            if (
+                not isinstance(version_obj, int)
+                or isinstance(version_obj, bool)
+                or version_obj != stored_version
+            ):
+                return False, (
+                    "锚定校验失败: issuer_key_version 与存储记录不一致"
+                )
+            if presentation.get("disclose") != list(row.get("disclose", [])):
+                return False, "锚定校验失败: disclose 与存储记录不一致"
+
+            obj_claims = presentation.get("claims")
+            if not isinstance(obj_claims, dict):
+                return False, "请求不合法: 演示 claims 必须为 JSON 对象"
+
+            credential_id = row["credential_id"]
+            issuer_did = row["issuer_did"]
+            cred = self._credentials.get(credential_id)
+            if cred is None:
+                return False, f"凭证不存在: {credential_id}"
+            source_claims = cred["body"].get("claims", {})
+            credential_status = cred.get("status")
+            revoke_reason = cred.get("revoke_reason")
+
+            public_pem = self._public_key_for_version_locked(
+                issuer_did, stored_version
+            )
+
+        # 按存储的 disclose 从存储凭证 claims 重算投影并核对
+        stored_disclose = list(row.get("disclose", []))
+        try:
+            parsed_stored = [
+                (pointer, _parse_pointer(pointer))
+                for pointer in stored_disclose
+            ]
+            recomputed = _project_claims(source_claims, parsed_stored)
+        except ValidationError as exc:
+            return False, f"投影重算失败: {exc}"
+        if obj_claims != recomputed:
+            return False, (
+                "锚定校验失败: claims 投影与按存储凭证重算的结果不一致"
+            )
+
+        if not public_pem:
+            return False, (
+                "历史公钥不可用: 签发者 "
+                f"{issuer_did} 密钥版本 {stored_version} 的公钥不存在"
+            )
+        try:
+            crypto.validate_public_key_pem(public_pem)
+        except (ValueError, TypeError):
+            return False, (
+                "历史公钥不可用: 签发者 "
+                f"{issuer_did} 密钥版本 {stored_version} 的公钥无法解析"
+            )
+
+        unsigned = {
+            "presentation_id": presentation_id,
+            "credential_id": credential_id,
+            "issuer_did": issuer_did,
+            "issuer_key_version": stored_version,
+            "disclose": list(row.get("disclose", [])),
+            "claims": recomputed,
+        }
+        try:
+            crypto.verify(unsigned, proof, public_pem)
+        except crypto.MalformedSignature:
+            return False, "签名格式错误: 不是合法的 ES256 签名编码"
+        except crypto.InvalidSignature:
+            return False, "签名校验失败，演示内容或 proof 可能被改动"
+        except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
+            return False, "验签过程发生内部错误"
+
+        # 签名与锚定均成功后检查凭证状态
+        if credential_status == "revoked":
+            saved_reason = revoke_reason or DEFAULT_REVOKE_REASON
+            return False, f"凭证已吊销：{saved_reason}"
+        return True, ""
 
     # ------------------------------------------------------------------ #
     # 凭证状态与吊销

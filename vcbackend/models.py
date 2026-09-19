@@ -44,3 +44,22 @@ class CredentialStatusRecord:
     updated_at: Optional[str]
     reason: Optional[str] = None
     revoked_at: Optional[str] = None
+
+
+@dataclass
+class PresentationRecord:
+    """一条选择性披露演示记录。
+
+    disclose 为命中 claims 的 RFC6901 指针列表（相对 claims，"[]" 时为
+    零披露空列表）；projection 为按 disclose 重算出的 claims 投影；
+    proof 为覆盖除 proof 外规范化 JSON 的 ES256 签名（base64url 无填充），
+    使用凭证签发时 issuer_key_version 对应的历史私钥。
+    """
+
+    presentation_id: str
+    credential_id: str
+    issuer_did: str
+    issuer_key_version: int
+    disclose: list
+    projection: Dict[str, Any]
+    proof: str
