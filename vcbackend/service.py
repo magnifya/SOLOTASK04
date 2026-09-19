@@ -1,20 +1,27 @@
 """HTTP 服务：基于标准库 http.server。
 
 路由：
-  POST /v1/dids                       注册 DID
-  GET  /v1/dids/{did}                 查询 DID
-  POST /v1/credentials                签发凭证
-  GET  /v1/credentials/{credential_id} 查询凭证
+  POST /v1/dids                                注册 DID
+  GET  /v1/dids/{did}                          查询 DID
+  POST /v1/dids/{did}/keys/rotate              轮换 DID 密钥
+  POST /v1/credentials                         签发凭证
+  GET  /v1/credentials/{credential_id}         查询凭证
+  POST /v1/credentials/{credential_id}/verify  校验凭证签名
 
 错误映射：ValidationError -> 400，NotFoundError -> 404。
+例外：验签接口对任何校验不通过都返回 200 与 {"valid": false, "reason": ...}。
 """
 
 import json
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
 from .store import NotFoundError, ValidationError, VCStore
+
+_KEYS_ROTATE_RE = re.compile(r"^/v1/dids/(.+)/keys/rotate$")
+_CRED_VERIFY_RE = re.compile(r"^/v1/credentials/(.+)/verify$")
 
 
 def _json_dumps(payload: Any) -> bytes:
@@ -63,9 +70,21 @@ def build_handler(store: VCStore) -> type:
                 elif path == "/v1/credentials":
                     self._post_credentials()
                 else:
-                    self._send_error(404, f"无此路径: {path}")
+                    rotate_match = _KEYS_ROTATE_RE.match(path)
+                    verify_match = _CRED_VERIFY_RE.match(path)
+                    if rotate_match:
+                        self._post_rotate_key(unquote(rotate_match.group(1)))
+                    elif verify_match:
+                        # 验签接口永不返回 4xx/5xx，统一在处理函数内收敛
+                        self._post_verify_credential(
+                            unquote(verify_match.group(1))
+                        )
+                    else:
+                        self._send_error(404, f"无此路径: {path}")
             except ValidationError as exc:
                 self._send_error(400, str(exc))
+            except NotFoundError as exc:
+                self._send_error(404, str(exc))
             except Exception as exc:  # noqa: BLE001
                 self._send_error(500, f"服务器内部错误: {exc}")
 
@@ -105,12 +124,17 @@ def build_handler(store: VCStore) -> type:
         def _post_dids(self) -> None:
             data = self._read_json()
             self._require_fields(data, ("method", "public_key"))
-            record = store.create_did(data["method"], data["public_key"])
+            record = store.create_did(
+                data["method"], data["public_key"], data.get("key_mode")
+            )
             self._send_json(
                 201,
                 {
                     "did": record.did,
                     "public_key": record.public_key,
+                    "key_mode": record.key_mode,
+                    "key_handle": record.key_handle,
+                    "key_version": record.key_version,
                 },
             )
 
@@ -122,6 +146,23 @@ def build_handler(store: VCStore) -> type:
                     "did": record.did,
                     "public_key": record.public_key,
                     "created_at": record.created_at,
+                    "key_mode": record.key_mode,
+                    "key_handle": record.key_handle,
+                    "key_version": record.key_version,
+                },
+            )
+
+        def _post_rotate_key(self, did: str) -> None:
+            data = self._read_json()
+            self._require_fields(data, ("key_handle",))
+            record = store.rotate_key(did, data["key_handle"])
+            self._send_json(
+                200,
+                {
+                    "did": record.did,
+                    "public_key": record.public_key,
+                    "key_handle": record.key_handle,
+                    "key_version": record.key_version,
                 },
             )
 
@@ -140,6 +181,7 @@ def build_handler(store: VCStore) -> type:
                 {
                     "credential_id": record.credential_id,
                     "signature": record.signature,
+                    "issuer_key_version": record.issuer_key_version,
                 },
             )
 
@@ -151,8 +193,37 @@ def build_handler(store: VCStore) -> type:
                     "credential_id": record.credential_id,
                     "body": record.body,
                     "signature": record.signature,
+                    "issuer_key_version": record.issuer_key_version,
                 },
             )
+
+        def _post_verify_credential(self, credential_id: str) -> None:
+            """验签结果一律 200：失败返回 valid=false 与中文非空原因。"""
+            try:
+                data = self._read_json()
+            except ValidationError as exc:
+                self._send_json(200, {"valid": False, "reason": str(exc)})
+                return
+            signature = data.get("signature")
+            if not isinstance(signature, str) or not signature:
+                self._send_json(
+                    200,
+                    {"valid": False, "reason": "字段 signature 必须为非空字符串"},
+                )
+                return
+            try:
+                store.verify_credential_signature(credential_id, signature)
+            except NotFoundError as exc:
+                self._send_json(200, {"valid": False, "reason": str(exc)})
+            except ValidationError as exc:
+                self._send_json(200, {"valid": False, "reason": str(exc)})
+            except Exception:  # noqa: BLE001
+                # 收敛为通用原因，避免 500 或泄露内部（含私钥）信息
+                self._send_json(
+                    200, {"valid": False, "reason": "验签过程发生内部错误"}
+                )
+            else:
+                self._send_json(200, {"valid": True})
 
     return Handler
 
