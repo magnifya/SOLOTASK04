@@ -106,16 +106,27 @@ def _cmd_issue(args: argparse.Namespace) -> int:
 
 
 def _cmd_verify(args: argparse.Namespace) -> int:
-    # 现取凭证正文与签名，交由服务端以存储记录为锚验签
-    vc = _request(
-        args.base_url, "GET", f"/v1/credentials/{args.credential_id}"
-    )
-    result = _request(
-        args.base_url,
-        "POST",
-        f"/v1/credentials/{args.credential_id}/verify",
-        {"body": vc["body"], "signature": vc["signature"]},
-    )
+    # 现取凭证正文与签名，交由服务端以存储记录为锚验签；
+    # 无论取凭证失败还是验签失败，都输出 false、stderr 说明原因并退出 1
+    try:
+        vc = _request(
+            args.base_url, "GET", f"/v1/credentials/{args.credential_id}"
+        )
+    except ClientError as exc:
+        print("false")
+        print(f"原因: 获取凭证失败: {exc.message}", file=sys.stderr)
+        return 1
+    try:
+        result = _request(
+            args.base_url,
+            "POST",
+            f"/v1/credentials/{args.credential_id}/verify",
+            {"body": vc["body"], "signature": vc["signature"]},
+        )
+    except ClientError as exc:
+        print("false")
+        print(f"原因: 验签请求失败: {exc.message}", file=sys.stderr)
+        return 1
     if result.get("valid"):
         print("true")
         return 0

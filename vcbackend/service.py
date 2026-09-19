@@ -9,6 +9,8 @@
   POST /v1/credentials/{credential_id}/verify  以存储记录为锚验签
 
 错误映射：ValidationError -> 400，NotFoundError -> 404。
+例外：验签端点所有失败（含请求体非法、凭证不存在、锚定不一致、
+签名/密钥问题）一律返回 200 {"valid": false, "reason": <中文原因>}。
 """
 
 import json
@@ -182,17 +184,52 @@ def build_handler(store: VCStore) -> type:
             )
 
         def _post_verify_credential(self, credential_id: str) -> None:
-            data = self._read_json()
+            # 验签端点的公开错误协议：任何失败都返回 200
+            # {"valid": false, "reason": "<分类中文原因>"}，
+            # 绝不返回 400/404/500，也不泄露私钥或堆栈。
+            try:
+                self._verify_credential_inner(credential_id)
+            except Exception:  # noqa: BLE001 验签端点绝不返回 500
+                self._send_json(
+                    200,
+                    {
+                        "valid": False,
+                        "reason": "请求错误: 验签请求处理失败",
+                    },
+                )
+
+        def _verify_credential_inner(self, credential_id: str) -> None:
+            def fail(reason: str) -> None:
+                self._send_json(200, {"valid": False, "reason": reason})
+
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b""
+            if not raw:
+                fail("请求错误: 请求体缺失")
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                fail("请求错误: 请求体不是合法 JSON")
+                return
+            if not isinstance(data, dict):
+                fail("请求错误: 请求体必须为 JSON 对象")
+                return
             if "body" not in data:
-                raise ValidationError("缺少字段: body")
+                fail("请求错误: 缺少字段 body")
+                return
             if not isinstance(data["body"], dict):
-                raise ValidationError("字段 body 必须为 JSON 对象")
+                fail("请求错误: 字段 body 必须为 JSON 对象")
+                return
             if "signature" not in data:
-                raise ValidationError("缺少字段: signature")
-            if not isinstance(data["signature"], str) or not data["signature"]:
-                raise ValidationError("字段 signature 必须为非空字符串")
+                fail("请求错误: 缺少字段 signature")
+                return
+            signature = data["signature"]
+            if not isinstance(signature, str) or not signature:
+                fail("请求错误: 字段 signature 必须为非空字符串")
+                return
             valid, reason = store.verify_credential(
-                credential_id, data["body"], data["signature"]
+                credential_id, data["body"], signature
             )
             payload: Dict[str, Any] = {"valid": valid}
             if not valid:

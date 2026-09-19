@@ -17,9 +17,15 @@ from cryptography.hazmat.primitives.asymmetric.utils import (
     encode_dss_signature,
 )
 
+class SignatureFormatError(ValueError):
+    """签名不是合法的 base64url(R||S) 64 字节编码。"""
+
+
 __all__ = [
     "InvalidSignature",
+    "SignatureFormatError",
     "canonicalize",
+    "decode_raw_signature",
     "generate_private_key_pem",
     "public_key_pem_from_private",
     "validate_public_key_pem",
@@ -113,12 +119,25 @@ def sign(body: Dict[str, Any], private_pem: str) -> str:
     return _b64url(raw)
 
 
-def verify(body: Dict[str, Any], signature_b64: str, public_pem: str) -> None:
-    """校验签名，失败抛 InvalidSignature。"""
-    public_key = _load_public_key(public_pem)
-    raw = _b64url_decode(signature_b64)
+def decode_raw_signature(signature_b64: str) -> bytes:
+    """解码 base64url 签名并校验为 64 字节 R||S，否则抛 SignatureFormatError。"""
+    if not isinstance(signature_b64, str) or not signature_b64:
+        raise SignatureFormatError("签名必须为非空字符串")
+    try:
+        raw = _b64url_decode(signature_b64)
+    except (ValueError, TypeError) as exc:
+        raise SignatureFormatError(
+            "签名不是合法的 base64url 编码"
+        ) from exc
     if len(raw) != 64:
-        raise InvalidSignature("签名长度不是 64 字节，非合法 ES256 签名")
+        raise SignatureFormatError("签名长度不是 64 字节，非合法 ES256 签名")
+    return raw
+
+
+def verify(body: Dict[str, Any], signature_b64: str, public_pem: str) -> None:
+    """校验签名，失败抛 InvalidSignature，格式非法抛 SignatureFormatError。"""
+    public_key = _load_public_key(public_pem)
+    raw = decode_raw_signature(signature_b64)
     r = int.from_bytes(raw[:32], "big")
     s = int.from_bytes(raw[32:], "big")
     der = encode_dss_signature(r, s)

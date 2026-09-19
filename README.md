@@ -29,7 +29,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/dids/{did}/keys/rotate` | 轮换密钥，请求体 `{"key_handle"}`，返回 200 与 `did`、`public_key`、`key_handle`、`key_version` |
 | POST | `/v1/credentials` | 签发凭证，请求体 `{"issuer_did","subject_did","claims"}`，返回 201 与 `credential_id`、`signature`、`issuer_key_version` |
 | GET | `/v1/credentials/{credential_id}` | 返回 `credential_id`、`body`、`signature`；不存在 404 |
-| POST | `/v1/credentials/{credential_id}/verify` | 验签，请求体 `{"body","signature"}`，返回 200 与 `valid`（失败时附中文 `reason`） |
+| POST | `/v1/credentials/{credential_id}/verify` | 验签，请求体 `{"body","signature"}`，返回 200 与 `valid`（失败时附中文 `reason`）；**任何失败都返回 200**，见下文错误协议 |
 
 - DID 形如 `did:example:<32 位 hex>`。
 - `public_key` 为**句柄**：非空且不能是 PEM 文本；同一句柄再次提交返回其既有 DID（按提交原文去重）。
@@ -64,7 +64,8 @@ python3 -m vcbackend.cli did-show  did:example:<id>
 python3 -m vcbackend.cli issue --issuer did:example:<a> --subject did:example:<b> \
     --claims '{"role":"admin"}'
 python3 -m vcbackend.cli verify vc_<id>     # 成功输出 true（退出码 0）
-                                           # 正文被改动输出 false，并在 stderr 说明原因（退出码 1）
+                                           # 取凭证失败或验签失败输出 false，
+                                           # 并在 stderr 说明原因（退出码 1）
 ```
 
 ## 签名与验真
@@ -76,8 +77,19 @@ python3 -m vcbackend.cli verify vc_<id>     # 成功输出 true（退出码 0）
   对其任一字段（含 claims 内部）的改动都会使验签失败。
 - `POST /v1/credentials/{credential_id}/verify` 以**存储的** `credential_id`、
   `issuer_did`、`issuer_key_version` 为锚：正文锚定字段与存储不一致即判失败；
-  验签公钥按 `issuer_key_version` 从签发者公钥历史中取出。失败返回 200
-  `{"valid": false, "reason": "<中文原因>"}`，不会返回 500，也不会泄露私钥。
+  验签公钥按 `issuer_key_version` 从签发者公钥历史中取出。
+- **验签端点错误协议**：任何失败都返回 HTTP 200
+  `{"valid": false, "reason": "<中文原因>"}`，绝不返回 400/404/500，
+  也不泄露私钥或堆栈。`reason` 以类别前缀区分：
+  - `请求错误:` 请求体缺失、非法 JSON、非 JSON 对象、缺 `body`/`signature`、
+    `body` 非对象、`signature` 非非空字符串；
+  - `资源错误:` 路径中的 `credential_id` 不存在；
+  - `锚定错误:` 正文 `credential_id`/`issuer_did`/`issuer_key_version`
+    与存储记录不一致；
+  - `签名错误:` 签名格式非法（非 base64url 的 64 字节 R||S）或签名校验失败；
+  - `密钥错误:` 对应版本的历史公钥不可用或无法解析。
+- 合法 `body` 与 `signature` 按提交正文规范化（key 升序紧凑 JSON）后验签，
+  成功返回 200 `{"valid": true}`。
 - 旧凭证正文缺 `issuer_key_version` 时按版本 1 验签，签名本身不受影响。
 
 ### 密钥模型与轮换
@@ -102,8 +114,9 @@ python3 tests/e2e_test.py
 
 脚本会临时在本地端口启动服务，覆盖：201/200/400/404 各路径、同 key 去重、
 PEM 句柄与非法 key_mode 拒绝、密钥轮换（含 404/400 路径）、轮换前后
-`issuer_key_version` 验签、verify 端点 valid=true/false、CLI verify 成功与失败、
-旧状态文件迁移与旧凭证按版本 1 验签。
+`issuer_key_version` 验签、verify 端点 valid=true/false 及其公开错误协议
+（请求/资源/锚定/签名各类失败均返回 200 + 中文 reason）、CLI verify
+成功与失败、旧状态文件迁移与旧凭证按版本 1 验签。
 
 ## 代码结构
 

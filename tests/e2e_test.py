@@ -33,6 +33,17 @@ def _http(method, url, payload=None):
         return exc.code, json.loads(exc.read().decode() or "{}")
 
 
+def _http_raw(method, url, raw):
+    """以原始字节作请求体发请求（用于构造非法 JSON 等场景）。"""
+    req = urllib.request.Request(url, data=raw, method=method)
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.status, json.loads(resp.read().decode() or "{}")
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode() or "{}")
+
+
 def wait_up(port, timeout=10.0):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -244,13 +255,41 @@ def main():
         check("verify 端点: 锚定版本不一致 valid=false",
               st == 200 and r.get("valid") is False and r.get("reason"))
 
-        # 19. verify 端点：缺字段 400 / 未知凭证 404
-        st, _ = _http("POST", f"{base}/v1/credentials/{cid2}/verify",
-                      {"body": {}})
-        check("verify 缺 signature -> 400", st == 400)
-        st, _ = _http("POST", f"{base}/v1/credentials/vc_nope/verify",
+        # 19. verify 端点公开错误协议：任何失败都是 200 + valid:false + 中文 reason
+        vurl = f"{base}/v1/credentials/{cid2}/verify"
+
+        def check_invalid(name, st, r, category):
+            check(name,
+                  st == 200 and r.get("valid") is False
+                  and isinstance(r.get("reason"), str)
+                  and r["reason"].startswith(category))
+
+        st, r = _http("POST", vurl, {"body": {}})
+        check_invalid("verify 缺 signature -> 200 valid=false(请求)", st, r, "请求")
+        st, r = _http("POST", vurl, {"signature": "x"})
+        check_invalid("verify 缺 body -> 200 valid=false(请求)", st, r, "请求")
+        st, r = _http("POST", vurl, {"body": [], "signature": "x"})
+        check_invalid("verify body 非对象 -> 200 valid=false(请求)", st, r, "请求")
+        st, r = _http("POST", vurl, {"body": {}, "signature": ""})
+        check_invalid("verify 空 signature -> 200 valid=false(请求)", st, r, "请求")
+        st, r = _http("POST", vurl, {"body": {}, "signature": 123})
+        check_invalid("verify signature 非字符串 -> 200 valid=false(请求)",
+                      st, r, "请求")
+        st, r = _http("POST", vurl, [])
+        check_invalid("verify 请求体非对象 -> 200 valid=false(请求)", st, r, "请求")
+        st, r = _http_raw("POST", vurl, b"{not json")
+        check_invalid("verify 非法 JSON -> 200 valid=false(请求)", st, r, "请求")
+        st, r = _http_raw("POST", vurl, b"")
+        check_invalid("verify 空请求体 -> 200 valid=false(请求)", st, r, "请求")
+        st, r = _http("POST", f"{base}/v1/credentials/vc_nope/verify",
                       {"body": {}, "signature": "x"})
-        check("verify 未知凭证 -> 404", st == 404)
+        check_invalid("verify 未知凭证 -> 200 valid=false(资源)", st, r, "资源")
+        st, r = _http("POST", vurl,
+                      {"body": vc2["body"], "signature": "!!!not-base64!!!"})
+        check_invalid("verify 签名格式非法 -> 200 valid=false(签名)", st, r, "签名")
+        st, r = _http("POST", vurl,
+                      {"body": vc2["body"], "signature": "a" * 86})
+        check_invalid("verify 签名长度非法 -> 200 valid=false(签名)", st, r, "签名")
 
         # 20. CLI verify：成功 true/0；未知凭证非 0
         env_cli = dict(env, VCBACKEND_URL=base)
@@ -262,8 +301,9 @@ def main():
         cp = subprocess.run(
             [sys.executable, "-m", "vcbackend.cli", "verify", "vc_nope"],
             cwd=ROOT, env=env_cli, capture_output=True, text=True)
-        check("CLI verify 未知凭证 -> 退出码 1",
-              cp.returncode == 1 and cp.stderr.strip())
+        check("CLI verify 未知凭证 -> false/stderr 原因/退出码 1",
+              cp.returncode == 1 and cp.stdout.strip() == "false"
+              and cp.stderr.strip())
 
         # 21. 旧状态文件迁移 + 旧凭证（无 issuer_key_version）按 1 验签
         with open(store, encoding="utf-8") as fh:
@@ -279,6 +319,10 @@ def main():
         old_sig = crypto.sign(old_body, issuer_row["private_key_pem"])
         bad_body = dict(old_body, credential_id="vc_bad")
         bad_sig = crypto.sign(bad_body, issuer_row["private_key_pem"])
+        # 正文锚定版本 5，但签发者历史只有版本 1：历史公钥不可用
+        nokey_body = dict(old_body, credential_id="vc_nokey",
+                          issuer_key_version=5)
+        nokey_sig = crypto.sign(nokey_body, issuer_row["private_key_pem"])
         old_state = {
             "dids": {
                 issuer: {
@@ -296,6 +340,8 @@ def main():
                     "body": dict(bad_body, claims={"n": 999}),
                     "signature": bad_sig,
                 },
+                # 锚定版本 5 无对应历史公钥
+                "vc_nokey": {"body": nokey_body, "signature": nokey_sig},
             },
         }
         old_store = tempfile.mktemp(suffix=".json")
@@ -325,6 +371,11 @@ def main():
                           {"body": tampered_old, "signature": old_sig})
             check("旧凭证篡改 valid=false 且 reason 非空",
                   st == 200 and r.get("valid") is False and r.get("reason"))
+            st, r = _http("POST", f"{base2}/v1/credentials/vc_nokey/verify",
+                          {"body": nokey_body, "signature": nokey_sig})
+            check("历史公钥不可用 -> 200 valid=false(密钥)",
+                  st == 200 and r.get("valid") is False
+                  and r.get("reason", "").startswith("密钥"))
             # CLI verify 失败路径：false + stderr 原因 + 退出码 1
             cp = subprocess.run(
                 [sys.executable, "-m", "vcbackend.cli", "verify", "vc_bad"],
