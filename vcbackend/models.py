@@ -71,6 +71,22 @@ class PresentationRecord:
 
 
 @dataclass
+class TrustAnchorRecord:
+    """一条信任锚点记录（按租户隔离）。
+
+    did 为锚点标识；public_key 为注册的 P-256 PEM 公钥；key_version
+    为正整数版本；status 为 active/revoked；updated_at 为首次吊销时间
+    （UTC ISO8601 秒精度），未吊销时为 None。
+    """
+
+    did: str
+    public_key: str
+    key_version: int
+    status: str = "active"
+    updated_at: Optional[str] = None
+
+
+@dataclass
 class AuditEvent:
     """一条审计事件。
 

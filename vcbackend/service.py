@@ -12,6 +12,10 @@
   POST /v1/credentials/{credential_id}/verify  以存储记录为锚验签
   POST /v1/credentials/{credential_id}/present 生成选择性披露演示
   POST /v1/presentations/{presentation_id}/verify  以存储记录为锚校验演示
+  POST /v1/trust/anchors                  注册信任锚点（同 DID/版本同 PEM 幂等）
+  GET  /v1/trust/anchors/{did}            查询 DID 的全部锚点版本
+  PUT  /v1/trust/anchors/{did}/{key_version}/status  吊销锚点版本
+  POST /v1/trust/verify                   用 active 锚点公钥验签
   GET  /v1/audit                          查询本租户审计事件
 
 多租户：所有 /v1 请求取 X-Tenant-ID 头，缺省为 "default"；显式
@@ -169,6 +173,10 @@ def build_handler(store: VCStore) -> type:
                     self._post_verify_presentation(
                         tenant, presentation_id
                     )
+                elif path == "/v1/trust/anchors":
+                    self._post_trust_anchors(tenant)
+                elif path == "/v1/trust/verify":
+                    self._post_trust_verify(tenant)
                 else:
                     self._send_error(404, f"无此路径: {path}")
             except ValidationError as exc:
@@ -194,6 +202,17 @@ def build_handler(store: VCStore) -> type:
                         path[len("/v1/credentials/") : -len("/status")]
                     )
                     self._put_credential_status(tenant, credential_id)
+                elif path.startswith("/v1/trust/anchors/") and path.endswith(
+                    "/status"
+                ):
+                    rest = path[len("/v1/trust/anchors/") : -len("/status")]
+                    did, sep, version_raw = rest.rpartition("/")
+                    if not sep or not did:
+                        self._send_error(404, f"无此路径: {path}")
+                    else:
+                        self._put_trust_anchor_status(
+                            tenant, unquote(did), unquote(version_raw)
+                        )
                 else:
                     self._send_error(404, f"无此路径: {path}")
             except ValidationError as exc:
@@ -232,6 +251,9 @@ def build_handler(store: VCStore) -> type:
                     self._get_credential(
                         tenant, unquote(path[len("/v1/credentials/") :])
                     )
+                elif path.startswith("/v1/trust/anchors/"):
+                    did = unquote(path[len("/v1/trust/anchors/") :])
+                    self._get_trust_anchors(tenant, did)
                 else:
                     self._send_error(404, f"无此路径: {path}")
             except ValidationError as exc:
@@ -547,8 +569,113 @@ def build_handler(store: VCStore) -> type:
                 payload["reason"] = reason or "验签失败"
             self._send_json(200, payload)
 
-        def _get_audit(self, tenant: str, query: str) -> None:
-            # GET /v1/audit?limit=&after=：租户内按 seq 升序。
+        # ------------------------------------------------------------ #
+        # 信任锚点
+        # ------------------------------------------------------------ #
+        @staticmethod
+        def _trust_anchor_payload(record: Any) -> Dict[str, Any]:
+            return {
+                "did": record.did,
+                "public_key": record.public_key,
+                "key_version": record.key_version,
+                "status": record.status,
+                "updated_at": record.updated_at,
+            }
+
+        def _post_trust_anchors(self, tenant: str) -> None:
+            # 字段依次为：did 非空字符串、public_key 为 P-256 PEM、
+            # key_version 为非布尔正整数；多余字段一律 400。
+            data = self._read_json()
+            self._require_fields(data, ("did", "public_key"))
+            if "key_version" not in data:
+                raise ValidationError("缺少字段: key_version")
+            extra = sorted(
+                set(data) - {"did", "public_key", "key_version"}
+            )
+            if extra:
+                raise ValidationError(f"多余字段: {', '.join(extra)}")
+            record, created = store.register_trust_anchor(
+                tenant,
+                data["did"],
+                data["public_key"],
+                data["key_version"],
+            )
+            # 新建 201；同 DID/版本同 PEM 幂等重试 200；PEM 不同由
+            # store 抛 ConflictError -> 409。
+            self._send_json(
+                201 if created else 200,
+                self._trust_anchor_payload(record),
+            )
+
+        def _get_trust_anchors(self, tenant: str, did: str) -> None:
+            # 返回该 DID 的全部锚点版本；未知 DID（含他租户）404。
+            records = store.list_trust_anchors(tenant, did)
+            self._send_json(
+                200, [self._trust_anchor_payload(r) for r in records]
+            )
+
+        def _put_trust_anchor_status(
+            self, tenant: str, did: str, key_version: str
+        ) -> None:
+            # 请求体必须恰为 {"status": "revoked"}；路径 key_version
+            # 须为非布尔正整数（路径参数为字符串）。
+            data = self._read_json()
+            if "status" not in data:
+                raise ValidationError("缺少字段: status")
+            extra = sorted(set(data) - {"status"})
+            if extra:
+                raise ValidationError(f"多余字段: {', '.join(extra)}")
+            if data["status"] != "revoked":
+                raise ValidationError(
+                    f"字段 status 非法: {data['status']!r}（仅支持 revoked）"
+                )
+            if (
+                not key_version
+                or any(ch < "0" or ch > "9" for ch in key_version)
+                or int(key_version) < 1
+            ):
+                raise ValidationError("路径参数 key_version 必须为正整数")
+            record = store.revoke_trust_anchor(tenant, did, int(key_version))
+            # 首次吊销与幂等重试均 200，updated_at 保持首次值
+            self._send_json(200, self._trust_anchor_payload(record))
+
+        def _post_trust_verify(self, tenant: str) -> None:
+            # 与凭证/演示 verify 相同的公开错误协议：任何失败都返回
+            # 200 + {"valid": false, "reason": "<非空中文原因>"}。
+            # 签名覆盖请求对象去掉 signature 后的规范化 JSON，用匹配
+            # (issuer_did, issuer_key_version) 的 active 锚点公钥验签。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                self._send_invalid("请求体缺失或长度声明非法")
+                return
+            except Exception:  # noqa: BLE001
+                self._send_invalid("请求体读取失败")
+                return
+            if not raw:
+                self._send_invalid("请求体缺失")
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                self._send_invalid("请求体不是合法 UTF-8 文本")
+                return
+            except json.JSONDecodeError:
+                self._send_invalid("请求体不是合法 JSON")
+                return
+
+            try:
+                valid, reason = store.verify_trust(tenant, data)
+            except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
+                self._send_invalid("验签过程发生内部错误")
+                return
+            payload: Dict[str, Any] = {"valid": valid}
+            if not valid:
+                payload["reason"] = reason or "验签失败"
+            self._send_json(200, payload)
+
+        def _get_audit(self, tenant: str, query: str) -> None:            # GET /v1/audit?limit=&after=：租户内按 seq 升序。
             # limit 缺省 50，须为 1..200 的整数；after 缺省 0，须为
             # 非负整数；非法一律 400。返回 events 与 next_after，
             # 空页 next_after 保持 after。
