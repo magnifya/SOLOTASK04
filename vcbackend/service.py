@@ -6,9 +6,12 @@
   POST /v1/dids/{did}/keys/rotate         轮换 DID 密钥
   POST /v1/credentials                    签发凭证
   GET  /v1/credentials/{credential_id}    查询凭证
+  PUT  /v1/credentials/{credential_id}/status   登记 active（首次 201/重复 200）
+  GET  /v1/credentials/{credential_id}/status   查询状态（无状态按 active）
+  POST /v1/credentials/{credential_id}/revoke   吊销凭证
   POST /v1/credentials/{credential_id}/verify  以存储记录为锚验签
 
-错误映射：ValidationError -> 400，NotFoundError -> 404。
+错误映射：ValidationError -> 400，NotFoundError -> 404，ConflictError -> 409。
 例外：凭证验签端点对一切失败都返回 200 + {"valid": false, "reason": ...}。
 """
 
@@ -17,7 +20,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
-from .store import NotFoundError, ValidationError, VCStore
+from .store import (
+    ConflictError,
+    NotFoundError,
+    REASON_UNSET,
+    ValidationError,
+    VCStore,
+)
 
 
 def _json_dumps(payload: Any) -> bytes:
@@ -59,6 +68,20 @@ def build_handler(store: VCStore) -> type:
                 raise ValidationError("请求体必须为 JSON 对象")
             return data
 
+        def _read_optional_json(self) -> Dict[str, Any]:
+            """读取可选请求体：空体等价于 {}，非空时须为 JSON 对象。"""
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b""
+            if not raw:
+                return {}
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValidationError(f"请求体不是合法 JSON: {exc}") from exc
+            if not isinstance(data, dict):
+                raise ValidationError("请求体必须为 JSON 对象")
+            return data
+
         # ------------------------------------------------------------ #
         # 路由
         # ------------------------------------------------------------ #
@@ -77,6 +100,13 @@ def build_handler(store: VCStore) -> type:
                     )
                     self._post_rotate_key(did)
                 elif path.startswith("/v1/credentials/") and path.endswith(
+                    "/revoke"
+                ):
+                    credential_id = unquote(
+                        path[len("/v1/credentials/") : -len("/revoke")]
+                    )
+                    self._post_revoke_credential(credential_id)
+                elif path.startswith("/v1/credentials/") and path.endswith(
                     "/verify"
                 ):
                     credential_id = unquote(
@@ -87,6 +117,29 @@ def build_handler(store: VCStore) -> type:
                     self._send_error(404, f"无此路径: {path}")
             except ValidationError as exc:
                 self._send_error(400, str(exc))
+            except ConflictError as exc:
+                self._send_error(409, str(exc))
+            except NotFoundError as exc:
+                self._send_error(404, str(exc))
+            except Exception as exc:  # noqa: BLE001
+                self._send_error(500, f"服务器内部错误: {exc}")
+
+        def do_PUT(self) -> None:  # noqa: N802
+            try:
+                path = urlparse(self.path).path.rstrip("/") or "/"
+                if path.startswith("/v1/credentials/") and path.endswith(
+                    "/status"
+                ):
+                    credential_id = unquote(
+                        path[len("/v1/credentials/") : -len("/status")]
+                    )
+                    self._put_credential_status(credential_id)
+                else:
+                    self._send_error(404, f"无此路径: {path}")
+            except ValidationError as exc:
+                self._send_error(400, str(exc))
+            except ConflictError as exc:
+                self._send_error(409, str(exc))
             except NotFoundError as exc:
                 self._send_error(404, str(exc))
             except Exception as exc:  # noqa: BLE001
@@ -97,6 +150,13 @@ def build_handler(store: VCStore) -> type:
                 path = urlparse(self.path).path.rstrip("/") or "/"
                 if path.startswith("/v1/dids/"):
                     self._get_did(unquote(path[len("/v1/dids/") :]))
+                elif path.startswith("/v1/credentials/") and path.endswith(
+                    "/status"
+                ):
+                    credential_id = unquote(
+                        path[len("/v1/credentials/") : -len("/status")]
+                    )
+                    self._get_credential_status(credential_id)
                 elif path.startswith("/v1/credentials/"):
                     self._get_credential(
                         unquote(path[len("/v1/credentials/") :])
@@ -183,6 +243,58 @@ def build_handler(store: VCStore) -> type:
                     "credential_id": record.credential_id,
                     "body": record.body,
                     "signature": record.signature,
+                },
+            )
+
+        @staticmethod
+        def _status_payload(record: Any) -> Dict[str, Any]:
+            return {
+                "credential_id": record.credential_id,
+                "status": record.status,
+                "updated_at": record.updated_at,
+            }
+
+        def _put_credential_status(self, credential_id: str) -> None:
+            # 请求体必须恰为 {"status": "active"}：缺字段、取值非法、
+            # 多余字段一律 400。
+            data = self._read_json()
+            if "status" not in data:
+                raise ValidationError("缺少字段: status")
+            extra = sorted(set(data) - {"status"})
+            if extra:
+                raise ValidationError(f"多余字段: {', '.join(extra)}")
+            if data["status"] != "active":
+                raise ValidationError(
+                    f"字段 status 非法: {data['status']!r}（仅支持 active）"
+                )
+            record, created = store.set_credential_active(credential_id)
+            # 无状态登记 201；重复登记 200，保持首次 updated_at
+            self._send_json(
+                201 if created else 200, self._status_payload(record)
+            )
+
+        def _get_credential_status(self, credential_id: str) -> None:
+            # 历史无状态按 active 返回，updated_at 为 null
+            record = store.get_credential_status(credential_id)
+            self._send_json(200, self._status_payload(record))
+
+        def _post_revoke_credential(self, credential_id: str) -> None:
+            # reason 可省略（请求体亦可整个缺省）；已吊销时任何 reason
+            # 均忽略并返回首次结果，非法 reason 仅首次请求 400。
+            data = self._read_optional_json()
+            # 省略 reason 时传哨兵走默认原因；提供时透传原值，非法
+            # reason 的 400 判定由 store 在确认非重复吊销后做出
+            # （已吊销时任何 reason 均忽略，含非法值）。
+            reason = data["reason"] if "reason" in data else REASON_UNSET
+            record = store.revoke_credential(credential_id, reason)
+            self._send_json(
+                200,
+                {
+                    "credential_id": record.credential_id,
+                    "status": record.status,
+                    "reason": record.reason,
+                    "revoked_at": record.revoked_at,
+                    "updated_at": record.updated_at,
                 },
             )
 

@@ -29,6 +29,9 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/dids/{did}/keys/rotate` | 轮换密钥，请求体 `{"key_handle"}`，返回 200 与 `did`、`public_key`、`key_handle`、`key_version` |
 | POST | `/v1/credentials` | 签发凭证，请求体 `{"issuer_did","subject_did","claims"}`，返回 201 与 `credential_id`、`signature`、`issuer_key_version` |
 | GET | `/v1/credentials/{credential_id}` | 返回 `credential_id`、`body`、`signature`；不存在 404 |
+| PUT | `/v1/credentials/{credential_id}/status` | 登记状态，请求体必须恰为 `{"status":"active"}`；首次 201、重复 200，均含 `credential_id`、`status`、`updated_at`（重复保持首次值）；已吊销 409 |
+| GET | `/v1/credentials/{credential_id}/status` | 返回 `credential_id`、`status`、`updated_at`；历史无状态按 `active` 返回且 `updated_at` 为 `null`；不存在 404 |
+| POST | `/v1/credentials/{credential_id}/revoke` | 吊销凭证；`reason` 可省略（默认“持证人主动吊销”），否则须为字符串且首尾裁剪后非空；返回 200 与 `credential_id`、`status:"revoked"`、`reason`、`revoked_at`、`updated_at`；不存在 404 |
 | POST | `/v1/credentials/{credential_id}/verify` | 验签，请求体 `{"body","signature"}`；**任何失败一律 HTTP 200**，返回 `valid`（失败时附分类中文 `reason`） |
 
 - DID 形如 `did:example:<32 位 hex>`。
@@ -46,6 +49,11 @@ curl -X POST localhost:8080/v1/dids/did:example:<id>/keys/rotate \
 curl -X POST localhost:8080/v1/credentials \
   -d '{"issuer_did":"did:example:<a>","subject_did":"did:example:<b>","claims":{"role":"admin"}}'
 curl localhost:8080/v1/credentials/vc_<id>
+curl -X PUT localhost:8080/v1/credentials/vc_<id>/status \
+  -d '{"status":"active"}'
+curl localhost:8080/v1/credentials/vc_<id>/status
+curl -X POST localhost:8080/v1/credentials/vc_<id>/revoke \
+  -d '{"reason":"持证人造假"}'   # reason 可省略
 curl -X POST localhost:8080/v1/credentials/vc_<id>/verify \
   -d '{"body":{...},"signature":"..."}'
 ```
@@ -90,6 +98,28 @@ python3 -m vcbackend.cli verify vc_<id>     # 成功输出 true（退出码 0）
 - 其他路径仍沿用原状态码协议：字段问题 400、资源不存在 404。
 - 旧凭证正文缺 `issuer_key_version` 时按版本 1 验签，签名本身不受影响。
 
+### 凭证状态与吊销
+
+- `PUT .../status` 请求体必须**恰为** `{"status":"active"}`：缺失 `status`、
+  取值非 `active`、含多余字段、请求体缺失/非法 JSON/非对象一律 400 并返回
+  非空 `error`。无状态登记返回 201，重复登记 200；两者均返回
+  `credential_id`、`status`、`updated_at`，重复登记保持首次 `updated_at`
+  与状态不变。
+- `GET .../status` 返回 `credential_id`、`status`、`updated_at`；历史无状态
+  凭证按 `active` 返回、`updated_at` 为 `null`；未知凭证 404。
+- `POST .../revoke`：未知凭证 404。首次请求可省略 `reason`（空请求体或
+  `{}` 均可），默认“持证人主动吊销”；提供时必须是字符串且首尾裁剪后非空
+  （显式 `null`、数字、空白串均为 400）。保存并返回裁剪后的值，成功为 200，
+  返回 `credential_id`、`status:"revoked"`、`reason`、`revoked_at`、
+  `updated_at`。已吊销时再次调用，任何 `reason`（含非法值）都被忽略并返回
+  首次结果；非法 `reason` 仅首次请求返回 400。
+- 已 `revoked` 的凭证再 `PUT .../status` 返回 409 与非空 `error`，状态与
+  时间字段保持不变。
+- 状态随状态文件持久化，**跨重启保留**。
+- verify 在签名与锚定均成功后检查状态：`revoked` 返回 200、
+  `{"valid":false,"reason":"凭证已吊销：<保存的 reason>"}`；`active` 或
+  无状态维持原结果（签名失败仍优先返回签名类原因）。
+
 ### 密钥模型与轮换
 
 为保证「服务端签发的签名能用注册时返回的公钥验真」，注册时由系统为该
@@ -110,10 +140,12 @@ python3 -m vcbackend.cli verify vc_<id>     # 成功输出 true（退出码 0）
 python3 tests/e2e_test.py
 ```
 
-脚本会临时在本地端口启动服务，覆盖：201/200/400/404 各路径、同 key 去重、
+脚本会临时在本地端口启动服务，覆盖：201/200/400/404/409 各路径、同 key 去重、
 PEM 句柄与非法 key_mode 拒绝、密钥轮换（含 404/400 路径）、轮换前后
 `issuer_key_version` 验签、verify 端点 valid=true/false、CLI verify 成功与失败、
-旧状态文件迁移与旧凭证按版本 1 验签。
+状态登记（201/200 幂等、严格 400、未知 404、已吊销 409）、吊销（默认/裁剪
+reason、重复吊销忽略 reason、非法 reason 仅首次 400）、verify 对已吊销凭证
+返回 valid:false、状态跨重启保留，以及旧状态文件迁移与旧凭证按版本 1 验签。
 
 ## 代码结构
 

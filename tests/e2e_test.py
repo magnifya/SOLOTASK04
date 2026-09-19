@@ -329,7 +329,174 @@ def main():
         check("verify 合法凭证仍 valid=true/200",
               st == 200 and r.get("valid") is True and "reason" not in r)
 
-        # 20. CLI verify：成功 true/0；未知凭证非 0
+        # 20. 凭证状态登记与吊销
+        # 新签发两张专用凭证，避免吊销影响后续 cid2 的 CLI verify 用例
+        st, r = _http("POST", f"{base}/v1/credentials", {
+            "issuer_did": issuer, "subject_did": alice,
+            "claims": {"kind": "status"}})
+        cid3 = r["credential_id"]
+        sig3 = r["signature"]
+        body3 = _http("GET", f"{base}/v1/credentials/{cid3}")[1]["body"]
+        st, r = _http("POST", f"{base}/v1/credentials", {
+            "issuer_did": issuer, "subject_did": alice,
+            "claims": {"kind": "revoke"}})
+        cid4 = r["credential_id"]
+        sig4 = r["signature"]
+        body4 = _http("GET", f"{base}/v1/credentials/{cid4}")[1]["body"]
+
+        # 20.1 历史无状态：GET status -> active / updated_at=null
+        st, r = _http("GET", f"{base}/v1/credentials/{cid3}/status")
+        check("GET status 无状态按 active 返回且 updated_at=null",
+              st == 200 and r == {
+                  "credential_id": cid3, "status": "active",
+                  "updated_at": None})
+
+        # 20.2 首次 PUT status -> 201，三字段齐全
+        st, r = _http("PUT", f"{base}/v1/credentials/{cid3}/status",
+                      {"status": "active"})
+        check("PUT status 首次 -> 201 含三字段",
+              st == 201 and r.get("credential_id") == cid3
+              and r.get("status") == "active"
+              and isinstance(r.get("updated_at"), str)
+              and r["updated_at"])
+        first_updated = r["updated_at"]
+
+        # 20.3 重复 PUT -> 200，updated_at 与首次一致
+        st, r = _http("PUT", f"{base}/v1/credentials/{cid3}/status",
+                      {"status": "active"})
+        check("PUT status 重复 -> 200 且 updated_at 不变",
+              st == 200 and r.get("status") == "active"
+              and r.get("updated_at") == first_updated
+              and set(r) == {"credential_id", "status", "updated_at"})
+
+        # 20.4 缺失/非法/多余字段/非法 JSON/空体/非对象 -> 400 非空 error
+        def put_status_raw(cid, raw_bytes):
+            req = urllib.request.Request(
+                f"{base}/v1/credentials/{cid}/status",
+                data=raw_bytes, method="PUT")
+            req.add_header("Content-Type", "application/json")
+            try:
+                with urllib.request.urlopen(req) as resp:
+                    return resp.status, json.loads(resp.read().decode() or "{}")
+            except urllib.error.HTTPError as exc:
+                return exc.code, json.loads(exc.read().decode() or "{}")
+
+        for bad in ({}, {"status": "revoked"}, {"status": 1},
+                    {"status": "active", "extra": 1}):
+            stx, rr = _http("PUT", f"{base}/v1/credentials/{cid3}/status", bad)
+            check(f"PUT status 非法请求体 {bad} -> 400",
+                  stx == 400 and isinstance(rr.get("error"), str)
+                  and rr["error"])
+        stx, rr = put_status_raw(cid3, b"{not json")
+        check("PUT status 非法 JSON -> 400", stx == 400 and rr.get("error"))
+        stx, rr = put_status_raw(cid3, b"")
+        check("PUT status 空请求体 -> 400", stx == 400 and rr.get("error"))
+        stx, rr = put_status_raw(cid3, b"[1]")
+        check("PUT status 非对象 -> 400", stx == 400 and rr.get("error"))
+
+        # 20.5 未知凭证各端点 -> 404
+        check("PUT status 未知凭证 -> 404",
+              _http("PUT", f"{base}/v1/credentials/vc_nope/status",
+                    {"status": "active"})[0] == 404)
+        check("GET status 未知凭证 -> 404",
+              _http("GET", f"{base}/v1/credentials/vc_nope/status")[0] == 404)
+        check("POST revoke 未知凭证 -> 404",
+              _http("POST", f"{base}/v1/credentials/vc_nope/revoke",
+                    {})[0] == 404)
+
+        # 20.6 首次吊销 reason 省略：空体 / {} 均用默认原因
+        st, r = _http("POST", f"{base}/v1/credentials/{cid4}/revoke")
+        check("revoke 空体 -> 200 默认 reason",
+              st == 200 and r.get("credential_id") == cid4
+              and r.get("status") == "revoked"
+              and r.get("reason") == "持证人主动吊销"
+              and isinstance(r.get("revoked_at"), str) and r["revoked_at"]
+              and r.get("updated_at") == r["revoked_at"])
+        revoked_at = r["revoked_at"]
+        # 重复吊销：任何 reason（含非法值）均忽略，返回首次结果
+        for body in ({"reason": "其他原因"}, {"reason": "   "},
+                     {"reason": None}, {"reason": 7}):
+            stx, rr = _http("POST", f"{base}/v1/credentials/{cid4}/revoke",
+                            body)
+            check(f"重复吊销忽略 {body}",
+                  stx == 200 and rr.get("reason") == "持证人主动吊销"
+                  and rr.get("revoked_at") == revoked_at
+                  and rr.get("updated_at") == revoked_at)
+
+        # 20.7 已 revoked 再 PUT active -> 409 非空 error，字段保持不变
+        st, rr = _http("PUT", f"{base}/v1/credentials/{cid4}/status",
+                       {"status": "active"})
+        check("已吊销 PUT active -> 409 非空 error",
+              st == 409 and isinstance(rr.get("error"), str) and rr["error"])
+        st, r = _http("GET", f"{base}/v1/credentials/{cid4}/status")
+        check("409 后状态字段保持 revoked 且时间不变",
+              st == 200 and r.get("status") == "revoked"
+              and r.get("updated_at") == revoked_at)
+
+        # 20.8 verify：签名锚定成功后吊销 -> 200 valid:false + 原因前缀
+        st, r = _http("POST", f"{base}/v1/credentials/{cid4}/verify",
+                      {"body": body4, "signature": sig4})
+        check("verify 已吊销 -> 200 valid:false 且原因含保存 reason",
+              st == 200 and r.get("valid") is False
+              and r.get("reason") == "凭证已吊销：持证人主动吊销")
+        # active 与无状态凭证维持 valid:true
+        st, r = _http("POST", f"{base}/v1/credentials/{cid3}/verify",
+                      {"body": body3, "signature": sig3})
+        check("verify active 凭证维持 valid:true",
+              st == 200 and r == {"valid": True})
+
+        # 20.9 自定义 reason：非法值仅首次 400；合法值保存裁剪结果
+        st, r = _http("POST", f"{base}/v1/credentials", {
+            "issuer_did": issuer, "subject_did": alice, "claims": {}})
+        cid5 = r["credential_id"]
+        sig5 = r["signature"]
+        body5 = _http("GET", f"{base}/v1/credentials/{cid5}")[1]["body"]
+        for bad in ({"reason": "   "}, {"reason": ""},
+                    {"reason": None}, {"reason": 9}):
+            stx, rr = _http("POST", f"{base}/v1/credentials/{cid5}/revoke",
+                            bad)
+            check(f"首次吊销非法 reason {bad} -> 400",
+                  stx == 400 and rr.get("error"))
+        st, r = _http("POST", f"{base}/v1/credentials/{cid5}/revoke",
+                      {"reason": "  违规使用  "})
+        check("首次吊销合法 reason 裁剪保存 -> 200",
+              st == 200 and r.get("reason") == "违规使用"
+              and r.get("status") == "revoked"
+              and set(r) == {"credential_id", "status", "reason",
+                             "revoked_at", "updated_at"})
+        st, r = _http("POST", f"{base}/v1/credentials/{cid5}/verify",
+                      {"body": body5, "signature": sig5})
+        check("verify 吊销原因使用裁剪后的值",
+              st == 200 and r.get("valid") is False
+              and r.get("reason") == "凭证已吊销：违规使用")
+
+        # 20.10 状态跨重启保留：终止主服务并以同一 store 重启
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "vcbackend.cli", "serve",
+             "--port", str(port), "--host", "127.0.0.1"],
+            cwd=ROOT, env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        assert wait_up(port), "主服务重启超时"
+        st, r = _http("GET", f"{base}/v1/credentials/{cid4}/status")
+        check("重启后 revoked 状态与时间保留",
+              st == 200 and r.get("status") == "revoked"
+              and r.get("updated_at") == revoked_at)
+        st, r = _http("POST", f"{base}/v1/credentials/{cid4}/verify",
+                      {"body": body4, "signature": sig4})
+        check("重启后 verify 仍判吊销",
+              st == 200 and r.get("valid") is False
+              and r.get("reason") == "凭证已吊销：持证人主动吊销")
+        st, r = _http("GET", f"{base}/v1/credentials/{cid3}/status")
+        check("重启后 active 状态与首次 updated_at 保留",
+              st == 200 and r.get("status") == "active"
+              and r.get("updated_at") == first_updated)
+
+        # 21. CLI verify：成功 true/0；未知凭证非 0
         env_cli = dict(env, VCBACKEND_URL=base)
         cp = subprocess.run(
             [sys.executable, "-m", "vcbackend.cli", "verify", cid2],
@@ -342,7 +509,7 @@ def main():
         check("CLI verify 未知凭证 -> 退出码 1",
               cp.returncode == 1 and cp.stderr.strip())
 
-        # 21. 旧状态文件迁移 + 旧凭证（无 issuer_key_version）按 1 验签
+        # 22. 旧状态文件迁移 + 旧凭证（无 issuer_key_version）按 1 验签
         with open(store, encoding="utf-8") as fh:
             state = json.load(fh)
         issuer_row = state["dids"][issuer]
