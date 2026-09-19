@@ -5,6 +5,7 @@
 不依赖第三方测试框架，仅用标准库 + cryptography。
 """
 
+import concurrent.futures
 import json
 import os
 import re
@@ -587,7 +588,7 @@ def main():
             if os.path.exists(old_store):
                 os.remove(old_store)
 
-        # 23. 选择性披露演示
+        # 23. 选择性披露演示（含防重放：challenge / expires_at / 一次性消费）
         _, r = _http("POST", f"{base}/v1/dids",
                      {"method": "example", "public_key": "sd-issuer"})
         sd_issuer = r["did"]
@@ -633,17 +634,28 @@ def main():
         check("present proof 为非空无填充 base64url",
               isinstance(r.get("proof"), str) and r["proof"]
               and "=" not in r["proof"])
-        check("present 响应恰为七个字段",
+        check("present 缺省 challenge 为 32 位小写 hex",
+              bool(re.fullmatch(r"[0-9a-f]{32}", r.get("challenge", ""))))
+        check("present expires_at 为 Z 结尾秒精度",
+              bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z",
+                                r.get("expires_at", ""))))
+        check("present 响应恰为九个字段",
               set(r) == {"presentation_id", "credential_id", "issuer_did",
-                         "issuer_key_version", "disclose", "claims", "proof"})
+                         "issuer_key_version", "disclose", "claims",
+                         "challenge", "expires_at", "proof"})
         vp1 = r
         pid1 = vp1["presentation_id"]
 
-        # 23.2 verify 成功：200 且响应恰为 {"valid": true}
+        # 23.2 verify 成功：200 且响应恰为 {"valid": true}；随后被消费
         st, r = _http("POST", f"{base}/v1/presentations/{pid1}/verify",
-                      {"presentation": vp1})
+                      {"presentation": vp1, "challenge": vp1["challenge"]})
         check("presentation verify valid=true 且无多余字段",
               st == 200 and r == {"valid": True})
+        st, r = _http("POST", f"{base}/v1/presentations/{pid1}/verify",
+                      {"presentation": vp1, "challenge": vp1["challenge"]})
+        check("重复验证 -> 200 valid:false 演示已消费",
+              st == 200 and r.get("valid") is False
+              and "已消费" in r.get("reason", ""))
 
         # 23.3 零披露：disclose [] / claims {}
         st, r = _http("POST", f"{base}/v1/credentials/{sd_cid}/present",
@@ -652,7 +664,7 @@ def main():
               and r.get("claims") == {})
         pid0 = r["presentation_id"]
         st, r = _http("POST", f"{base}/v1/presentations/{pid0}/verify",
-                      {"presentation": r})
+                      {"presentation": r, "challenge": r["challenge"]})
         check("零披露 verify valid=true", st == 200 and r == {"valid": True})
 
         # 23.4 数组整值可披露、数组索引禁止
@@ -699,6 +711,41 @@ def main():
         present_400("present 非法 JSON -> 400", raw=b"{not json")
         present_400("present 空请求体 -> 400", raw=b"")
         present_400("present 非对象 -> 400", raw=b"[1]")
+        # challenge / expires_in 字段校验
+        present_400("present challenge 空串 -> 400",
+                    {"disclose": [], "challenge": ""})
+        present_400("present challenge 非字符串 -> 400",
+                    {"disclose": [], "challenge": 7})
+        present_400("present challenge 超 256 码点 -> 400",
+                    {"disclose": [], "challenge": "c" * 257})
+        present_400("present expires_in 布尔 -> 400",
+                    {"disclose": [], "expires_in": True})
+        present_400("present expires_in 非整数 -> 400",
+                    {"disclose": [], "expires_in": 1.5})
+        present_400("present expires_in=0 -> 400",
+                    {"disclose": [], "expires_in": 0})
+        present_400("present expires_in=86401 -> 400",
+                    {"disclose": [], "expires_in": 86401})
+        present_400("present expires_in 字符串 -> 400",
+                    {"disclose": [], "expires_in": "300"})
+
+        # 边界合法值：256 码点 challenge、expires_in 1 与 86400
+        st, r = _http("POST", f"{base}/v1/credentials/{sd_cid}/present",
+                      {"disclose": [], "challenge": "c" * 256,
+                       "expires_in": 86400})
+        check("present 256 码点 challenge + expires_in=86400 -> 201",
+              st == 201 and r.get("challenge") == "c" * 256)
+        # 自定义 challenge 原样回显并用于验证
+        st, r = _http("POST", f"{base}/v1/credentials/{sd_cid}/present",
+                      {"disclose": ["/role"], "challenge": "我的挑战-1"})
+        check("present 自定义 challenge 回显",
+              st == 201 and r.get("challenge") == "我的挑战-1")
+        vpc = r
+        st, r = _http("POST",
+                      f"{base}/v1/presentations/{vpc['presentation_id']}/verify",
+                      {"presentation": vpc, "challenge": "我的挑战-1"})
+        check("自定义 challenge verify valid=true",
+              st == 200 and r == {"valid": True})
 
         # 23.7 未知凭证 present -> 404
         st, _ = _http("POST", f"{base}/v1/credentials/vc_nope/present",
@@ -720,79 +767,120 @@ def main():
             check(name, ok)
             return rr2
 
-        vp_invalid("vp verify 空请求体", pid1, raw=b"")
-        vp_invalid("vp verify 非法 JSON", pid1, raw=b"{not json")
-        vp_invalid("vp verify 非对象", pid1, raw=b"[1]")
-        vp_invalid("vp verify 缺 presentation", pid1, {"x": 1})
-        vp_invalid("vp verify 多余顶层字段", pid1,
-                   {"presentation": vp1, "x": 1})
-        vp_invalid("vp verify presentation 非对象", pid1,
+        # 专用于失败用例的演示（失败不消费，可反复使用）
+        st, r = _http("POST", f"{base}/v1/credentials/{sd_cid}/present",
+                      {"disclose": ["/role", "/addr/city"]})
+        vpx = r
+        pidx = vpx["presentation_id"]
+        chx = vpx["challenge"]
+
+        vp_invalid("vp verify 空请求体", pidx, raw=b"")
+        vp_invalid("vp verify 非法 JSON", pidx, raw=b"{not json")
+        vp_invalid("vp verify 非对象", pidx, raw=b"[1]")
+        vp_invalid("vp verify 缺 presentation", pidx, {"x": 1})
+        vp_invalid("vp verify 多余顶层字段", pidx,
+                   {"presentation": vpx, "challenge": chx, "x": 1})
+        vp_invalid("vp verify presentation 非对象", pidx,
                    {"presentation": []})
         vp_invalid("vp verify 路径 ID 未持久化", "vp_nope",
                    {"presentation": {}})
-        bad = json.loads(json.dumps(vp1))
+        # 新演示请求必须携带非空 challenge
+        vp_invalid("vp verify 缺 challenge", pidx,
+                   {"presentation": vpx}, needle="challenge")
+        vp_invalid("vp verify challenge 空串", pidx,
+                   {"presentation": vpx, "challenge": ""},
+                   needle="challenge")
+        vp_invalid("vp verify challenge 非字符串", pidx,
+                   {"presentation": vpx, "challenge": 1},
+                   needle="challenge")
+        vp_invalid("vp verify 请求 challenge 不匹配", pidx,
+                   {"presentation": vpx, "challenge": "错误的挑战"},
+                   needle="challenge")
+        bad = json.loads(json.dumps(vpx))
+        bad["challenge"] = "被篡改的挑战"
+        vp_invalid("vp verify 演示 challenge 被改", pidx,
+                   {"presentation": bad, "challenge": chx},
+                   needle="challenge")
+        bad = json.loads(json.dumps(vpx))
+        bad["expires_at"] = "2999-01-01T00:00:00Z"
+        vp_invalid("vp verify expires_at 被改", pidx,
+                   {"presentation": bad, "challenge": chx},
+                   needle="expires_at")
+        bad = json.loads(json.dumps(vpx))
         bad["presentation_id"] = "vp_other"
-        vp_invalid("vp verify 对象 ID 与路径不一致", pid1,
-                   {"presentation": bad}, needle="presentation_id")
-        bad = json.loads(json.dumps(vp1))
+        vp_invalid("vp verify 对象 ID 与路径不一致", pidx,
+                   {"presentation": bad, "challenge": chx},
+                   needle="presentation_id")
+        bad = json.loads(json.dumps(vpx))
         bad["credential_id"] = "vc_other"
-        vp_invalid("vp verify credential_id 被改", pid1,
-                   {"presentation": bad}, needle="锚定")
-        bad = json.loads(json.dumps(vp1))
+        vp_invalid("vp verify credential_id 被改", pidx,
+                   {"presentation": bad, "challenge": chx}, needle="锚定")
+        bad = json.loads(json.dumps(vpx))
         bad["issuer_did"] = sd_subject
-        vp_invalid("vp verify issuer_did 被改", pid1,
-                   {"presentation": bad}, needle="锚定")
-        bad = json.loads(json.dumps(vp1))
+        vp_invalid("vp verify issuer_did 被改", pidx,
+                   {"presentation": bad, "challenge": chx}, needle="锚定")
+        bad = json.loads(json.dumps(vpx))
         bad["issuer_key_version"] = 2
-        vp_invalid("vp verify issuer_key_version 被改", pid1,
-                   {"presentation": bad}, needle="锚定")
-        bad = json.loads(json.dumps(vp1))
+        vp_invalid("vp verify issuer_key_version 被改", pidx,
+                   {"presentation": bad, "challenge": chx}, needle="锚定")
+        bad = json.loads(json.dumps(vpx))
         bad["disclose"] = ["/addr/city", "/role"]
-        vp_invalid("vp verify disclose 顺序调换", pid1,
-                   {"presentation": bad}, needle="disclose")
-        bad = json.loads(json.dumps(vp1))
+        vp_invalid("vp verify disclose 顺序调换", pidx,
+                   {"presentation": bad, "challenge": chx},
+                   needle="disclose")
+        bad = json.loads(json.dumps(vpx))
         bad["disclose"] = []
         bad["claims"] = {}
-        vp_invalid("vp verify disclose 被替换", pid1,
-                   {"presentation": bad}, needle="disclose")
+        vp_invalid("vp verify disclose 被替换", pidx,
+                   {"presentation": bad, "challenge": chx},
+                   needle="disclose")
         # claims 投影篡改：加未披露字段 / 改值 / 删键
-        bad = json.loads(json.dumps(vp1))
+        bad = json.loads(json.dumps(vpx))
         bad["claims"]["secret"] = "leak"
-        vp_invalid("vp verify claims 加未披露字段", pid1,
-                   {"presentation": bad}, needle="claims")
-        bad = json.loads(json.dumps(vp1))
+        vp_invalid("vp verify claims 加未披露字段", pidx,
+                   {"presentation": bad, "challenge": chx}, needle="claims")
+        bad = json.loads(json.dumps(vpx))
         bad["claims"]["role"] = "root"
-        vp_invalid("vp verify claims 值被改", pid1,
-                   {"presentation": bad}, needle="claims")
-        bad = json.loads(json.dumps(vp1))
+        vp_invalid("vp verify claims 值被改", pidx,
+                   {"presentation": bad, "challenge": chx}, needle="claims")
+        bad = json.loads(json.dumps(vpx))
         del bad["claims"]["role"]
-        vp_invalid("vp verify claims 缺所选值", pid1,
-                   {"presentation": bad}, needle="claims")
-        bad = json.loads(json.dumps(vp1))
+        vp_invalid("vp verify claims 缺所选值", pidx,
+                   {"presentation": bad, "challenge": chx}, needle="claims")
+        bad = json.loads(json.dumps(vpx))
         bad["proof"] = bad["proof"][:-2] + ("ab" if bad["proof"][-2:] != "ab"
                                             else "cd")
-        vp_invalid("vp verify proof 被改", pid1,
-                   {"presentation": bad}, needle="签名校验")
-        bad = json.loads(json.dumps(vp1))
+        vp_invalid("vp verify proof 被改", pidx,
+                   {"presentation": bad, "challenge": chx}, needle="签名校验")
+        bad = json.loads(json.dumps(vpx))
         bad["proof"] = "@@@"
-        vp_invalid("vp verify proof 编码非法", pid1,
-                   {"presentation": bad}, needle="签名格式")
-        bad = json.loads(json.dumps(vp1))
+        vp_invalid("vp verify proof 编码非法", pidx,
+                   {"presentation": bad, "challenge": chx}, needle="签名格式")
+        bad = json.loads(json.dumps(vpx))
         bad["extra"] = 1
-        vp_invalid("vp verify presentation 多字段", pid1,
-                   {"presentation": bad})
-        bad = json.loads(json.dumps(vp1))
+        vp_invalid("vp verify presentation 多字段", pidx,
+                   {"presentation": bad, "challenge": chx})
+        bad = json.loads(json.dumps(vpx))
         del bad["claims"]
-        vp_invalid("vp verify presentation 缺字段", pid1,
-                   {"presentation": bad})
+        vp_invalid("vp verify presentation 缺字段", pidx,
+                   {"presentation": bad, "challenge": chx})
+        # 全部失败均不消费：正确请求随后仍应成功（随后即被消费）
+        st, r = _http("POST", f"{base}/v1/presentations/{pidx}/verify",
+                      {"presentation": vpx, "challenge": chx})
+        check("失败用例不消费，合法验证仍 valid=true",
+              st == 200 and r == {"valid": True})
 
         # 23.9 轮换后旧演示仍按历史版本验真
+        st, r = _http("POST", f"{base}/v1/credentials/{sd_cid}/present",
+                      {"disclose": ["/role"]})
+        vp_pre = r
         st, r = _http("POST", f"{base}/v1/dids/{sd_issuer}/keys/rotate",
                       {"key_handle": "sd-issuer-v2"})
         check("SD 签发者轮换 -> 200 key_version=2",
               st == 200 and r.get("key_version") == 2)
-        st, r = _http("POST", f"{base}/v1/presentations/{pid1}/verify",
-                      {"presentation": vp1})
+        st, r = _http("POST",
+                      f"{base}/v1/presentations/{vp_pre['presentation_id']}/verify",
+                      {"presentation": vp_pre, "challenge": vp_pre["challenge"]})
         check("轮换后旧演示仍 valid=true（历史版本公钥）",
               st == 200 and r == {"valid": True})
         # 轮换后新凭证演示用 v2 密钥
@@ -806,10 +894,10 @@ def main():
               st == 201 and r.get("issuer_key_version") == 2)
         pid2 = r["presentation_id"]
         st, r = _http("POST", f"{base}/v1/presentations/{pid2}/verify",
-                      {"presentation": r})
+                      {"presentation": r, "challenge": r["challenge"]})
         check("v2 演示 valid=true", st == 200 and r == {"valid": True})
 
-        # 23.10 已吊销凭证：验签成功后返回“凭证已吊销：<原因>”
+        # 23.10 已吊销凭证：验签成功后返回“凭证已吊销：<原因>”且不消费
         st, r = _http("POST", f"{base}/v1/credentials", {
             "issuer_did": sd_issuer, "subject_did": sd_subject,
             "claims": {"kind": "revoke-vp"}})
@@ -820,12 +908,59 @@ def main():
         _http("POST", f"{base}/v1/credentials/{sd_cid3}/revoke",
               {"reason": "演示吊销测试"})
         st, r = _http("POST", f"{base}/v1/presentations/{pid3}/verify",
-                      {"presentation": vp3})
+                      {"presentation": vp3, "challenge": vp3["challenge"]})
         check("已吊销凭证演示 valid:false 且附保存原因",
               st == 200 and r.get("valid") is False
               and r.get("reason") == "凭证已吊销：演示吊销测试")
+        st, r = _http("POST", f"{base}/v1/presentations/{pid3}/verify",
+                      {"presentation": vp3, "challenge": vp3["challenge"]})
+        check("吊销失败不消费（仍返回吊销原因而非已消费）",
+              st == 200 and r.get("valid") is False
+              and r.get("reason") == "凭证已吊销：演示吊销测试")
 
-        # 23.11 演示记录跨重启持久化，重启后可验签/吊销结论保留
+        # 23.11 过期：expires_in=1，过期后验证失败且不消费
+        st, r = _http("POST", f"{base}/v1/credentials/{sd_cid}/present",
+                      {"disclose": ["/role"], "expires_in": 1})
+        check("present expires_in=1 -> 201", st == 201)
+        vpe = r
+        time.sleep(1.3)
+        st, r = _http("POST",
+                      f"{base}/v1/presentations/{vpe['presentation_id']}/verify",
+                      {"presentation": vpe, "challenge": vpe["challenge"]})
+        check("过期演示 valid:false 且 reason 含已过期",
+              st == 200 and r.get("valid") is False
+              and "已过期" in r.get("reason", ""))
+        st, r = _http("POST",
+                      f"{base}/v1/presentations/{vpe['presentation_id']}/verify",
+                      {"presentation": vpe, "challenge": vpe["challenge"]})
+        check("过期不消费（仍返回已过期而非已消费）",
+              st == 200 and r.get("valid") is False
+              and "已过期" in r.get("reason", ""))
+
+        # 23.12 并发验证：同一演示并发请求仅一次成功
+        st, r = _http("POST", f"{base}/v1/credentials/{sd_cid}/present",
+                      {"disclose": ["/level"]})
+        vpg = r
+        urlg = f"{base}/v1/presentations/{vpg['presentation_id']}/verify"
+        payloadg = {"presentation": vpg, "challenge": vpg["challenge"]}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            results = list(ex.map(
+                lambda _: _http("POST", urlg, payloadg), range(8)))
+        oks = [rr for stx, rr in results if rr.get("valid") is True]
+        consumed = [rr for stx, rr in results
+                    if "已消费" in rr.get("reason", "")]
+        check("并发验证恰一次成功，其余均为已消费",
+              all(stx == 200 for stx, _ in results)
+              and len(oks) == 1 and len(consumed) == 7)
+
+        # 23.13 演示记录跨重启持久化：消费记录保留，重启后重复验证判已消费
+        st, r = _http("POST", f"{base}/v1/credentials/{sd_cid}/present",
+                      {"disclose": ["/role"]})
+        vpp = r
+        pidp = vpp["presentation_id"]
+        st, r = _http("POST", f"{base}/v1/presentations/{pidp}/verify",
+                      {"presentation": vpp, "challenge": vpp["challenge"]})
+        check("重启前验证 valid=true", st == 200 and r == {"valid": True})
         proc.terminate()
         try:
             proc.wait(timeout=5)
@@ -837,15 +972,94 @@ def main():
             cwd=ROOT, env=env,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         assert wait_up(port), "主服务（SD 用例）重启超时"
-        st, r = _http("POST", f"{base}/v1/presentations/{pid1}/verify",
-                      {"presentation": vp1})
-        check("重启后旧演示仍 valid=true",
-              st == 200 and r == {"valid": True})
+        st, r = _http("POST", f"{base}/v1/presentations/{pidp}/verify",
+                      {"presentation": vpp, "challenge": vpp["challenge"]})
+        check("重启后重复验证 -> 演示已消费（消费记录跨重启保留）",
+              st == 200 and r.get("valid") is False
+              and "已消费" in r.get("reason", ""))
         st, r = _http("POST", f"{base}/v1/presentations/{pid3}/verify",
-                      {"presentation": vp3})
+                      {"presentation": vp3, "challenge": vp3["challenge"]})
         check("重启后吊销演示仍返回吊销原因",
               st == 200 and r.get("valid") is False
               and r.get("reason") == "凭证已吊销：演示吊销测试")
+
+        # 23.14 旧演示（存储记录缺少 challenge）：恰含 presentation 即可，
+        # 不检查挑战、过期与消费
+        leg_priv = crypto.generate_private_key_pem()
+        leg_pub = crypto.public_key_pem_from_private(leg_priv).strip()
+        leg_did = f"did:example:{'0' * 32}"
+        leg_unsigned = {
+            "presentation_id": f"vp_{'1' * 32}",
+            "credential_id": "vc_leg",
+            "issuer_did": leg_did,
+            "issuer_key_version": 1,
+            "disclose": ["/role"],
+            "claims": {"role": "admin"},
+        }
+        leg_vp = dict(leg_unsigned, proof=crypto.sign(leg_unsigned, leg_priv))
+        leg_body = {
+            "credential_id": "vc_leg",
+            "issuer_did": leg_did,
+            "subject_did": leg_did,
+            "claims": {"role": "admin"},
+            "issued_at": "2025-01-01T00:00:00Z",
+            "issuer_key_version": 1,
+        }
+        leg_state = {
+            "dids": {
+                leg_did: {
+                    "method": "example",
+                    "public_key": leg_pub,
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "private_key_pem": leg_priv,
+                }
+            },
+            "credentials": {
+                "vc_leg": {
+                    "body": leg_body,
+                    "signature": crypto.sign(leg_body, leg_priv),
+                }
+            },
+            "presentations": {leg_vp["presentation_id"]: leg_vp},
+        }
+        leg_store = tempfile.mktemp(suffix=".json")
+        with open(leg_store, "w", encoding="utf-8") as fh:
+            json.dump(leg_state, fh)
+        port3 = 8943
+        env3 = dict(os.environ, VCBACKEND_STORE=leg_store)
+        proc3 = subprocess.Popen(
+            [sys.executable, "-m", "vcbackend.cli", "serve",
+             "--port", str(port3), "--host", "127.0.0.1"],
+            cwd=ROOT, env=env3,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        base3 = f"http://127.0.0.1:{port3}"
+        try:
+            assert wait_up(port3), "旧演示服务启动超时"
+            leg_pid = leg_vp["presentation_id"]
+            st, r = _http("POST",
+                          f"{base3}/v1/presentations/{leg_pid}/verify",
+                          {"presentation": leg_vp})
+            check("旧演示恰含 presentation -> valid=true",
+                  st == 200 and r == {"valid": True})
+            st, r = _http("POST",
+                          f"{base3}/v1/presentations/{leg_pid}/verify",
+                          {"presentation": leg_vp})
+            check("旧演示不消费，重复验证仍 valid=true",
+                  st == 200 and r == {"valid": True})
+            st, r = _http("POST",
+                          f"{base3}/v1/presentations/{leg_pid}/verify",
+                          {"presentation": leg_vp, "challenge": "x"})
+            check("旧演示携带 challenge -> valid:false",
+                  st == 200 and r.get("valid") is False
+                  and r.get("reason"))
+        finally:
+            proc3.terminate()
+            try:
+                proc3.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc3.kill()
+            if os.path.exists(leg_store):
+                os.remove(leg_store)
 
     finally:
         proc.terminate()

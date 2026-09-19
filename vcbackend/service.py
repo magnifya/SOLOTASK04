@@ -23,6 +23,8 @@ from typing import Any, Dict, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
 from .store import (
+    CHALLENGE_UNSET,
+    EXPIRES_IN_UNSET,
     ConflictError,
     NotFoundError,
     REASON_UNSET,
@@ -374,16 +376,30 @@ def build_handler(store: VCStore) -> type:
             self._send_json(200, payload)
 
         def _post_present(self, credential_id: str) -> None:
-            # 请求体必须恰为 {"disclose": [路径...]}：缺失、类型非法、
-            # 重复路径或祖先重叠、多余字段一律 400；未知凭证 404；
-            # 空列表表示零披露。成功 201 返回演示记录。
+            # 请求体必须恰为 {"disclose": [...]} 加可选 challenge、
+            # expires_in：缺失 disclose、类型非法、多余字段一律 400；
+            # 未知凭证 404；空列表表示零披露。成功 201 返回演示记录
+            # （含 challenge 与 expires_at）。
             data = self._read_json()
             if "disclose" not in data:
                 raise ValidationError("缺少字段: disclose")
-            extra = sorted(set(data) - {"disclose"})
+            extra = sorted(set(data) - {"disclose", "challenge", "expires_in"})
             if extra:
                 raise ValidationError(f"多余字段: {', '.join(extra)}")
-            record = store.create_presentation(credential_id, data["disclose"])
+            challenge = (
+                data["challenge"] if "challenge" in data else CHALLENGE_UNSET
+            )
+            expires_in = (
+                data["expires_in"]
+                if "expires_in" in data
+                else EXPIRES_IN_UNSET
+            )
+            record = store.create_presentation(
+                credential_id,
+                data["disclose"],
+                challenge=challenge,
+                expires_in=expires_in,
+            )
             self._send_json(
                 201,
                 {
@@ -393,6 +409,8 @@ def build_handler(store: VCStore) -> type:
                     "issuer_key_version": record.issuer_key_version,
                     "disclose": record.disclose,
                     "claims": record.projection,
+                    "challenge": record.challenge,
+                    "expires_at": record.expires_at,
                     "proof": record.proof,
                 },
             )
@@ -400,7 +418,9 @@ def build_handler(store: VCStore) -> type:
         def _post_verify_presentation(self, presentation_id: str) -> None:
             # 与凭证 verify 相同的公开错误协议：任何失败都返回 200 +
             # {"valid": false, "reason": "<非空中文原因>"}，绝不返回
-            # 400/404/500。
+            # 400/404/500。新演示请求体须恰为 {presentation, challenge}
+            # 且 challenge 为非空字符串；旧演示（存储记录缺少
+            # challenge）接受恰含 {presentation} 的请求。
             try:
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length) if length > 0 else b""
@@ -427,14 +447,26 @@ def build_handler(store: VCStore) -> type:
             if "presentation" not in data:
                 self._send_invalid("请求缺少字段: presentation")
                 return
-            extra = sorted(set(data) - {"presentation"})
+            extra = sorted(set(data) - {"presentation", "challenge"})
             if extra:
                 self._send_invalid(f"请求含多余字段: {', '.join(extra)}")
                 return
+            if "challenge" in data:
+                if (
+                    not isinstance(data["challenge"], str)
+                    or not data["challenge"]
+                ):
+                    self._send_invalid(
+                        "请求字段 challenge 必须为非空字符串"
+                    )
+                    return
+                challenge = data["challenge"]
+            else:
+                challenge = CHALLENGE_UNSET
 
             try:
                 valid, reason = store.verify_presentation(
-                    presentation_id, data["presentation"]
+                    presentation_id, data["presentation"], challenge
                 )
             except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
                 self._send_invalid("验签过程发生内部错误")
