@@ -54,6 +54,9 @@ class PresentationRecord:
     零披露空列表）；projection 为按 disclose 重算出的 claims 投影；
     proof 为覆盖除 proof 外规范化 JSON 的 ES256 签名（base64url 无填充），
     使用凭证签发时 issuer_key_version 对应的历史私钥。
+    challenge/expires_at 为防重放字段（旧演示记录没有，为 None）：
+    challenge 为挑战串，expires_at 为过期时间（UTC、Z 结尾、秒精度），
+    二者均随演示一起签名并持久化。
     """
 
     presentation_id: str
@@ -63,3 +66,5 @@ class PresentationRecord:
     disclose: list
     projection: Dict[str, Any]
     proof: str
+    challenge: Optional[str] = None
+    expires_at: Optional[str] = None

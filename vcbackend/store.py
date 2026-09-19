@@ -21,7 +21,7 @@ import os
 import re
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import crypto
@@ -61,10 +61,30 @@ DEFAULT_REVOKE_REASON = "持证人主动吊销"
 # 哨兵：调用方未提供 reason 字段（区别于显式传 None 等非法值）
 REASON_UNSET = object()
 
+# 哨兵：演示验签请求未提供 challenge 字段（区别于显式传非法值）
+CHALLENGE_UNSET = object()
+
+# 演示默认有效期（秒）与允许范围
+DEFAULT_EXPIRES_IN = 300
+MAX_EXPIRES_IN = 86400
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace(
         "+00:00", "Z"
+    )
+
+
+def _utc_after(seconds: int) -> str:
+    """当前 UTC 时间加 seconds 秒，Z 结尾秒精度。"""
+    moment = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+    return moment.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _parse_utc_z(text: str) -> datetime:
+    """解析 Z 结尾秒精度 UTC 时间戳为 aware datetime。"""
+    return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=timezone.utc
     )
 
 
@@ -468,19 +488,33 @@ class VCStore:
             disclose=list(row.get("disclose", [])),
             projection=row.get("claims", {}),
             proof=row["proof"],
+            challenge=row.get("challenge"),
+            expires_at=row.get("expires_at"),
         )
 
     def create_presentation(
-        self, credential_id: str, disclose: Any
+        self,
+        credential_id: str,
+        disclose: Any,
+        challenge: Optional[str] = None,
+        expires_in: Optional[int] = None,
     ) -> PresentationRecord:
         """对已签发凭证生成选择性披露演示并持久化。
 
         - 凭证不存在抛 NotFoundError；disclose 非法（非数组、路径语法/
           越界/重复/祖先重叠）抛 ValidationError；空列表表示零披露；
+        - challenge 缺省时生成 32 位小写 hex；expires_in 缺省 300 秒，
+          expires_at 为当前 UTC 时间加 expires_in 秒（Z 结尾秒精度）；
+        - challenge 与 expires_at 均写入被签名的演示正文并持久化；
         - proof 为 ES256 签名，覆盖除 proof 外按 key 升序规范化 JSON，
           使用凭证 issuer_key_version（旧凭证缺省按 1）对应的历史私钥；
         - presentation_id 为 vp_ 加 32 位小写 hex。
         """
+        if challenge is None:
+            challenge = uuid.uuid4().hex
+        if expires_in is None:
+            expires_in = DEFAULT_EXPIRES_IN
+        expires_at = _utc_after(expires_in)
         with self._lock:
             cred = self._credentials.get(credential_id)
             if cred is None:
@@ -513,6 +547,8 @@ class VCStore:
                 "issuer_key_version": version,
                 "disclose": disclose_paths,
                 "claims": projection,
+                "challenge": challenge,
+                "expires_at": expires_at,
             }
             proof = crypto.sign(unsigned, private_pem)
             row = dict(unsigned)
@@ -530,15 +566,23 @@ class VCStore:
             return self._presentation_record(row)
 
     def verify_presentation(
-        self, presentation_id: str, presentation: Any
+        self,
+        presentation_id: str,
+        presentation: Any,
+        challenge: Any = CHALLENGE_UNSET,
     ) -> Tuple[bool, str]:
         """以存储记录为锚校验选择性披露演示，返回 (是否有效, 失败原因)。
 
-        顺序：路径 ID 须已持久化；对象 presentation_id 须与路径一致；
-        核对 credential_id/issuer_did/issuer_key_version 绑定字段、disclose；
-        按存储凭证 claims 重算投影并核对 claims；再按历史公钥验 proof。
-        签名成功后若凭证已 revoked，返回“凭证已吊销：<保存原因>”。
-        任何失败均返回非空中文原因，绝不抛异常、不泄露私钥。
+        校验顺序：请求 -> 资源 ID -> 绑定（含 challenge）-> 已消费 ->
+        过期（当前时间 >= expires_at）-> 投影 -> proof 格式与签名 ->
+        吊销。新演示（存储记录含 challenge）要求请求恰含 presentation
+        与 challenge，且请求 challenge、演示 challenge 与 proof 覆盖的
+        存储 challenge 三者一致；旧演示（无 challenge）只接受恰含
+        presentation 的请求，不做挑战、过期与消费检查。验签成功且未
+        过期、未吊销时原子标记已消费（并发仅一次成功，跨重启保留）；
+        已消费优先于过期与吊销；签名成功但已吊销返回“凭证已吊销：
+        <原因>”且不消费。任何失败均返回非空中文原因，绝不抛异常、
+        不泄露私钥。
         """
         if not isinstance(presentation, dict):
             return False, "请求不合法: 字段 presentation 必须为 JSON 对象"
@@ -547,6 +591,14 @@ class VCStore:
             row = self._presentations.get(presentation_id)
             if row is None:
                 return False, f"演示不存在: {presentation_id}"
+
+            # 新/旧演示按存储记录是否含 challenge 判定
+            is_replay_protected = "challenge" in row
+            if is_replay_protected:
+                if challenge is CHALLENGE_UNSET:
+                    return False, "请求缺少字段: challenge"
+            elif challenge is not CHALLENGE_UNSET:
+                return False, "请求含多余字段: challenge"
 
             expected_keys = {
                 "presentation_id",
@@ -557,6 +609,8 @@ class VCStore:
                 "claims",
                 "proof",
             }
+            if is_replay_protected:
+                expected_keys |= {"challenge", "expires_at"}
             if set(presentation) != expected_keys:
                 return False, (
                     "锚定校验失败: presentation 字段集合与存储记录不一致"
@@ -586,6 +640,32 @@ class VCStore:
                 )
             if presentation.get("disclose") != list(row.get("disclose", [])):
                 return False, "锚定校验失败: disclose 与存储记录不一致"
+
+            if is_replay_protected:
+                # 请求 challenge、演示 challenge 与 proof 覆盖的存储
+                # challenge 三者必须一致
+                stored_challenge = row.get("challenge")
+                if presentation.get("challenge") != stored_challenge:
+                    return False, (
+                        "锚定校验失败: challenge 与存储记录不一致"
+                    )
+                if challenge != stored_challenge:
+                    return False, (
+                        "锚定校验失败: 请求 challenge 与存储记录不一致"
+                    )
+                if presentation.get("expires_at") != row.get("expires_at"):
+                    return False, (
+                        "锚定校验失败: expires_at 与存储记录不一致"
+                    )
+                # 已消费优先于过期与吊销
+                if row.get("consumed"):
+                    return False, "演示已消费"
+                try:
+                    expires_at = _parse_utc_z(row["expires_at"])
+                except (KeyError, TypeError, ValueError):
+                    return False, "验签过程发生内部错误"
+                if datetime.now(timezone.utc) >= expires_at:
+                    return False, "演示已过期"
 
             obj_claims = presentation.get("claims")
             if not isinstance(obj_claims, dict):
@@ -640,6 +720,9 @@ class VCStore:
             "disclose": list(row.get("disclose", [])),
             "claims": recomputed,
         }
+        if is_replay_protected:
+            unsigned["challenge"] = row.get("challenge")
+            unsigned["expires_at"] = row.get("expires_at")
         try:
             crypto.verify(unsigned, proof, public_pem)
         except crypto.MalformedSignature:
@@ -649,10 +732,29 @@ class VCStore:
         except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
             return False, "验签过程发生内部错误"
 
-        # 签名与锚定均成功后检查凭证状态
+        # 签名与锚定均成功后检查凭证状态：已吊销不消费
         if credential_status == "revoked":
             saved_reason = revoke_reason or DEFAULT_REVOKE_REASON
             return False, f"凭证已吊销：{saved_reason}"
+
+        if is_replay_protected:
+            # 原子标记已消费：并发仅一次成功，跨重启保留；过期或
+            # 已吊销不消费
+            with self._lock:
+                row = self._presentations.get(presentation_id)
+                if row is None:
+                    return False, f"演示不存在: {presentation_id}"
+                if row.get("consumed"):
+                    return False, "演示已消费"
+                cred = self._credentials.get(credential_id)
+                if cred is not None and cred.get("status") == "revoked":
+                    saved_reason = (
+                        cred.get("revoke_reason") or DEFAULT_REVOKE_REASON
+                    )
+                    return False, f"凭证已吊销：{saved_reason}"
+                row["consumed"] = True
+                row["consumed_at"] = _utc_now()
+                self._save_locked()
         return True, ""
 
     # ------------------------------------------------------------------ #

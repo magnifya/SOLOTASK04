@@ -23,6 +23,7 @@ from typing import Any, Dict, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
 from .store import (
+    CHALLENGE_UNSET,
     ConflictError,
     NotFoundError,
     REASON_UNSET,
@@ -374,16 +375,44 @@ def build_handler(store: VCStore) -> type:
             self._send_json(200, payload)
 
         def _post_present(self, credential_id: str) -> None:
-            # 请求体必须恰为 {"disclose": [路径...]}：缺失、类型非法、
-            # 重复路径或祖先重叠、多余字段一律 400；未知凭证 404；
-            # 空列表表示零披露。成功 201 返回演示记录。
+            # 请求体必须恰为 {"disclose": [...]} 加可选 challenge、
+            # expires_in：缺失 disclose、类型非法、重复路径或祖先重叠、
+            # 多余字段一律 400；未知凭证 404；空列表表示零披露。
+            # challenge 须为非空字符串且按 Unicode 码点不超过 256，
+            # 缺省生成 32 位小写 hex；expires_in 须为非布尔整数且
+            # 在 1..86400 之间，缺省 300。成功 201 返回演示记录。
             data = self._read_json()
             if "disclose" not in data:
                 raise ValidationError("缺少字段: disclose")
-            extra = sorted(set(data) - {"disclose"})
+            extra = sorted(set(data) - {"disclose", "challenge", "expires_in"})
             if extra:
                 raise ValidationError(f"多余字段: {', '.join(extra)}")
-            record = store.create_presentation(credential_id, data["disclose"])
+            challenge = None
+            if "challenge" in data:
+                challenge = data["challenge"]
+                if not isinstance(challenge, str) or not challenge:
+                    raise ValidationError("字段 challenge 必须为非空字符串")
+                if len(challenge) > 256:
+                    raise ValidationError(
+                        "字段 challenge 按 Unicode 码点不能超过 256"
+                    )
+            expires_in = None
+            if "expires_in" in data:
+                expires_in = data["expires_in"]
+                if not isinstance(expires_in, int) or isinstance(
+                    expires_in, bool
+                ):
+                    raise ValidationError("字段 expires_in 必须为整数")
+                if not 1 <= expires_in <= 86400:
+                    raise ValidationError(
+                        "字段 expires_in 须在 1 到 86400 之间"
+                    )
+            record = store.create_presentation(
+                credential_id,
+                data["disclose"],
+                challenge=challenge,
+                expires_in=expires_in,
+            )
             self._send_json(
                 201,
                 {
@@ -393,6 +422,8 @@ def build_handler(store: VCStore) -> type:
                     "issuer_key_version": record.issuer_key_version,
                     "disclose": record.disclose,
                     "claims": record.projection,
+                    "challenge": record.challenge,
+                    "expires_at": record.expires_at,
                     "proof": record.proof,
                 },
             )
@@ -427,14 +458,22 @@ def build_handler(store: VCStore) -> type:
             if "presentation" not in data:
                 self._send_invalid("请求缺少字段: presentation")
                 return
-            extra = sorted(set(data) - {"presentation"})
+            extra = sorted(set(data) - {"presentation", "challenge"})
             if extra:
                 self._send_invalid(f"请求含多余字段: {', '.join(extra)}")
                 return
+            challenge = CHALLENGE_UNSET
+            if "challenge" in data:
+                challenge = data["challenge"]
+                if not isinstance(challenge, str) or not challenge:
+                    self._send_invalid(
+                        "请求字段 challenge 必须为非空字符串"
+                    )
+                    return
 
             try:
                 valid, reason = store.verify_presentation(
-                    presentation_id, data["presentation"]
+                    presentation_id, data["presentation"], challenge
                 )
             except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
                 self._send_invalid("验签过程发生内部错误")
