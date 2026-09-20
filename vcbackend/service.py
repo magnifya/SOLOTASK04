@@ -22,6 +22,7 @@
   POST /v1/trust/credentials/verify       跨系统凭证验真（无需登记 DID/凭证）
   POST /v1/trust/credential-status/sync   同步外部凭证状态（active 锚点验签）
   GET  /v1/trust/credential-status/{id}   查询已同步的外部凭证状态
+  GET  /v1/trust/credential-status/{id}/history  查询外部凭证状态历史（只读）
   GET  /v1/audit                          查询本租户审计事件
 
 多租户：所有 /v1 请求取 X-Tenant-ID 头，缺省为 "default"；显式
@@ -285,6 +286,19 @@ def build_handler(store: VCStore) -> type:
                 elif path.startswith("/v1/trust/anchors/"):
                     did = unquote(path[len("/v1/trust/anchors/") :])
                     self._get_trust_anchors(tenant, did)
+                elif path.startswith("/v1/trust/credential-status/") and path.endswith(
+                    "/history"
+                ):
+                    credential_id = unquote(
+                        path[
+                            len("/v1/trust/credential-status/") : -len(
+                                "/history"
+                            )
+                        ]
+                    )
+                    self._get_trust_credential_status_history(
+                        tenant, credential_id, parsed.query
+                    )
                 elif path.startswith("/v1/trust/credential-status/"):
                     credential_id = unquote(
                         path[len("/v1/trust/credential-status/") :]
@@ -949,6 +963,68 @@ def build_handler(store: VCStore) -> type:
                     "status": record.status,
                     "reason": record.reason,
                     "updated_at": record.updated_at,
+                },
+            )
+
+        def _get_trust_credential_status_history(
+            self, tenant: str, credential_id: str, query: str
+        ) -> None:
+            # GET .../{credential_id}/history?issuer_did=...&limit=&after=
+            # issuer_did 须唯一且非空（缺失/重复/空值 400）；limit 缺省
+            # 50、须为 1..200 的 ASCII 十进制；after 缺省 0、须为非负
+            # ASCII 十进制；重复或非法 400。未同步双键（含他租户）404。
+            # 只读，不记审计。
+            if not credential_id:
+                raise ValidationError("路径缺少 credential_id")
+            params = parse_qs(query, keep_blank_values=True)
+            issuer_values = params.get("issuer_did")
+            if issuer_values is None:
+                raise ValidationError("查询参数 issuer_did 必填")
+            if len(issuer_values) != 1:
+                raise ValidationError("查询参数 issuer_did 只能提供一次")
+            issuer_did = issuer_values[0]
+            if not issuer_did:
+                raise ValidationError(
+                    "查询参数 issuer_did 必须为非空字符串"
+                )
+            limit_values = params.get("limit")
+            if limit_values is not None:
+                if len(limit_values) != 1:
+                    raise ValidationError("查询参数 limit 只能提供一次")
+                limit = _parse_nonneg_int(limit_values[0], "limit")
+                if not 1 <= limit <= 200:
+                    raise ValidationError("查询参数 limit 须在 1 到 200 之间")
+            else:
+                limit = 50
+            after_values = params.get("after")
+            if after_values is not None:
+                if len(after_values) != 1:
+                    raise ValidationError("查询参数 after 只能提供一次")
+                after = _parse_nonneg_int(after_values[0], "after")
+            else:
+                after = 0
+
+            events, next_after = store.list_credential_status_history(
+                tenant, issuer_did, credential_id, after, limit
+            )
+            self._send_json(
+                200,
+                {
+                    "issuer_did": issuer_did,
+                    "credential_id": credential_id,
+                    "events": [
+                        {
+                            "status": event.status,
+                            "reason": event.reason,
+                            "updated_at": event.updated_at,
+                            "issuer_key_version": event.issuer_key_version,
+                            "audit_seq": event.audit_seq,
+                            "audit_timestamp": event.audit_timestamp,
+                            "cursor": event.cursor,
+                        }
+                        for event in events
+                    ],
+                    "next_after": next_after,
                 },
             )
 

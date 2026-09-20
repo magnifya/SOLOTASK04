@@ -44,6 +44,7 @@ from .models import (
     CredentialRecord,
     CredentialStatusRecord,
     CredentialStatusSyncRecord,
+    CredentialStatusHistoryRecord,
     DIDRecord,
     PredicateProofRecord,
     PresentationRecord,
@@ -393,6 +394,8 @@ class VCStore:
         # 全局审计事件（按追加顺序即 seq 升序）
         self._audit: List[Dict[str, Any]] = []
         self._audit_seq: int = 0
+        # 外部凭证状态历史全局 cursor（持久化正整数，按追加递增）
+        self._status_history_seq: int = 0
         self._load()
 
     # ------------------------------------------------------------------ #
@@ -419,6 +422,7 @@ class VCStore:
             )
         else:
             self._audit_seq = int(data.get("audit_seq", 0))
+        self._status_history_seq = int(data.get("credential_status_history_seq", 0))
         for bucket in self._tenants.values():
             bucket.setdefault("dids", {})
             bucket.setdefault("credentials", {})
@@ -426,8 +430,73 @@ class VCStore:
             bucket.setdefault("proofs", {})
             bucket.setdefault("trust_anchors", {})
             bucket.setdefault("credential_status_sync", {})
+            bucket.setdefault("credential_status_history", {})
             for rec in bucket["dids"].values():
                 _migrate_did_row(rec)
+        # 旧状态缺历史：补兼容项并经一次原子写持久化（cursor 持久化、
+        # 重启保留）。仅在确实存在缺历史的同步状态时落盘。
+        if self._migrate_status_history_locked():
+            self._save_locked()
+
+    def _migrate_status_history_locked(self) -> bool:
+        """为缺历史的旧同步状态补一条兼容项（audit 字段为 None）。
+
+        兼容项在迁移时即分配持久化正整数 cursor（按
+        租户/issuer_did/credential_id 排序顺序自全局 cursor 依次分配），
+        保证后续追加的 cursor 严格更大。返回是否发生了迁移（需要落盘）。
+        """
+        changed = False
+        pending: List[Tuple[str, str, str, Dict[str, Any]]] = []
+        for tenant_id in sorted(self._tenants):
+            bucket = self._tenants[tenant_id]
+            history_map = bucket.setdefault("credential_status_history", {})
+            sync_map = bucket.get("credential_status_sync", {}) or {}
+            for issuer_did in sorted(sync_map):
+                issuer_history = history_map.setdefault(issuer_did, {})
+                for credential_id in sorted(sync_map[issuer_did]):
+                    entries = issuer_history.setdefault(credential_id, [])
+                    if entries:
+                        continue
+                    pending.append(
+                        (
+                            tenant_id,
+                            issuer_did,
+                            credential_id,
+                            sync_map[issuer_did][credential_id],
+                        )
+                    )
+        # 先校正全局 cursor（新格式文件中历史条目的 cursor 为准）
+        for bucket in self._tenants.values():
+            for issuer_history in bucket.get(
+                "credential_status_history", {}
+            ).values():
+                for entries in issuer_history.values():
+                    for entry in entries:
+                        cursor = entry.get("cursor")
+                        if (
+                            isinstance(cursor, int)
+                            and not isinstance(cursor, bool)
+                            and cursor > self._status_history_seq
+                        ):
+                            self._status_history_seq = cursor
+        # 兼容项按确定顺序依次分配 cursor
+        for _tenant_id, issuer_did, credential_id, row in pending:
+            self._status_history_seq += 1
+            entry = {
+                "cursor": self._status_history_seq,
+                "status": row.get("status"),
+                "reason": row.get("reason"),
+                "updated_at": row.get("updated_at"),
+                "issuer_key_version": int(row.get("issuer_key_version", 1)),
+                "audit_seq": None,
+                "audit_timestamp": None,
+            }
+            bucket = self._tenants[_tenant_id]
+            bucket["credential_status_history"][issuer_did][
+                credential_id
+            ].append(entry)
+            changed = True
+        return changed
 
     def _save_locked(self) -> None:
         directory = os.path.dirname(os.path.abspath(self.path))
@@ -437,6 +506,7 @@ class VCStore:
             "tenants": self._tenants,
             "audit": self._audit,
             "audit_seq": self._audit_seq,
+            "credential_status_history_seq": self._status_history_seq,
         }
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
@@ -444,13 +514,16 @@ class VCStore:
 
     def _snapshot_locked(self) -> Any:
         """深拷贝当前全部可变状态，供落盘失败时回滚。"""
-        return copy.deepcopy((self._tenants, self._audit, self._audit_seq))
+        return copy.deepcopy(
+            (self._tenants, self._audit, self._audit_seq, self._status_history_seq)
+        )
 
     def _restore_locked(self, snapshot: Any) -> None:
-        tenants, audit, audit_seq = copy.deepcopy(snapshot)
+        tenants, audit, audit_seq, history_seq = copy.deepcopy(snapshot)
         self._tenants = tenants
         self._audit = audit
         self._audit_seq = audit_seq
+        self._status_history_seq = history_seq
 
     # ------------------------------------------------------------------ #
     # 租户桶与审计
@@ -468,6 +541,7 @@ class VCStore:
                 "proofs": {},
                 "trust_anchors": {},
                 "credential_status_sync": {},
+                "credential_status_history": {},
             }
             self._tenants[tenant_id] = bucket
         return bucket
@@ -2315,11 +2389,21 @@ class VCStore:
             snapshot = self._snapshot_locked()
             try:
                 issuer_map[credential_id] = new_row
-                self._append_audit_locked(
+                audit_event = self._append_audit_locked(
                     tenant_id,
                     AUDIT_TRUST_CREDENTIAL_STATUS_SYNCED,
                     "trust_credential_status",
                     f"{issuer_did}#{credential_id}",
+                )
+                # 历史与状态、审计同一次原子写：仅首次同步或严格更新
+                # 追加（重放/更早日/冲突均在前面返回，不会到达这里）。
+                self._append_status_history_locked(
+                    bucket,
+                    issuer_did,
+                    credential_id,
+                    new_row,
+                    audit_seq=int(audit_event["seq"]),
+                    audit_timestamp=int(audit_event["timestamp"]),
                 )
                 self._save_locked()
             except Exception:
@@ -2356,3 +2440,91 @@ class VCStore:
                     f"{issuer_did}#{credential_id}"
                 )
             return self._sync_status_record(issuer_did, credential_id, row)
+
+    @staticmethod
+    def _status_history_record(entry: Dict[str, Any]) -> CredentialStatusHistoryRecord:
+        return CredentialStatusHistoryRecord(
+            cursor=int(entry["cursor"]),
+            status=entry["status"],
+            reason=entry.get("reason"),
+            updated_at=entry["updated_at"],
+            issuer_key_version=int(entry["issuer_key_version"]),
+            audit_seq=entry.get("audit_seq"),
+            audit_timestamp=entry.get("audit_timestamp"),
+        )
+
+    def _append_status_history_locked(
+        self,
+        bucket: Dict[str, Any],
+        issuer_did: str,
+        credential_id: str,
+        row: Dict[str, Any],
+        audit_seq: int,
+        audit_timestamp: int,
+    ) -> Dict[str, Any]:
+        """在锁内追加一条状态历史（须与状态/审计同一次原子写落盘）。"""
+        self._status_history_seq += 1
+        entry = {
+            "cursor": self._status_history_seq,
+            "status": row["status"],
+            "reason": row.get("reason"),
+            "updated_at": row["updated_at"],
+            "issuer_key_version": int(row["issuer_key_version"]),
+            "audit_seq": audit_seq,
+            "audit_timestamp": audit_timestamp,
+        }
+        history_map = bucket.setdefault("credential_status_history", {})
+        issuer_history = history_map.setdefault(issuer_did, {})
+        issuer_history.setdefault(credential_id, []).append(entry)
+        return entry
+
+    def list_credential_status_history(
+        self,
+        tenant_id: str,
+        issuer_did: str,
+        credential_id: str,
+        after: int = 0,
+        limit: int = 50,
+    ) -> Tuple[List[CredentialStatusHistoryRecord], int]:
+        """查询外部凭证状态历史（只读，按 cursor 分页）。
+
+        结果按 updated_at 升序、同 updated_at 按 cursor 升序；after 排除
+        cursor 不大于其值的记录，limit 截断本页。next_after 为本页末项
+        cursor，空页保持 after。未同步双键（含他租户）抛 NotFoundError。
+        audit_seq 为 None 的兼容项同样按 cursor 返回。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            sync_row = None
+            entries: List[Dict[str, Any]] = []
+            if bucket is not None:
+                sync_row = (
+                    bucket.get("credential_status_sync", {})
+                    .get(issuer_did, {})
+                    .get(credential_id)
+                )
+                entries = list(
+                    bucket.get("credential_status_history", {})
+                    .get(issuer_did, {})
+                    .get(credential_id, [])
+                )
+            if sync_row is None:
+                raise NotFoundError(
+                    "外部凭证状态未同步: "
+                    f"{issuer_did}#{credential_id}"
+                )
+            picked = [
+                entry
+                for entry in entries
+                if int(entry.get("cursor", 0)) > after
+            ]
+            picked.sort(
+                key=lambda entry: (
+                    _parse_utc_z(entry["updated_at"]),
+                    int(entry["cursor"]),
+                )
+            )
+            page = picked[:limit]
+            records = [self._status_history_record(entry) for entry in page]
+            next_after = int(page[-1]["cursor"]) if page else after
+            return records, next_after
