@@ -43,6 +43,7 @@ from .models import (
     AuditEvent,
     CredentialRecord,
     CredentialStatusRecord,
+    CredentialStatusSyncRecord,
     DIDRecord,
     PredicateProofRecord,
     PresentationRecord,
@@ -101,6 +102,7 @@ AUDIT_TRUST_ANCHOR_REVOKED = "trust.anchor.revoked"
 AUDIT_TRUST_ANCHOR_ROTATED = "trust.anchor.rotated"
 AUDIT_PROOF_CREATED = "proof.created"
 AUDIT_PROOF_CONSUMED = "proof.consumed"
+AUDIT_TRUST_CREDENTIAL_STATUS_SYNCED = "trust.credential.status.synced"
 
 
 def _utc_now() -> str:
@@ -423,6 +425,7 @@ class VCStore:
             bucket.setdefault("presentations", {})
             bucket.setdefault("proofs", {})
             bucket.setdefault("trust_anchors", {})
+            bucket.setdefault("credential_status_sync", {})
             for rec in bucket["dids"].values():
                 _migrate_did_row(rec)
 
@@ -464,6 +467,7 @@ class VCStore:
                 "presentations": {},
                 "proofs": {},
                 "trust_anchors": {},
+                "credential_status_sync": {},
             }
             self._tenants[tenant_id] = bucket
         return bucket
@@ -2082,3 +2086,273 @@ class VCStore:
             except Exception:
                 self._restore_locked(snapshot)
                 raise
+
+    # ------------------------------------------------------------------ #
+    # 外部凭证状态同步
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _sync_status_record(
+        issuer_did: str, credential_id: str, row: Dict[str, Any]
+    ) -> CredentialStatusSyncRecord:
+        return CredentialStatusSyncRecord(
+            issuer_did=issuer_did,
+            credential_id=credential_id,
+            status=row["status"],
+            updated_at=row["updated_at"],
+            issuer_key_version=int(row["issuer_key_version"]),
+            reason=row.get("reason"),
+        )
+
+    def sync_credential_status(
+        self,
+        tenant_id: str,
+        data: Any,
+    ) -> Dict[str, Any]:
+        """同步一条外部凭证状态，返回结果字典。
+
+        请求体须恰含 body（JSON 对象）与 signature（非空字符串）；
+        body 须恰含 issuer_did、credential_id、status、updated_at、
+        issuer_key_version，并可选 reason：
+          - issuer_did/credential_id/status/updated_at 为非空字符串；
+          - status 仅 active、revoked、unknown；
+          - issuer_key_version 为非布尔正整数；
+          - updated_at 为 UTC 秒精度 Z 格式（YYYY-MM-DDTHH:MM:SSZ）；
+          - reason 提供时须为非空字符串。
+        任何请求/字段非法均抛 ValidationError（HTTP 400）。
+
+        签名覆盖 body 的规范化 JSON，用本租户 (issuer_did,
+        issuer_key_version) 的 active 信任锚点公钥验签。锚点缺失/吊销、
+        签名格式错误、密码学验签失败均不抛异常、不写入、不记审计，返回
+        {"valid": False, "reason": ...}（reason 前缀依次为
+        “锚点”/“签名格式错误”/“签名校验失败”）。
+
+        验签通过后按 (issuer_did, credential_id) 双键在本租户内持久化：
+          - 首次同步 201；
+          - 相同内容（同 updated_at 且 status/version/reason 相同）重放
+            200，不替换、不重复审计；
+          - updated_at 严格更新才替换（200 并记审计）；更早或相等内容
+            时间但内容不同的处理见下；
+          - 同 updated_at 但内容不同抛 ConflictError（409），不写入。
+        成功变更（首次或严格更新）记 trust.credential.status.synced，
+        resource_id 为 issuer_did#credential_id；状态与审计同一次原子写，
+        失败回滚。绝不改动本租户既有凭证状态。
+        """
+        # ---- 请求结构（错误 -> 400）----
+        if not isinstance(data, dict):
+            raise ValidationError("请求体必须为 JSON 对象")
+        if set(data) != {"body", "signature"}:
+            missing = [f for f in ("body", "signature") if f not in data]
+            if missing:
+                raise ValidationError(f"缺少字段: {', '.join(missing)}")
+            extra = sorted(set(data) - {"body", "signature"})
+            raise ValidationError(f"多余字段: {', '.join(extra)}")
+        body = data["body"]
+        signature = data["signature"]
+        if not isinstance(body, dict):
+            raise ValidationError("字段 body 必须为 JSON 对象")
+        if not isinstance(signature, str) or not signature:
+            raise ValidationError("字段 signature 必须为非空字符串")
+
+        # ---- body 字段（错误 -> 400）----
+        required = (
+            "issuer_did",
+            "credential_id",
+            "status",
+            "updated_at",
+            "issuer_key_version",
+        )
+        for field in required:
+            if field not in body:
+                raise ValidationError(f"body 缺少字段: {field}")
+        extra = sorted(set(body) - set(required) - {"reason"})
+        if extra:
+            raise ValidationError(f"body 含多余字段: {', '.join(extra)}")
+        issuer_did = body["issuer_did"]
+        credential_id = body["credential_id"]
+        status = body["status"]
+        updated_at = body["updated_at"]
+        key_version = body["issuer_key_version"]
+        for name, value in (
+            ("issuer_did", issuer_did),
+            ("credential_id", credential_id),
+            ("status", status),
+            ("updated_at", updated_at),
+        ):
+            if not isinstance(value, str) or not value:
+                raise ValidationError(
+                    f"body 字段 {name} 必须为非空字符串"
+                )
+        if status not in ("active", "revoked", "unknown"):
+            raise ValidationError(
+                "body 字段 status 仅支持 active、revoked、unknown"
+            )
+        if not isinstance(key_version, int) or isinstance(
+            key_version, bool
+        ) or key_version < 1:
+            raise ValidationError(
+                "body 字段 issuer_key_version 必须为非布尔正整数"
+            )
+        try:
+            incoming_dt = _parse_utc_z(updated_at)
+        except (TypeError, ValueError):
+            raise ValidationError(
+                "body 字段 updated_at 必须为 UTC 秒精度 Z 格式"
+                "（YYYY-MM-DDTHH:MM:SSZ）"
+            )
+        reason: Optional[str] = None
+        if "reason" in body:
+            reason = body["reason"]
+            if not isinstance(reason, str) or not reason:
+                raise ValidationError("body 字段 reason 必须为非空字符串")
+
+        # ---- 锚点（缺失/吊销 -> 200 valid:false，且不写入）----
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            anchors = (
+                bucket["trust_anchors"].get(issuer_did)
+                if bucket is not None
+                else None
+            )
+            anchor_row = (
+                anchors.get(str(key_version))
+                if anchors is not None
+                else None
+            )
+            public_pem = (
+                anchor_row.get("public_key", "")
+                if anchor_row is not None
+                else ""
+            )
+            anchor_status = (
+                anchor_row.get("status", "active")
+                if anchor_row is not None
+                else None
+            )
+        if anchor_row is None:
+            return {
+                "valid": False,
+                "reason": f"锚点不存在: {issuer_did}#{key_version}",
+            }
+        if anchor_status == "revoked":
+            return {
+                "valid": False,
+                "reason": f"锚点已吊销: {issuer_did}#{key_version}",
+            }
+        try:
+            crypto.validate_public_key_pem(public_pem)
+        except (ValueError, TypeError):
+            return {
+                "valid": False,
+                "reason": (
+                    f"锚点公钥不可用: {issuer_did}#{key_version}"
+                    " 不是合法 P-256 公钥"
+                ),
+            }
+
+        # ---- 签名（覆盖 body 的规范化 JSON）----
+        try:
+            crypto.verify(body, signature, public_pem)
+        except crypto.MalformedSignature:
+            return {
+                "valid": False,
+                "reason": "签名格式错误: 不是合法的 ES256 签名编码",
+            }
+        except crypto.InvalidSignature:
+            return {
+                "valid": False,
+                "reason": "签名校验失败，状态正文或签名可能被改动",
+            }
+        except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
+            return {"valid": False, "reason": "签名校验失败: 验签过程发生内部错误"}
+
+        # ---- 持久化（双键隔离、严格更新、重放幂等、原子审计）----
+        with self._lock:
+            bucket = self._ensure_bucket_locked(tenant_id)
+            sync_map = bucket.setdefault("credential_status_sync", {})
+            issuer_map = sync_map.setdefault(issuer_did, {})
+            existing = issuer_map.get(credential_id)
+            if existing is not None:
+                existing_dt = _parse_utc_z(existing["updated_at"])
+                if incoming_dt == existing_dt:
+                    identical = (
+                        existing.get("status") == status
+                        and int(existing.get("issuer_key_version"))
+                        == key_version
+                        and existing.get("reason") == reason
+                    )
+                    if identical:
+                        # 相同重放：200、不替换、不重复审计
+                        return {
+                            "valid": True,
+                            "status_code": 200,
+                            "record": self._sync_status_record(
+                                issuer_did, credential_id, existing
+                            ),
+                        }
+                    # 同时间不同内容：冲突，不写入、不记审计
+                    raise ConflictError(
+                        "凭证状态 updated_at 相同但内容不同: "
+                        f"{issuer_did}#{credential_id}@{updated_at}"
+                    )
+                if incoming_dt < existing_dt:
+                    # 更早的状态：忽略，保持既有值，200 且不记审计
+                    return {
+                        "valid": True,
+                        "status_code": 200,
+                        "record": self._sync_status_record(
+                            issuer_did, credential_id, existing
+                        ),
+                    }
+
+            # 首次同步（201）或严格更新（200）：替换并记审计
+            created = existing is None
+            new_row = {
+                "status": status,
+                "updated_at": updated_at,
+                "issuer_key_version": key_version,
+                "reason": reason,
+            }
+            snapshot = self._snapshot_locked()
+            try:
+                issuer_map[credential_id] = new_row
+                self._append_audit_locked(
+                    tenant_id,
+                    AUDIT_TRUST_CREDENTIAL_STATUS_SYNCED,
+                    "trust_credential_status",
+                    f"{issuer_did}#{credential_id}",
+                )
+                self._save_locked()
+            except Exception:
+                self._restore_locked(snapshot)
+                raise
+            return {
+                "valid": True,
+                "status_code": 201 if created else 200,
+                "record": self._sync_status_record(
+                    issuer_did, credential_id, new_row
+                ),
+            }
+
+    def get_synced_credential_status(
+        self, tenant_id: str, issuer_did: str, credential_id: str
+    ) -> CredentialStatusSyncRecord:
+        """查询已同步的外部凭证状态。
+
+        按本租户 (issuer_did, credential_id) 双键查找；未同步或属他租户
+        均抛 NotFoundError（HTTP 404，跨租户不可探测）。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            row = None
+            if bucket is not None:
+                row = (
+                    bucket.get("credential_status_sync", {})
+                    .get(issuer_did, {})
+                    .get(credential_id)
+                )
+            if row is None:
+                raise NotFoundError(
+                    "外部凭证状态未同步: "
+                    f"{issuer_did}#{credential_id}"
+                )
+            return self._sync_status_record(issuer_did, credential_id, row)

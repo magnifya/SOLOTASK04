@@ -43,6 +43,8 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | PUT | `/v1/trust/anchors/{did}/{key_version}/status` | 吊销锚点版本，请求体必须恰为 `{"status":"revoked"}`；首次与重复均 200，首次置 UTC 秒精度 `updated_at`，重复保持不变；未知版本 404 |
 | POST | `/v1/trust/verify` | 信任验签，请求体含非空字符串 `issuer_did`、正整数 `issuer_key_version`、非空字符串 `signature`；**缺失、吊销或验签失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
 | POST | `/v1/trust/credentials/verify` | 跨系统凭证验真：验证未在本租户签发或存储的外部凭证，无需登记 DID/凭证；请求体须恰含 `body`、`signature`；**任何失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
+| POST | `/v1/trust/credential-status/sync` | 外部凭证状态同步：请求体须恰含 `body`、`signature`，`body` 须恰含 `issuer_did`、`credential_id`、`status`、`updated_at`、`issuer_key_version`，可选 `reason`；请求/字段非法 400；锚点或签名失败 HTTP 200、`valid:false` 且不写入；首次同步 201、相同重放 200 不重复审计、严格更新替换、同时间不同内容 409 |
+| GET | `/v1/trust/credential-status/{credential_id}?issuer_did=...` | 查询已同步的外部凭证状态；`issuer_did` 须唯一非空；已同步返回 `status`、`reason`、`updated_at`，未同步（含他租户）404 |
 | GET | `/v1/audit?limit=&after=` | 查询本租户审计事件，按 seq 升序；返回 `events`、`next_after`，参数校验见下文 |
 
 - 所有 `/v1` 请求读取 `X-Tenant-ID` 头确定租户：**缺省为 `default`**；显式提供时必须非空，否则 400。
@@ -342,6 +344,59 @@ curl -X POST localhost:8080/v1/trust/credentials/verify \
        "issuer_key_version":1},"signature":"<base64url R||S>"}'
 ```
 
+### 外部凭证状态同步
+
+在不改变本租户既有凭证状态的前提下，按信任锚点同步**外部**凭证的状态。
+状态保存在独立的 `credential_status_sync` 命名空间，与本租户签发的凭证
+（`credentials`）互不影响；按租户与 `(issuer_did, credential_id)` 双键隔离。
+
+- `POST /v1/trust/credential-status/sync` 请求体必须**恰含** `body`
+  （JSON 对象）与 `signature`（非空字符串）；缺失、多余字段、请求体
+  缺失/非法 JSON/非对象一律 **400**。
+- `body` 必须**恰含** `issuer_did`、`credential_id`、`status`、
+  `updated_at`、`issuer_key_version`，并可选 `reason`：
+  - `issuer_did`、`credential_id` 为**非空字符串**；
+  - `status` 仅 `active`、`revoked`、`unknown`；
+  - `issuer_key_version` 为**非布尔正整数**；
+  - `updated_at` 为 **UTC 秒精度 Z 格式**（`YYYY-MM-DDTHH:MM:SSZ`，
+    不接受毫秒/时区偏移/空格分隔/非法时刻）；
+  - `reason` 提供时必须为**非空字符串**（按原文保存，不做裁剪）。
+  任一字段缺失、类型非法、含多余字段均 **400**。
+- 签名为 **ES256/SHA-256**、64 字节裸 `R||S` 的无填充 base64url，覆盖
+  **完整 `body`** 的递归排序紧凑 JSON。公钥取本租户匹配
+  `(issuer_did, issuer_key_version)` 的信任锚点，且仅 **active** 锚点
+  可用。锚点缺失/已吊销、签名格式错误、密码学验签失败均返回
+  **HTTP 200** 与 `{"valid":false,"reason":...}`，`reason` 前缀依次为
+  **锚点**、**签名格式错误**、**签名校验失败**，且**不写入、不记审计**。
+- 验签通过后按双键持久化：
+  - **首次同步**返回 **201**；
+  - **相同内容重放**（同 `updated_at` 且 `status`/`issuer_key_version`/
+    `reason` 全同）返回 **200**，不替换、**不重复审计**；
+  - `updated_at` **严格更新**（更晚）才替换旧值，返回 **200** 并记一次
+    审计；更早的 `updated_at` 被忽略（保持新值，200、不记审计）；
+  - **同 `updated_at` 但内容不同**返回 **409**，不写入、不记审计。
+- 成功变更（首次或严格更新）记 `trust.credential.status.synced`，
+  `resource_type` 为 `trust_credential_status`、`resource_id` 为
+  `<issuer_did>#<credential_id>`；锚点/签名失败、400/409、重放与更早日
+  期均不记。状态替换与审计事件在同一把锁内经**同一次原子写**落盘，
+  落盘失败回滚（状态不变、事件不记录）。
+- 同步结果响应字段恰为：`issuer_did`、`credential_id`、`status`、
+  `reason`、`updated_at`、`issuer_key_version`。
+- `GET /v1/trust/credential-status/{credential_id}?issuer_did=...`：
+  `issuer_did` 查询参数**必须提供且唯一、非空**（缺失/重复/空值 400）；
+  已同步返回 **200** 与恰三字段 `status`、`reason`、`updated_at`
+  （`active`/`unknown` 等无原因时 `reason` 为 `null`）；未同步或属
+  他租户一律 **404**（跨租户不可探测双键是否存在）。
+
+```bash
+curl -X POST localhost:8080/v1/trust/credential-status/sync -d '{
+  "body":{"issuer_did":"did:web:example.com","credential_id":"vc_ext_1",
+          "status":"revoked","updated_at":"2026-09-21T00:00:00Z",
+          "issuer_key_version":1,"reason":"持证人违规"},
+  "signature":"<base64url R||S>"}'
+curl "localhost:8080/v1/trust/credential-status/vc_ext_1?issuer_did=did:web:example.com"
+```
+
 ### 多租户与审计日志
 
 - 所有 `/v1` 请求以 `X-Tenant-ID` 头标识租户，缺省 `default`；显式
@@ -370,10 +425,13 @@ curl -X POST localhost:8080/v1/trust/credentials/verify \
   | 信任锚点注册（含同 DID/版本同 PEM 幂等重试，每次都记） | `trust.anchor.registered` | `trust_anchor` |
   | 信任锚点吊销（首次与幂等重试均记） | `trust.anchor.revoked` | `trust_anchor` |
   | 信任锚点轮换（新建与同前置同 PEM 幂等重试均记） | `trust.anchor.rotated` | `trust_anchor` |
+  | 外部凭证状态首次同步 / 严格更新（重放、更早日、失败不记） | `trust.credential.status.synced` | `trust_credential_status` |
 
   信任锚点审计 `resource_id` 为 `<did>#<key_version>`（轮换取目标版本
   `from_key_version+1`）；注册冲突 409、轮换冲突 409/校验失败 400、
-  验签（成功或失败）等只读或失败路径不记审计。
+  验签（成功或失败）等只读或失败路径不记审计。外部凭证状态同步审计
+  `resource_id` 为 `<issuer_did>#<credential_id>`；锚点/签名失败、
+  400/409、相同重放与更早日均不记。
 
   验签失败、演示已消费、演示过期、凭证/演示吊销判定等**只读或失败
   路径不记审计**。
@@ -399,6 +457,7 @@ python3 tests/trust_anchor_test.py
 python3 tests/trust_anchor_rotate_test.py
 python3 tests/predicate_proof_test.py
 python3 tests/trust_credential_verify_test.py
+python3 tests/trust_credential_status_sync_test.py
 ```
 
 脚本会临时在本地端口启动服务。`e2e_test.py` 覆盖：201/200/400/404/409 各路径、同 key 去重、
@@ -428,13 +487,14 @@ vcbackend/
   crypto.py    ES256 签名/验签、规范化 JSON、P-256 密钥
   models.py    DIDRecord / CredentialRecord / CredentialStatusRecord /
                PresentationRecord / PredicateProofRecord /
-               TrustAnchorRecord / AuditEvent 数据模型
+               TrustAnchorRecord / CredentialStatusSyncRecord / AuditEvent 数据模型
   store.py     多租户文件存储（租户分桶、旧格式迁移）、DID 去重、密钥
                轮换、凭证签发/验签、选择性披露演示（RFC6901 路径校验、
                claims 投影）、谓词证明（谓词校验/求值、results 重算）、
                消费锁内复查过期，信任锚点注册/吊销/验签/
-               带前置版本校验的轮换、跨系统外部凭证验真，以及全局连续
-               审计事件与状态变更的同一次原子写（失败回滚）
+               带前置版本校验的轮换、跨系统外部凭证验真、外部凭证状态
+               同步（双键隔离、严格更新、重放幂等、原子审计），以及全局
+               连续审计事件与状态变更的同一次原子写（失败回滚）
   service.py   标准库 HTTP 路由、X-Tenant-ID 租户解析、/v1/audit 与错误映射
   cli.py       did-create / did-show / issue / verify / serve
 tests/e2e_test.py                  端到端测试（默认租户，全协议兼容）
@@ -446,4 +506,9 @@ tests/predicate_proof_test.py      谓词证明（prove 字段/400/404、verify 
 tests/trust_credential_verify_test.py  跨系统凭证验真（请求/凭证/锚点/
                                    签名格式/验签分类 reason、省略版本不注入、
                                    扩展字段参与签名、只读不记审计、跨租户/重启）
+tests/trust_credential_status_sync_test.py  外部凭证状态同步（请求/字段 400、
+                                   锚点/签名格式/验签分类 reason、201/200/409、
+                                   严格更新与更早日忽略、重放不重复审计、
+                                   GET 三字段/404、跨租户双键隔离、不改本地
+                                   凭证状态、重启持久化、落盘失败回滚）
 ```

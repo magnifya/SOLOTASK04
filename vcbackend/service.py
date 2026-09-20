@@ -20,6 +20,8 @@
   PUT  /v1/trust/anchors/{did}/{key_version}/status  吊销锚点版本
   POST /v1/trust/verify                   用 active 锚点公钥验签
   POST /v1/trust/credentials/verify       跨系统凭证验真（无需登记 DID/凭证）
+  POST /v1/trust/credential-status/sync   同步外部凭证状态（active 锚点验签）
+  GET  /v1/trust/credential-status/{id}   查询已同步的外部凭证状态
   GET  /v1/audit                          查询本租户审计事件
 
 多租户：所有 /v1 请求取 X-Tenant-ID 头，缺省为 "default"；显式
@@ -204,6 +206,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_verify(tenant)
                 elif path == "/v1/trust/credentials/verify":
                     self._post_trust_credentials_verify(tenant)
+                elif path == "/v1/trust/credential-status/sync":
+                    self._post_trust_credential_status_sync(tenant)
                 else:
                     self._send_error(404, f"无此路径: {path}")
             except ValidationError as exc:
@@ -281,6 +285,13 @@ def build_handler(store: VCStore) -> type:
                 elif path.startswith("/v1/trust/anchors/"):
                     did = unquote(path[len("/v1/trust/anchors/") :])
                     self._get_trust_anchors(tenant, did)
+                elif path.startswith("/v1/trust/credential-status/"):
+                    credential_id = unquote(
+                        path[len("/v1/trust/credential-status/") :]
+                    )
+                    self._get_trust_credential_status(
+                        tenant, credential_id, parsed.query
+                    )
                 else:
                     self._send_error(404, f"无此路径: {path}")
             except ValidationError as exc:
@@ -884,6 +895,62 @@ def build_handler(store: VCStore) -> type:
             if not valid:
                 payload["reason"] = reason or "验签失败"
             self._send_json(200, payload)
+
+        def _post_trust_credential_status_sync(self, tenant: str) -> None:
+            # 外部凭证状态同步。请求/字段非法由 _read_json 与 store 抛
+            # ValidationError -> 400；同 updated_at 不同内容由 store 抛
+            # ConflictError -> 409。锚点缺失/吊销、签名格式错误、验签
+            # 失败均按公开错误协议返回 200 + {"valid":false,"reason":...}
+            # （前缀依次为“锚点”/“签名格式错误”/“签名校验失败”）且不写入。
+            data = self._read_json()
+            result = store.sync_credential_status(tenant, data)
+            if not result.get("valid"):
+                self._send_invalid(result.get("reason") or "验签失败")
+                return
+            record = result["record"]
+            # 首次同步 201；严格更新或重放 200（重放内容不变）。
+            self._send_json(
+                result["status_code"],
+                {
+                    "issuer_did": record.issuer_did,
+                    "credential_id": record.credential_id,
+                    "status": record.status,
+                    "reason": record.reason,
+                    "updated_at": record.updated_at,
+                    "issuer_key_version": record.issuer_key_version,
+                },
+            )
+
+        def _get_trust_credential_status(
+            self, tenant: str, credential_id: str, query: str
+        ) -> None:
+            # GET .../{credential_id}?issuer_did=...：issuer_did 须唯一
+            # 且非空，否则 400；未同步（含他租户双键）404，跨租户不可
+            # 探测。已同步仅返回 status、reason、updated_at。
+            if not credential_id:
+                raise ValidationError("路径缺少 credential_id")
+            params = parse_qs(query, keep_blank_values=True)
+            values = params.get("issuer_did")
+            if values is None:
+                raise ValidationError("查询参数 issuer_did 必填")
+            if len(values) != 1:
+                raise ValidationError("查询参数 issuer_did 只能提供一次")
+            issuer_did = values[0]
+            if not issuer_did:
+                raise ValidationError(
+                    "查询参数 issuer_did 必须为非空字符串"
+                )
+            record = store.get_synced_credential_status(
+                tenant, issuer_did, credential_id
+            )
+            self._send_json(
+                200,
+                {
+                    "status": record.status,
+                    "reason": record.reason,
+                    "updated_at": record.updated_at,
+                },
+            )
 
         def _get_audit(self, tenant: str, query: str) -> None:            # GET /v1/audit?limit=&after=：租户内按 seq 升序。
             # limit 缺省 50，须为 1..200 的整数；after 缺省 0，须为

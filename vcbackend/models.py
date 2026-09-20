@@ -109,6 +109,23 @@ class TrustAnchorRecord:
 
 
 @dataclass
+class CredentialStatusSyncRecord:
+    """一条外部凭证状态同步记录（按租户与 issuer_did#credential_id 双键隔离）。
+
+    status 为 active/revoked/unknown；updated_at 为签发方声明的状态时间
+    （UTC ISO8601 秒精度，Z 结尾）；reason 在状态非 active 时可携带
+    （active/unknown 时通常为 None）。
+    """
+
+    issuer_did: str
+    credential_id: str
+    status: str
+    updated_at: str
+    issuer_key_version: int
+    reason: Optional[str] = None
+
+
+@dataclass
 class AuditEvent:
     """一条审计事件。
 
