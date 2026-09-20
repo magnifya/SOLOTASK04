@@ -37,6 +37,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/presentations/{presentation_id}/verify` | 校验演示，新演示请求体恰为 `{"presentation":对象,"challenge":串}`（旧演示恰为 `{"presentation":对象}`）；**任何失败一律 HTTP 200**，成功 `{"valid":true}`，失败附非空中文 `reason` |
 | POST | `/v1/trust/anchors` | 注册信任锚点，请求体 `{"did","public_key","key_version"}`（非空字符串、P-256 PEM、非布尔正整数）；返回 201 与 `did`、`public_key`、`key_version`、`status:"active"`、`updated_at:null` |
 | GET | `/v1/trust/anchors/{did}` | 返回该 DID 的全部锚点版本数组（按 `key_version` 升序）；未知 DID 404 |
+| POST | `/v1/trust/anchors/{did}/rotate` | 带前置版本校验的密钥轮换，请求体恰含 `from_key_version`（非布尔正整数）、`public_key`（P-256 PEM）；目标版本为前置+1，成功与幂等重试均 200 |
 | PUT | `/v1/trust/anchors/{did}/{key_version}/status` | 吊销锚点版本，请求体必须恰为 `{"status":"revoked"}`；首次与重复均 200，首次置 UTC 秒精度 `updated_at`，重复保持不变；未知版本 404 |
 | POST | `/v1/trust/verify` | 信任验签，请求体含非空字符串 `issuer_did`、正整数 `issuer_key_version`、非空字符串 `signature`；**缺失、吊销或验签失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
 | GET | `/v1/audit?limit=&after=` | 查询本租户审计事件，按 seq 升序；返回 `events`、`next_after`，参数校验见下文 |
@@ -213,6 +214,27 @@ curl -X POST localhost:8080/v1/presentations/vp_<id>/verify \
   `trust.anchor.registered`；PEM **不同**返回 **409**，不记审计。
 - `GET /v1/trust/anchors/{did}` 返回该 DID 的**全部锚点版本数组**
   （按 `key_version` 升序，元素字段同注册响应）；DID 未知（含他租户）404。
+- `POST /v1/trust/anchors/{did}/rotate` 请求体必须**恰含**
+  `from_key_version`（**非布尔正整数**）与 `public_key`
+  （**可解析的 P-256 公钥 PEM**）；缺字段、多余字段、类型非法、
+  PEM 不可解析一律 400。目标版本固定为 `from_key_version + 1`：
+  - DID 不存在（含他租户）返回 **404**；
+  - **幂等**：目标版本已由**同一前置版本**（`created_from` 相同）创建且
+    **PEM 相同**，返回 **200** 与原锚点（含其当前状态与 `updated_at`），
+    状态不变——即使前置或目标版本后来被吊销也照此幂等；
+  - **冲突 409**：目标版本已存在但 PEM 不同，或 PEM 相同但前置版本不同
+    （含目标由 `POST /v1/trust/anchors` 直接注册、无 `created_from`）；
+  - 其余请求（目标版本尚不存在）仅允许 `from_key_version` 为本租户
+    **当前最高且 active** 的版本：前置不存在 404，前置过旧/非最高/
+    已吊销均 400，失败**不改动任何版本**；
+  - 新建版本为 `active`、`updated_at:null`，旧版本状态原样保留；
+  - 成功响应字段同 GET 元素，统一 **200**；
+  - 新建及幂等重试均记 `trust.anchor.rotated`（`resource_type` 为
+    `trust_anchor`、`resource_id` 为 `<did>#<目标版本>`）；409 冲突、
+    400 校验失败与验签均不记审计；
+  - 轮换与审计事件在同一把锁内经同一次原子写落盘，落盘失败回滚；
+    重启后版本、状态与审计保留。旧版本在**显式吊销前**仍可验签，
+    新版本可验签；跨租户继续遵循既有 404 或 200/`valid:false` 规则。
 - `PUT /v1/trust/anchors/{did}/{key_version}/status` 请求体必须恰为
   `{"status":"revoked"}`（其他值/多余字段/路径版本非正整数均 400）；
   锚点版本未知（含他租户）404。首次吊销与重复吊销均返回 **200**：
@@ -240,6 +262,8 @@ curl -X POST localhost:8080/v1/trust/anchors -d '{
 curl localhost:8080/v1/trust/anchors/did:web:example.com
 curl -X PUT localhost:8080/v1/trust/anchors/did:web:example.com/1/status \
   -d '{"status":"revoked"}'
+curl -X POST localhost:8080/v1/trust/anchors/did:web:example.com/rotate \
+  -d '{"from_key_version":1,"public_key":"-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----\n"}'
 curl -X POST localhost:8080/v1/trust/verify \
   -d '{"issuer_did":"did:web:example.com","issuer_key_version":1,
        "payload":{...},"signature":"<base64url R||S>"}'
@@ -270,6 +294,7 @@ curl -X POST localhost:8080/v1/trust/verify \
   | 演示消费成功（并发仅一次） | `presentation.consumed` | `presentation` |
   | 信任锚点注册（含同 DID/版本同 PEM 幂等重试，每次都记） | `trust.anchor.registered` | `trust_anchor` |
   | 信任锚点吊销（首次与幂等重试均记） | `trust.anchor.revoked` | `trust_anchor` |
+  | 信任锚点轮换（新建与幂等重试均记，冲突/校验失败不记） | `trust.anchor.rotated` | `trust_anchor` |
 
   信任锚点审计 `resource_id` 为 `<did>#<key_version>`；注册冲突 409、
   验签（成功或失败）等只读或失败路径不记审计。
@@ -295,6 +320,7 @@ curl -H 'X-Tenant-ID: acme' 'localhost:8080/v1/audit?limit=50&after=0'
 python3 tests/e2e_test.py
 python3 tests/tenant_audit_test.py
 python3 tests/trust_anchor_test.py
+python3 tests/trust_anchor_rotate_test.py
 ```
 
 脚本会临时在本地端口启动服务。`e2e_test.py` 覆盖：201/200/400/404/409 各路径、同 key 去重、
