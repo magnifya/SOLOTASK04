@@ -44,6 +44,7 @@ from .models import (
     CredentialRecord,
     CredentialStatusRecord,
     DIDRecord,
+    PredicateProofRecord,
     PresentationRecord,
     TrustAnchorRecord,
 )
@@ -98,6 +99,8 @@ AUDIT_PRESENTATION_CONSUMED = "presentation.consumed"
 AUDIT_TRUST_ANCHOR_REGISTERED = "trust.anchor.registered"
 AUDIT_TRUST_ANCHOR_REVOKED = "trust.anchor.revoked"
 AUDIT_TRUST_ANCHOR_ROTATED = "trust.anchor.rotated"
+AUDIT_PROOF_CREATED = "proof.created"
+AUDIT_PROOF_CONSUMED = "proof.consumed"
 
 
 def _utc_now() -> str:
@@ -129,18 +132,18 @@ def _validate_key_handle(value: Any, field: str) -> str:
     return handle
 
 
-def _parse_pointer(pointer: str) -> Tuple[str, ...]:
+def _parse_pointer(pointer: str, label: str = "disclose") -> Tuple[str, ...]:
     """解析相对 claims 的 RFC6901 JSON Pointer 为 token 元组。
 
     仅做语法解析：必须为以 "/" 开头的字符串，按 "/" 分段并对
     "~1"/"~0" 反转义（顺序不可颠倒）；根指针 "" 与数组索引语义在
-    _resolve_pointer 中按业务规则拒绝。
+    _resolve_pointer 中按业务规则拒绝。label 为错误措辞中的字段名。
     """
     if not isinstance(pointer, str):
-        raise ValidationError("disclose 路径必须为字符串")
+        raise ValidationError(f"{label} 路径必须为字符串")
     if not pointer.startswith("/"):
         raise ValidationError(
-            f"disclose 路径非法（须以 / 开头）: {pointer!r}"
+            f"{label} 路径非法（须以 / 开头）: {pointer!r}"
         )
     tokens: List[str] = []
     for raw in pointer.split("/")[1:]:
@@ -152,7 +155,7 @@ def _parse_pointer(pointer: str) -> Tuple[str, ...]:
                     idx + 1 >= len(raw) or raw[idx + 1] not in "01"
                 ):
                     raise ValidationError(
-                        f"disclose 路径含非法转义（~ 后须为 0 或 1）: {pointer!r}"
+                        f"{label} 路径含非法转义（~ 后须为 0 或 1）: {pointer!r}"
                     )
                 idx += 1
         tokens.append(raw.replace("~1", "/").replace("~0", "~"))
@@ -160,7 +163,10 @@ def _parse_pointer(pointer: str) -> Tuple[str, ...]:
 
 
 def _resolve_pointer(
-    claims: Dict[str, Any], tokens: Tuple[str, ...], pointer: str
+    claims: Dict[str, Any],
+    tokens: Tuple[str, ...],
+    pointer: str,
+    label: str = "disclose",
 ) -> Any:
     """沿 token 导航 claims 并返回目标值。
 
@@ -168,16 +174,16 @@ def _resolve_pointer(
     经过非对象叶子均按越界/未命中拒绝。
     """
     if not tokens:
-        raise ValidationError("disclose 不允许根路径（零披露请传空列表）")
+        raise ValidationError(f"{label} 不允许根路径（零披露请传空列表）")
     current: Any = claims
     for token in tokens:
         if isinstance(current, list):
             raise ValidationError(
-                f"disclose 路径不允许数组索引: {pointer!r}"
+                f"{label} 路径不允许数组索引: {pointer!r}"
             )
         if not isinstance(current, dict) or token not in current:
             raise ValidationError(
-                f"disclose 路径越界或未命中 claims 属性: {pointer!r}"
+                f"{label} 路径越界或未命中 claims 属性: {pointer!r}"
             )
         current = current[token]
     return current
@@ -228,6 +234,113 @@ def _project_claims(
             target = target.setdefault(key, {})
         target[tokens[-1]] = value
     return projection
+
+
+# 谓词证明支持的操作符
+_PREDICATE_OPS = ("exists", "eq", "gte", "lte")
+
+
+def _json_exact_equal(left: Any, right: Any) -> bool:
+    """JSON 精确相等：布尔与数字不互通（True != 1），其余按值比较。"""
+    if isinstance(left, bool) or isinstance(right, bool):
+        return (
+            isinstance(left, bool)
+            and isinstance(right, bool)
+            and left == right
+        )
+    return left == right
+
+
+def _is_number(value: Any) -> bool:
+    """非布尔 JSON 数字（int/float，排除 True/False）。"""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _validate_predicates(
+    claims: Dict[str, Any], predicates: Any
+) -> Tuple[List[Dict[str, Any]], List[bool]]:
+    """校验谓词列表并对 claims 求值，返回 (回显谓词列表, 同序布尔结果)。
+
+    - predicates 必须为非空数组；元素为 {path, op[, value]} 对象，
+      op 仅支持 exists/eq/gte/lte；exists 禁带 value，其余必须带 value；
+    - path 为相对 claims 的 RFC6901 指针：禁根、禁数组索引、禁越界，
+      且列表内不得重复、不得祖先/后代重叠；
+    - eq 为精确相等（布尔与数字不互通）；gte/lte 要求谓词 value 与
+      claims 命中值均为非布尔数字，否则 ValidationError。
+    """
+    if not isinstance(predicates, list) or not predicates:
+        raise ValidationError("字段 predicates 必须为非空数组")
+    echo: List[Dict[str, Any]] = []
+    results: List[bool] = []
+    seen_tokens: List[Tuple[str, ...]] = []
+    for item in predicates:
+        if not isinstance(item, dict):
+            raise ValidationError("predicates 元素必须为 JSON 对象")
+        if "path" not in item:
+            raise ValidationError("谓词缺少字段: path")
+        if "op" not in item:
+            raise ValidationError("谓词缺少字段: op")
+        op = item["op"]
+        if op not in _PREDICATE_OPS:
+            raise ValidationError(
+                f"谓词 op 非法: {op!r}（仅支持 exists/eq/gte/lte）"
+            )
+        if op == "exists":
+            extra = sorted(set(item) - {"path", "op"})
+            if extra:
+                raise ValidationError(
+                    f"exists 谓词不允许字段: {', '.join(extra)}"
+                )
+        else:
+            if "value" not in item:
+                raise ValidationError(f"{op} 谓词缺少字段: value")
+            extra = sorted(set(item) - {"path", "op", "value"})
+            if extra:
+                raise ValidationError(
+                    f"谓词含多余字段: {', '.join(extra)}"
+                )
+        pointer = item["path"]
+        tokens = _parse_pointer(pointer, label="谓词 path")
+        if tokens in seen_tokens:
+            raise ValidationError(f"谓词 path 重复: {pointer!r}")
+        for existing in seen_tokens:
+            if tokens[: len(existing)] == existing:
+                raise ValidationError(
+                    f"谓词 path 存在祖先重叠: {pointer!r} 被已选路径覆盖"
+                )
+            if existing[: len(tokens)] == tokens:
+                raise ValidationError(
+                    f"谓词 path 存在祖先重叠: 已选路径被 {pointer!r} 覆盖"
+                )
+        claim_value = _resolve_pointer(
+            claims, tokens, pointer, label="谓词 path"
+        )
+        seen_tokens.append(tokens)
+
+        if op == "exists":
+            result = True
+        elif op == "eq":
+            result = _json_exact_equal(claim_value, item["value"])
+        else:
+            if not _is_number(item["value"]):
+                raise ValidationError(
+                    f"{op} 谓词 value 必须为非布尔数字: {pointer!r}"
+                )
+            if not _is_number(claim_value):
+                raise ValidationError(
+                    f"{op} 谓词命中的 claims 值必须为非布尔数字: {pointer!r}"
+                )
+            if op == "gte":
+                result = claim_value >= item["value"]
+            else:
+                result = claim_value <= item["value"]
+
+        echo_item: Dict[str, Any] = {"path": pointer, "op": op}
+        if op != "exists":
+            echo_item["value"] = item["value"]
+        echo.append(echo_item)
+        results.append(result)
+    return echo, results
 
 
 
@@ -292,6 +405,7 @@ class VCStore:
             bucket.setdefault("dids", {})
             bucket.setdefault("credentials", {})
             bucket.setdefault("presentations", {})
+            bucket.setdefault("proofs", {})
             bucket.setdefault("trust_anchors", {})
             for rec in bucket["dids"].values():
                 _migrate_did_row(rec)
@@ -332,6 +446,7 @@ class VCStore:
                 "dids": {},
                 "credentials": {},
                 "presentations": {},
+                "proofs": {},
                 "trust_anchors": {},
             }
             self._tenants[tenant_id] = bucket
@@ -986,6 +1101,302 @@ class VCStore:
                 except Exception:
                     self._restore_locked(snapshot)
                     return False, "验签过程发生内部错误"
+        return True, ""
+
+    # ------------------------------------------------------------------ #
+    # 谓词证明
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _proof_record(row: Dict[str, Any]) -> PredicateProofRecord:
+        return PredicateProofRecord(
+            proof_id=row["proof_id"],
+            credential_id=row["credential_id"],
+            issuer_did=row["issuer_did"],
+            issuer_key_version=int(row["issuer_key_version"]),
+            predicates=list(row.get("predicates", [])),
+            results=list(row.get("results", [])),
+            proof=row["proof"],
+            challenge=row.get("challenge"),
+            expires_at=row.get("expires_at"),
+        )
+
+    def create_proof(
+        self,
+        tenant_id: str,
+        credential_id: str,
+        predicates: Any,
+        challenge: Optional[str] = None,
+        expires_in: Optional[int] = None,
+    ) -> PredicateProofRecord:
+        """对本租户已签发凭证生成谓词证明并持久化，记审计。
+
+        - 凭证不存在（含他租户资源）抛 NotFoundError；predicates 非法
+          （非空数组约束、元素结构、路径语法/越界/重复/祖先重叠、
+          gte/lte 非数字）抛 ValidationError；
+        - challenge 缺省时生成 32 位小写 hex；expires_in 缺省 300 秒，
+          expires_at 为当前 UTC 时间加 expires_in 秒（Z 结尾秒精度）；
+        - results 为与 predicates 同序的布尔求值结果；
+        - proof 为 ES256 签名，覆盖除 proof 外全部字段加 tenant_id 的
+          规范化 JSON，使用凭证 issuer_key_version（旧凭证缺省按 1）
+          对应的历史私钥；proof_id 为 zp_ 加 32 位小写 hex；
+        - 成功记 proof.created（资源类型 predicate_proof）。
+        """
+        if challenge is None:
+            challenge = uuid.uuid4().hex
+        if expires_in is None:
+            expires_in = DEFAULT_EXPIRES_IN
+        expires_at = _utc_after(expires_in)
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            cred = (
+                bucket["credentials"].get(credential_id)
+                if bucket is not None else None
+            )
+            if cred is None:
+                raise NotFoundError(f"凭证不存在: {credential_id}")
+            stored_body = cred["body"]
+            claims = stored_body.get("claims", {})
+            if not isinstance(claims, dict):
+                raise ValidationError("凭证 claims 不是 JSON 对象，无法证明")
+
+            echo, results = _validate_predicates(claims, predicates)
+
+            issuer_did = stored_body["issuer_did"]
+            version = int(stored_body.get("issuer_key_version", 1))
+            private_pem = self._private_key_for_version_locked(
+                bucket, issuer_did, version
+            )
+            if not private_pem:
+                raise ValidationError(
+                    "历史私钥不可用: 签发者 "
+                    f"{issuer_did} 密钥版本 {version} 的私钥不存在"
+                )
+
+            snapshot = self._snapshot_locked()
+            try:
+                proof_id = f"zp_{uuid.uuid4().hex}"
+                unsigned: Dict[str, Any] = {
+                    "proof_id": proof_id,
+                    "credential_id": credential_id,
+                    "issuer_did": issuer_did,
+                    "issuer_key_version": version,
+                    "predicates": echo,
+                    "results": results,
+                    "challenge": challenge,
+                    "expires_at": expires_at,
+                    "tenant_id": tenant_id,
+                }
+                proof = crypto.sign(unsigned, private_pem)
+                row = dict(unsigned)
+                row["proof"] = proof
+                bucket["proofs"][proof_id] = row
+                self._append_audit_locked(
+                    tenant_id, AUDIT_PROOF_CREATED,
+                    "predicate_proof", proof_id,
+                )
+                self._save_locked()
+                return self._proof_record(row)
+            except Exception:
+                self._restore_locked(snapshot)
+                raise
+
+    def verify_proof(
+        self,
+        tenant_id: str,
+        proof_id: str,
+        proof_obj: Any,
+        challenge: Any = CHALLENGE_UNSET,
+    ) -> Tuple[bool, str]:
+        """以存储记录为锚核验谓词证明，返回 (是否有效, 失败原因)。
+
+        校验顺序：请求 -> 资源 -> 绑定（字段集合与各锚定字段，含
+        challenge）-> 已消费 -> 过期 -> 结果重算 -> proof 格式与签名
+        -> 吊销。任何失败均返回非空中文原因，绝不抛异常、不泄露私钥；
+        失败不消费、不记审计。
+
+        验签成功后在消费锁内复查已消费/到期/吊销：复查到期即返回
+        “证明已过期”，不消费、不记审计；未到期并发验证仅一次成功，
+        成功时原子标记已消费并记一次 proof.consumed（标记与事件同一
+        次原子写，失败回滚不记），跨重启保留；已消费优先于过期与
+        吊销；签名成功但凭证已吊销返回“凭证已吊销：<原因>”且不消费。
+        """
+        if not isinstance(proof_obj, dict):
+            return False, "请求不合法: 字段 proof 必须为 JSON 对象"
+        if challenge is CHALLENGE_UNSET:
+            return False, "请求缺少字段: challenge"
+        if not isinstance(challenge, str) or not challenge:
+            return False, "请求字段 challenge 必须为非空字符串"
+
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            row = (
+                bucket["proofs"].get(proof_id)
+                if bucket is not None else None
+            )
+            if row is None:
+                return False, f"证明不存在: {proof_id}"
+
+            expected_keys = {
+                "proof_id",
+                "credential_id",
+                "issuer_did",
+                "issuer_key_version",
+                "predicates",
+                "results",
+                "challenge",
+                "expires_at",
+                "proof",
+            }
+            if set(proof_obj) != expected_keys:
+                return False, (
+                    "锚定校验失败: proof 字段集合与存储记录不一致"
+                )
+            signature = proof_obj.get("proof")
+            if not isinstance(signature, str) or not signature:
+                return False, "请求不合法: 字段 proof.proof 必须为非空字符串"
+            if proof_obj.get("proof_id") != proof_id:
+                return False, (
+                    "锚定校验失败: proof_id 与路径或存储记录不一致"
+                )
+            if proof_obj.get("credential_id") != row.get("credential_id"):
+                return False, (
+                    "锚定校验失败: credential_id 与存储记录不一致"
+                )
+            if proof_obj.get("issuer_did") != row.get("issuer_did"):
+                return False, "锚定校验失败: issuer_did 与存储记录不一致"
+            stored_version = int(row.get("issuer_key_version", 1))
+            version_obj = proof_obj.get("issuer_key_version")
+            if (
+                not isinstance(version_obj, int)
+                or isinstance(version_obj, bool)
+                or version_obj != stored_version
+            ):
+                return False, (
+                    "锚定校验失败: issuer_key_version 与存储记录不一致"
+                )
+            if proof_obj.get("predicates") != row.get("predicates"):
+                return False, "锚定校验失败: predicates 与存储记录不一致"
+            if proof_obj.get("results") != row.get("results"):
+                return False, "锚定校验失败: results 与存储记录不一致"
+            stored_challenge = row.get("challenge")
+            if proof_obj.get("challenge") != stored_challenge:
+                return False, "锚定校验失败: challenge 与存储记录不一致"
+            if challenge != stored_challenge:
+                return False, "锚定校验失败: 请求 challenge 与存储记录不一致"
+            if proof_obj.get("expires_at") != row.get("expires_at"):
+                return False, "锚定校验失败: expires_at 与存储记录不一致"
+            # 已消费优先于过期与吊销
+            if row.get("consumed"):
+                return False, "证明已消费"
+            try:
+                expires_at = _parse_utc_z(row["expires_at"])
+            except (KeyError, TypeError, ValueError):
+                return False, "验签过程发生内部错误"
+            if datetime.now(timezone.utc) >= expires_at:
+                return False, "证明已过期"
+
+            credential_id = row["credential_id"]
+            issuer_did = row["issuer_did"]
+            cred = bucket["credentials"].get(credential_id)
+            if cred is None:
+                return False, f"凭证不存在: {credential_id}"
+            source_claims = cred["body"].get("claims", {})
+            credential_status = cred.get("status")
+            revoke_reason = cred.get("revoke_reason")
+
+            public_pem = self._public_key_for_version_locked(
+                bucket, issuer_did, stored_version
+            )
+
+        # 按存储的 predicates 从存储凭证 claims 重算结果并核对
+        try:
+            recomputed_echo, recomputed_results = _validate_predicates(
+                source_claims, row.get("predicates", [])
+            )
+        except ValidationError as exc:
+            return False, f"结果重算失败: {exc}"
+        if recomputed_echo != row.get("predicates"):
+            return False, "结果重算失败: predicates 与存储记录不一致"
+        if recomputed_results != row.get("results"):
+            return False, (
+                "锚定校验失败: results 与按存储凭证重算的结果不一致"
+            )
+
+        if not public_pem:
+            return False, (
+                "历史公钥不可用: 签发者 "
+                f"{issuer_did} 密钥版本 {stored_version} 的公钥不存在"
+            )
+        try:
+            crypto.validate_public_key_pem(public_pem)
+        except (ValueError, TypeError):
+            return False, (
+                "历史公钥不可用: 签发者 "
+                f"{issuer_did} 密钥版本 {stored_version} 的公钥无法解析"
+            )
+
+        unsigned = {
+            "proof_id": proof_id,
+            "credential_id": credential_id,
+            "issuer_did": issuer_did,
+            "issuer_key_version": stored_version,
+            "predicates": row.get("predicates"),
+            "results": row.get("results"),
+            "challenge": row.get("challenge"),
+            "expires_at": row.get("expires_at"),
+            "tenant_id": tenant_id,
+        }
+        try:
+            crypto.verify(unsigned, signature, public_pem)
+        except crypto.MalformedSignature:
+            return False, "签名格式错误: 不是合法的 ES256 签名编码"
+        except crypto.InvalidSignature:
+            return False, "签名校验失败，证明内容或 proof 可能被改动"
+        except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
+            return False, "验签过程发生内部错误"
+
+        # 签名与锚定均成功后检查凭证状态：已吊销不消费
+        if credential_status == "revoked":
+            saved_reason = revoke_reason or DEFAULT_REVOKE_REASON
+            return False, f"凭证已吊销：{saved_reason}"
+
+        # 原子标记已消费：消费锁内复查已消费/到期/吊销，防止
+        # “锁外验签期间证明到期仍被消费”的竞态。并发仅一次成功，
+        # 跨重启保留；复查到期或已吊销均不消费、不记审计。
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            row = (
+                bucket["proofs"].get(proof_id)
+                if bucket is not None else None
+            )
+            if row is None:
+                return False, f"证明不存在: {proof_id}"
+            if row.get("consumed"):
+                return False, "证明已消费"
+            try:
+                expires_at = _parse_utc_z(row["expires_at"])
+            except (KeyError, TypeError, ValueError):
+                return False, "验签过程发生内部错误"
+            if datetime.now(timezone.utc) >= expires_at:
+                return False, "证明已过期"
+            cred = bucket["credentials"].get(credential_id)
+            if cred is not None and cred.get("status") == "revoked":
+                saved_reason = (
+                    cred.get("revoke_reason") or DEFAULT_REVOKE_REASON
+                )
+                return False, f"凭证已吊销：{saved_reason}"
+            snapshot = self._snapshot_locked()
+            try:
+                row["consumed"] = True
+                row["consumed_at"] = _utc_now()
+                self._append_audit_locked(
+                    tenant_id, AUDIT_PROOF_CONSUMED,
+                    "predicate_proof", proof_id,
+                )
+                self._save_locked()
+            except Exception:
+                self._restore_locked(snapshot)
+                return False, "验签过程发生内部错误"
         return True, ""
 
     # ------------------------------------------------------------------ #

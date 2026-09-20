@@ -35,6 +35,8 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/credentials/{credential_id}/verify` | 验签，请求体 `{"body","signature"}`；**任何失败一律 HTTP 200**，返回 `valid`（失败时附分类中文 `reason`） |
 | POST | `/v1/credentials/{credential_id}/present` | 生成选择性披露演示，请求体恰为 `{"disclose":[路径...]}` 加可选 `challenge`、`expires_in`；成功 201 返回演示对象；字段问题 400、未知凭证 404 |
 | POST | `/v1/presentations/{presentation_id}/verify` | 校验演示，新演示请求体恰为 `{"presentation":对象,"challenge":串}`（旧演示恰为 `{"presentation":对象}`）；**任何失败一律 HTTP 200**，成功 `{"valid":true}`，失败附非空中文 `reason` |
+| POST | `/v1/credentials/{credential_id}/prove` | 生成谓词证明，请求体恰为 `{"predicates":[{path,op[,value]}...]}`（非空）加可选 `challenge`、`expires_in`；成功 201 返回证明对象；字段问题 400、未知凭证 404 |
+| POST | `/v1/proofs/{proof_id}/verify` | 核验谓词证明，请求体恰为 `{"proof":对象,"challenge":串}`；**任何失败一律 HTTP 200**，成功 `{"valid":true}`，失败附非空中文 `reason`；并发仅一次成功 |
 | POST | `/v1/trust/anchors` | 注册信任锚点，请求体 `{"did","public_key","key_version"}`（非空字符串、P-256 PEM、非布尔正整数）；返回 201 与 `did`、`public_key`、`key_version`、`status:"active"`、`updated_at:null` |
 | POST | `/v1/trust/anchors/{did}/rotate` | 带前置版本校验的密钥轮换，请求体须恰含 `from_key_version`（非布尔正整数）、`public_key`（P-256 PEM）；目标版本为 `from_key_version+1`；新建 201、同前置同 PEM 幂等重试 200，响应字段同 GET 元素 |
 | GET | `/v1/trust/anchors/{did}` | 返回该 DID 的全部锚点版本数组（按 `key_version` 升序）；未知 DID 404 |
@@ -43,7 +45,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | GET | `/v1/audit?limit=&after=` | 查询本租户审计事件，按 seq 升序；返回 `events`、`next_after`，参数校验见下文 |
 
 - 所有 `/v1` 请求读取 `X-Tenant-ID` 头确定租户：**缺省为 `default`**；显式提供时必须非空，否则 400。
-- DID、凭证、演示与 `key_handle` 均按租户隔离：同一句柄可在不同租户分别注册；访问他租户资源一律按不存在处理（DID/凭证/演示为 404，跨租户引用 DID 签发为 400 并指明 `issuer_did`/`subject_did`，验签类端点仍遵循公开错误协议返回 200/`valid:false`）。
+- DID、凭证、演示、谓词证明与 `key_handle` 均按租户隔离：同一句柄可在不同租户分别注册；访问他租户资源一律按不存在处理（DID/凭证/演示为 404，跨租户引用 DID 签发为 400 并指明 `issuer_did`/`subject_did`，验签类端点仍遵循公开错误协议返回 200/`valid:false`）。
 - DID 形如 `did:example:<32 位 hex>`。
 - `public_key` 为**句柄**：非空且不能是 PEM 文本；同一句柄再次提交返回其既有 DID（按提交原文去重）。
 - `key_mode` 缺省为 `server`（服务端托管密钥），其余取值一律 400。
@@ -199,6 +201,48 @@ curl -X POST localhost:8080/v1/credentials/vc_<id>/present \
   -d '{"disclose":["/role","/addr/city"],"challenge":"abc","expires_in":300}'
 curl -X POST localhost:8080/v1/presentations/vp_<id>/verify \
   -d '{"presentation":{ ...上一步返回的整个演示对象... },"challenge":"abc"}'
+```
+
+### 谓词证明
+
+- `POST /v1/credentials/{credential_id}/prove` 请求体必须**恰为**
+  `{"predicates":[谓词...]}` 加可选 `challenge`、`expires_in`：`predicates`
+  缺失、为空或不是数组、含多余字段一律 400；未知凭证 404。
+  `challenge`/`expires_in` 规则与演示一致（非空字符串、按 Unicode 码点
+  不超过 256、缺省 32 位小写 hex；非布尔整数 1–86400、缺省 300）。
+- 每个谓词为 `{"path","op"[,"value"]}`：`op` 仅支持 `exists`/`eq`/
+  `gte`/`lte`；`exists` **禁带 `value`**，其余必须带 `value`；元素不得
+  含多余字段。`path` 为相对 `claims` 的 RFC 6901 指针，规则与演示相同
+  （禁根、禁数组索引、禁越界、不得重复、不得祖先/后代重叠）。
+- 求值语义：`eq` 为**精确相等**（布尔与数字不互通，`true != 1`）；
+  `gte`/`lte` 要求谓词 `value` 与命中的 claims 值**均为非布尔数字**，
+  否则 400。
+- 成功返回 201，字段恰为：`proof_id`（`zp_` 加 32 位小写 hex）、
+  `credential_id`、`issuer_did`、`issuer_key_version`、`predicates`
+  （原样回显）、`results`（与 `predicates` **同序**的布尔结果）、
+  `challenge`、`expires_at`、`proof`。
+- `proof` 为 **ES256**、无填充 base64url 的裸 `R||S` 签名，覆盖**除
+  `proof` 外全部字段加 `tenant_id`** 按 key 升序的规范化 JSON，使用凭证
+  `issuer_key_version` 对应的历史版本私钥；证明记录随状态文件持久化在
+  `proofs` 中，重启后仍可核验。
+- `POST /v1/proofs/{proof_id}/verify` 采用与演示验签相同的公开错误协议：
+  **任何失败都返回 HTTP 200** 与 `{"valid":false,"reason":"<非空中文
+  原因>"}`。请求体必须**恰为** `{"proof":对象,"challenge":串}`。校验
+  顺序：请求 -> 资源 -> 绑定（字段集合与各锚定字段，请求 `challenge`、
+  证明 `challenge` 与存储 `challenge` 一致）-> 已消费（`证明已消费`，
+  优先于过期与吊销）-> 过期（`证明已过期`）-> 按存储凭证 `claims` 与
+  存储 `predicates` **重算结果**并核对 -> `proof` 格式与签名 -> 吊销。
+  成功才进入消费：消费锁内复查已消费/到期/吊销后原子标记，未到期并发
+  验证仅一次返回 `{"valid":true}` 并记一次 `proof.consumed`（资源类型
+  `predicate_proof`）；**失败不消费**，消费记录跨重启保留。
+- 审计：签发记 `proof.created`，成功消费记 `proof.consumed`，资源类型
+  均为 `predicate_proof`，资源 ID 为 `proof_id`。
+
+```bash
+curl -X POST localhost:8080/v1/credentials/vc_<id>/prove \
+  -d '{"predicates":[{"path":"/age","op":"gte","value":18},{"path":"/addr/city","op":"exists"}]}'
+curl -X POST localhost:8080/v1/proofs/zp_<id>/verify \
+  -d '{"proof":{ ...上一步返回的整个证明对象... },"challenge":"<证明的 challenge>"}'
 ```
 
 ### 信任锚点注册表

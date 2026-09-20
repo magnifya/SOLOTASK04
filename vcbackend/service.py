@@ -12,6 +12,8 @@
   POST /v1/credentials/{credential_id}/verify  以存储记录为锚验签
   POST /v1/credentials/{credential_id}/present 生成选择性披露演示
   POST /v1/presentations/{presentation_id}/verify  以存储记录为锚校验演示
+  POST /v1/credentials/{credential_id}/prove    生成谓词证明
+  POST /v1/proofs/{proof_id}/verify             以存储记录为锚核验谓词证明
   POST /v1/trust/anchors                  注册信任锚点（同 DID/版本同 PEM 幂等）
   POST /v1/trust/anchors/{did}/rotate     带前置版本校验的密钥轮换
   GET  /v1/trust/anchors/{did}            查询 DID 的全部锚点版本
@@ -165,6 +167,20 @@ def build_handler(store: VCStore) -> type:
                         path[len("/v1/credentials/") : -len("/present")]
                     )
                     self._post_present(tenant, credential_id)
+                elif path.startswith("/v1/credentials/") and path.endswith(
+                    "/prove"
+                ):
+                    credential_id = unquote(
+                        path[len("/v1/credentials/") : -len("/prove")]
+                    )
+                    self._post_prove(tenant, credential_id)
+                elif path.startswith("/v1/proofs/") and path.endswith(
+                    "/verify"
+                ):
+                    proof_id = unquote(
+                        path[len("/v1/proofs/") : -len("/verify")]
+                    )
+                    self._post_verify_proof(tenant, proof_id)
                 elif path.startswith("/v1/presentations/") and path.endswith(
                     "/verify"
                 ):
@@ -568,6 +584,119 @@ def build_handler(store: VCStore) -> type:
             try:
                 valid, reason = store.verify_presentation(
                     tenant, presentation_id, data["presentation"], challenge
+                )
+            except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
+                self._send_invalid("验签过程发生内部错误")
+                return
+            payload: Dict[str, Any] = {"valid": valid}
+            if not valid:
+                payload["reason"] = reason or "验签失败"
+            self._send_json(200, payload)
+
+        def _post_prove(self, tenant: str, credential_id: str) -> None:
+            # 请求体必须恰为 {"predicates": [...]} 加可选 challenge、
+            # expires_in：predicates 缺失/为空、元素结构或路径非法、
+            # 多余字段一律 400；未知凭证 404。
+            # challenge 须为非空字符串且按 Unicode 码点不超过 256，
+            # 缺省生成 32 位小写 hex；expires_in 须为非布尔整数且
+            # 在 1..86400 之间，缺省 300。成功 201 返回证明记录。
+            data = self._read_json()
+            if "predicates" not in data:
+                raise ValidationError("缺少字段: predicates")
+            extra = sorted(
+                set(data) - {"predicates", "challenge", "expires_in"}
+            )
+            if extra:
+                raise ValidationError(f"多余字段: {', '.join(extra)}")
+            challenge = None
+            if "challenge" in data:
+                challenge = data["challenge"]
+                if not isinstance(challenge, str) or not challenge:
+                    raise ValidationError("字段 challenge 必须为非空字符串")
+                if len(challenge) > 256:
+                    raise ValidationError(
+                        "字段 challenge 按 Unicode 码点不能超过 256"
+                    )
+            expires_in = None
+            if "expires_in" in data:
+                expires_in = data["expires_in"]
+                if not isinstance(expires_in, int) or isinstance(
+                    expires_in, bool
+                ):
+                    raise ValidationError("字段 expires_in 必须为整数")
+                if not 1 <= expires_in <= 86400:
+                    raise ValidationError(
+                        "字段 expires_in 须在 1 到 86400 之间"
+                    )
+            record = store.create_proof(
+                tenant,
+                credential_id,
+                data["predicates"],
+                challenge=challenge,
+                expires_in=expires_in,
+            )
+            self._send_json(
+                201,
+                {
+                    "proof_id": record.proof_id,
+                    "credential_id": record.credential_id,
+                    "issuer_did": record.issuer_did,
+                    "issuer_key_version": record.issuer_key_version,
+                    "predicates": record.predicates,
+                    "results": record.results,
+                    "challenge": record.challenge,
+                    "expires_at": record.expires_at,
+                    "proof": record.proof,
+                },
+            )
+
+        def _post_verify_proof(self, tenant: str, proof_id: str) -> None:
+            # 与凭证/演示 verify 相同的公开错误协议：任何“验签失败”
+            # 都返回 200 + {"valid": false, "reason": "<非空中文原因>"}，
+            # 绝不返回 404/500。请求体必须恰为 {"proof": 对象,
+            # "challenge": 串}。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                self._send_invalid("请求体缺失或长度声明非法")
+                return
+            except Exception:  # noqa: BLE001
+                self._send_invalid("请求体读取失败")
+                return
+            if not raw:
+                self._send_invalid("请求体缺失")
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                self._send_invalid("请求体不是合法 UTF-8 文本")
+                return
+            except json.JSONDecodeError:
+                self._send_invalid("请求体不是合法 JSON")
+                return
+            if not isinstance(data, dict):
+                self._send_invalid("请求体必须为 JSON 对象")
+                return
+            if "proof" not in data:
+                self._send_invalid("请求缺少字段: proof")
+                return
+            extra = sorted(set(data) - {"proof", "challenge"})
+            if extra:
+                self._send_invalid(f"请求含多余字段: {', '.join(extra)}")
+                return
+            challenge = CHALLENGE_UNSET
+            if "challenge" in data:
+                challenge = data["challenge"]
+                if not isinstance(challenge, str) or not challenge:
+                    self._send_invalid(
+                        "请求字段 challenge 必须为非空字符串"
+                    )
+                    return
+
+            try:
+                valid, reason = store.verify_proof(
+                    tenant, proof_id, data["proof"], challenge
                 )
             except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
                 self._send_invalid("验签过程发生内部错误")
