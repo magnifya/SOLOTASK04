@@ -42,6 +42,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | GET | `/v1/trust/anchors/{did}` | 返回该 DID 的全部锚点版本数组（按 `key_version` 升序）；未知 DID 404 |
 | PUT | `/v1/trust/anchors/{did}/{key_version}/status` | 吊销锚点版本，请求体必须恰为 `{"status":"revoked"}`；首次与重复均 200，首次置 UTC 秒精度 `updated_at`，重复保持不变；未知版本 404 |
 | POST | `/v1/trust/verify` | 信任验签，请求体含非空字符串 `issuer_did`、正整数 `issuer_key_version`、非空字符串 `signature`；**缺失、吊销或验签失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
+| POST | `/v1/trust/credentials/verify` | 跨系统凭证验真：验证未在本租户签发或存储的外部凭证，无需登记 DID/凭证；请求体须恰含 `body`、`signature`；**任何失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
 | GET | `/v1/audit?limit=&after=` | 查询本租户审计事件，按 seq 升序；返回 `events`、`next_after`，参数校验见下文 |
 
 - 所有 `/v1` 请求读取 `X-Tenant-ID` 头确定租户：**缺省为 `default`**；显式提供时必须非空，否则 400。
@@ -279,6 +280,24 @@ curl -X POST localhost:8080/v1/proofs/zp_<id>/verify \
   去掉 `signature` 字段后**按 key 升序的规范化 JSON（紧凑序列化、UTF-8、
   嵌套对象递归排序）；公钥取本租户匹配 `(issuer_did, issuer_key_version)`
   的锚点，且仅 `active` 状态参与验签。
+- `POST /v1/trust/credentials/verify` 验证**未在本租户签发或存储的外部
+  凭证**：无需登记 DID/凭证，只读、不写凭证/状态/审计，跨租户各自使用
+  本租户锚点，重启后行为不变。
+  - 请求体必须**恰含** `body`（JSON 对象）与 `signature`（非空字符串）；
+    缺失、多余字段、请求体缺失/非法 JSON/非对象一律按请求错误返回
+    HTTP 200 + `{"valid":false,"reason":"请求…"}`。
+  - `body` 必须含 `credential_id`、`issuer_did`、`subject_did`、
+    `claims`、`issued_at`，依次为非空字符串、非空字符串、非空字符串、
+    对象、非空字符串；缺失或类型非法返回前缀“凭证”的原因。
+  - `issuer_key_version` 可省略：省略时按版本 **1** 查锚点，且**不得注入
+    签名正文**（签名覆盖的就是请求中的完整 `body` 原文）；提供时须为
+    非布尔正整数。其他扩展字段允许出现在 `body` 中且**全部参与签名**。
+  - 校验顺序：请求结构 → 凭证字段 → 锚点 → 签名格式 → 密码学验签。
+    锚点按本租户 `(issuer_did, 版本)` 查找，仅 `active` 的 P-256 公钥
+    可用：缺失返回前缀“锚点”的原因，已吊销返回前缀“锚点”的吊销原因。
+  - 签名为 **ES256/SHA-256**，64 字节裸 `R||S` 的无填充 base64url，覆盖
+    完整 `body` 的递归排序紧凑 JSON；签名编码非法返回前缀“签名格式错误”，
+    密码学验签失败返回前缀“签名校验失败”。成功仅返回 `{"valid":true}`。
 - `POST /v1/trust/anchors/{did}/rotate` 在既有锚点上做带前置版本校验的
   密钥轮换：
   - 请求体必须**恰含** `from_key_version`（非布尔正整数）与 `public_key`
@@ -317,6 +336,10 @@ curl -X PUT localhost:8080/v1/trust/anchors/did:web:example.com/1/status \
 curl -X POST localhost:8080/v1/trust/verify \
   -d '{"issuer_did":"did:web:example.com","issuer_key_version":1,
        "payload":{...},"signature":"<base64url R||S>"}'
+curl -X POST localhost:8080/v1/trust/credentials/verify \
+  -d '{"body":{"credential_id":"vc_ext_1","issuer_did":"did:web:example.com",
+       "subject_did":"did:web:subject","claims":{...},"issued_at":"2026-09-21T00:00:00Z",
+       "issuer_key_version":1},"signature":"<base64url R||S>"}'
 ```
 
 ### 多租户与审计日志
@@ -375,6 +398,7 @@ python3 tests/tenant_audit_test.py
 python3 tests/trust_anchor_test.py
 python3 tests/trust_anchor_rotate_test.py
 python3 tests/predicate_proof_test.py
+python3 tests/trust_credential_verify_test.py
 ```
 
 脚本会临时在本地端口启动服务。`e2e_test.py` 覆盖：201/200/400/404/409 各路径、同 key 去重、
@@ -409,8 +433,8 @@ vcbackend/
                轮换、凭证签发/验签、选择性披露演示（RFC6901 路径校验、
                claims 投影）、谓词证明（谓词校验/求值、results 重算）、
                消费锁内复查过期，信任锚点注册/吊销/验签/
-               带前置版本校验的轮换，以及全局连续审计事件与状态变更的
-               同一次原子写（失败回滚）
+               带前置版本校验的轮换、跨系统外部凭证验真，以及全局连续
+               审计事件与状态变更的同一次原子写（失败回滚）
   service.py   标准库 HTTP 路由、X-Tenant-ID 租户解析、/v1/audit 与错误映射
   cli.py       did-create / did-show / issue / verify / serve
 tests/e2e_test.py                  端到端测试（默认租户，全协议兼容）
@@ -419,4 +443,7 @@ tests/trust_anchor_test.py         信任锚点注册/查询/吊销/验签测试
 tests/trust_anchor_rotate_test.py  信任锚点密钥轮换（400/404/409/幂等/审计/重启）
 tests/predicate_proof_test.py      谓词证明（prove 字段/400/404、verify 消费/
                                    过期/篡改/跨租户/并发/审计/重启）
+tests/trust_credential_verify_test.py  跨系统凭证验真（请求/凭证/锚点/
+                                   签名格式/验签分类 reason、省略版本不注入、
+                                   扩展字段参与签名、只读不记审计、跨租户/重启）
 ```
