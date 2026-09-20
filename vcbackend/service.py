@@ -19,6 +19,7 @@
   GET  /v1/trust/anchors/{did}            查询 DID 的全部锚点版本
   PUT  /v1/trust/anchors/{did}/{key_version}/status  吊销锚点版本
   POST /v1/trust/verify                   用 active 锚点公钥验签
+  POST /v1/trust/credentials/verify       跨系统外部凭证验真（以锚点公钥验签完整 body）
   GET  /v1/audit                          查询本租户审计事件
 
 多租户：所有 /v1 请求取 X-Tenant-ID 头，缺省为 "default"；显式
@@ -201,6 +202,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_anchor_rotate(tenant, did)
                 elif path == "/v1/trust/verify":
                     self._post_trust_verify(tenant)
+                elif path == "/v1/trust/credentials/verify":
+                    self._post_trust_credentials_verify(tenant)
                 else:
                     self._send_error(404, f"无此路径: {path}")
             except ValidationError as exc:
@@ -838,6 +841,43 @@ def build_handler(store: VCStore) -> type:
 
             try:
                 valid, reason = store.verify_trust(tenant, data)
+            except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
+                self._send_invalid("验签过程发生内部错误")
+                return
+            payload: Dict[str, Any] = {"valid": valid}
+            if not valid:
+                payload["reason"] = reason or "验签失败"
+            self._send_json(200, payload)
+
+        def _post_trust_credentials_verify(self, tenant: str) -> None:
+            # 跨系统凭证验真：与 /v1/trust/verify 相同的公开错误协议，
+            # 任何失败都返回 200 + {"valid": false, "reason": 中文原因}。
+            # 请求层失败（缺体/非法 UTF-8/非法 JSON/非对象）原因以“请求”
+            # 开头；其余结构与凭证字段校验在 store 内按统一前缀返回。
+            # 只读：不写凭证、状态或审计。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                self._send_invalid("请求体缺失或长度声明非法")
+                return
+            except Exception:  # noqa: BLE001
+                self._send_invalid("请求体读取失败")
+                return
+            if not raw:
+                self._send_invalid("请求体缺失")
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                self._send_invalid("请求体不是合法 UTF-8 文本")
+                return
+            except json.JSONDecodeError:
+                self._send_invalid("请求体不是合法 JSON")
+                return
+
+            try:
+                valid, reason = store.verify_trust_credential(tenant, data)
             except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
                 self._send_invalid("验签过程发生内部错误")
                 return

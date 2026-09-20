@@ -1859,6 +1859,104 @@ class VCStore:
             return False, "验签过程发生内部错误"
         return True, ""
 
+    def verify_trust_credential(
+        self,
+        tenant_id: str,
+        data: Any,
+    ) -> Tuple[bool, str]:
+        """跨系统凭证验真：验证未在本租户签发或存储的外部凭证。
+
+        校验顺序为 请求结构 -> 凭证字段 -> 锚点 -> 签名格式 -> 密码学验签，
+        任一步失败返回 (False, 非空中文原因)，成功返回 (True, "")。
+
+        - 请求体须为 JSON 对象且恰含 body（对象）与 signature（非空字符串）；
+        - body 须含 credential_id/issuer_did/subject_did（均非空字符串）、
+          claims（对象）、issued_at（非空字符串）；issuer_key_version 可省略，
+          省略时按版本 1 查锚点且不注入签名正文，提供时须为非布尔正整数；
+          其余扩展字段允许且全部参与签名；
+        - 锚点按本租户 (issuer_did, 版本) 查找，仅 active 的 P-256 公钥可用，
+          缺失或已吊销均失败；
+        - 签名为 ES256/SHA-256，64 字节裸 R||S 的无填充 base64url，覆盖完整
+          body 按 key 递归升序的紧凑 JSON。
+
+        只读操作：不写凭证/状态/审计，不注入或改动任何字段，跨租户使用
+        各自锚点。
+        """
+        # --- 1. 请求结构 ---
+        if not isinstance(data, dict):
+            return False, "请求不合法: 请求体必须为 JSON 对象"
+        if "body" not in data:
+            return False, "请求缺少字段: body"
+        if "signature" not in data:
+            return False, "请求缺少字段: signature"
+        extra = sorted(set(data) - {"body", "signature"})
+        if extra:
+            return False, f"请求含多余字段: {', '.join(extra)}"
+        body = data["body"]
+        if not isinstance(body, dict):
+            return False, "请求不合法: 字段 body 必须为 JSON 对象"
+        signature = data["signature"]
+        if not isinstance(signature, str) or not signature:
+            return False, "请求不合法: 字段 signature 必须为非空字符串"
+
+        # --- 2. 凭证字段 ---
+        for field in ("credential_id", "issuer_did", "subject_did", "issued_at"):
+            value = body.get(field)
+            if not isinstance(value, str) or not value:
+                return False, (
+                    f"凭证字段 {field} 必须为非空字符串"
+                )
+        claims = body.get("claims")
+        if not isinstance(claims, dict):
+            return False, "凭证字段 claims 必须为 JSON 对象"
+        key_version = 1
+        if "issuer_key_version" in body:
+            raw_version = body["issuer_key_version"]
+            if (
+                not isinstance(raw_version, int)
+                or isinstance(raw_version, bool)
+                or raw_version < 1
+            ):
+                return False, (
+                    "凭证字段 issuer_key_version 必须为非布尔正整数"
+                )
+            key_version = raw_version
+        issuer_did = body["issuer_did"]
+
+        # --- 3. 锚点（仅本租户、仅 active） ---
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            anchors = (
+                bucket["trust_anchors"].get(issuer_did)
+                if bucket is not None else None
+            )
+            row = (
+                anchors.get(str(key_version))
+                if anchors is not None else None
+            )
+            if row is None:
+                return False, (
+                    f"锚点不存在: {issuer_did}#{key_version}"
+                )
+            status = row.get("status", "active")
+            public_pem = row.get("public_key", "")
+
+        if status == "revoked":
+            return False, f"锚点已吊销: {issuer_did}#{key_version}"
+
+        # --- 4/5. 签名格式与密码学验签 ---
+        # 签名覆盖完整 body 原文（含全部扩展字段）；省略
+        # issuer_key_version 时不注入任何字段。
+        try:
+            crypto.verify(body, signature, public_pem)
+        except crypto.MalformedSignature:
+            return False, "签名格式错误: 不是合法的 ES256 签名编码"
+        except crypto.InvalidSignature:
+            return False, "签名校验失败，凭证正文或签名可能被改动"
+        except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
+            return False, "验签过程发生内部错误"
+        return True, ""
+
     def rotate_trust_anchor(
         self,
         tenant_id: str,
