@@ -13,6 +13,7 @@
   POST /v1/credentials/{credential_id}/present 生成选择性披露演示
   POST /v1/presentations/{presentation_id}/verify  以存储记录为锚校验演示
   POST /v1/trust/anchors                  注册信任锚点（同 DID/版本同 PEM 幂等）
+  POST /v1/trust/anchors/{did}/rotate     带前置版本校验的密钥轮换
   GET  /v1/trust/anchors/{did}            查询 DID 的全部锚点版本
   PUT  /v1/trust/anchors/{did}/{key_version}/status  吊销锚点版本
   POST /v1/trust/verify                   用 active 锚点公钥验签
@@ -175,6 +176,13 @@ def build_handler(store: VCStore) -> type:
                     )
                 elif path == "/v1/trust/anchors":
                     self._post_trust_anchors(tenant)
+                elif path.startswith("/v1/trust/anchors/") and path.endswith(
+                    "/rotate"
+                ):
+                    did = unquote(
+                        path[len("/v1/trust/anchors/") : -len("/rotate")]
+                    )
+                    self._post_trust_anchor_rotate(tenant, did)
                 elif path == "/v1/trust/verify":
                     self._post_trust_verify(tenant)
                 else:
@@ -638,6 +646,40 @@ def build_handler(store: VCStore) -> type:
             record = store.revoke_trust_anchor(tenant, did, int(key_version))
             # 首次吊销与幂等重试均 200，updated_at 保持首次值
             self._send_json(200, self._trust_anchor_payload(record))
+
+        def _post_trust_anchor_rotate(
+            self, tenant: str, did: str
+        ) -> None:
+            # 请求体必须恰含 from_key_version（非布尔正整数）与
+            # public_key（可解析的 P-256 PEM）；缺失、多余、类型或
+            # PEM 非法一律 400。DID 不存在（含他租户）由 store 判 404。
+            data = self._read_json()
+            if "from_key_version" not in data:
+                raise ValidationError("缺少字段: from_key_version")
+            if "public_key" not in data:
+                raise ValidationError("缺少字段: public_key")
+            extra = sorted(
+                set(data) - {"from_key_version", "public_key"}
+            )
+            if extra:
+                raise ValidationError(f"多余字段: {', '.join(extra)}")
+            from_key_version = data["from_key_version"]
+            if (
+                not isinstance(from_key_version, int)
+                or isinstance(from_key_version, bool)
+                or from_key_version < 1
+            ):
+                raise ValidationError(
+                    "字段 from_key_version 必须为正整数"
+                )
+            record, created = store.rotate_trust_anchor(
+                tenant, did, from_key_version, data["public_key"]
+            )
+            # 新建版本 201；同一前置同 PEM 的幂等重试 200。
+            self._send_json(
+                201 if created else 200,
+                self._trust_anchor_payload(record),
+            )
 
         def _post_trust_verify(self, tenant: str) -> None:
             # 与凭证/演示 verify 相同的公开错误协议：任何失败都返回

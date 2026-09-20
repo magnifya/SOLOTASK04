@@ -97,6 +97,7 @@ AUDIT_PRESENTATION_CREATED = "presentation.created"
 AUDIT_PRESENTATION_CONSUMED = "presentation.consumed"
 AUDIT_TRUST_ANCHOR_REGISTERED = "trust.anchor.registered"
 AUDIT_TRUST_ANCHOR_REVOKED = "trust.anchor.revoked"
+AUDIT_TRUST_ANCHOR_ROTATED = "trust.anchor.rotated"
 
 
 def _utc_now() -> str:
@@ -1436,3 +1437,124 @@ class VCStore:
         except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
             return False, "验签过程发生内部错误"
         return True, ""
+
+    def rotate_trust_anchor(
+        self,
+        tenant_id: str,
+        did: Any,
+        from_key_version: Any,
+        public_key: Any,
+    ) -> Tuple[TrustAnchorRecord, bool]:
+        """基于前置版本轮换信任锚点密钥，返回 (新版本记录, 是否新建)。
+
+        请求字段：from_key_version 为非布尔正整数，public_key 为可解析
+        的 P-256 PEM；否则 ValidationError(400)。目标版本恒为
+        from_key_version + 1。
+
+        - DID 在本租户不存在（含他租户）抛 NotFoundError(404)；
+        - 目标版本已存在：
+          * 由同一 from_key_version 创建且 PEM 相同 -> 幂等返回既有记录
+            （200），每次重试均记 trust.anchor.rotated；即使前置或目标
+            后来已吊销也照此幂等；
+          * PEM 不同，或 PEM 相同但前置不同 -> ConflictError(409)，
+            不记审计；
+        - 目标不存在时仅允许前置为本租户当前最高且 active 的版本：
+          前置不存在 NotFoundError(404)；前置已吊销或非最高版本
+          ValidationError(400)，不改动任何版本、不记审计；
+        - 新版本为 active、updated_at 为 None，旧版本状态原样保留；
+          轮换与审计在同一把锁内经同一次原子写落盘，失败回滚。
+        """
+        if not isinstance(did, str) or not did:
+            raise ValidationError("路径参数 did 必须为非空字符串")
+        if not isinstance(public_key, str) or not public_key:
+            raise ValidationError("字段 public_key 必须为非空字符串")
+        if (
+            not isinstance(from_key_version, int)
+            or isinstance(from_key_version, bool)
+            or from_key_version < 1
+        ):
+            raise ValidationError("字段 from_key_version 必须为正整数")
+        try:
+            crypto.validate_public_key_pem(public_key)
+        except (ValueError, TypeError) as exc:
+            raise ValidationError(
+                f"字段 public_key 不是合法的 P-256 PEM: {exc}"
+            )
+
+        target_version = from_key_version + 1
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            anchors = (
+                bucket["trust_anchors"].get(did)
+                if bucket is not None else None
+            )
+            if not anchors:
+                raise NotFoundError(f"信任锚点不存在: {did}")
+
+            target_row = anchors.get(str(target_version))
+            if target_row is not None:
+                same_pem = target_row.get("public_key") == public_key
+                same_from = (
+                    int(target_row.get("from_key_version", -1))
+                    == from_key_version
+                )
+                if same_pem and same_from:
+                    snapshot = self._snapshot_locked()
+                    try:
+                        # 幂等重试同样每次记录审计（前置/目标已吊销亦然）
+                        self._append_audit_locked(
+                            tenant_id,
+                            AUDIT_TRUST_ANCHOR_ROTATED,
+                            "trust_anchor",
+                            f"{did}#{target_version}",
+                        )
+                        self._save_locked()
+                    except Exception:
+                        self._restore_locked(snapshot)
+                        raise
+                    return self._trust_anchor_record(did, target_row), False
+                # 目标已被其他 PEM 或其他前置占用
+                raise ConflictError(
+                    f"信任锚点目标版本已存在且不可幂等复用: "
+                    f"{did}#{target_version}"
+                )
+
+            # 目标不存在：前置必须存在、active 且为当前最高版本
+            from_row = anchors.get(str(from_key_version))
+            if from_row is None:
+                raise NotFoundError(
+                    f"信任锚点前置版本不存在: {did}#{from_key_version}"
+                )
+            if from_row.get("status", "active") == "revoked":
+                raise ValidationError(
+                    "前置版本已吊销，不能作为轮换基准: "
+                    f"{did}#{from_key_version}"
+                )
+            max_version = max(int(version) for version in anchors)
+            if from_key_version != max_version:
+                raise ValidationError(
+                    "from_key_version 不是当前最高 active 版本"
+                    f"（当前最高 {max_version}）: {did}#{from_key_version}"
+                )
+
+            snapshot = self._snapshot_locked()
+            try:
+                row = {
+                    "key_version": target_version,
+                    "public_key": public_key,
+                    "status": "active",
+                    "updated_at": None,
+                    "from_key_version": from_key_version,
+                }
+                anchors[str(target_version)] = row
+                self._append_audit_locked(
+                    tenant_id,
+                    AUDIT_TRUST_ANCHOR_ROTATED,
+                    "trust_anchor",
+                    f"{did}#{target_version}",
+                )
+                self._save_locked()
+                return self._trust_anchor_record(did, row), True
+            except Exception:
+                self._restore_locked(snapshot)
+                raise
