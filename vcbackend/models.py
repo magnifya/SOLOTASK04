@@ -126,6 +126,24 @@ class CredentialStatusSyncRecord:
 
 
 @dataclass
+class CredentialStatusHistoryEvent:
+    """外部凭证状态历史中的一条追加事件（只读查询用）。
+
+    按 (issuer_did, credential_id) 双键归属；cursor 为租户内持久化正整数，
+    按追加顺序递增。audit_seq/audit_timestamp 关联产生该状态的同步审计
+    事件；无法追溯（旧状态补录的兼容项）时为 None。
+    """
+
+    status: str
+    reason: Optional[str]
+    updated_at: str
+    issuer_key_version: int
+    cursor: int
+    audit_seq: Optional[int] = None
+    audit_timestamp: Optional[int] = None
+
+
+@dataclass
 class AuditEvent:
     """一条审计事件。
 

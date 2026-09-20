@@ -45,6 +45,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/trust/credentials/verify` | 跨系统凭证验真：验证未在本租户签发或存储的外部凭证，无需登记 DID/凭证；请求体须恰含 `body`、`signature`；**任何失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
 | POST | `/v1/trust/credential-status/sync` | 外部凭证状态同步：请求体须恰含 `body`、`signature`，`body` 须恰含 `issuer_did`、`credential_id`、`status`、`updated_at`、`issuer_key_version`，可选 `reason`；请求/字段非法 400；锚点或签名失败 HTTP 200、`valid:false` 且不写入；首次同步 201、相同重放 200 不重复审计、严格更新替换、同时间不同内容 409 |
 | GET | `/v1/trust/credential-status/{credential_id}?issuer_did=...` | 查询已同步的外部凭证状态；`issuer_did` 须唯一非空；已同步返回 `status`、`reason`、`updated_at`，未同步（含他租户）404 |
+| GET | `/v1/trust/credential-status/{credential_id}/history?issuer_did=...&limit=&after=` | 只读查询外部凭证状态历史（兼容同步）；按 `updated_at` 升序、同值按 `cursor`；缺/重/空 `issuer_did` 400，`limit`/`after` 非法 400，未同步双键（含他租户）404 |
 | GET | `/v1/audit?limit=&after=` | 查询本租户审计事件，按 seq 升序；返回 `events`、`next_after`，参数校验见下文 |
 
 - 所有 `/v1` 请求读取 `X-Tenant-ID` 头确定租户：**缺省为 `default`**；显式提供时必须非空，否则 400。
@@ -397,6 +398,43 @@ curl -X POST localhost:8080/v1/trust/credential-status/sync -d '{
 curl "localhost:8080/v1/trust/credential-status/vc_ext_1?issuer_did=did:web:example.com"
 ```
 
+#### 外部凭证状态历史（只读）
+
+`GET /v1/trust/credential-status/{credential_id}/history` 在不改变同步
+语义与本地凭证状态的前提下，只读返回某双键外部凭证的状态变更历史，
+与同步完全兼容。
+
+- 查询参数 `issuer_did` **必须提供且唯一、非空**；缺失、重复或空值
+  一律 **400**。`limit` 缺省 **50**，须为 **1–200** 的 ASCII 十进制
+  整数；`after` 缺省 **0**，须为**非负** ASCII 十进制整数；重复参数、
+  空白、布尔词、小数、符号、Unicode 数字等一律 **400**。
+- 双键在本租户**未同步（含属他租户）一律 404**（跨租户不可探测）。
+- **仅首次同步或 `updated_at` 更晚的严格更新才追加**历史项；相同重放、
+  更早的 `updated_at`、同 `updated_at` 内容冲突（409）以及锚点/验签/
+  字段失败（200/`valid:false` 或 400）均**不追加**。
+- 历史按 **`updated_at` 升序**，同一 `updated_at` 按 **`cursor`** 升序。
+  每项恰含：`status`、`reason`、`updated_at`、`issuer_key_version`、
+  `audit_seq`、`audit_timestamp`、`cursor`。
+- `cursor` 为**持久化正整数**，按追加顺序单调递增；`after` 排除
+  `cursor` 不大于其值的记录，`next_after` 为本页末项的 `cursor`，
+  **空页保持为 `after`**。
+- `audit_seq`/`audit_timestamp` **关联产生该状态的同步审计事件**
+  （`trust.credential.status.synced`）；无法追溯时为 `null`。
+  `audit_seq` 为 `null` 的兼容项仍照常按 `cursor` 返回与分页。
+- **旧状态兼容**：旧版本状态文件中已同步但无历史的双键，在加载时补
+  一条内容取自旧状态行的兼容项，`cursor` 为新分配的持久化正整数，
+  `audit_seq`/`audit_timestamp` 为 `null`；该兼容项随下一次原子写
+  一并落盘，重启后 `cursor` 稳定。
+- 历史项、当前状态与审计事件在同一把锁内经**同一次原子写**落盘，
+  落盘失败一并回滚（历史不追加、游标不前进、状态不变、事件不记录），
+  跨重启保留。历史查询为只读，**不记审计**、不改变同步语义，也不触碰
+  本租户签发凭证的状态。
+- 响应字段恰为：`issuer_did`、`credential_id`、`events`、`next_after`。
+
+```bash
+curl "localhost:8080/v1/trust/credential-status/vc_ext_1/history?issuer_did=did:web:example.com&limit=50&after=0"
+```
+
 ### 多租户与审计日志
 
 - 所有 `/v1` 请求以 `X-Tenant-ID` 头标识租户，缺省 `default`；显式
@@ -458,6 +496,7 @@ python3 tests/trust_anchor_rotate_test.py
 python3 tests/predicate_proof_test.py
 python3 tests/trust_credential_verify_test.py
 python3 tests/trust_credential_status_sync_test.py
+python3 tests/trust_credential_status_history_test.py
 ```
 
 脚本会临时在本地端口启动服务。`e2e_test.py` 覆盖：201/200/400/404/409 各路径、同 key 去重、
@@ -487,15 +526,18 @@ vcbackend/
   crypto.py    ES256 签名/验签、规范化 JSON、P-256 密钥
   models.py    DIDRecord / CredentialRecord / CredentialStatusRecord /
                PresentationRecord / PredicateProofRecord /
-               TrustAnchorRecord / CredentialStatusSyncRecord / AuditEvent 数据模型
+               TrustAnchorRecord / CredentialStatusSyncRecord /
+               CredentialStatusHistoryEvent / AuditEvent 数据模型
   store.py     多租户文件存储（租户分桶、旧格式迁移）、DID 去重、密钥
                轮换、凭证签发/验签、选择性披露演示（RFC6901 路径校验、
                claims 投影）、谓词证明（谓词校验/求值、results 重算）、
                消费锁内复查过期，信任锚点注册/吊销/验签/
                带前置版本校验的轮换、跨系统外部凭证验真、外部凭证状态
-               同步（双键隔离、严格更新、重放幂等、原子审计），以及全局
-               连续审计事件与状态变更的同一次原子写（失败回滚）
-  service.py   标准库 HTTP 路由、X-Tenant-ID 租户解析、/v1/audit 与错误映射
+               同步（双键隔离、严格更新、重放幂等、原子审计）、外部凭证
+               状态历史（持久化游标、旧状态兼容补项、追加与查询），以及
+               全局连续审计事件与状态变更的同一次原子写（失败回滚）
+  service.py   标准库 HTTP 路由、X-Tenant-ID 租户解析、/v1/audit、
+               /v1/trust/credential-status/{id}/history 与错误映射
   cli.py       did-create / did-show / issue / verify / serve
 tests/e2e_test.py                  端到端测试（默认租户，全协议兼容）
 tests/tenant_audit_test.py         租户隔离 / 审计 / 过期竞态测试
@@ -511,4 +553,11 @@ tests/trust_credential_status_sync_test.py  外部凭证状态同步（请求/�
                                    严格更新与更早日忽略、重放不重复审计、
                                    GET 三字段/404、跨租户双键隔离、不改本地
                                    凭证状态、重启持久化、落盘失败回滚）
+tests/trust_credential_status_history_test.py  外部凭证状态历史（追加规则：
+                                   仅首次/严格更新追加，重放/更早/冲突/验签
+                                   失败不追加；字段与审计关联、updated_at/
+                                   cursor 排序、limit/after 分页与空页保持、
+                                   各类非法参数 400、双键 404、租户隔离、
+                                   只读不审计、重启 cursor 持久化、旧状态补
+                                   兼容项 audit 为 null、落盘失败回滚）
 ```
