@@ -35,6 +35,8 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/credentials/{credential_id}/verify` | 验签，请求体 `{"body","signature"}`；**任何失败一律 HTTP 200**，返回 `valid`（失败时附分类中文 `reason`） |
 | POST | `/v1/credentials/{credential_id}/present` | 生成选择性披露演示，请求体恰为 `{"disclose":[路径...]}` 加可选 `challenge`、`expires_in`；成功 201 返回演示对象；字段问题 400、未知凭证 404 |
 | POST | `/v1/presentations/{presentation_id}/verify` | 校验演示，新演示请求体恰为 `{"presentation":对象,"challenge":串}`（旧演示恰为 `{"presentation":对象}`）；**任何失败一律 HTTP 200**，成功 `{"valid":true}`，失败附非空中文 `reason` |
+| POST | `/v1/credentials/{credential_id}/prove` | 生成谓词证明，请求体恰为 `{"predicates":[项...]}` 加可选 `challenge`、`expires_in`；成功 201 返回证明对象；字段问题 400、未知凭证 404 |
+| POST | `/v1/proofs/{proof_id}/verify` | 校验谓词证明，请求体恰为 `{"proof":对象,"challenge":串}`；**任何失败一律 HTTP 200**，成功 `{"valid":true}`，失败附非空中文 `reason` |
 | POST | `/v1/trust/anchors` | 注册信任锚点，请求体 `{"did","public_key","key_version"}`（非空字符串、P-256 PEM、非布尔正整数）；返回 201 与 `did`、`public_key`、`key_version`、`status:"active"`、`updated_at:null` |
 | POST | `/v1/trust/anchors/{did}/rotate` | 带前置版本校验的密钥轮换，请求体须恰含 `from_key_version`（非布尔正整数）、`public_key`（P-256 PEM）；目标版本为 `from_key_version+1`；新建 201、同前置同 PEM 幂等重试 200，响应字段同 GET 元素 |
 | GET | `/v1/trust/anchors/{did}` | 返回该 DID 的全部锚点版本数组（按 `key_version` 升序）；未知 DID 404 |
@@ -201,6 +203,54 @@ curl -X POST localhost:8080/v1/presentations/vp_<id>/verify \
   -d '{"presentation":{ ...上一步返回的整个演示对象... },"challenge":"abc"}'
 ```
 
+### 谓词证明
+
+- `POST /v1/credentials/{credential_id}/prove` 请求体必须**恰为**
+  `{"predicates":[项...]}` 加可选 `challenge`、`expires_in`：
+  `predicates` 须为**非空数组**，每项恰含 `path`、`op` 与可选
+  `value`（`exists` **禁止** `value`，其余 op 必须提供）；缺字段、
+  多余字段、类型非法一律 400；未知凭证 404。`challenge` 须为非空
+  字符串且按 Unicode 码点不超过 256，缺省生成 32 位小写 hex；
+  `expires_in` 须为非布尔整数且在 1–86400 之间，缺省 300。
+- `path` 按 RFC 6901 解释（相对凭证 `claims`），规则与选择性披露
+  一致：必须以 `/` 开头并命中实际属性、支持 `~0`/`~1` 转义、
+  **禁根路径、禁数组索引**、越界 400；路径不得重复、不得存在
+  祖先/后代重叠。
+- `op ∈ {exists, eq, gte, lte}`：`eq` 为 JSON 精确相等（布尔与数字
+  不互通，容器递归比较）；`gte`/`lte` 要求谓词 `value` 与 claims
+  命中值**均为非布尔数字**，否则 400。
+- 成功返回 201，字段恰为：`proof_id`（`zp_` 加 32 位小写 hex）、
+  `credential_id`、`issuer_did`、`issuer_key_version`、`predicates`
+  （原样回显）、`results`（与 `predicates` **同序的布尔数组**）、
+  `challenge`、`expires_at`、`proof`。
+- `proof` 为 **ES256**、无填充 base64url 的裸 `R||S` 签名，覆盖
+  除 `proof` 外上述字段**加 `tenant_id`** 按 key 升序的规范化 JSON，
+  使用凭证 `issuer_key_version` 对应的历史私钥；证明记录随状态文件
+  持久化（`proofs`），重启后仍可验签。
+- `POST /v1/proofs/{proof_id}/verify` 采用与演示 verify 相同的公开
+  错误协议：**任何失败都返回 HTTP 200** 与
+  `{"valid":false,"reason":"<非空中文原因>"}`，成功返回
+  `{"valid":true}`（无其他字段）。请求体须恰为
+  `{"proof":对象,"challenge":串}`。校验顺序：请求 -> 资源 ID ->
+  绑定（字段集合与各锚定字段、请求/证明/存储 challenge 三者一致）
+  -> 已消费（`证明已消费`，优先于过期）-> 过期（`证明已过期`）->
+  按存储凭证 `claims` 与存储 `predicates` **重算 results** 并核对 ->
+  `proof` 格式与签名。验签成功后在消费锁内复查已消费/到期再标记
+  已消费：**失败不消费**，未到期并发验证仅一次成功并记一次
+  `proof.consumed`，消费记录跨重启保留。
+- 审计：创建记 `proof.created`、成功消费记 `proof.consumed`，
+  `resource_type` 均为 `predicate_proof`、`resource_id` 为
+  `proof_id`；失败与只读路径不记审计。
+
+```bash
+curl -X POST localhost:8080/v1/credentials/vc_<id>/prove \
+  -d '{"predicates":[{"path":"/age","op":"gte","value":18},
+       {"path":"/role","op":"eq","value":"admin"},
+       {"path":"/name","op":"exists"}],"challenge":"abc"}'
+curl -X POST localhost:8080/v1/proofs/zp_<id>/verify \
+  -d '{"proof":{ ...上一步返回的整个证明对象... },"challenge":"abc"}'
+```
+
 ### 信任锚点注册表
 
 - 信任锚点按租户隔离：锚点仅在所属租户内可见，跨租户访问按不存在
@@ -292,6 +342,8 @@ curl -X POST localhost:8080/v1/trust/verify \
   | 吊销凭证（首次与幂等重试均记） | `credential.revoked` | `credential` |
   | 创建演示 | `presentation.created` | `presentation` |
   | 演示消费成功（并发仅一次） | `presentation.consumed` | `presentation` |
+  | 创建谓词证明 | `proof.created` | `predicate_proof` |
+  | 谓词证明消费成功（并发仅一次） | `proof.consumed` | `predicate_proof` |
   | 信任锚点注册（含同 DID/版本同 PEM 幂等重试，每次都记） | `trust.anchor.registered` | `trust_anchor` |
   | 信任锚点吊销（首次与幂等重试均记） | `trust.anchor.revoked` | `trust_anchor` |
   | 信任锚点轮换（新建与同前置同 PEM 幂等重试均记） | `trust.anchor.rotated` | `trust_anchor` |
@@ -322,6 +374,7 @@ python3 tests/e2e_test.py
 python3 tests/tenant_audit_test.py
 python3 tests/trust_anchor_test.py
 python3 tests/trust_anchor_rotate_test.py
+python3 tests/predicate_proof_test.py
 ```
 
 脚本会临时在本地端口启动服务。`e2e_test.py` 覆盖：201/200/400/404/409 各路径、同 key 去重、
@@ -350,10 +403,12 @@ seq 跨重启接续，以及落盘失败时内存回滚（变更不生效、审�
 vcbackend/
   crypto.py    ES256 签名/验签、规范化 JSON、P-256 密钥
   models.py    DIDRecord / CredentialRecord / CredentialStatusRecord /
-               PresentationRecord / TrustAnchorRecord / AuditEvent 数据模型
+               PresentationRecord / PredicateProofRecord /
+               TrustAnchorRecord / AuditEvent 数据模型
   store.py     多租户文件存储（租户分桶、旧格式迁移）、DID 去重、密钥
                轮换、凭证签发/验签、选择性披露演示（RFC6901 路径校验、
-               claims 投影）、消费锁内复查过期，信任锚点注册/吊销/验签/
+               claims 投影）、谓词证明（谓词校验/求值、results 重算）、
+               消费锁内复查过期，信任锚点注册/吊销/验签/
                带前置版本校验的轮换，以及全局连续审计事件与状态变更的
                同一次原子写（失败回滚）
   service.py   标准库 HTTP 路由、X-Tenant-ID 租户解析、/v1/audit 与错误映射
@@ -362,4 +417,6 @@ tests/e2e_test.py                  端到端测试（默认租户，全协议兼
 tests/tenant_audit_test.py         租户隔离 / 审计 / 过期竞态测试
 tests/trust_anchor_test.py         信任锚点注册/查询/吊销/验签测试
 tests/trust_anchor_rotate_test.py  信任锚点密钥轮换（400/404/409/幂等/审计/重启）
+tests/predicate_proof_test.py      谓词证明（prove 字段/400/404、verify 消费/
+                                   过期/篡改/跨租户/并发/审计/重启）
 ```

@@ -71,6 +71,28 @@ class PresentationRecord:
 
 
 @dataclass
+class PredicateProofRecord:
+    """一条谓词证明记录。
+
+    predicates 为原样回显的谓词列表（每项 {path, op[, value]}，路径为
+    相对 claims 的 RFC6901 指针）；results 为与 predicates 同序的布尔
+    结果；challenge/expires_at 为防重放字段；proof 为覆盖除 proof 外
+    字段（含 tenant_id）规范化 JSON 的 ES256 签名（base64url 无填充），
+    使用凭证签发时 issuer_key_version 对应的历史私钥。
+    """
+
+    proof_id: str
+    credential_id: str
+    issuer_did: str
+    issuer_key_version: int
+    predicates: list
+    results: list
+    challenge: str
+    expires_at: str
+    proof: str
+
+
+@dataclass
 class TrustAnchorRecord:
     """一条信任锚点记录（按租户隔离）。
 
