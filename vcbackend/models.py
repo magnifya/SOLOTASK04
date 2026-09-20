@@ -109,6 +109,25 @@ class TrustAnchorRecord:
 
 
 @dataclass
+class ExternalCredentialStatusRecord:
+    """一条外部凭证状态同步记录（按租户、双键隔离）。
+
+    记录外部系统（经信任锚点验签）推送的凭证状态，不影响本租户既有的
+    凭证状态。issuer_did 与 credential_id 构成双键；status 为
+    active/revoked/unknown；updated_at 为签发方时间戳（UTC、Z 结尾、
+    秒精度）；issuer_key_version 为验签所用锚点版本；reason 仅在推送方
+    提供时存在。
+    """
+
+    issuer_did: str
+    credential_id: str
+    status: str
+    updated_at: str
+    issuer_key_version: int
+    reason: Optional[str] = None
+
+
+@dataclass
 class AuditEvent:
     """一条审计事件。
 

@@ -20,6 +20,8 @@
   PUT  /v1/trust/anchors/{did}/{key_version}/status  吊销锚点版本
   POST /v1/trust/verify                   用 active 锚点公钥验签
   POST /v1/trust/credentials/verify       跨系统凭证验真（无需登记 DID/凭证）
+  POST /v1/trust/credential-status/sync   同步外部凭证状态（锚点验签）
+  GET  /v1/trust/credential-status/{id}   查询已同步的外部凭证状态
   GET  /v1/audit                          查询本租户审计事件
 
 多租户：所有 /v1 请求取 X-Tenant-ID 头，缺省为 "default"；显式
@@ -204,6 +206,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_verify(tenant)
                 elif path == "/v1/trust/credentials/verify":
                     self._post_trust_credentials_verify(tenant)
+                elif path == "/v1/trust/credential-status/sync":
+                    self._post_trust_credential_status_sync(tenant)
                 else:
                     self._send_error(404, f"无此路径: {path}")
             except ValidationError as exc:
@@ -281,6 +285,13 @@ def build_handler(store: VCStore) -> type:
                 elif path.startswith("/v1/trust/anchors/"):
                     did = unquote(path[len("/v1/trust/anchors/") :])
                     self._get_trust_anchors(tenant, did)
+                elif path.startswith("/v1/trust/credential-status/"):
+                    credential_id = unquote(
+                        path[len("/v1/trust/credential-status/") :]
+                    )
+                    self._get_trust_credential_status(
+                        tenant, credential_id, parsed.query
+                    )
                 else:
                     self._send_error(404, f"无此路径: {path}")
             except ValidationError as exc:
@@ -884,6 +895,79 @@ def build_handler(store: VCStore) -> type:
             if not valid:
                 payload["reason"] = reason or "验签失败"
             self._send_json(200, payload)
+
+        def _post_trust_credential_status_sync(self, tenant: str) -> None:
+            # 外部凭证状态同步：请求体须恰含 body（对象）与 signature
+            # （非空字符串）。body 字段问题一律 400；锚点/签名失败遵循
+            # 公开错误协议返回 200 + {"valid": false, "reason": ...}，
+            # 且不写入、不记审计。成功首次 201，重放/替换 200。
+            data = self._read_json()
+            if set(data) != {"body", "signature"}:
+                missing = [f for f in ("body", "signature") if f not in data]
+                if missing:
+                    raise ValidationError(f"缺少字段: {', '.join(missing)}")
+                extra = sorted(set(data) - {"body", "signature"})
+                raise ValidationError(f"多余字段: {', '.join(extra)}")
+            if not isinstance(data["body"], dict):
+                raise ValidationError("字段 body 必须为 JSON 对象")
+            if (
+                not isinstance(data["signature"], str)
+                or not data["signature"]
+            ):
+                raise ValidationError("字段 signature 必须为非空字符串")
+            record, status_code, valid, reason = (
+                store.sync_external_credential_status(
+                    tenant, data["body"], data["signature"]
+                )
+            )
+            if not valid:
+                self._send_json(
+                    200, {"valid": False, "reason": reason or "验签失败"}
+                )
+                return
+            payload: Dict[str, Any] = {
+                "valid": True,
+                "issuer_did": record.issuer_did,
+                "credential_id": record.credential_id,
+                "status": record.status,
+                "reason": record.reason,
+                "updated_at": record.updated_at,
+                "issuer_key_version": record.issuer_key_version,
+            }
+            self._send_json(status_code, payload)
+
+        def _get_trust_credential_status(
+            self, tenant: str, credential_id: str, query: str
+        ) -> None:
+            # GET /v1/trust/credential-status/{credential_id}?issuer_did=...
+            # issuer_did 必须唯一提供且非空；未同步（含他租户）404。
+            if not credential_id:
+                raise NotFoundError(f"无此路径: {self.path}")
+            params = parse_qs(query, keep_blank_values=True)
+            issuer_values = params.get("issuer_did")
+            if issuer_values is None:
+                raise ValidationError("缺少查询参数: issuer_did")
+            if len(issuer_values) != 1:
+                raise ValidationError("查询参数 issuer_did 只能提供一次")
+            issuer_did = issuer_values[0]
+            if not issuer_did:
+                raise ValidationError("查询参数 issuer_did 不能为空")
+            extra = sorted(set(params) - {"issuer_did"})
+            if extra:
+                raise ValidationError(
+                    f"多余查询参数: {', '.join(extra)}"
+                )
+            record = store.get_external_credential_status(
+                tenant, issuer_did, credential_id
+            )
+            self._send_json(
+                200,
+                {
+                    "status": record.status,
+                    "reason": record.reason,
+                    "updated_at": record.updated_at,
+                },
+            )
 
         def _get_audit(self, tenant: str, query: str) -> None:            # GET /v1/audit?limit=&after=：租户内按 seq 升序。
             # limit 缺省 50，须为 1..200 的整数；after 缺省 0，须为
