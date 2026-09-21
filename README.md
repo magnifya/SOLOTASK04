@@ -48,6 +48,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | PUT | `/v1/trust/anchors/{did}/{key_version}/status` | 吊销锚点版本，请求体必须恰为 `{"status":"revoked"}`；首次与重复均 200，首次置 UTC 秒精度 `updated_at`，重复保持不变；未知版本 404 |
 | POST | `/v1/trust/verify` | 信任验签，请求体含非空字符串 `issuer_did`、正整数 `issuer_key_version`、非空字符串 `signature`；**缺失、吊销或验签失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
 | POST | `/v1/trust/credentials/verify` | 跨系统凭证验真：验证未在本租户签发或存储的外部凭证，无需登记 DID/凭证；请求体须恰含 `body`、`signature`；**任何失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
+| POST | `/v1/trust/presentations/verify` | 跨系统演示验真：验证其他系统生成且未在本租户保存的演示，无需登记 DID/凭证/演示；请求体须恰为 `{"presentation":对象,"challenge":非空串}`；**任何失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
 | POST | `/v1/trust/credentials/verify-batch` | 批量跨系统凭证验真：请求体恰为 `{"credentials":[项...]}`，数组非空且不超过 100 项，每项规则与单项验真一致；**任何失败均 HTTP 200**，返回 `{"results":[...]}`（长度与顺序与输入一致，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`，不短路）；请求体非法、空数组或超上限时返回 `{"results":[],"reason":"请求..."}` |
 | POST | `/v1/trust/credentials/verify-with-status` | 外部凭证验真并合并同步状态（只读）：请求体与验真规则同 `/v1/trust/credentials/verify`；**任何验真/过期失败均 HTTP 200** 返回 `valid:false` 与中文 `reason`；验签通过后按本租户 `(issuer_did, credential_id)` 查同步记录：未同步 `valid:false`/“外部凭证状态未同步”，active 仅 `{"valid":true}`，revoked 为“外部凭证已吊销：<reason>”（无 reason 用“未知原因”），unknown 为“外部凭证状态未知”；不创建凭证、不改状态、不写同步记录或审计 |
 | POST | `/v1/trust/credentials/verify-batch-with-status` | 批量外部凭证验真并合并同步状态（只读）：请求体恰为 `{"credentials":[项...]}`，数组非空且不超过 100 项；请求级非法（缺失、非法 JSON、非对象、字段缺失或多余、credentials 非数组、空数组或超限）统一 HTTP 200 返回 `{"results":[],"reason":"请求..."}`；合法批次逐项复用 `/v1/trust/credentials/verify-with-status` 规则（含同步状态合并），按输入顺序不短路返回 `{"results":[...]}`，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`；不写凭证、状态、历史或审计 |
@@ -520,6 +521,30 @@ curl -X POST localhost:8080/v1/proofs/zp_<id>/verify \
   - 签名为 **ES256/SHA-256**，64 字节裸 `R||S` 的无填充 base64url，覆盖
     完整 `body` 的递归排序紧凑 JSON；签名编码非法返回前缀“签名格式错误”，
     密码学验签失败返回前缀“签名校验失败”。成功仅返回 `{"valid":true}`。
+- `POST /v1/trust/presentations/verify` 验证**其他系统生成且未在本租户
+  保存的演示**：无需登记本地 DID/凭证/演示，只读、不写凭证/演示/状态/
+  历史/审计，跨租户各自使用本租户锚点，重启后结论一致。
+  - 请求体必须**恰为** `{"presentation":对象,"challenge":非空字符串}`；
+    缺失、多余字段、请求体缺失/非法 JSON/非对象一律按请求错误返回
+    HTTP 200 + `{"valid":false,"reason":"请求…"}`。
+  - `presentation` 必须**恰为** present 接口返回的**未绑定九字段**演示：
+    `presentation_id`、`credential_id`、`issuer_did`（均为非空字符串）、
+    `issuer_key_version`（非布尔正整数）、`disclose`（字符串数组）、
+    `claims`（对象）、`challenge`、`expires_at`、`proof`（均为非空
+    字符串）；缺字段、多余字段、类型非法或出现任何 `holder_*` 字段均
+    返回前缀“演示”的原因。请求 `challenge` 必须等于演示对象的
+    `challenge`，不一致返回前缀“挑战”的原因。
+  - 校验顺序：请求结构 → 演示字段与 challenge → 锚点 → 签名格式 →
+    密码学验签 → 期限。锚点按本租户 `(issuer_did, issuer_key_version)`
+    查找，仅 `active` 的 P-256 公钥可用：缺失或已吊销返回前缀“锚点”
+    的原因。
+  - `proof` 为 **ES256/SHA-256**，64 字节裸 `R||S` 的无填充 base64url，
+    覆盖对象中**除 `proof` 外全部字段**的递归排序紧凑 JSON；编码非法
+    返回前缀“签名格式错误”，验签失败返回前缀“签名校验失败”。
+  - `expires_at` 必须为 UTC 秒精度 Z 格式 `YYYY-MM-DDTHH:MM:SSZ`
+    （非法返回前缀“演示”的原因）；当前时间达到它时返回
+    `{"valid":false,"reason":"演示已过期"}`。成功仅返回
+    `{"valid":true}`。
 - `POST /v1/trust/credentials/verify-batch` 为批量版本，逐项规则与单项
   验真完全一致（字段、锚点、签名与原因分类）：
   - 请求体必须**恰为** `{"credentials":[项...]}`；`credentials` 须为
@@ -823,6 +848,7 @@ python3 tests/trust_anchor_history_test.py
 python3 tests/predicate_proof_test.py
 python3 tests/holder_binding_test.py
 python3 tests/trust_credential_verify_test.py
+python3 tests/trust_presentation_verify_test.py
 python3 tests/trust_credential_verify_with_status_test.py
 python3 tests/trust_credential_status_sync_test.py
 python3 tests/trust_credential_status_history_test.py
@@ -870,7 +896,8 @@ vcbackend/
                带前置版本校验的轮换/生命周期历史（租户内跨 DID
                共享持久化游标、旧锚点加载按版本补注册/轮换/吊销事件、
                追加与分页）、跨系统外部凭证验真（含合并同步状态
-               的只读判定）、外部凭证状态
+               的只读判定）、跨系统外部演示验真（未绑定九字段、
+               挑战一致性与期限判定）、外部凭证状态
                同步（双键隔离、严格更新、重放幂等、原子审计）、外部凭证
                状态历史（持久化游标、旧状态兼容补项、追加与查询），以及
                全局连续审计事件与状态变更的同一次原子写（失败回滚）
@@ -928,6 +955,9 @@ tests/holder_binding_test.py       演示持有者绑定（未绑定兼容、绑
 tests/trust_credential_verify_test.py  跨系统凭证验真（请求/凭证/锚点/
                                    签名格式/验签分类 reason、省略版本不注入、
                                    扩展字段参与签名、只读不记审计、跨租户/重启）
+tests/trust_presentation_verify_test.py 跨系统演示验真（请求/演示字段/holder_*
+                                   拒绝/挑战/锚点/签名格式/验签/过期分类 reason、
+                                   恰九字段与类型、只读不记审计、跨租户/重启）
 tests/trust_credential_verify_with_status_test.py  外部凭证验真并合并状态
                                    判定（未同步/active/revoked/unknown 四分支、
                                    无 reason 用“未知原因”、验真与过期优先级、

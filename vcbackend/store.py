@@ -2950,6 +2950,156 @@ class VCStore:
                 )
         return True, "", results
 
+    def verify_trust_presentation(
+        self,
+        tenant_id: str,
+        data: Any,
+    ) -> Tuple[bool, str]:
+        """验证未在本租户保存的外部选择性披露演示，返回 (是否有效, 失败原因)。
+
+        校验顺序：请求结构 -> 演示字段与 challenge -> 锚点 -> 签名格式 ->
+        密码学验签 -> 期限。
+        - 请求体须恰含 presentation（对象）与 challenge（非空字符串）；
+        - 演示对象须恰为未绑定九字段（presentation_id、credential_id、
+          issuer_did、issuer_key_version、disclose、claims、challenge、
+          expires_at、proof），字段类型沿用原协议；出现任何 holder_*
+          字段即失败；请求 challenge 须等于演示 challenge；
+        - 锚点按本租户 (issuer_did, issuer_key_version) 查找，仅 active
+          的 P-256 公钥可用，缺失或 revoked 失败；
+        - proof 为 ES256/SHA-256，64 字节裸 R||S 的无填充 base64url，
+          覆盖对象中除 proof 外全部字段的递归排序紧凑 JSON；
+        - expires_at 须为 UTC 秒精度 Z 格式，当前时间达到它即过期。
+        只读：不登记 DID/凭证/演示，不写状态、历史或审计，绝不向上抛异常。
+        """
+        # 1. 请求结构
+        if not isinstance(data, dict):
+            return False, "请求不合法: 请求体必须为 JSON 对象"
+        if set(data) != {"presentation", "challenge"}:
+            missing = [
+                f for f in ("presentation", "challenge") if f not in data
+            ]
+            if missing:
+                return False, f"请求缺少字段: {', '.join(missing)}"
+            extra = sorted(set(data) - {"presentation", "challenge"})
+            return False, f"请求含多余字段: {', '.join(extra)}"
+        presentation = data["presentation"]
+        request_challenge = data["challenge"]
+        if not isinstance(presentation, dict):
+            return False, "请求不合法: 字段 presentation 必须为 JSON 对象"
+        if not isinstance(request_challenge, str) or not request_challenge:
+            return False, "请求不合法: 字段 challenge 必须为非空字符串"
+
+        # 2. 演示字段与 challenge：恰为未绑定九字段，类型沿用原协议；
+        # 出现 holder_* 字段即失败。
+        required_fields = {
+            "presentation_id",
+            "credential_id",
+            "issuer_did",
+            "issuer_key_version",
+            "disclose",
+            "claims",
+            "challenge",
+            "expires_at",
+            "proof",
+        }
+        holder_fields = sorted(
+            key for key in presentation if key.startswith("holder_")
+        )
+        if holder_fields:
+            return False, (
+                "演示字段不合法: 不得包含持有者绑定字段 "
+                f"{', '.join(holder_fields)}"
+            )
+        if set(presentation) != required_fields:
+            missing = sorted(required_fields - set(presentation))
+            if missing:
+                return False, f"演示缺少字段: {', '.join(missing)}"
+            extra = sorted(set(presentation) - required_fields)
+            return False, f"演示含多余字段: {', '.join(extra)}"
+        for field in ("presentation_id", "credential_id", "issuer_did"):
+            value = presentation[field]
+            if not isinstance(value, str) or not value:
+                return False, f"演示字段 {field} 必须为非空字符串"
+        key_version = presentation["issuer_key_version"]
+        if (
+            not isinstance(key_version, int)
+            or isinstance(key_version, bool)
+            or key_version < 1
+        ):
+            return False, "演示字段 issuer_key_version 必须为正整数"
+        disclose = presentation["disclose"]
+        if not isinstance(disclose, list) or any(
+            not isinstance(item, str) for item in disclose
+        ):
+            return False, "演示字段 disclose 必须为字符串数组"
+        if not isinstance(presentation["claims"], dict):
+            return False, "演示字段 claims 必须为 JSON 对象"
+        for field in ("challenge", "expires_at", "proof"):
+            value = presentation[field]
+            if not isinstance(value, str) or not value:
+                return False, f"演示字段 {field} 必须为非空字符串"
+        if request_challenge != presentation["challenge"]:
+            return False, "挑战不匹配: 请求 challenge 与演示 challenge 不一致"
+
+        # 3. 锚点：本租户 (issuer_did, issuer_key_version)，仅 active。
+        issuer_did = presentation["issuer_did"]
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            anchors = (
+                bucket["trust_anchors"].get(issuer_did)
+                if bucket is not None else None
+            )
+            row = (
+                anchors.get(str(key_version))
+                if anchors is not None else None
+            )
+            public_pem = row.get("public_key", "") if row is not None else ""
+            status = row.get("status", "active") if row is not None else None
+        if row is None:
+            return False, f"锚点不存在: {issuer_did}#{key_version}"
+        if status == "revoked":
+            return False, f"锚点已吊销: {issuer_did}#{key_version}"
+        try:
+            crypto.validate_public_key_pem(public_pem)
+        except (ValueError, TypeError):
+            return False, (
+                f"锚点公钥不可用: {issuer_did}#{key_version} 不是合法 P-256 公钥"
+            )
+
+        # 4/5. 签名格式与密码学验签：覆盖对象中除 proof 外的全部字段。
+        proof = presentation["proof"]
+        message = {k: v for k, v in presentation.items() if k != "proof"}
+        try:
+            crypto.verify(message, proof, public_pem)
+        except crypto.MalformedSignature:
+            return False, "签名格式错误: 不是合法的 ES256 签名编码"
+        except crypto.InvalidSignature:
+            return False, "签名校验失败，演示内容或签名可能被改动"
+        except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
+            return False, "签名校验失败: 验签过程发生内部错误"
+
+        # 6. 期限：expires_at 须为 UTC 秒精度 Z 格式；当前时间达到它即
+        # 过期。只读，不写任何状态、不记审计。
+        expires_value = presentation["expires_at"]
+        if (
+            not isinstance(expires_value, str)
+            or not _UTC_Z_SHAPE_RE.match(expires_value)
+        ):
+            return False, (
+                "演示字段 expires_at 必须为 UTC 秒精度 Z 格式"
+                "（YYYY-MM-DDTHH:MM:SSZ）"
+            )
+        try:
+            expires_dt = _parse_utc_z(expires_value)
+        except ValueError:
+            return False, (
+                "演示字段 expires_at 必须为 UTC 秒精度 Z 格式"
+                "（YYYY-MM-DDTHH:MM:SSZ）"
+            )
+        if datetime.now(timezone.utc) >= expires_dt:
+            return False, "演示已过期"
+        return True, ""
+
     def rotate_trust_anchor(
         self,
         tenant_id: str,
