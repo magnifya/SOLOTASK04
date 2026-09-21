@@ -2324,6 +2324,58 @@ class VCStore:
                 return False, CREDENTIAL_EXPIRED_REASON
         return True, ""
 
+    def verify_trust_credential_with_status(
+        self,
+        tenant_id: str,
+        data: Any,
+    ) -> Tuple[bool, str]:
+        """外部凭证验真并合并本地同步状态判定（只读）。
+
+        先按 :meth:`verify_trust_credential` 的全部规则完成外部凭证验真
+        （请求结构 → 凭证字段 → 锚点 → 签名格式 → 密码学验签 →
+        expires_at），失败原样返回 ``(False, 原因)``，保持既有优先级与
+        中文原因分类；签名覆盖请求提交的完整 ``body``，省略
+        ``issuer_key_version`` 时按版本 1 且不注入正文。
+
+        验签通过后按当前租户 ``(issuer_did, credential_id)`` 双键只读
+        查询 ``credential_status_sync`` 同步记录：
+          - 未同步（含属他租户）：``(False, "外部凭证状态未同步")``；
+          - active：``(True, "")``；
+          - revoked：``(False, "外部凭证已吊销：<保存的 reason>")``，
+            保存记录无 reason 时用“未知原因”；
+          - unknown：``(False, "外部凭证状态未知")``。
+
+        纯只读：不创建凭证、不修改本地状态、不写同步记录、不记审计。
+        """
+        valid, reason = self.verify_trust_credential(tenant_id, data)
+        if not valid:
+            return False, reason
+
+        body = data["body"]
+        issuer_did = body["issuer_did"]
+        credential_id = body["credential_id"]
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            row = None
+            if bucket is not None:
+                row = (
+                    bucket.get("credential_status_sync", {})
+                    .get(issuer_did, {})
+                    .get(credential_id)
+                )
+        if row is None:
+            return False, "外部凭证状态未同步"
+        status = row.get("status")
+        if status == "active":
+            return True, ""
+        if status == "revoked":
+            saved_reason = row.get("reason")
+            if not saved_reason:
+                saved_reason = "未知原因"
+            return False, f"外部凭证已吊销：{saved_reason}"
+        # status 仅可能为 active/revoked/unknown（同步入口已约束）。
+        return False, "外部凭证状态未知"
+
     def verify_trust_credentials_batch(
         self,
         tenant_id: str,

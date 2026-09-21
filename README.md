@@ -45,6 +45,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/trust/verify` | 信任验签，请求体含非空字符串 `issuer_did`、正整数 `issuer_key_version`、非空字符串 `signature`；**缺失、吊销或验签失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
 | POST | `/v1/trust/credentials/verify` | 跨系统凭证验真：验证未在本租户签发或存储的外部凭证，无需登记 DID/凭证；请求体须恰含 `body`、`signature`；**任何失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
 | POST | `/v1/trust/credentials/verify-batch` | 批量跨系统凭证验真：请求体恰为 `{"credentials":[项...]}`，数组非空且不超过 100 项，每项规则与单项验真一致；**任何失败均 HTTP 200**，返回 `{"results":[...]}`（长度与顺序与输入一致，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`，不短路）；请求体非法、空数组或超上限时返回 `{"results":[],"reason":"请求..."}` |
+| POST | `/v1/trust/credentials/verify-with-status` | 外部凭证验真并合并同步状态（只读）：请求体与验真规则同 `/v1/trust/credentials/verify`；**任何验真/过期失败均 HTTP 200** 返回 `valid:false` 与中文 `reason`；验签通过后按本租户 `(issuer_did, credential_id)` 查同步记录：未同步 `valid:false`/“外部凭证状态未同步”，active 仅 `{"valid":true}`，revoked 为“外部凭证已吊销：<reason>”（无 reason 用“未知原因”），unknown 为“外部凭证状态未知”；不创建凭证、不改状态、不写同步记录或审计 |
 | POST | `/v1/trust/credential-status/sync` | 外部凭证状态同步：请求体须恰含 `body`、`signature`，`body` 须恰含 `issuer_did`、`credential_id`、`status`、`updated_at`、`issuer_key_version`，可选 `reason`；请求/字段非法 400；锚点或签名失败 HTTP 200、`valid:false` 且不写入；首次同步 201、相同重放 200 不重复审计、严格更新替换、同时间不同内容 409 |
 | GET | `/v1/trust/credential-status/{credential_id}?issuer_did=...` | 查询已同步的外部凭证状态；`issuer_did` 须唯一非空；已同步返回 `status`、`reason`、`updated_at`，未同步（含他租户）404 |
 | GET | `/v1/trust/credential-status/{credential_id}/history?issuer_did=...&limit=&after=` | 只读查询外部凭证状态历史（兼容同步）；按 `updated_at` 升序、同值按 `cursor`；缺/重/空 `issuer_did` 400，`limit`/`after` 非法 400，未同步双键（含他租户）404 |
@@ -431,6 +432,26 @@ curl -X POST localhost:8080/v1/proofs/zp_<id>/verify \
     `reason` 区分请求、凭证、锚点、签名格式错误、签名校验失败。
   - 同样只读：不写凭证、状态或审计；遵守租户缺省 `default`、显式空值
     400 与跨租户锚点隔离。
+- `POST /v1/trust/credentials/verify-with-status` 合并**外部凭证验真与
+  状态判定**，供依赖方一次调用得到最终结论：
+  - 请求体**恰为** `{"body":对象,"signature":非空字符串}`；`body` 字段
+    类型、扩展字段、ES256 规范化 JSON 签名（覆盖提交的完整 `body`）、
+    `issuer_key_version` 省略按 1 且不注入正文、`expires_at` 规则与
+    校验优先级，全部沿用 `/v1/trust/credentials/verify`。请求、凭证、
+    锚点、签名格式、签名校验或过期失败，均 **HTTP 200** 返回
+    `{"valid":false,"reason":...}`，保持既有的分类措辞与优先级。
+  - 验签通过后按**当前租户**的 `(issuer_did, credential_id)` 双键查询
+    外部凭证状态同步记录（含他租户未同步在内的未命中不可探测）：
+    - **未同步**：`{"valid":false,"reason":"外部凭证状态未同步"}`；
+    - **active**：仅 `{"valid":true}`；
+    - **revoked**：`{"valid":false,
+      "reason":"外部凭证已吊销：<保存的 reason>"}`；同步记录无
+      `reason` 时使用“未知原因”；
+    - **unknown**：`{"valid":false,"reason":"外部凭证状态未知"}`。
+  - **纯只读**：不创建凭证、不修改本地凭证状态、不写同步记录或历史、
+    不记审计；遵守 `X-Tenant-ID` 缺省 `default`、显式空值 **400** 与
+    租户隔离，结论随状态文件**跨重启持久化**。既有验真、同步与历史
+    查询接口协议保持不变。
 - `POST /v1/trust/anchors/{did}/rotate` 在既有锚点上做带前置版本校验的
   密钥轮换：
   - 请求体必须**恰含** `from_key_version`（非布尔正整数）与 `public_key`
@@ -631,6 +652,7 @@ python3 tests/trust_anchor_rotate_test.py
 python3 tests/predicate_proof_test.py
 python3 tests/holder_binding_test.py
 python3 tests/trust_credential_verify_test.py
+python3 tests/trust_credential_verify_with_status_test.py
 python3 tests/trust_credential_status_sync_test.py
 python3 tests/trust_credential_status_history_test.py
 ```
@@ -668,7 +690,8 @@ vcbackend/
                轮换、DID 文档只读查询（历史公钥与当前版本私钥证明）、凭证签发/验签、选择性披露演示（RFC6901 路径校验、
                claims 投影）、谓词证明（谓词校验/求值、results 重算）、
                消费锁内复查过期，信任锚点注册/吊销/验签/
-               带前置版本校验的轮换、跨系统外部凭证验真、外部凭证状态
+               带前置版本校验的轮换、跨系统外部凭证验真（含合并同步状态
+               的只读判定）、外部凭证状态
                同步（双键隔离、严格更新、重放幂等、原子审计）、外部凭证
                状态历史（持久化游标、旧状态兼容补项、追加与查询），以及
                全局连续审计事件与状态变更的同一次原子写（失败回滚）
@@ -698,6 +721,11 @@ tests/holder_binding_test.py       演示持有者绑定（未绑定兼容、绑
 tests/trust_credential_verify_test.py  跨系统凭证验真（请求/凭证/锚点/
                                    签名格式/验签分类 reason、省略版本不注入、
                                    扩展字段参与签名、只读不记审计、跨租户/重启）
+tests/trust_credential_verify_with_status_test.py  外部凭证验真并合并状态
+                                   判定（未同步/active/revoked/unknown 四分支、
+                                   无 reason 用“未知原因”、验真与过期优先级、
+                                   省略版本与扩展字段沿用验真规则、只读不审计
+                                   不改同步记录、租户隔离与显式空值 400、重启持久化）
 tests/trust_credential_status_sync_test.py  外部凭证状态同步（请求/字段 400、
                                    锚点/签名格式/验签分类 reason、201/200/409、
                                    严格更新与更早日忽略、重放不重复审计、
