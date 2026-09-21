@@ -57,6 +57,12 @@ class PresentationRecord:
     challenge/expires_at 为防重放字段（旧演示记录没有，为 None）：
     challenge 为挑战串，expires_at 为过期时间（UTC、Z 结尾、秒精度），
     二者均随演示一起签名并持久化。
+
+    持有者绑定（holder binding）为可选项（未绑定演示对应字段为 None）：
+    holder_did 为持有者（凭证 subject_did）；holder_key_version 为生成
+    演示时该 DID 的当前密钥版本；holder_proof 为持有者签名（ES256 裸
+    R||S 的无填充 base64url），覆盖去掉 proof、holder_proof 后的完整
+    演示对象并附加 tenant_id，按规范化 JSON/UTF-8 签名。
     """
 
     presentation_id: str
@@ -68,6 +74,9 @@ class PresentationRecord:
     proof: str
     challenge: Optional[str] = None
     expires_at: Optional[str] = None
+    holder_did: Optional[str] = None
+    holder_key_version: Optional[int] = None
+    holder_proof: Optional[str] = None
 
 
 @dataclass

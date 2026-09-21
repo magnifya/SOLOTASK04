@@ -895,6 +895,13 @@ class VCStore:
             proof=row["proof"],
             challenge=row.get("challenge"),
             expires_at=row.get("expires_at"),
+            holder_did=row.get("holder_did"),
+            holder_key_version=(
+                int(row["holder_key_version"])
+                if row.get("holder_key_version") is not None
+                else None
+            ),
+            holder_proof=row.get("holder_proof"),
         )
 
     def create_presentation(
@@ -904,6 +911,7 @@ class VCStore:
         disclose: Any,
         challenge: Optional[str] = None,
         expires_in: Optional[int] = None,
+        holder_binding: bool = False,
     ) -> PresentationRecord:
         """对本租户已签发凭证生成选择性披露演示并持久化，记审计。
 
@@ -915,6 +923,12 @@ class VCStore:
         - challenge 与 expires_at 均写入被签名的演示正文并持久化；
         - proof 为 ES256 签名，覆盖除 proof 外按 key 升序规范化 JSON，
           使用凭证 issuer_key_version（旧凭证缺省按 1）对应的历史私钥；
+        - holder_binding 为 True 时要求凭证 subject_did 是本租户已注册
+          DID（凭证本租户签发时必然成立），并附加持有者绑定：
+          holder_did 为 subject_did、holder_key_version 为生成时该 DID
+          当前密钥版本，holder_proof 用其当前私钥对“去掉 proof、
+          holder_proof 的完整演示对象 + tenant_id”规范化 JSON 签名；
+          未绑定（缺省 False）演示与旧流程完全一致，不写持有者字段；
         - presentation_id 为 vp_ 加 32 位小写 hex。
         """
         if challenge is None:
@@ -949,6 +963,32 @@ class VCStore:
                     f"{issuer_did} 密钥版本 {version} 的私钥不存在"
                 )
 
+            # 持有者绑定：subject_did 须为本租户已注册 DID；取其生成时
+            # 的当前密钥版本与私钥。未绑定流程不触碰任何持有者字段。
+            holder_did: Optional[str] = None
+            holder_version: Optional[int] = None
+            holder_private_pem: Optional[str] = None
+            if holder_binding:
+                subject_did = stored_body.get("subject_did")
+                holder_row = (
+                    bucket["dids"].get(subject_did)
+                    if isinstance(subject_did, str) else None
+                )
+                if holder_row is None:
+                    raise ValidationError(
+                        f"subject_did 不是本租户已注册 DID: {subject_did}"
+                    )
+                holder_did = subject_did
+                holder_version = int(holder_row.get("key_version", 1))
+                holder_private_pem = self._private_key_for_version_locked(
+                    bucket, holder_did, holder_version
+                )
+                if not holder_private_pem:
+                    raise ValidationError(
+                        "持有者私钥不可用: "
+                        f"{holder_did} 密钥版本 {holder_version} 的私钥不存在"
+                    )
+
             snapshot = self._snapshot_locked()
             try:
                 presentation_id = f"vp_{uuid.uuid4().hex}"
@@ -966,6 +1006,24 @@ class VCStore:
                 proof = crypto.sign(unsigned, private_pem)
                 row = dict(unsigned)
                 row["proof"] = proof
+                if holder_binding:
+                    # 先写入 holder_did/holder_key_version：holder_proof
+                    # 覆盖去掉 proof、holder_proof 后的完整演示对象（含
+                    # holder_did、holder_key_version）及 tenant_id。
+                    row["holder_did"] = holder_did
+                    row["holder_key_version"] = holder_version
+                    holder_message = {
+                        key: value
+                        for key, value in row.items()
+                        if key not in ("proof", "holder_proof")
+                    }
+                    holder_message["tenant_id"] = tenant_id
+                    row["holder_proof"] = crypto.sign(
+                        holder_message, holder_private_pem
+                    )
+                # 租户标识随记录持久化，供重启后重算持有者签名消息；
+                # 记录本就按租户桶隔离，未绑定演示携带该字段不影响验签。
+                row["tenant_id"] = tenant_id
                 bucket["presentations"][presentation_id] = row
                 self._append_audit_locked(
                     tenant_id, AUDIT_PRESENTATION_CREATED,
@@ -1000,12 +1058,20 @@ class VCStore:
     ) -> Tuple[bool, str]:
         """以存储记录为锚校验选择性披露演示，返回 (是否有效, 失败原因)。
 
-        校验顺序：请求 -> 资源 ID -> 绑定（含 challenge）-> 已消费 ->
-        过期（当前时间 >= expires_at）-> 投影 -> proof 格式与签名 ->
+        校验顺序：请求 -> 资源 ID -> 绑定（含 challenge 与持有者绑定
+        字段）-> 已消费 -> 过期（当前时间 >= expires_at）-> 投影 ->
+        签发者 proof 格式与签名 -> 持有者 holder_proof（仅绑定演示）->
         吊销。新演示（存储记录含 challenge）要求请求恰含 presentation
         与 challenge，且请求 challenge、演示 challenge 与 proof 覆盖的
         存储 challenge 三者一致；旧演示（无 challenge）只接受恰含
         presentation 的请求，不做挑战、过期与消费检查。
+
+        绑定演示（存储记录含 holder_proof）请求对象必须恰含
+        holder_did、holder_key_version、holder_proof：holder_did 与
+        holder_key_version 与存储锚定，持有者公钥按该 DID 的历史版本
+        取出（轮换后仍可验真；缺失/不可解析判 valid:false），
+        holder_proof 覆盖演示对象去掉 proof、holder_proof 后的完整字段
+        及 tenant_id；未绑定演示不得携带任何持有者字段，流程与旧版一致。
 
         验签成功后在消费锁内复查已消费/到期/吊销：复查到期即返回
         “演示已过期”，不消费、不记审计；未到期并发验证仅一次成功，
@@ -1028,6 +1094,8 @@ class VCStore:
 
             # 新/旧演示按存储记录是否含 challenge 判定
             is_replay_protected = "challenge" in row
+            # 持有者绑定演示按存储记录是否含 holder_proof 判定
+            is_holder_bound = row.get("holder_proof") is not None
             if is_replay_protected:
                 if challenge is CHALLENGE_UNSET:
                     return False, "请求缺少字段: challenge"
@@ -1045,6 +1113,12 @@ class VCStore:
             }
             if is_replay_protected:
                 expected_keys |= {"challenge", "expires_at"}
+            if is_holder_bound:
+                expected_keys |= {
+                    "holder_did",
+                    "holder_key_version",
+                    "holder_proof",
+                }
             if set(presentation) != expected_keys:
                 return False, (
                     "锚定校验失败: presentation 字段集合与存储记录不一致"
@@ -1074,6 +1148,41 @@ class VCStore:
                 )
             if presentation.get("disclose") != list(row.get("disclose", [])):
                 return False, "锚定校验失败: disclose 与存储记录不一致"
+
+            if is_holder_bound:
+                # holder_did/holder_key_version/holder_proof 与存储锚定：
+                # 字段集合已在上方保证三者齐备（未绑定演示则必须缺省）。
+                if presentation.get("holder_did") != row.get("holder_did"):
+                    return False, (
+                        "锚定校验失败: holder_did 与存储记录不一致"
+                    )
+                stored_holder_version = int(
+                    row.get("holder_key_version", 0)
+                )
+                holder_version_obj = presentation.get("holder_key_version")
+                if (
+                    not isinstance(holder_version_obj, int)
+                    or isinstance(holder_version_obj, bool)
+                    or holder_version_obj != stored_holder_version
+                ):
+                    return False, (
+                        "锚定校验失败: holder_key_version 与存储记录不一致"
+                    )
+                holder_proof = presentation.get("holder_proof")
+                if not isinstance(holder_proof, str) or not holder_proof:
+                    return False, (
+                        "请求不合法: 字段 holder_proof 必须为非空字符串"
+                    )
+                # holder_did 还须是本租户已注册 DID（跨租户/已删除均
+                # 按不可用处理，返回 200/valid:false）。
+                holder_public_pem = self._public_key_for_version_locked(
+                    bucket,
+                    row.get("holder_did"),
+                    stored_holder_version,
+                )
+            else:
+                holder_proof = None
+                holder_public_pem = None
 
             if is_replay_protected:
                 # 请求 challenge、演示 challenge 与 proof 覆盖的存储
@@ -1166,6 +1275,47 @@ class VCStore:
             return False, "签名校验失败，演示内容或 proof 可能被改动"
         except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
             return False, "验签过程发生内部错误"
+
+        # 持有者绑定：签发者 proof 通过后再校验持有者历史公钥与
+        # holder_proof（双签名）。holder_proof 覆盖请求演示对象去掉
+        # proof、holder_proof 后的完整字段及持久化的 tenant_id；
+        # 公钥取 holder_did 的 holder_key_version 历史版本，因此密钥
+        # 轮换后仍可验真，密钥缺失/不可解析一律 200/valid:false。
+        if is_holder_bound:
+            if not holder_public_pem:
+                return False, (
+                    "持有者历史公钥不可用: "
+                    f"{row.get('holder_did')} 密钥版本 "
+                    f"{int(row.get('holder_key_version', 0))} 的公钥不存在"
+                )
+            try:
+                crypto.validate_public_key_pem(holder_public_pem)
+            except (ValueError, TypeError):
+                return False, (
+                    "持有者历史公钥不可用: "
+                    f"{row.get('holder_did')} 密钥版本 "
+                    f"{int(row.get('holder_key_version', 0))} 的公钥无法解析"
+                )
+            holder_message = {
+                key: value
+                for key, value in presentation.items()
+                if key not in ("proof", "holder_proof")
+            }
+            holder_message["tenant_id"] = row.get("tenant_id", tenant_id)
+            try:
+                crypto.verify(
+                    holder_message, holder_proof, holder_public_pem
+                )
+            except crypto.MalformedSignature:
+                return False, (
+                    "持有者签名格式错误: 不是合法的 ES256 签名编码"
+                )
+            except crypto.InvalidSignature:
+                return False, (
+                    "持有者签名校验失败，演示内容或 holder_proof 可能被改动"
+                )
+            except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露细节
+                return False, "验签过程发生内部错误"
 
         # 签名与锚定均成功后检查凭证有效期：凭证已到期直接拒绝，不消费
         if _is_expired(credential_expires_at):
