@@ -5,6 +5,7 @@
   GET  /v1/dids/{did}                     查询 DID
   GET  /v1/dids/{did}/document            查询 DID 文档（历史公钥，只读）
   POST /v1/dids/{did}/keys/rotate         轮换 DID 密钥
+  POST /v1/dids/{did}/keys/{ver}/revoke   吊销 DID 旧密钥版本
   POST /v1/credentials                    签发凭证
   GET  /v1/credentials/{credential_id}    查询凭证
   PUT  /v1/credentials/{credential_id}/status   登记 active（首次 201/重复 200）
@@ -171,6 +172,14 @@ def build_handler(store: VCStore) -> type:
                         path[len("/v1/dids/") : -len("/keys/rotate")]
                     )
                     self._post_rotate_key(tenant, did)
+                elif path.startswith("/v1/dids/") and "/keys/" in path and path.endswith(
+                    "/revoke"
+                ):
+                    middle = path[len("/v1/dids/") : -len("/revoke")]
+                    did_raw, sep, version_raw = middle.partition("/keys/")
+                    did = unquote(did_raw)
+                    key_version = unquote(version_raw) if sep else ""
+                    self._post_revoke_key(tenant, did, key_version)
                 elif path.startswith("/v1/credentials/") and path.endswith(
                     "/revoke"
                 ):
@@ -420,6 +429,43 @@ def build_handler(store: VCStore) -> type:
             self._require_fields(data, ("key_handle",))
             record = store.rotate_key(tenant, did, data["key_handle"])
             self._send_json(200, self._did_payload(record))
+
+        def _post_revoke_key(
+            self, tenant: str, did: str, key_version: str
+        ) -> None:
+            # POST /v1/dids/{did}/keys/{key_version}/revoke：
+            # key_version 须为 ASCII 十进制正整数，否则 400；DID 或版本
+            # 不存在（含他租户）404；当前版本 409。请求体空体或 {} 表示
+            # 省略 reason；非空时必须恰含 reason，其值由 store 在确认非
+            # 重复吊销后校验（字符串裁剪后非空，否则 400），重复吊销时
+            # 任何 reason（含非法值）均忽略并返回首次结果。
+            if (
+                not key_version
+                or any(ch < "0" or ch > "9" for ch in key_version)
+                or int(key_version) < 1
+            ):
+                raise ValidationError("路径参数 key_version 必须为 ASCII 十进制正整数")
+            data = self._read_optional_json()
+            if data:
+                extra = sorted(set(data) - {"reason"})
+                if extra:
+                    raise ValidationError(f"多余字段: {', '.join(extra)}")
+                if "reason" not in data:
+                    raise ValidationError("请求体非空时必须恰含字段: reason")
+            reason = data["reason"] if data and "reason" in data else REASON_UNSET
+            record = store.revoke_key_version(
+                tenant, did, int(key_version), reason
+            )
+            self._send_json(
+                200,
+                {
+                    "did": record.did,
+                    "key_version": record.key_version,
+                    "status": record.status,
+                    "reason": record.reason,
+                    "updated_at": record.updated_at,
+                },
+            )
 
         def _post_credentials(self, tenant: str) -> None:
             data = self._read_json()

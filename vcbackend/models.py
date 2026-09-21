@@ -22,6 +22,23 @@ class DIDRecord:
 
 
 @dataclass
+class KeyVersionStatusRecord:
+    """一条 DID 密钥版本吊销记录。
+
+    did 为所属 DID；key_version 为被吊销的历史密钥版本（自 1 起，
+    必为旧版本，当前版本不可吊销）；status 恒为 "revoked"；reason 为
+    裁剪后非空的吊销原因；updated_at/revoked_at 为首次吊销时间（UTC
+    ISO8601 秒精度 Z 结尾）。
+    """
+
+    did: str
+    key_version: int
+    status: str
+    reason: str
+    updated_at: str
+
+
+@dataclass
 class CredentialRecord:
     """一条已签发凭证：正文与其 ES256 签名。"""
 

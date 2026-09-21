@@ -46,6 +46,7 @@ from .models import (
     CredentialStatusSyncRecord,
     CredentialStatusHistoryEvent,
     DIDRecord,
+    KeyVersionStatusRecord,
     PredicateProofRecord,
     PresentationRecord,
     TrustAnchorRecord,
@@ -80,6 +81,9 @@ class ConflictError(RuntimeError):
 # 吊销时未提供合法 reason 的默认原因
 DEFAULT_REVOKE_REASON = "持证人主动吊销"
 
+# 吊销 DID 旧密钥版本时未提供 reason 的默认原因
+DEFAULT_KEY_REVOKE_REASON = "密钥版本主动吊销"
+
 # 凭证（及其演示/谓词证明/外部凭证）到期时的统一中文原因
 CREDENTIAL_EXPIRED_REASON = "凭证已过期"
 
@@ -110,6 +114,7 @@ AUDIT_TRUST_ANCHOR_REVOKED = "trust.anchor.revoked"
 AUDIT_TRUST_ANCHOR_ROTATED = "trust.anchor.rotated"
 AUDIT_PROOF_CREATED = "proof.created"
 AUDIT_PROOF_CONSUMED = "proof.consumed"
+AUDIT_KEY_REVOKED = "key.revoked"
 AUDIT_TRUST_CREDENTIAL_STATUS_SYNCED = "trust.credential.status.synced"
 
 
@@ -783,6 +788,19 @@ class VCStore:
                 return entry.get("public_key")
         return None
 
+    @staticmethod
+    def _key_history_entry_by_version_locked(
+        bucket: Dict[str, Any], did: str, version: int
+    ) -> Optional[Dict[str, Any]]:
+        """取 DID key_history 中指定版本条目；DID/版本不存在返回 None。"""
+        rec = bucket["dids"].get(did) if bucket is not None else None
+        if rec is None:
+            return None
+        for entry in rec.get("key_history", []):
+            if int(entry.get("version", 0)) == version:
+                return entry
+        return None
+
     def get_did_document(
         self,
         tenant_id: str,
@@ -852,6 +870,106 @@ class VCStore:
                 document, current_private_pem
             )
             return document
+
+    def _key_history_entry_locked(
+        self, bucket: Dict[str, Any], did: str, version: int
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """取本租户 DID 行与其 key_history 中指定版本条目。
+
+        DID 不存在（含他租户资源）或版本不在历史中均抛 NotFoundError。
+        """
+        rec = bucket["dids"].get(did) if bucket is not None else None
+        if rec is None:
+            raise NotFoundError(f"DID 不存在: {did}")
+        for entry in rec.get("key_history", []):
+            if int(entry.get("version", 0)) == version:
+                return rec, entry
+        raise NotFoundError(f"DID {did} 的密钥版本不存在: {version}")
+
+    def revoke_key_version(
+        self,
+        tenant_id: str,
+        did: str,
+        key_version: int,
+        reason: Any = REASON_UNSET,
+    ) -> KeyVersionStatusRecord:
+        """吊销 DID 的旧密钥版本。
+
+        - DID 不存在（含他租户资源）或版本不在其 key_history 中均抛
+          NotFoundError（HTTP 404，跨租户不可探测）；
+        - key_version 为 DID 当前密钥版本时抛 ConflictError（HTTP 409），
+          当前版本只能先轮换再吊销；
+        - 重复吊销时任何 reason（含非法值）均忽略，返回首次吊销结果；
+          非法 reason（非字符串或裁剪后为空，含显式 null）仅在首次
+          吊销时抛 ValidationError（HTTP 400）；
+        - 吊销标记写入该版本 key_history 条目（status/revoke_reason/
+          revoked_at），版本仍保留在 DID 文档历史中；轮换与新签发使用
+          当前版本，不受影响；
+        - 首次吊销与幂等重试均记 key.revoked（resource_type 为 did、
+          resource_id 为 <did>#<version>）；标记与审计在同一把锁内经
+          同一次原子写落盘，失败回滚（版本不变、事件不记录），重启保留。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            rec, entry = self._key_history_entry_locked(
+                bucket, did, key_version
+            )
+            current_version = int(rec.get("key_version", 1))
+            if key_version == current_version:
+                raise ConflictError(
+                    f"当前密钥版本不能吊销，请先轮换: {did}#{key_version}"
+                )
+
+            if entry.get("status") == "revoked":
+                snapshot = self._snapshot_locked()
+                try:
+                    # 幂等成功同样每次记录审计；重复请求的 reason 忽略。
+                    self._append_audit_locked(
+                        tenant_id, AUDIT_KEY_REVOKED,
+                        "did", f"{did}#{key_version}",
+                    )
+                    self._save_locked()
+                except Exception:
+                    self._restore_locked(snapshot)
+                    raise
+                return KeyVersionStatusRecord(
+                    did=did,
+                    key_version=key_version,
+                    status="revoked",
+                    reason=entry["revoke_reason"],
+                    updated_at=entry["revoked_at"],
+                )
+
+            if reason is REASON_UNSET:
+                final_reason = DEFAULT_KEY_REVOKE_REASON
+            else:
+                if not isinstance(reason, str):
+                    raise ValidationError("字段 reason 必须为字符串")
+                final_reason = reason.strip()
+                if not final_reason:
+                    raise ValidationError("字段 reason 裁剪后不能为空")
+
+            now = _utc_now()
+            snapshot = self._snapshot_locked()
+            try:
+                entry["status"] = "revoked"
+                entry["revoke_reason"] = final_reason
+                entry["revoked_at"] = now
+                self._append_audit_locked(
+                    tenant_id, AUDIT_KEY_REVOKED,
+                    "did", f"{did}#{key_version}",
+                )
+                self._save_locked()
+            except Exception:
+                self._restore_locked(snapshot)
+                raise
+            return KeyVersionStatusRecord(
+                did=did,
+                key_version=key_version,
+                status="revoked",
+                reason=final_reason,
+                updated_at=now,
+            )
 
     # ------------------------------------------------------------------ #
     # 凭证
@@ -1034,6 +1152,18 @@ class VCStore:
                     "历史私钥不可用: 签发者 "
                     f"{issuer_did} 密钥版本 {version} 的私钥不存在"
                 )
+            # 签发密钥版本已吊销：拒绝生成，400 且不留任何记录/审计。
+            issuer_entry = self._key_history_entry_by_version_locked(
+                bucket, issuer_did, version
+            )
+            if (
+                issuer_entry is not None
+                and issuer_entry.get("status") == "revoked"
+            ):
+                raise ValidationError(
+                    "签发密钥版本已吊销，不能生成演示: "
+                    f"{issuer_did}#{version}"
+                )
 
             # 持有者绑定：subject_did 须为本租户已注册 DID，使用其当前
             # 密钥版本私钥签名；未绑定不查询、不注入任何 holder_* 字段。
@@ -1059,6 +1189,18 @@ class VCStore:
                     raise ValidationError(
                         "持有者当前密钥不可用: 持有者 "
                         f"{holder_did} 密钥版本 {holder_key_version} 的私钥不存在"
+                    )
+                # 绑定的持有者密钥版本已吊销：拒绝生成，400 且不留记录。
+                holder_entry = self._key_history_entry_by_version_locked(
+                    bucket, holder_did, holder_key_version
+                )
+                if (
+                    holder_entry is not None
+                    and holder_entry.get("status") == "revoked"
+                ):
+                    raise ValidationError(
+                        "持有者密钥版本已吊销，不能生成绑定演示: "
+                        f"{holder_did}#{holder_key_version}"
                     )
 
             snapshot = self._snapshot_locked()
@@ -1277,6 +1419,18 @@ class VCStore:
             public_pem = self._public_key_for_version_locked(
                 bucket, issuer_did, stored_version
             )
+            issuer_entry = self._key_history_entry_by_version_locked(
+                bucket, issuer_did, stored_version
+            )
+            issuer_key_revoked = (
+                issuer_entry is not None
+                and issuer_entry.get("status") == "revoked"
+            )
+            issuer_key_revoke_reason = (
+                issuer_entry.get("revoke_reason")
+                if issuer_entry is not None
+                else None
+            )
 
             # 持有者绑定：holder_did 必须等于凭证正文 subject_did，且
             # 持有者为本租户已注册 DID，按 holder_key_version 从其公钥
@@ -1284,6 +1438,8 @@ class VCStore:
             holder_did_value: Optional[str] = None
             holder_version_value: Optional[int] = None
             holder_public_pem: Optional[str] = None
+            holder_key_revoked = False
+            holder_key_revoke_reason: Optional[str] = None
             if is_holder_bound:
                 holder_did_value = row.get("holder_did")
                 subject_did = cred["body"].get("subject_did")
@@ -1301,6 +1457,18 @@ class VCStore:
                 )
                 holder_public_pem = self._public_key_for_version_locked(
                     bucket, holder_did_value, holder_version_value
+                )
+                holder_entry = self._key_history_entry_by_version_locked(
+                    bucket, holder_did_value, holder_version_value
+                )
+                holder_key_revoked = (
+                    holder_entry is not None
+                    and holder_entry.get("status") == "revoked"
+                )
+                holder_key_revoke_reason = (
+                    holder_entry.get("revoke_reason")
+                    if holder_entry is not None
+                    else None
                 )
 
         # 按存储的 disclose 从存储凭证 claims 重算投影并核对
@@ -1351,6 +1519,14 @@ class VCStore:
         except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
             return False, "验签过程发生内部错误"
 
+        # issuer proof 验签成功后检查签发密钥版本是否已吊销（优先于
+        # 持有者校验、凭证有效期与凭证吊销）。
+        if issuer_key_revoked:
+            saved_reason = (
+                issuer_key_revoke_reason or DEFAULT_KEY_REVOKE_REASON
+            )
+            return False, f"签发密钥已吊销：{saved_reason}"
+
         if is_holder_bound:
             # 持有者第二签名：覆盖去掉 proof、holder_proof 后的完整演示
             # 对象（此处与 issuer proof 覆盖对象同构，另含 holder_did、
@@ -1390,6 +1566,14 @@ class VCStore:
             except Exception:  # noqa: BLE001 验签绝不向上抛错
                 return False, "验签过程发生内部错误"
 
+            # 持有者 proof 验签成功后检查持有者密钥版本是否已吊销
+            # （优先于凭证有效期与凭证吊销）。
+            if holder_key_revoked:
+                saved_reason = (
+                    holder_key_revoke_reason or DEFAULT_KEY_REVOKE_REASON
+                )
+                return False, f"持有者密钥已吊销：{saved_reason}"
+
         # 签名与锚定均成功后检查凭证有效期：凭证已到期直接拒绝，不消费
         if _is_expired(credential_expires_at):
             return False, CREDENTIAL_EXPIRED_REASON
@@ -1420,6 +1604,37 @@ class VCStore:
                 if datetime.now(timezone.utc) >= expires_at:
                     return False, "演示已过期"
                 cred = bucket["credentials"].get(credential_id)
+                # 锁内复查密钥版本吊销状态（防锁外验签期间被吊销的竞态）：
+                # 签发密钥优先于持有者密钥，二者均优先于凭证有效期/吊销。
+                issuer_entry_now = self._key_history_entry_by_version_locked(
+                    bucket, issuer_did, stored_version
+                )
+                if (
+                    issuer_entry_now is not None
+                    and issuer_entry_now.get("status") == "revoked"
+                ):
+                    saved_reason = (
+                        issuer_entry_now.get("revoke_reason")
+                        or DEFAULT_KEY_REVOKE_REASON
+                    )
+                    return False, f"签发密钥已吊销：{saved_reason}"
+                if is_holder_bound and holder_did_value is not None:
+                    holder_entry_now = (
+                        self._key_history_entry_by_version_locked(
+                            bucket,
+                            holder_did_value,
+                            holder_version_value,
+                        )
+                    )
+                    if (
+                        holder_entry_now is not None
+                        and holder_entry_now.get("status") == "revoked"
+                    ):
+                        saved_reason = (
+                            holder_entry_now.get("revoke_reason")
+                            or DEFAULT_KEY_REVOKE_REASON
+                        )
+                        return False, f"持有者密钥已吊销：{saved_reason}"
                 if cred is not None and _is_expired(
                     cred["body"].get("expires_at")
                 ):
@@ -1510,6 +1725,18 @@ class VCStore:
                 raise ValidationError(
                     "历史私钥不可用: 签发者 "
                     f"{issuer_did} 密钥版本 {version} 的私钥不存在"
+                )
+            # 签发密钥版本已吊销：拒绝生成，400 且不留任何记录/审计。
+            issuer_entry = self._key_history_entry_by_version_locked(
+                bucket, issuer_did, version
+            )
+            if (
+                issuer_entry is not None
+                and issuer_entry.get("status") == "revoked"
+            ):
+                raise ValidationError(
+                    "签发密钥版本已吊销，不能生成谓词证明: "
+                    f"{issuer_did}#{version}"
                 )
 
             snapshot = self._snapshot_locked()
@@ -1657,6 +1884,18 @@ class VCStore:
             public_pem = self._public_key_for_version_locked(
                 bucket, issuer_did, stored_version
             )
+            issuer_entry = self._key_history_entry_by_version_locked(
+                bucket, issuer_did, stored_version
+            )
+            issuer_key_revoked = (
+                issuer_entry is not None
+                and issuer_entry.get("status") == "revoked"
+            )
+            issuer_key_revoke_reason = (
+                issuer_entry.get("revoke_reason")
+                if issuer_entry is not None
+                else None
+            )
 
         # 按存储的 predicates 从存储凭证 claims 重算结果并核对
         stored_predicates = list(row.get("predicates", []))
@@ -1702,6 +1941,13 @@ class VCStore:
         except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
             return False, "验签过程发生内部错误"
 
+        # 验签成功后检查签发密钥版本是否已吊销（优先于凭证有效期）。
+        if issuer_key_revoked:
+            saved_reason = (
+                issuer_key_revoke_reason or DEFAULT_KEY_REVOKE_REASON
+            )
+            return False, f"签发密钥已吊销：{saved_reason}"
+
         # 绑定与签名均成功后检查凭证有效期：凭证已到期直接拒绝，不消费、
         # 不记消费审计（自身绑定/签名失败仍优先返回原分类原因）。
         if _is_expired(credential_expires_at):
@@ -1725,6 +1971,19 @@ class VCStore:
                 return False, "验签过程发生内部错误"
             if datetime.now(timezone.utc) >= expires_at:
                 return False, "证明已过期"
+            # 锁内复查签发密钥吊销状态（防锁外验签期间被吊销的竞态）。
+            issuer_entry_now = self._key_history_entry_by_version_locked(
+                bucket, issuer_did, stored_version
+            )
+            if (
+                issuer_entry_now is not None
+                and issuer_entry_now.get("status") == "revoked"
+            ):
+                saved_reason = (
+                    issuer_entry_now.get("revoke_reason")
+                    or DEFAULT_KEY_REVOKE_REASON
+                )
+                return False, f"签发密钥已吊销：{saved_reason}"
             cred = bucket["credentials"].get(credential_id)
             if cred is not None and _is_expired(cred["body"].get("expires_at")):
                 return False, CREDENTIAL_EXPIRED_REASON
@@ -1943,6 +2202,17 @@ class VCStore:
             public_pem = self._public_key_for_version_locked(
                 bucket, issuer_did, stored_version
             )
+            issuer_entry = self._key_history_entry_by_version_locked(
+                bucket, issuer_did, stored_version
+            )
+            # 签发密钥版本的吊销判定在验签成功后进行；锁内捕获状态。
+            issuer_key_revoked = (
+                issuer_entry is not None
+                and issuer_entry.get("status") == "revoked"
+            )
+            issuer_key_revoke_reason = (
+                issuer_entry.get("revoke_reason") if issuer_entry is not None else None
+            )
             # 状态在锚定、签名校验成功后才参与判定；active 或无状态维持结果
             credential_status = rec.get("status")
             revoke_reason = rec.get("revoke_reason")
@@ -1968,6 +2238,12 @@ class VCStore:
             return False, "签名校验失败，正文或签名可能被改动"
         except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
             return False, "验签过程发生内部错误"
+
+        # 验签成功后按“签发密钥 -> 有效期 -> 凭证吊销”顺序判定：
+        # 签发密钥版本被吊销时 valid:false，优先于有效期与凭证吊销。
+        if issuer_key_revoked:
+            saved_reason = issuer_key_revoke_reason or DEFAULT_KEY_REVOKE_REASON
+            return False, f"签发密钥已吊销：{saved_reason}"
 
         # 签名、锚定均成功后检查有效期：当前时间 >= expires_at 判
         # valid:false（只读，不记审计）；无 expires_at 的旧凭证无期限。
