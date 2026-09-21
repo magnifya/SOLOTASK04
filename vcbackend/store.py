@@ -783,6 +783,73 @@ class VCStore:
                 return entry.get("public_key")
         return None
 
+    def get_did_document(
+        self,
+        tenant_id: str,
+        did: str,
+        version: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """只读返回 DID 文档（含历史公钥）与当前版本私钥的 document_proof。
+
+        - DID 不存在（含他租户资源）抛 NotFoundError；
+        - verification_methods 按 key_version 升序，每项仅含
+          key_version、key_handle、public_key（P-256 PEM），绝不暴露
+          私钥；current_key_version 取登记/轮换维护的当前版本；
+        - version 给定时仅返回该版本（找不到抛 NotFoundError），
+          current_key_version 仍为当前版本；
+        - document_proof 始终用当前版本私钥，按 ES256 裸 R||S、无填充
+          base64url 与规范化 JSON 规则，覆盖除 document_proof 外的整个
+          响应对象。只读：不记审计、不写任何状态。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            rec = bucket["dids"].get(did) if bucket is not None else None
+            if rec is None:
+                raise NotFoundError(f"DID 不存在: {did}")
+
+            history = sorted(
+                rec.get("key_history", []),
+                key=lambda entry: int(entry.get("version", 0)),
+            )
+            current_version = int(rec.get("key_version", 1))
+            if version is not None:
+                history = [
+                    entry
+                    for entry in history
+                    if int(entry.get("version", 0)) == version
+                ]
+                if not history:
+                    raise NotFoundError(
+                        f"DID {did} 不存在密钥版本: {version}"
+                    )
+
+            methods = [
+                {
+                    "key_version": int(entry.get("version", 0)),
+                    "key_handle": entry.get("key_handle", ""),
+                    "public_key": entry.get("public_key", ""),
+                }
+                for entry in history
+            ]
+            unsigned: Dict[str, Any] = {
+                "did": did,
+                "current_key_version": current_version,
+                "verification_methods": methods,
+            }
+            current_private_pem = (
+                self._private_key_for_version_locked(
+                    bucket, did, current_version
+                )
+            )
+            if not current_private_pem:
+                raise NotFoundError(
+                    f"DID {did} 当前密钥版本 {current_version} 的私钥不可用"
+                )
+            unsigned["document_proof"] = crypto.sign(
+                unsigned, current_private_pem
+            )
+            return unsigned
+
     # ------------------------------------------------------------------ #
     # 凭证
     # ------------------------------------------------------------------ #

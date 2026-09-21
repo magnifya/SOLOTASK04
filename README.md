@@ -26,6 +26,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | --- | --- | --- |
 | POST | `/v1/dids` | 注册 DID，请求体 `{"method","public_key","key_mode"?}`，返回 201 与 `did`、`public_key`、`key_mode`、`key_handle`、`key_version` |
 | GET | `/v1/dids/{did}` | 返回 `did`、`public_key`、`key_mode`、`key_handle`、`key_version`、`created_at`；不存在 404 |
+| GET | `/v1/dids/{did}/document` | 只读 DID 文档：返回 `did`、`current_key_version`、`verification_methods`（按 `key_version` 升序，每项含 `key_version`、`key_handle`、`public_key` 的 P-256 PEM，绝不暴露私钥）、`document_proof`（当前版本私钥对除证明外对象的 ES256 签名）；可选 `?version=` 仅返回该版本（ASCII 十进制正整数且只能一次，非法 400、版本不存在 404）；未知 DID/他租户 404；只读不记审计 |
 | POST | `/v1/dids/{did}/keys/rotate` | 轮换密钥，请求体 `{"key_handle"}`，返回 200 与 `did`、`public_key`、`key_handle`、`key_version` |
 | POST | `/v1/credentials` | 签发凭证，请求体 `{"issuer_did","subject_did","claims"}` 加可选 `expires_at`；提供时必须是 UTC 秒精度 Z 格式 `YYYY-MM-DDTHH:MM:SSZ` 且严格晚于当前时刻（否则 400），仅在提供时写入正文并参与签名；返回 201 与 `credential_id`、`signature`、`issuer_key_version` |
 | GET | `/v1/credentials/{credential_id}` | 返回 `credential_id`、`body`、`signature`；不存在 404 |
@@ -194,6 +195,36 @@ python3 -m vcbackend.cli verify vc_<id>     # 成功输出 true（退出码 0）
   因此旧凭证在轮换后仍可验真。
 - 旧状态文件中缺少密钥元数据的 DID 在加载时自动迁移为 `server`/版本 1：
   历史即原 `public_key`，句柄取 `submitted_public_key`（缺省为原 `public_key`）。
+
+#### DID 文档（历史公钥，只读）
+
+`GET /v1/dids/{did}/document` 为**只读**接口，提供密钥轮换前签发物验签
+所需的历史公钥，不改变审计、凭证、演示、状态及轮换。
+
+- 响应字段恰为 `did`、`current_key_version`、`verification_methods`、
+  `document_proof`：
+  - `current_key_version` 与注册及历次轮换维护的当前版本一致；
+  - `verification_methods` 按 `key_version` **升序**，每项恰含
+    `key_version`、`key_handle`、`public_key`；`public_key` 为可直接用于
+    ES256 验签的 **P-256 公钥 PEM**，响应**绝不暴露 `private_key`**；
+  - `document_proof` 为 **ES256**、64 字节裸 `R||S` 的无填充 base64url
+    签名，覆盖**除 `document_proof` 外按 key 升序规范化 JSON** 的整个
+    响应对象，签名私钥为**当前版本**私钥。
+- 查询参数 `version` **可选且只能出现一次**：提供时必须是 **ASCII 十进制
+  正整数**，仅返回该版本的验证方法（`current_key_version` 仍为当前版本），
+  并用当前版本私钥**重新生成证明**；版本不存在返回 **404**。缺失、空值、
+  重复、符号、小数、布尔词、空白或 Unicode 数字一律 **400** 并返回非空
+  `error`。
+- 遵守 `X-Tenant-ID`：缺省 `default`、显式空值 **400**；未知 DID 或访问
+  他租户资源一律 **404**。
+- 文档数据（公钥历史）与证明均基于随状态文件持久化的密钥元数据，**重启后
+  验签结论稳定**；旧状态缺密钥元数据时按既有迁移规则公开版本 1，且既有
+  GET/签发/轮换等接口行为完全兼容。
+
+```bash
+curl localhost:8080/v1/dids/did:example:<id>/document
+curl "localhost:8080/v1/dids/did:example:<id>/document?version=1"
+```
 
 ### 选择性披露演示
 
@@ -582,6 +613,7 @@ curl -H 'X-Tenant-ID: acme' 'localhost:8080/v1/audit?limit=50&after=0'
 ```bash
 python3 tests/e2e_test.py
 python3 tests/credential_expiry_test.py
+python3 tests/did_document_test.py
 python3 tests/tenant_audit_test.py
 python3 tests/trust_anchor_test.py
 python3 tests/trust_anchor_rotate_test.py
@@ -636,6 +668,10 @@ tests/e2e_test.py                  端到端测试（默认租户，全协议兼
 tests/credential_expiry_test.py    凭证有效期（签发 400/不注入/参与签名、
                                    verify 过期原因与优先级/不记审计、演示与
                                    谓词证明拒签不消费、外部凭证验真、重启持久化）
+tests/did_document_test.py         只读 DID 文档（历史公钥升序/无私钥泄露/
+                                   document_proof 验签与当前私钥、轮换一致、
+                                   version 过滤 200/404 与各类非法参数 400、
+                                   租户隔离、只读不审计、重启稳定、旧状态迁移公开版本1）
 tests/tenant_audit_test.py         租户隔离 / 审计 / 过期竞态测试
 tests/trust_anchor_test.py         信任锚点注册/查询/吊销/验签测试
 tests/trust_anchor_rotate_test.py  信任锚点密钥轮换（400/404/409/幂等/审计/重启）

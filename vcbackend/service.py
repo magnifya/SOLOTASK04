@@ -3,6 +3,7 @@
 路由：
   POST /v1/dids                           注册 DID
   GET  /v1/dids/{did}                     查询 DID
+  GET  /v1/dids/{did}/document            只读 DID 文档（历史公钥与文档证明）
   POST /v1/dids/{did}/keys/rotate         轮换 DID 密钥
   POST /v1/credentials                    签发凭证
   GET  /v1/credentials/{credential_id}    查询凭证
@@ -274,6 +275,13 @@ def build_handler(store: VCStore) -> type:
                 tenant = self._tenant_id()
                 if path == "/v1/audit":
                     self._get_audit(tenant, parsed.query)
+                elif path.startswith("/v1/dids/") and path.endswith(
+                    "/document"
+                ):
+                    did = unquote(
+                        path[len("/v1/dids/") : -len("/document")]
+                    )
+                    self._get_did_document(tenant, did, parsed.query)
                 elif path.startswith("/v1/dids/"):
                     self._get_did(tenant, unquote(path[len("/v1/dids/") :]))
                 elif path.startswith("/v1/credentials/") and path.endswith(
@@ -357,6 +365,33 @@ def build_handler(store: VCStore) -> type:
             record = store.get_did(tenant, did)
             payload = self._did_payload(record)
             payload["created_at"] = record.created_at
+            self._send_json(200, payload)
+
+        def _get_did_document(
+            self, tenant: str, did: str, query: str
+        ) -> None:
+            # GET /v1/dids/{did}/document?version=：只读 DID 文档。
+            # version 可选且只能出现一次；提供时须为 ASCII 十进制正整数
+            # （缺失/空值/重复/符号/小数/Unicode 数字一律 400），仅返回
+            # 该版本并重新生成 document_proof；版本不存在 404。未知 DID
+            # 或他租户资源由 store 判 404。只读：不记审计、不写状态。
+            params = parse_qs(query, keep_blank_values=True)
+            version: Optional[int] = None
+            version_values = params.get("version")
+            if version_values is not None:
+                if len(version_values) != 1:
+                    raise ValidationError("查询参数 version 只能提供一次")
+                raw = version_values[0]
+                if (
+                    not raw
+                    or any(ch < "0" or ch > "9" for ch in raw)
+                    or int(raw) < 1
+                ):
+                    raise ValidationError(
+                        "查询参数 version 必须为正整数"
+                    )
+                version = int(raw)
+            payload = store.get_did_document(tenant, did, version)
             self._send_json(200, payload)
 
         def _post_rotate_key(self, tenant: str, did: str) -> None:
