@@ -1216,9 +1216,10 @@ def build_handler(store: VCStore) -> type:
         def _post_trust_presentations_verify(self, tenant: str) -> None:
             # 跨系统演示验真：与其他验签端点相同的公开错误协议，任何失败
             # 都返回 200 + {"valid": false, "reason": "<非空中文原因>"}。
-            # 请求体须恰含 presentation（对象）与 challenge（非空字符串）；
-            # 非法 JSON/非对象/缺失/多余字段均为请求类原因。只读，不写
-            # 凭证、演示、状态、历史或审计。
+            # 未绑定请求体须恰含 presentation（对象）与 challenge（非空
+            # 字符串）；持有者绑定请求体恰含这两项及非空字符串
+            # source_tenant_id。非法 JSON/非对象/缺失/多余字段均为请求类
+            # 原因。只读，不写凭证、演示、状态、历史或审计。
             try:
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length) if length > 0 else b""
