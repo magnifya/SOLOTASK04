@@ -80,11 +80,18 @@ class ConflictError(RuntimeError):
 # 吊销时未提供合法 reason 的默认原因
 DEFAULT_REVOKE_REASON = "持证人主动吊销"
 
+# 凭证（及其演示/谓词证明/外部凭证）到期时的统一中文原因
+CREDENTIAL_EXPIRED_REASON = "凭证已过期"
+
 # 哨兵：调用方未提供 reason 字段（区别于显式传 None 等非法值）
 REASON_UNSET = object()
 
 # 哨兵：演示验签请求未提供 challenge 字段（区别于显式传非法值）
 CHALLENGE_UNSET = object()
+
+# 哨兵：签发请求未提供 expires_at（区别于显式传 null 等非法值）；
+# 未提供时凭证正文不得注入该字段，凭证保持无期限。
+EXPIRES_AT_UNSET = object()
 
 # 演示默认有效期（秒）与允许范围
 DEFAULT_EXPIRES_IN = 300
@@ -125,6 +132,35 @@ def _parse_utc_z(text: str) -> datetime:
     )
 
 
+# 凭证 expires_at 的严格形状：YYYY-MM-DDTHH:MM:SSZ（秒精度、无偏移、
+# 无小数秒）；时刻合法性（月/日/时分秒范围）再由 strptime 把关。
+_UTC_Z_SHAPE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+
+def _validate_future_utc_z(value: Any, field: str) -> str:
+    """校验并返回凭证 expires_at：严格 UTC 秒精度 Z 格式且晚于当前时刻。
+
+    - 必须为字符串且形状恰为 YYYY-MM-DDTHH:MM:SSZ（拒绝毫秒、时区
+      偏移、空格分隔、非法时刻等）；
+    - 必须严格晚于服务接收时刻（相等或更早均拒绝）。
+    """
+    if not isinstance(value, str) or not _UTC_Z_SHAPE_RE.match(value):
+        raise ValidationError(
+            f"字段 {field} 必须为 UTC 秒精度 Z 格式"
+            "（YYYY-MM-DDTHH:MM:SSZ）"
+        )
+    try:
+        expires_dt = _parse_utc_z(value)
+    except ValueError:
+        raise ValidationError(
+            f"字段 {field} 必须为 UTC 秒精度 Z 格式"
+            "（YYYY-MM-DDTHH:MM:SSZ）"
+        )
+    if expires_dt <= datetime.now(timezone.utc):
+        raise ValidationError(f"字段 {field} 必须严格晚于当前时间")
+    return value
+
+
 def _validate_key_handle(value: Any, field: str) -> str:
     """句柄必须为非空字符串且不是 PEM 文本，返回去空白后的句柄。"""
     if not isinstance(value, str) or not value.strip():
@@ -133,6 +169,21 @@ def _validate_key_handle(value: Any, field: str) -> str:
     if _PEM_MARKER in handle:
         raise ValidationError(f"字段 {field} 必须为句柄，而非 PEM 密钥文本")
     return handle
+
+
+def _is_expired(expires_at: Any) -> bool:
+    """凭证正文的 expires_at 已到期（当前时间 >= expires_at）即 True。
+
+    服务端签发的 expires_at 已按严格格式校验；此处为只读判定，缺省
+    （无字段/空）视为无期限。任何解析异常都按未到期处理，绝不抛出，
+    以免影响锚定/签名等既有分类原因。
+    """
+    if not isinstance(expires_at, str) or not expires_at:
+        return False
+    try:
+        return datetime.now(timezone.utc) >= _parse_utc_z(expires_at)
+    except ValueError:
+        return False
 
 
 def _parse_pointer(pointer: str, label: str = "disclose") -> Tuple[str, ...]:
@@ -741,14 +792,23 @@ class VCStore:
         issuer_did: str,
         subject_did: str,
         claims: Dict[str, Any],
+        expires_at: Any = EXPIRES_AT_UNSET,
     ) -> CredentialRecord:
-        """校验签发者/持有者 DID（限本租户），构造正文并签名，记审计。"""
+        """校验签发者/持有者 DID（限本租户），构造正文并签名，记审计。
+
+        expires_at 省略（EXPIRES_AT_UNSET）时正文不含该字段，凭证无
+        期限；提供时必须为 UTC 秒精度 Z 格式且严格晚于当前时刻，并原样
+        写入正文参与 ES256 规范化签名。
+        """
         if not isinstance(issuer_did, str) or not issuer_did:
             raise ValidationError("缺少字段或字段为空: issuer_did")
         if not isinstance(subject_did, str) or not subject_did:
             raise ValidationError("缺少字段或字段为空: subject_did")
         if not isinstance(claims, dict):
             raise ValidationError("字段 claims 必须为 JSON 对象")
+        raw_expires_at = None
+        if expires_at is not EXPIRES_AT_UNSET:
+            raw_expires_at = _validate_future_utc_z(expires_at, "expires_at")
 
         with self._lock:
             bucket = self._ensure_bucket_locked(tenant_id)
@@ -771,6 +831,9 @@ class VCStore:
                     "issued_at": _utc_now(),
                     "issuer_key_version": int(issuer.get("key_version", 1)),
                 }
+                # 仅在请求提供时写入：未提供不得注入字段（旧凭证无期限）。
+                if raw_expires_at is not None:
+                    body["expires_at"] = raw_expires_at
                 signature = crypto.sign(body, issuer["private_key_pem"])
                 bucket["credentials"][credential_id] = {
                     "body": body,
@@ -1050,6 +1113,7 @@ class VCStore:
             source_claims = cred["body"].get("claims", {})
             credential_status = cred.get("status")
             revoke_reason = cred.get("revoke_reason")
+            credential_expires_at = cred["body"].get("expires_at")
 
             public_pem = self._public_key_for_version_locked(
                 bucket, issuer_did, stored_version
@@ -1103,6 +1167,10 @@ class VCStore:
         except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
             return False, "验签过程发生内部错误"
 
+        # 签名与锚定均成功后检查凭证有效期：凭证已到期直接拒绝，不消费
+        if _is_expired(credential_expires_at):
+            return False, CREDENTIAL_EXPIRED_REASON
+
         # 签名与锚定均成功后检查凭证状态：已吊销不消费
         if credential_status == "revoked":
             saved_reason = revoke_reason or DEFAULT_REVOKE_REASON
@@ -1129,6 +1197,10 @@ class VCStore:
                 if datetime.now(timezone.utc) >= expires_at:
                     return False, "演示已过期"
                 cred = bucket["credentials"].get(credential_id)
+                if cred is not None and _is_expired(
+                    cred["body"].get("expires_at")
+                ):
+                    return False, CREDENTIAL_EXPIRED_REASON
                 if cred is not None and cred.get("status") == "revoked":
                     saved_reason = (
                         cred.get("revoke_reason") or DEFAULT_REVOKE_REASON
@@ -1357,6 +1429,7 @@ class VCStore:
             if cred is None:
                 return False, f"凭证不存在: {credential_id}"
             source_claims = cred["body"].get("claims", {})
+            credential_expires_at = cred["body"].get("expires_at")
 
             public_pem = self._public_key_for_version_locked(
                 bucket, issuer_did, stored_version
@@ -1406,6 +1479,11 @@ class VCStore:
         except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
             return False, "验签过程发生内部错误"
 
+        # 绑定与签名均成功后检查凭证有效期：凭证已到期直接拒绝，不消费、
+        # 不记消费审计（自身绑定/签名失败仍优先返回原分类原因）。
+        if _is_expired(credential_expires_at):
+            return False, CREDENTIAL_EXPIRED_REASON
+
         # 原子标记已消费：消费锁内复查已消费/到期，并发仅一次成功，
         # 跨重启保留；复查到期不消费、不记审计。
         with self._lock:
@@ -1424,6 +1502,9 @@ class VCStore:
                 return False, "验签过程发生内部错误"
             if datetime.now(timezone.utc) >= expires_at:
                 return False, "证明已过期"
+            cred = bucket["credentials"].get(credential_id)
+            if cred is not None and _is_expired(cred["body"].get("expires_at")):
+                return False, CREDENTIAL_EXPIRED_REASON
             snapshot = self._snapshot_locked()
             try:
                 row["consumed"] = True
@@ -1664,6 +1745,12 @@ class VCStore:
             return False, "签名校验失败，正文或签名可能被改动"
         except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
             return False, "验签过程发生内部错误"
+
+        # 签名、锚定均成功后检查有效期：当前时间 >= expires_at 判
+        # valid:false（只读，不记审计）；无 expires_at 的旧凭证无期限。
+        # 其余失败（请求/资源/锚定/签名）已在上方优先返回原分类原因。
+        if _is_expired(stored_body.get("expires_at")):
+            return False, CREDENTIAL_EXPIRED_REASON
 
         # 签名、锚定均成功后检查状态：revoked 判 valid:false，
         # active 或历史无状态维持 valid:true
@@ -1989,6 +2076,29 @@ class VCStore:
             return False, "签名校验失败，凭证正文或签名可能被改动"
         except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
             return False, "签名校验失败: 验签过程发生内部错误"
+
+        # 6. 有效期：仅在请求 body 提供 expires_at 时检查（缺失保持兼容，
+        # 无期限）。须为 UTC 秒精度 Z 格式；当前时间 >= expires_at 判
+        # 到期。只读，不写任何状态、不记审计。
+        if "expires_at" in body:
+            expires_value = body["expires_at"]
+            if (
+                not isinstance(expires_value, str)
+                or not _UTC_Z_SHAPE_RE.match(expires_value)
+            ):
+                return False, (
+                    "凭证字段 expires_at 必须为 UTC 秒精度 Z 格式"
+                    "（YYYY-MM-DDTHH:MM:SSZ）"
+                )
+            try:
+                expires_dt = _parse_utc_z(expires_value)
+            except ValueError:
+                return False, (
+                    "凭证字段 expires_at 必须为 UTC 秒精度 Z 格式"
+                    "（YYYY-MM-DDTHH:MM:SSZ）"
+                )
+            if datetime.now(timezone.utc) >= expires_dt:
+                return False, CREDENTIAL_EXPIRED_REASON
         return True, ""
 
     def verify_trust_credentials_batch(

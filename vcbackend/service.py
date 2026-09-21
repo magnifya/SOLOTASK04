@@ -44,6 +44,7 @@ from .store import (
     CHALLENGE_UNSET,
     ConflictError,
     DEFAULT_TENANT,
+    EXPIRES_AT_UNSET,
     NotFoundError,
     REASON_UNSET,
     ValidationError,
@@ -371,11 +372,18 @@ def build_handler(store: VCStore) -> type:
                 raise ValidationError("缺少字段: claims")
             if not isinstance(data["claims"], dict):
                 raise ValidationError("字段 claims 必须为 JSON 对象")
+            # expires_at 可选：提供时必须为 UTC 秒精度 Z 格式且严格晚于
+            # 当前时刻（否则 400）；未提供传哨兵，正文不注入该字段，
+            # 凭证保持无期限。
+            expires_at = (
+                data["expires_at"] if "expires_at" in data else EXPIRES_AT_UNSET
+            )
             record = store.create_credential(
                 tenant,
                 data["issuer_did"],
                 data["subject_did"],
                 data["claims"],
+                expires_at=expires_at,
             )
             self._send_json(
                 201,

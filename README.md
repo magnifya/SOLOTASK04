@@ -27,7 +27,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/dids` | 注册 DID，请求体 `{"method","public_key","key_mode"?}`，返回 201 与 `did`、`public_key`、`key_mode`、`key_handle`、`key_version` |
 | GET | `/v1/dids/{did}` | 返回 `did`、`public_key`、`key_mode`、`key_handle`、`key_version`、`created_at`；不存在 404 |
 | POST | `/v1/dids/{did}/keys/rotate` | 轮换密钥，请求体 `{"key_handle"}`，返回 200 与 `did`、`public_key`、`key_handle`、`key_version` |
-| POST | `/v1/credentials` | 签发凭证，请求体 `{"issuer_did","subject_did","claims"}`，返回 201 与 `credential_id`、`signature`、`issuer_key_version` |
+| POST | `/v1/credentials` | 签发凭证，请求体 `{"issuer_did","subject_did","claims"}` 加可选 `expires_at`；提供时必须是 UTC 秒精度 Z 格式 `YYYY-MM-DDTHH:MM:SSZ` 且严格晚于当前时刻（否则 400），仅在提供时写入正文并参与签名；返回 201 与 `credential_id`、`signature`、`issuer_key_version` |
 | GET | `/v1/credentials/{credential_id}` | 返回 `credential_id`、`body`、`signature`；不存在 404 |
 | PUT | `/v1/credentials/{credential_id}/status` | 登记状态，请求体必须恰为 `{"status":"active"}`；首次 201、重复 200，均含 `credential_id`、`status`、`updated_at`（重复保持首次值）；已吊销 409 |
 | GET | `/v1/credentials/{credential_id}/status` | 返回 `credential_id`、`status`、`updated_at`；历史无状态按 `active` 返回且 `updated_at` 为 `null`；不存在 404 |
@@ -65,6 +65,9 @@ curl -X POST localhost:8080/v1/dids/did:example:<id>/keys/rotate \
   -d '{"key_handle":"alice-key-v2"}'
 curl -X POST localhost:8080/v1/credentials \
   -d '{"issuer_did":"did:example:<a>","subject_did":"did:example:<b>","claims":{"role":"admin"}}'
+# 可选有效期（UTC 秒精度 Z，且必须晚于当前时刻）
+curl -X POST localhost:8080/v1/credentials \
+  -d '{"issuer_did":"did:example:<a>","subject_did":"did:example:<b>","claims":{"role":"admin"},"expires_at":"2030-01-01T00:00:00Z"}'
 curl localhost:8080/v1/credentials/vc_<id>
 curl -X PUT localhost:8080/v1/credentials/vc_<id>/status \
   -d '{"status":"active"}'
@@ -102,7 +105,9 @@ python3 -m vcbackend.cli verify vc_<id>     # 成功输出 true（退出码 0）
 - 算法为 **ES256**：ECDSA over P-256 与 SHA-256，签名编码为 64 字节裸 `R||S` 的 base64url（无填充）。
 - 签名覆盖凭证**正文按 key 升序的规范化 JSON**（紧凑序列化、UTF-8、嵌套对象同样递归排序）。
 - 凭证正文包含 `credential_id`、`issuer_did`、`subject_did`、`claims`、`issued_at`
-  与整数 `issuer_key_version`（签发时签发者的当前密钥版本，随正文一起签名），
+  与整数 `issuer_key_version`（签发时签发者的当前密钥版本，随正文一起签名）；
+  当且仅当请求提供 `expires_at` 时，正文还包含 `expires_at`（UTC 秒精度
+  Z 格式），一并参与规范化签名，未提供时不注入该字段（旧凭证无期限）。
   对其任一字段（含 claims 内部）的改动都会使验签失败。
 - `POST /v1/credentials/{credential_id}/verify` 以**存储的** `credential_id`、
   `issuer_did`、`issuer_key_version` 为锚：正文锚定字段与存储不一致即判失败；
@@ -118,6 +123,37 @@ python3 -m vcbackend.cli verify vc_<id>     # 成功输出 true（退出码 0）
   密钥（`历史公钥不可用…`）。验签成功返回 200 `{"valid": true}`。
 - 其他路径仍沿用原状态码协议：字段问题 400、资源不存在 404。
 - 旧凭证正文缺 `issuer_key_version` 时按版本 1 验签，签名本身不受影响。
+
+### 凭证有效期
+
+- `POST /v1/credentials` 在原有 `issuer_did`、`subject_did`、`claims`
+  之外接受**可选** `expires_at`：
+  - 未提供时正文**不含**该字段，凭证无期限，行为与旧凭证完全一致；
+  - 提供时必须是 **UTC 秒精度 Z 格式** `YYYY-MM-DDTHH:MM:SSZ`
+    （不接受毫秒/小数秒、时区偏移、空格分隔、缺 `Z`、未补零或非法
+    时刻），且必须**严格晚于服务接收时刻**；格式或时刻非法、等于或
+    早于当前时间一律 **400** 并在 `error` 中说明。
+  - 提供时 `expires_at` 按原文写入凭证正文并参与 ES256 规范化签名，
+    对它的任何篡改都会使验签失败；`GET /v1/credentials/{id}` 原样
+    返回，签发响应字段保持 `credential_id`、`signature`、
+    `issuer_key_version` 三项不变。
+- `POST /v1/credentials/{id}/verify` 在**请求、资源、锚定与签名均成功**
+  后检查有效期：当前时间大于等于 `expires_at` 时返回 **HTTP 200**、
+  `{"valid":false,"reason":"凭证已过期"}`；未到期保持 `valid:true`；
+  无 `expires_at` 的旧凭证无期限。请求/资源/锚定/签名等其余失败仍
+  **优先返回原分类原因**（如正文被篡改仍返回“签名校验失败…”）。
+  过期判定为**只读**操作，**不记审计**。
+- 选择性披露演示与谓词证明的 `verify`：在自身绑定与签名校验均成功后，
+  若其底层凭证已到期，同样返回 **HTTP 200**、`valid:false`、
+  `reason`“凭证已过期”，且**不消费、不记消费审计**；它们的生成接口
+  （`present`/`prove`）协议不变（仍可对已到期凭证生成，由 verify 兜底）。
+- `POST /v1/trust/credentials/verify` 验证外部凭证时，若请求 `body`
+  **含** `expires_at`：必须为同样的 UTC 秒精度 Z 格式（非法返回
+  200/`valid:false`，原因为“凭证字段 expires_at …”），并在到期时
+  返回 200/`{"valid":false,"reason":"凭证已过期"}`；签名等先置校验
+  失败仍优先返回各自原因；`body` 不含该字段时保持兼容（无期限）。
+  该判定同样只读、不写状态、不记审计。
+- `expires_at` 随凭证记录在状态文件中持久化，**重启后结论一致**。
 
 ### 凭证状态与吊销
 
@@ -296,6 +332,12 @@ curl -X POST localhost:8080/v1/proofs/zp_<id>/verify \
   - `issuer_key_version` 可省略：省略时按版本 **1** 查锚点，且**不得注入
     签名正文**（签名覆盖的就是请求中的完整 `body` 原文）；提供时须为
     非布尔正整数。其他扩展字段允许出现在 `body` 中且**全部参与签名**。
+  - `expires_at` 同为可选扩展字段：在请求结构、凭证字段、锚点与签名
+    全部通过后才检查——`body` 不含该字段时保持兼容（无期限）；含该
+    字段时必须为 UTC 秒精度 Z 格式 `YYYY-MM-DDTHH:MM:SSZ`（非法返回
+    前缀“凭证字段 expires_at”的原因），当前时间大于等于它时返回
+    `{"valid":false,"reason":"凭证已过期"}`；签名等先置失败仍优先
+    返回各自原因。该判定只读、不写状态、不记审计。
   - 校验顺序：请求结构 → 凭证字段 → 锚点 → 签名格式 → 密码学验签。
     锚点按本租户 `(issuer_did, 版本)` 查找，仅 `active` 的 P-256 公钥
     可用：缺失返回前缀“锚点”的原因，已吊销返回前缀“锚点”的吊销原因。
@@ -489,7 +531,7 @@ curl "localhost:8080/v1/trust/credential-status/vc_ext_1/history?issuer_did=did:
   `resource_id` 为 `<issuer_did>#<credential_id>`；锚点/签名失败、
   400/409、相同重放与更早日均不记。
 
-  验签失败、演示已消费、演示过期、凭证/演示吊销判定等**只读或失败
+  验签失败、演示已消费、演示过期、凭证过期、凭证/演示吊销判定等**只读或失败
   路径不记审计**。
 - `GET /v1/audit?limit=&after=` 返回本租户事件（按 seq 升序）：
   - `limit` 缺省 50，须为非布尔整数且在 1–200；`after` 缺省 0，须为
@@ -508,6 +550,7 @@ curl -H 'X-Tenant-ID: acme' 'localhost:8080/v1/audit?limit=50&after=0'
 
 ```bash
 python3 tests/e2e_test.py
+python3 tests/credential_expiry_test.py
 python3 tests/tenant_audit_test.py
 python3 tests/trust_anchor_test.py
 python3 tests/trust_anchor_rotate_test.py
@@ -558,6 +601,9 @@ vcbackend/
                /v1/trust/credential-status/{id}/history 与错误映射
   cli.py       did-create / did-show / issue / verify / serve
 tests/e2e_test.py                  端到端测试（默认租户，全协议兼容）
+tests/credential_expiry_test.py    凭证有效期（签发 400/不注入/参与签名、
+                                   verify 过期原因与优先级/不记审计、演示与
+                                   谓词证明拒签不消费、外部凭证验真、重启持久化）
 tests/tenant_audit_test.py         租户隔离 / 审计 / 过期竞态测试
 tests/trust_anchor_test.py         信任锚点注册/查询/吊销/验签测试
 tests/trust_anchor_rotate_test.py  信任锚点密钥轮换（400/404/409/幂等/审计/重启）
