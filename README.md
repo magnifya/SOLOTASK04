@@ -29,6 +29,8 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | GET | `/v1/dids/{did}/document` | 只读 DID 文档：返回 `did`、`current_key_version`、按版本升序的 `verification_methods`（每项 `key_version`、`key_handle`、`public_key` P-256 PEM）与 `document_proof`；可选 `?version=N`（ASCII 十进制正整数，仅该版本并重新生成证明），版本不存在 404，参数非法 400；不暴露私钥、不改变任何状态 |
 | POST | `/v1/dids/{did}/keys/rotate` | 轮换密钥，请求体 `{"key_handle"}`，返回 200 与 `did`、`public_key`、`key_handle`、`key_version` |
 | POST | `/v1/dids/{did}/keys/{key_version}/revoke` | 吊销旧密钥版本；空体或 `{}` 省略 `reason`，非空须恰含 `reason`（裁剪后非空字符串，非法 400）；`key_version` 须为 ASCII 正整数，DID/版本（含他租户）不存在 404，当前版本 409；旧版本首次 200 返回 `did`、`key_version`、`status:"revoked"`、`reason`、`updated_at`，重复忽略 `reason` 并返回首次结果 |
+| GET | `/v1/dids/{did}/keys/{key_version}/status` | 只读查询密钥版本吊销状态；路径版本须为 ASCII 正整数（非法 400），DID/版本不存在（含跨租户）404；200 恰返 `{did,key_version,status,reason,updated_at}`，active 为 `null`/`null`，revoked 为首次原因与 UTC 秒精度 Z 时间 |
+| GET | `/v1/dids/{did}/keys/revocations?limit=&after=` | 只读查询 DID 密钥吊销历史；响应恰含 `did`、`events`、`next_after`，事件恰含 `{key_version,reason,updated_at,cursor}`；仅首次成功吊销追加；`limit` 默认 50、限 1–200，`after` 默认 0、须非负，重复/非空 ASCII 数字外取值均 400；未知或跨租户 DID 404，已有 DID 无历史返空页 |
 | POST | `/v1/credentials` | 签发凭证，请求体 `{"issuer_did","subject_did","claims"}` 加可选 `expires_at`；提供时必须是 UTC 秒精度 Z 格式 `YYYY-MM-DDTHH:MM:SSZ` 且严格晚于当前时刻（否则 400），仅在提供时写入正文并参与签名；返回 201 与 `credential_id`、`signature`、`issuer_key_version` |
 | GET | `/v1/credentials/{credential_id}` | 返回 `credential_id`、`body`、`signature`；不存在 404 |
 | PUT | `/v1/credentials/{credential_id}/status` | 登记状态，请求体必须恰为 `{"status":"active"}`；首次 201、重复 200，均含 `credential_id`、`status`、`updated_at`（重复保持首次值）；已吊销 409 |
@@ -70,6 +72,9 @@ curl -X POST localhost:8080/v1/dids/did:example:<id>/keys/rotate \
 # 吊销旧密钥版本（须先轮换；空体省略 reason）
 curl -X POST localhost:8080/v1/dids/did:example:<id>/keys/1/revoke \
   -d '{"reason":"旧版本密钥疑似泄漏"}'
+# 查询密钥版本吊销状态与吊销历史（只读）
+curl localhost:8080/v1/dids/did:example:<id>/keys/1/status
+curl "localhost:8080/v1/dids/did:example:<id>/keys/revocations?limit=50&after=0"
 curl localhost:8080/v1/dids/did:example:<id>/document
 curl "localhost:8080/v1/dids/did:example:<id>/document?version=1"
 curl -X POST localhost:8080/v1/credentials \
@@ -245,6 +250,55 @@ python3 -m vcbackend.cli verify vc_<id>     # 成功输出 true（退出码 0）
   已吊销，返回 **400** 且**不留任何记录/审计**。
 - 旧凭证正文缺 `issuer_key_version` 时按版本 1 兼容判定；密钥吊销按租户
   隔离，跨租户不可探测。
+
+#### 密钥版本状态与吊销历史（只读）
+
+`GET /v1/dids/{did}/keys/{key_version}/status` 与
+`GET /v1/dids/{did}/keys/revocations` 为密钥吊销提供只读查询，均
+**不记审计**、不触发落盘，租户规则与其他 `/v1` 接口一致。
+
+**单版本状态：**
+
+- 路径 `key_version` 须为 **ASCII 十进制正整数**：空值、`0`、符号
+  （`-1`/`+1`）、小数、空白、布尔词、字母或 Unicode 数字一律 **400**。
+- DID 不存在或该版本不在其密钥历史中（**含访问他租户资源**）一律
+  **404**（跨租户不可探测）。
+- 200 响应恰含 `did`、`key_version`、`status`、`reason`、`updated_at`：
+  - 未吊销版本 `status:"active"`，`reason`/`updated_at` 均为 `null`
+    （当前版本与旧版本一致）；
+  - 已吊销版本 `status:"revoked"`，`reason`/`updated_at` 为**首次**
+    吊销的裁剪原因与 UTC 秒精度 Z 时间，重复吊销不改变其值。
+
+**吊销历史：**
+
+- 响应恰含 `did`、`events`、`next_after`；`events` 按 `cursor` 升序，
+  每项恰含 `key_version`、`reason`、`updated_at`、`cursor`。
+- **仅首次成功吊销追加**事件；重复吊销（每次仍记审计）与任何失败路径
+  （400/404/409）均不追加。
+- `cursor` 为**租户内持久化正整数**：同一租户内不同 DID 的吊销事件
+  共享同一游标空间，按追加顺序单调递增并跨重启稳定。
+- `limit` 缺省 **50**，须为 **1–200** 的 ASCII 十进制整数；`after`
+  缺省 **0**，须为**非负** ASCII 十进制整数。二者均**只能出现一次**
+  且须为**非空 ASCII 数字**：重复参数、空白、布尔词、小数、符号、
+  Unicode 数字等一律 **400**。
+- `after` 排除 `cursor` 不大于其值的事件，`next_after` 为本页末项的
+  `cursor`，**空页等于 `after`**。
+- DID 在本租户已存在但从未吊销时返回**空页**（`events:[]`、
+  `next_after` 取 `after`）；未知 DID 或访问他租户 DID 返回 **404**。
+- **旧状态兼容**：旧版本状态文件中密钥版本已吊销（key_history 条目标记）
+  但无吊销历史时，加载时按（租户、DID、版本）稳定顺序为每个缺历史的
+  吊销版本补一条兼容事件，内容取自吊销标记，`cursor` 为该租户内新分配
+  的持久化正整数；兼容项随下一次原子写一并落盘，即使加载后无写操作，
+  重启时也按相同顺序重建为**相同 cursor**。
+- 首次吊销时**吊销标记、历史事件与原审计事件**在同一把锁内经**同一次
+  原子写**落盘，落盘失败一并回滚（版本状态不变、历史不追加、游标不
+  前进、审计不记录）。DID 文档、密钥历史、吊销的幂等响应及验真优先级
+  均保持不变。
+
+```bash
+curl localhost:8080/v1/dids/did:example:<id>/keys/1/status
+curl "localhost:8080/v1/dids/did:example:<id>/keys/revocations?limit=50&after=0"
+```
 
 ### DID 文档与历史公钥（只读）
 
@@ -713,6 +767,7 @@ curl -H 'X-Tenant-ID: acme' 'localhost:8080/v1/audit?limit=50&after=0'
 python3 tests/e2e_test.py
 python3 tests/did_document_test.py
 python3 tests/key_revocation_test.py
+python3 tests/key_revocation_status_history_test.py
 python3 tests/credential_expiry_test.py
 python3 tests/tenant_audit_test.py
 python3 tests/trust_anchor_test.py
@@ -751,14 +806,16 @@ seq 跨重启接续，以及落盘失败时内存回滚（变更不生效、审�
 vcbackend/
   crypto.py    ES256 签名/验签、规范化 JSON、P-256 密钥
   models.py    DIDRecord / CredentialRecord / CredentialStatusRecord /
-               KeyVersionStatusRecord /
+               KeyVersionStatusRecord / KeyRevocationEvent /
                PresentationRecord / PredicateProofRecord /
                TrustAnchorRecord / CredentialStatusSyncRecord /
                CredentialStatusHistoryEvent / AuditEvent 数据模型
   store.py     多租户文件存储（租户分桶、旧格式迁移）、DID 去重、密钥
                轮换、DID 旧密钥版本吊销（当前版本 409、重复忽略 reason、
                原子审计与验真端签发/持有者密钥吊销判定）、
-               DID 文档只读查询（历史公钥与当前版本私钥证明）、凭证签发/验签、选择性披露演示（RFC6901 路径校验、
+               DID 文档只读查询（历史公钥与当前版本私钥证明）、密钥版本
+               状态与吊销历史只读查询（租户内持久化游标、旧吊销状态
+               加载补兼容事件、追加与分页）、凭证签发/验签、选择性披露演示（RFC6901 路径校验、
                claims 投影）、谓词证明（谓词校验/求值、results 重算）、
                消费锁内复查过期，信任锚点注册/吊销/验签/
                带前置版本校验的轮换、跨系统外部凭证验真（含合并同步状态
@@ -768,6 +825,8 @@ vcbackend/
                全局连续审计事件与状态变更的同一次原子写（失败回滚）
   service.py   标准库 HTTP 路由、X-Tenant-ID 租户解析、/v1/audit、
                /v1/dids/{did}/document、
+               /v1/dids/{did}/keys/{ver}/status、
+               /v1/dids/{did}/keys/revocations、
                /v1/trust/credential-status/{id}/history 与错误映射
   cli.py       did-create / did-show / issue / verify / serve
 tests/e2e_test.py                  端到端测试（默认租户，全协议兼容）
@@ -785,6 +844,15 @@ tests/key_revocation_test.py       DID 旧密钥版本吊销（400/404/409、空
                                    已消费/过期优先、失败不消费、present/prove
                                    400 不留记录、旧凭证按版本 1、租户隔离、
                                    重启保留、落盘失败回滚）
+tests/key_revocation_status_history_test.py DID 密钥版本状态与吊销历史
+                                   （status active null/null、revoked 首次原因/
+                                   时间、路径版本 400、DID/版本/跨租户 404；
+                                   历史字段与 cursor 租户内跨 DID 递增、重复与
+                                   失败吊销不追加、limit/after 分页与空页保持、
+                                   各类非法参数 400、未知/跨租户 404、空 DID
+                                   空页、只读不审计、重启 cursor 稳定、旧吊销
+                                   状态补兼容事件且无写重启 cursor 稳定、
+                                   首次吊销落盘失败状态/历史/游标/审计全回滚）
 tests/tenant_audit_test.py         租户隔离 / 审计 / 过期竞态测试
 tests/trust_anchor_test.py         信任锚点注册/查询/吊销/验签测试
 tests/trust_anchor_rotate_test.py  信任锚点密钥轮换（400/404/409/幂等/审计/重启）

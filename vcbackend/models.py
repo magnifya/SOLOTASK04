@@ -39,6 +39,21 @@ class KeyVersionStatusRecord:
 
 
 @dataclass
+class KeyRevocationEvent:
+    """DID 密钥吊销历史中的一条事件（只读吊销历史查询用）。
+
+    按 (租户, did) 归属；仅首次成功吊销追加。cursor 为租户内持久化
+    正整数，按追加顺序单调递增；同一租户内不同 DID 的吊销事件共享
+    同一游标空间。updated_at 为首次吊销时间（UTC ISO8601 秒精度 Z）。
+    """
+
+    key_version: int
+    reason: str
+    updated_at: str
+    cursor: int
+
+
+@dataclass
 class CredentialRecord:
     """一条已签发凭证：正文与其 ES256 签名。"""
 

@@ -6,6 +6,8 @@
   GET  /v1/dids/{did}/document            查询 DID 文档（历史公钥，只读）
   POST /v1/dids/{did}/keys/rotate         轮换 DID 密钥
   POST /v1/dids/{did}/keys/{ver}/revoke   吊销 DID 旧密钥版本
+  GET  /v1/dids/{did}/keys/{ver}/status   查询 DID 密钥版本吊销状态（只读）
+  GET  /v1/dids/{did}/keys/revocations    查询 DID 密钥吊销历史（只读）
   POST /v1/credentials                    签发凭证
   GET  /v1/credentials/{credential_id}    查询凭证
   PUT  /v1/credentials/{credential_id}/status   登记 active（首次 201/重复 200）
@@ -317,6 +319,24 @@ def build_handler(store: VCStore) -> type:
                         path[len("/v1/dids/") : -len("/document")]
                     )
                     self._get_did_document(tenant, did, parsed.query)
+                elif path.startswith("/v1/dids/") and "/keys/" in path and (
+                    path.endswith("/status")
+                    or path.endswith("/keys/revocations")
+                ):
+                    middle = path[len("/v1/dids/") :]
+                    did_raw, sep, rest = middle.partition("/keys/")
+                    did = unquote(did_raw)
+                    if rest == "revocations":
+                        self._get_key_revocations(
+                            tenant, did, parsed.query
+                        )
+                    else:
+                        key_version = unquote(
+                            rest[: -len("/status")]
+                        )
+                        self._get_key_version_status(
+                            tenant, did, key_version
+                        )
                 elif path.startswith("/v1/dids/"):
                     self._get_did(tenant, unquote(path[len("/v1/dids/") :]))
                 elif path.startswith("/v1/credentials/") and path.endswith(
@@ -423,6 +443,90 @@ def build_handler(store: VCStore) -> type:
                 )
             payload = store.get_did_document(tenant, did, version=version)
             self._send_json(200, payload)
+
+        def _get_key_version_status(
+            self, tenant: str, did: str, key_version: str
+        ) -> None:
+            # GET /v1/dids/{did}/keys/{key_version}/status：只读密钥版本
+            # 吊销状态。key_version 须为 ASCII 十进制正整数（空值、0、
+            # 符号/小数/空白/布尔词/字母/Unicode 数字一律 400）；DID 或
+            # 版本不存在（含他租户）404。active 返回 reason/updated_at
+            # 均为 null；revoked 返回首次原因与 UTC 秒精度 Z 时间。
+            # 纯只读：不改变状态与审计。
+            if (
+                not key_version
+                or any(ch < "0" or ch > "9" for ch in key_version)
+                or int(key_version) < 1
+            ):
+                raise ValidationError(
+                    "路径参数 key_version 必须为 ASCII 十进制正整数"
+                )
+            record = store.get_key_version_status(
+                tenant, did, int(key_version)
+            )
+            self._send_json(
+                200,
+                {
+                    "did": record.did,
+                    "key_version": record.key_version,
+                    "status": record.status,
+                    "reason": record.reason,
+                    "updated_at": record.updated_at,
+                },
+            )
+
+        def _get_key_revocations(
+            self, tenant: str, did: str, query: str
+        ) -> None:
+            # GET /v1/dids/{did}/keys/revocations?limit=&after=：只读
+            # 密钥吊销历史。limit 缺省 50，须为 1..200 的 ASCII 十进制
+            # 整数；after 缺省 0，须为非负 ASCII 十进制整数；重复/空白/
+            # 布尔词/小数/符号/Unicode 数字一律 400。未知或他租户 DID
+            # 404；已有 DID 无历史返回空页，空页 next_after 保持 after。
+            # 纯只读：不写任何状态、不记审计。
+            if not did:
+                raise ValidationError("路径缺少 did")
+            params = parse_qs(query, keep_blank_values=True)
+
+            limit_values = params.get("limit")
+            if limit_values is not None:
+                if len(limit_values) != 1:
+                    raise ValidationError("查询参数 limit 只能提供一次")
+                limit = _parse_nonneg_int(limit_values[0], "limit")
+                if not 1 <= limit <= 200:
+                    raise ValidationError(
+                        "查询参数 limit 须在 1 到 200 之间"
+                    )
+            else:
+                limit = 50
+
+            after_values = params.get("after")
+            if after_values is not None:
+                if len(after_values) != 1:
+                    raise ValidationError("查询参数 after 只能提供一次")
+                after = _parse_nonneg_int(after_values[0], "after")
+            else:
+                after = 0
+
+            events, next_after = store.list_key_revocations(
+                tenant, did, after, limit
+            )
+            self._send_json(
+                200,
+                {
+                    "did": did,
+                    "events": [
+                        {
+                            "key_version": event.key_version,
+                            "reason": event.reason,
+                            "updated_at": event.updated_at,
+                            "cursor": event.cursor,
+                        }
+                        for event in events
+                    ],
+                    "next_after": next_after,
+                },
+            )
 
         def _post_rotate_key(self, tenant: str, did: str) -> None:
             data = self._read_json()

@@ -47,6 +47,7 @@ from .models import (
     CredentialStatusHistoryEvent,
     DIDRecord,
     KeyVersionStatusRecord,
+    KeyRevocationEvent,
     PredicateProofRecord,
     PresentationRecord,
     TrustAnchorRecord,
@@ -484,6 +485,7 @@ class VCStore:
             bucket.setdefault("trust_anchors", {})
             bucket.setdefault("credential_status_sync", {})
             bucket.setdefault("credential_status_history", {})
+            bucket.setdefault("key_revocations", {})
             for rec in bucket["dids"].values():
                 _migrate_did_row(rec)
         # 外部凭证状态历史游标（租户内持久化正整数，按追加递增）。
@@ -501,6 +503,24 @@ class VCStore:
                                 max_cursor, int(event.get("cursor", 0))
                             )
             self._history_cursor = max_cursor
+        # DID 密钥吊销历史游标：按租户各自维护的持久化正整数
+        # （tenant_id -> cursor），同一租户内不同 DID 的吊销事件共享
+        # 该游标空间。旧状态文件无该字段时，从各租户已有吊销历史项的
+        # 最大 cursor 推导。
+        raw_cursors = data.get("key_revocation_cursors", {})
+        self._key_revocation_cursors: Dict[str, int] = {
+            str(tenant_id): int(cursor)
+            for tenant_id, cursor in raw_cursors.items()
+        } if isinstance(raw_cursors, dict) else {}
+        for tenant_id, bucket in self._tenants.items():
+            max_cursor = self._key_revocation_cursors.get(tenant_id, 0)
+            for entries in bucket.get("key_revocations", {}).values():
+                for event in entries:
+                    max_cursor = max(max_cursor, int(event.get("cursor", 0)))
+            self._key_revocation_cursors[tenant_id] = max_cursor
+        # 旧状态文件中已吊销但无历史的密钥版本补一条兼容项（内存态）；
+        # 随下一次原子写一并落盘，重启后 cursor 稳定。
+        self._backfill_key_revocations_locked()
         # 旧状态文件中已有同步状态但无历史的双键补一条兼容项（内存态，
         # audit 字段为 None）；随下一次原子写一并落盘。
         self._backfill_all_history_locked()
@@ -514,6 +534,7 @@ class VCStore:
             "audit": self._audit,
             "audit_seq": self._audit_seq,
             "credential_status_history_cursor": self._history_cursor,
+            "key_revocation_cursors": self._key_revocation_cursors,
         }
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
@@ -522,15 +543,28 @@ class VCStore:
     def _snapshot_locked(self) -> Any:
         """深拷贝当前全部可变状态，供落盘失败时回滚。"""
         return copy.deepcopy(
-            (self._tenants, self._audit, self._audit_seq, self._history_cursor)
+            (
+                self._tenants,
+                self._audit,
+                self._audit_seq,
+                self._history_cursor,
+                self._key_revocation_cursors,
+            )
         )
 
     def _restore_locked(self, snapshot: Any) -> None:
-        tenants, audit, audit_seq, history_cursor = copy.deepcopy(snapshot)
+        (
+            tenants,
+            audit,
+            audit_seq,
+            history_cursor,
+            key_revocation_cursors,
+        ) = copy.deepcopy(snapshot)
         self._tenants = tenants
         self._audit = audit
         self._audit_seq = audit_seq
         self._history_cursor = history_cursor
+        self._key_revocation_cursors = key_revocation_cursors
 
     # ------------------------------------------------------------------ #
     # 租户桶与审计
@@ -549,6 +583,7 @@ class VCStore:
                 "trust_anchors": {},
                 "credential_status_sync": {},
                 "credential_status_history": {},
+                "key_revocations": {},
             }
             self._tenants[tenant_id] = bucket
         return bucket
@@ -959,6 +994,22 @@ class VCStore:
                     tenant_id, AUDIT_KEY_REVOKED,
                     "did", f"{did}#{key_version}",
                 )
+                # 仅首次成功吊销追加历史事件；重复吊销与失败路径均不会
+                # 到达此处。吊销标记、历史与审计在同一次原子写落盘。
+                revocation_entries = (
+                    bucket.setdefault("key_revocations", {})
+                    .setdefault(did, [])
+                )
+                revocation_entries.append(
+                    {
+                        "key_version": key_version,
+                        "reason": final_reason,
+                        "updated_at": now,
+                        "cursor": (
+                            self._next_key_revocation_cursor_locked(tenant_id)
+                        ),
+                    }
+                )
                 self._save_locked()
             except Exception:
                 self._restore_locked(snapshot)
@@ -970,6 +1021,84 @@ class VCStore:
                 reason=final_reason,
                 updated_at=now,
             )
+
+    def get_key_version_status(
+        self, tenant_id: str, did: str, key_version: int
+    ) -> KeyVersionStatusRecord:
+        """只读查询 DID 某密钥版本的吊销状态。
+
+        - DID 不存在（含他租户资源）或版本不在其 key_history 中均抛
+          NotFoundError（HTTP 404，跨租户不可探测）；
+        - active 版本返回 status="active"、reason/updated_at 均为 None；
+        - revoked 版本返回首次吊销的原因与 UTC 秒精度 Z 时间。
+        纯只读：不修改任何状态、不记审计、不触发落盘。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            rec, entry = self._key_history_entry_locked(
+                bucket, did, key_version
+            )
+            if entry.get("status") == "revoked":
+                return KeyVersionStatusRecord(
+                    did=did,
+                    key_version=key_version,
+                    status="revoked",
+                    reason=entry["revoke_reason"],
+                    updated_at=entry["revoked_at"],
+                )
+            return KeyVersionStatusRecord(
+                did=did,
+                key_version=key_version,
+                status="active",
+                reason=None,
+                updated_at=None,
+            )
+
+    def list_key_revocations(
+        self,
+        tenant_id: str,
+        did: str,
+        after: int = 0,
+        limit: int = 50,
+    ) -> Tuple[List[KeyRevocationEvent], int]:
+        """只读查询某 DID 的密钥吊销历史，按页返回。
+
+        - DID 在本租户不存在（含他租户）抛 NotFoundError（HTTP 404）；
+          DID 存在但从未吊销返回空页；
+        - 仅首次成功吊销追加事件（重复吊销与失败不追加），按 cursor
+          升序返回；
+        - after 排除 cursor 不大于其值的事件，至多返回 limit 项；
+        - next_after 为本页末项 cursor，空页保持 after。
+        纯只读：不修改任何状态、不记审计、不触发落盘。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            rec = bucket["dids"].get(did) if bucket is not None else None
+            if rec is None:
+                raise NotFoundError(f"DID 不存在: {did}")
+            entries = sorted(
+                (
+                    bucket.get("key_revocations", {}).get(did, [])
+                ),
+                key=lambda event: int(event.get("cursor", 0)),
+            )
+            picked: List[KeyRevocationEvent] = []
+            for row in entries:
+                if len(picked) >= limit:
+                    break
+                cursor = int(row["cursor"])
+                if cursor <= after:
+                    continue
+                picked.append(
+                    KeyRevocationEvent(
+                        key_version=int(row["key_version"]),
+                        reason=row["reason"],
+                        updated_at=row["updated_at"],
+                        cursor=cursor,
+                    )
+                )
+            next_after = picked[-1].cursor if picked else after
+            return picked, next_after
 
     # ------------------------------------------------------------------ #
     # 凭证
@@ -2903,6 +3032,65 @@ class VCStore:
         """分配下一个持久化历史游标（正整数，按追加递增）。"""
         self._history_cursor += 1
         return self._history_cursor
+
+    def _next_key_revocation_cursor_locked(self, tenant_id: str) -> int:
+        """分配租户内下一个持久化密钥吊销游标（正整数，按追加递增）。"""
+        cursor = self._key_revocation_cursors.get(tenant_id, 0) + 1
+        self._key_revocation_cursors[tenant_id] = cursor
+        return cursor
+
+    def _backfill_key_revocations_locked(self) -> None:
+        """加载迁移：为旧状态文件中已吊销但无历史的版本补兼容项。
+
+        对每个租户的每个 DID，按 key_history 中被标记为 revoked 但在
+        key_revocations 历史中没有对应事件的版本，按版本升序补录一条
+        内容取自吊销标记（revoke_reason/revoked_at）的兼容项，cursor
+        为该租户内新分配的持久化正整数。仅在内存中补录：随下一次原子
+        写一并落盘；若无写操作，重启时按相同（租户、DID、版本）顺序
+        重建，cursor 稳定。
+        """
+        for tenant_id in sorted(self._tenants):
+            bucket = self._tenants[tenant_id]
+            history_map = bucket.setdefault("key_revocations", {})
+            dids = bucket.get("dids", {})
+            for did in sorted(dids):
+                rec = dids[did]
+                revoked_versions = sorted(
+                    int(entry.get("version", 0))
+                    for entry in rec.get("key_history", [])
+                    if entry.get("status") == "revoked"
+                )
+                if not revoked_versions:
+                    continue
+                entries = history_map.setdefault(did, [])
+                known = {int(event.get("key_version", 0)) for event in entries}
+                for version in revoked_versions:
+                    if version in known:
+                        continue
+                    entry = None
+                    for item in rec.get("key_history", []):
+                        if int(item.get("version", 0)) == version:
+                            entry = item
+                            break
+                    if entry is None:
+                        continue
+                    entries.append(
+                        {
+                            "key_version": version,
+                            "reason": entry.get(
+                                "revoke_reason", DEFAULT_KEY_REVOKE_REASON
+                            ),
+                            "updated_at": entry.get("revoked_at"),
+                            "cursor": (
+                                self._next_key_revocation_cursor_locked(
+                                    tenant_id
+                                )
+                            ),
+                        }
+                    )
+                entries.sort(
+                    key=lambda event: int(event.get("key_version", 0))
+                )
 
     def _backfill_all_history_locked(self) -> None:
         """加载迁移：为缺历史的旧同步状态补一条兼容项（内存态）。
