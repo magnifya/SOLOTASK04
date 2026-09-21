@@ -46,6 +46,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/trust/credentials/verify` | 跨系统凭证验真：验证未在本租户签发或存储的外部凭证，无需登记 DID/凭证；请求体须恰含 `body`、`signature`；**任何失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
 | POST | `/v1/trust/credentials/verify-batch` | 批量跨系统凭证验真：请求体恰为 `{"credentials":[项...]}`，数组非空且不超过 100 项，每项规则与单项验真一致；**任何失败均 HTTP 200**，返回 `{"results":[...]}`（长度与顺序与输入一致，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`，不短路）；请求体非法、空数组或超上限时返回 `{"results":[],"reason":"请求..."}` |
 | POST | `/v1/trust/credentials/verify-with-status` | 外部凭证验真并合并同步状态（只读）：请求体与验真规则同 `/v1/trust/credentials/verify`；**任何验真/过期失败均 HTTP 200** 返回 `valid:false` 与中文 `reason`；验签通过后按本租户 `(issuer_did, credential_id)` 查同步记录：未同步 `valid:false`/“外部凭证状态未同步”，active 仅 `{"valid":true}`，revoked 为“外部凭证已吊销：<reason>”（无 reason 用“未知原因”），unknown 为“外部凭证状态未知”；不创建凭证、不改状态、不写同步记录或审计 |
+| POST | `/v1/trust/credentials/verify-batch-with-status` | 批量外部凭证验真并合并同步状态（只读）：请求体恰为 `{"credentials":[项...]}`，数组非空且不超过 100 项；请求级非法（缺失、非法 JSON、非对象、字段缺失或多余、credentials 非数组、空数组或超限）统一 HTTP 200 返回 `{"results":[],"reason":"请求..."}`；合法批次逐项复用 `/v1/trust/credentials/verify-with-status` 规则（含同步状态合并），按输入顺序不短路返回 `{"results":[...]}`，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`；不写凭证、状态、历史或审计 |
 | POST | `/v1/trust/credential-status/sync` | 外部凭证状态同步：请求体须恰含 `body`、`signature`，`body` 须恰含 `issuer_did`、`credential_id`、`status`、`updated_at`、`issuer_key_version`，可选 `reason`；请求/字段非法 400；锚点或签名失败 HTTP 200、`valid:false` 且不写入；首次同步 201、相同重放 200 不重复审计、严格更新替换、同时间不同内容 409 |
 | GET | `/v1/trust/credential-status/{credential_id}?issuer_did=...` | 查询已同步的外部凭证状态；`issuer_did` 须唯一非空；已同步返回 `status`、`reason`、`updated_at`，未同步（含他租户）404 |
 | GET | `/v1/trust/credential-status/{credential_id}/history?issuer_did=...&limit=&after=` | 只读查询外部凭证状态历史（兼容同步）；按 `updated_at` 升序、同值按 `cursor`；缺/重/空 `issuer_did` 400，`limit`/`after` 非法 400，未同步双键（含他租户）404 |
@@ -452,6 +453,24 @@ curl -X POST localhost:8080/v1/proofs/zp_<id>/verify \
     不记审计；遵守 `X-Tenant-ID` 缺省 `default`、显式空值 **400** 与
     租户隔离，结论随状态文件**跨重启持久化**。既有验真、同步与历史
     查询接口协议保持不变。
+- `POST /v1/trust/credentials/verify-batch-with-status` 批量合并**外部
+  凭证验真与本租户同步状态**，一次调用得到整批最终结论：
+  - 请求体**恰为** `{"credentials":[项...]}`，数组须为 **1–100 项**；
+    外层缺失、非法 JSON、非对象、字段缺失或多余、`credentials` 非数组、
+    空数组或超限，统一 **HTTP 200** 返回
+    `{"results":[],"reason":"请求…"}`。
+  - 请求级合法时按输入**顺序逐项处理、失败不短路**：每项恰含 `body`
+    对象与非空 `signature`，项级结构或类型错误只写入对应结果
+    （`valid:false` + “请求”前缀原因），不清空整批；`body` 字段错误
+    沿用“凭证”分类，其余验真规则（版本省略按 1、扩展字段参与 ES256
+    规范化签名、`expires_at` 与校验优先级）与状态合并约定（未同步 /
+    active / revoked / unknown）全部沿用
+    `/v1/trust/credentials/verify-with-status`。
+  - 返回 `{"results":[...]}`：长度与顺序与输入一致，成功项
+    `{"valid":true}`（不含 `reason`），失败项
+    `{"valid":false,"reason":"…"}`（非空中文原因）。
+  - **纯只读**：不写凭证、状态、历史或审计；遵守 `X-Tenant-ID` 缺省
+    `default`、显式空值 **400**、跨租户隔离与重启持久化。
 - `POST /v1/trust/anchors/{did}/rotate` 在既有锚点上做带前置版本校验的
   密钥轮换：
   - 请求体必须**恰含** `from_key_version`（非布尔正整数）与 `public_key`
