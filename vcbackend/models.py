@@ -152,6 +152,23 @@ class CredentialStatusHistoryEvent:
 
 
 @dataclass
+class KeyRevocationRecord:
+    """一条 DID 密钥版本吊销记录。
+
+    did 为所属 DID；key_version 为被吊销的历史版本（当前版本不可吊销）；
+    status 恒为 "revoked"；reason 为裁剪后的吊销原因（请求省略时为
+    None）；updated_at 为首次吊销时间（UTC ISO8601 秒精度，Z 结尾），
+    重复吊销保持首次值。
+    """
+
+    did: str
+    key_version: int
+    status: str
+    reason: Optional[str]
+    updated_at: Optional[str]
+
+
+@dataclass
 class AuditEvent:
     """一条审计事件。
 

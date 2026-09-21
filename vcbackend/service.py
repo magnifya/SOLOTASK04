@@ -162,6 +162,17 @@ def build_handler(store: VCStore) -> type:
                 tenant = self._tenant_id()
                 if path == "/v1/dids":
                     self._post_dids(tenant)
+                elif path.startswith("/v1/dids/") and path.endswith(
+                    "/revoke"
+                ):
+                    rest = path[len("/v1/dids/") : -len("/revoke")]
+                    did, sep, version_raw = rest.rpartition("/keys/")
+                    if not sep:
+                        self._send_error(404, f"无此路径: {path}")
+                    else:
+                        self._post_revoke_key(
+                            tenant, unquote(did), unquote(version_raw)
+                        )
                 elif path == "/v1/credentials":
                     self._post_credentials(tenant)
                 elif path.startswith("/v1/dids/") and path.endswith(
@@ -420,6 +431,44 @@ def build_handler(store: VCStore) -> type:
             self._require_fields(data, ("key_handle",))
             record = store.rotate_key(tenant, did, data["key_handle"])
             self._send_json(200, self._did_payload(record))
+
+        def _post_revoke_key(
+            self, tenant: str, did: str, key_version_raw: str
+        ) -> None:
+            # POST /v1/dids/{did}/keys/{key_version}/revoke：吊销历史密钥
+            # 版本。key_version 须为 ASCII 十进制正整数（否则 400）；空体
+            # 或 {} 省略 reason；非空请求体须恰含 reason（裁剪后非空字符
+            # 串，非法 400）。DID/版本不存在（含他租户）404，当前版本
+            # 409；重复吊销忽略 reason 并返回首次结果。
+            if (
+                not key_version_raw
+                or any(ch < "0" or ch > "9" for ch in key_version_raw)
+                or int(key_version_raw) < 1
+            ):
+                raise ValidationError(
+                    "路径参数 key_version 必须为 ASCII 十进制正整数"
+                )
+            data = self._read_optional_json()
+            if data:
+                extra = sorted(set(data) - {"reason"})
+                if extra:
+                    raise ValidationError(f"多余字段: {', '.join(extra)}")
+            # 省略 reason 时传哨兵；提供时透传原值，非法 reason 的 400
+            # 判定由 store 在确认非重复吊销后做出（重复吊销一律忽略）。
+            reason = data["reason"] if "reason" in data else REASON_UNSET
+            record = store.revoke_key_version(
+                tenant, did, int(key_version_raw), reason
+            )
+            self._send_json(
+                200,
+                {
+                    "did": record.did,
+                    "key_version": record.key_version,
+                    "status": record.status,
+                    "reason": record.reason,
+                    "updated_at": record.updated_at,
+                },
+            )
 
         def _post_credentials(self, tenant: str) -> None:
             data = self._read_json()

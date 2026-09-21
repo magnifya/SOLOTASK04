@@ -28,6 +28,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | GET | `/v1/dids/{did}` | 返回 `did`、`public_key`、`key_mode`、`key_handle`、`key_version`、`created_at`；不存在 404 |
 | GET | `/v1/dids/{did}/document` | 只读 DID 文档：返回 `did`、`current_key_version`、按版本升序的 `verification_methods`（每项 `key_version`、`key_handle`、`public_key` P-256 PEM）与 `document_proof`；可选 `?version=N`（ASCII 十进制正整数，仅该版本并重新生成证明），版本不存在 404，参数非法 400；不暴露私钥、不改变任何状态 |
 | POST | `/v1/dids/{did}/keys/rotate` | 轮换密钥，请求体 `{"key_handle"}`，返回 200 与 `did`、`public_key`、`key_handle`、`key_version` |
+| POST | `/v1/dids/{did}/keys/{key_version}/revoke` | 吊销历史密钥版本：空体或 `{}` 省略 `reason`；非空请求体须恰含 `reason`（裁剪后非空字符串，非法 400）；`key_version` 须为 ASCII 正整数；DID/版本（含他租户）不存在 404，当前版本 409；首次 200 返回 `did`、`key_version`、`status:"revoked"`、`reason`、`updated_at`，重复吊销忽略 `reason` 并返回首次结果 |
 | POST | `/v1/credentials` | 签发凭证，请求体 `{"issuer_did","subject_did","claims"}` 加可选 `expires_at`；提供时必须是 UTC 秒精度 Z 格式 `YYYY-MM-DDTHH:MM:SSZ` 且严格晚于当前时刻（否则 400），仅在提供时写入正文并参与签名；返回 201 与 `credential_id`、`signature`、`issuer_key_version` |
 | GET | `/v1/credentials/{credential_id}` | 返回 `credential_id`、`body`、`signature`；不存在 404 |
 | PUT | `/v1/credentials/{credential_id}/status` | 登记状态，请求体必须恰为 `{"status":"active"}`；首次 201、重复 200，均含 `credential_id`、`status`、`updated_at`（重复保持首次值）；已吊销 409 |
@@ -199,6 +200,45 @@ python3 -m vcbackend.cli verify vc_<id>     # 成功输出 true（退出码 0）
   因此旧凭证在轮换后仍可验真。
 - 旧状态文件中缺少密钥元数据的 DID 在加载时自动迁移为 `server`/版本 1：
   历史即原 `public_key`，句柄取 `submitted_public_key`（缺省为原 `public_key`）。
+
+### 密钥版本吊销
+
+`POST /v1/dids/{did}/keys/{key_version}/revoke` 吊销 DID 的**历史**密钥
+版本（当前版本不可吊销），使按该版本签发的凭证/演示/谓词证明在验真时
+被判无效。
+
+- 路径 `key_version` 须为 **ASCII 十进制正整数**（空值、`0`、符号、
+  小数、空白、字母、Unicode 数字等一律 **400**）；DID 或版本不存在
+  （含他租户资源）**404**；当前版本 **409**。
+- 请求体：空体或 `{}` 表示省略 `reason`（响应 `reason` 为 `null`）；
+  非空请求体必须**恰含** `reason`，且为裁剪后非空的字符串（显式
+  `null`、数字、布尔、空白串、多余字段均为 **400**）。
+- 旧版本首次吊销返回 **200** 与恰五字段 `did`、`key_version`、
+  `status:"revoked"`、`reason`（裁剪后的值）、`updated_at`（UTC 秒
+  精度 Z）；**重复吊销忽略任何 `reason`（含非法值）并返回首次结果**，
+  非法 `reason` 仅首次请求 400。
+- 首次吊销与幂等重试均记 `key.revoked`（`resource_type` 为 `did`、
+  `resource_id` 为 `<did>#<version>`）；失败路径不记。吊销记录与审计
+  在同一把锁内经同一次原子写落盘，落盘失败回滚，**跨重启保留**。
+- 被吊销版本**保留在 DID 文档历史**（`verification_methods`）中，
+  `document_proof` 仍恒由当前版本私钥签发。
+- 验真联动（均只读、不记审计、失败不消费）：
+  - 凭证 `verify` 在验签成功后按 **签发密钥 → 有效期 → 凭证吊销**
+    顺序检查，签发密钥命中返回 200、`valid:false`、
+    `reason`“签发密钥已吊销：<reason>”（省略 reason 时用“未知原因”）；
+  - 演示 `verify` 按 **issuer proof → 签发密钥 → holder proof →
+    持有者密钥** 顺序检查，分别返回“签发密钥已吊销：…”或
+    “持有者密钥已吊销：…”；**已消费/演示过期优先**；
+  - 谓词证明 `verify` 验签成功后查签发密钥；
+  - `present`/`prove` 生成时遇已吊销的签发版本（或绑定的持有者
+    版本）一律 **400** 且不留任何记录。
+- 轮换产生的新版本照常签发与验真；旧凭证缺 `issuer_key_version` 按
+  版本 1 兼容；吊销状态按租户隔离。
+
+```bash
+curl -X POST localhost:8080/v1/dids/did:example:<id>/keys/1/revoke \
+  -d '{"reason":"密钥泄露"}'   # reason 可省略（空体或 {}）
+```
 
 ### DID 文档与历史公钥（只读）
 
@@ -627,6 +667,7 @@ curl "localhost:8080/v1/trust/credential-status/vc_ext_1/history?issuer_did=did:
   | DID 注册（含同句柄幂等重试，每次都记） | `did.created` | `did` |
   | 签发凭证 | `credential.issued` | `credential` |
   | 密钥轮换 | `key.rotated` | `did` |
+  | 密钥版本吊销（首次与幂等重试均记） | `key.revoked` | `did` |
   | active 登记（首次 201 与幂等 200 均记） | `status.updated` | `credential` |
   | 吊销凭证（首次与幂等重试均记） | `credential.revoked` | `credential` |
   | 创建演示 | `presentation.created` | `presentation` |
@@ -674,6 +715,7 @@ python3 tests/trust_credential_verify_test.py
 python3 tests/trust_credential_verify_with_status_test.py
 python3 tests/trust_credential_status_sync_test.py
 python3 tests/trust_credential_status_history_test.py
+python3 tests/key_revocation_test.py
 ```
 
 脚本会临时在本地端口启动服务。`e2e_test.py` 覆盖：201/200/400/404/409 各路径、同 key 去重、
@@ -704,9 +746,11 @@ vcbackend/
   models.py    DIDRecord / CredentialRecord / CredentialStatusRecord /
                PresentationRecord / PredicateProofRecord /
                TrustAnchorRecord / CredentialStatusSyncRecord /
-               CredentialStatusHistoryEvent / AuditEvent 数据模型
+               CredentialStatusHistoryEvent / KeyRevocationRecord /
+               AuditEvent 数据模型
   store.py     多租户文件存储（租户分桶、旧格式迁移）、DID 去重、密钥
-               轮换、DID 文档只读查询（历史公钥与当前版本私钥证明）、凭证签发/验签、选择性披露演示（RFC6901 路径校验、
+               轮换、密钥版本吊销（吊销版本保留在文档历史、验真联动）、
+               DID 文档只读查询（历史公钥与当前版本私钥证明）、凭证签发/验签、选择性披露演示（RFC6901 路径校验、
                claims 投影）、谓词证明（谓词校验/求值、results 重算）、
                消费锁内复查过期，信任锚点注册/吊销/验签/
                带前置版本校验的轮换、跨系统外部凭证验真（含合并同步状态
@@ -757,4 +801,12 @@ tests/trust_credential_status_history_test.py  外部凭证状态历史（追加
                                    各类非法参数 400、双键 404、租户隔离、
                                    只读不审计、重启 cursor 持久化、旧状态补
                                    兼容项 audit 为 null、落盘失败回滚）
+tests/key_revocation_test.py       密钥版本吊销（路径版本 400、DID/版本/
+                                   他租户 404、当前版本 409、reason 省略/
+                                   裁剪/非法 400、重复吊销忽略 reason、
+                                   key.revoked 审计、文档保留吊销版本且
+                                   证明仍由当前版签发、凭证/演示/谓词证明
+                                   verify 命中密钥吊销与优先级、present/
+                                   prove 400 不留记录、轮换照常签发、
+                                   重启保留、租户隔离）
 ```
