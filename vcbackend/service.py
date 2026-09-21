@@ -21,6 +21,7 @@
   POST /v1/trust/anchors                  注册信任锚点（同 DID/版本同 PEM 幂等）
   POST /v1/trust/anchors/{did}/rotate     带前置版本校验的密钥轮换
   GET  /v1/trust/anchors/{did}            查询 DID 的全部锚点版本
+  GET  /v1/trust/anchors/{did}/history    查询信任锚点生命周期历史（只读）
   PUT  /v1/trust/anchors/{did}/{key_version}/status  吊销锚点版本
   POST /v1/trust/verify                   用 active 锚点公钥验签
   POST /v1/trust/credentials/verify       跨系统凭证验真（无需登记 DID/凭证）
@@ -349,6 +350,17 @@ def build_handler(store: VCStore) -> type:
                 elif path.startswith("/v1/credentials/"):
                     self._get_credential(
                         tenant, unquote(path[len("/v1/credentials/") :])
+                    )
+                elif path.startswith("/v1/trust/anchors/") and path.endswith(
+                    "/history"
+                ):
+                    did = unquote(
+                        path[
+                            len("/v1/trust/anchors/") : -len("/history")
+                        ]
+                    )
+                    self._get_trust_anchor_history(
+                        tenant, did, parsed.query
                     )
                 elif path.startswith("/v1/trust/anchors/"):
                     did = unquote(path[len("/v1/trust/anchors/") :])
@@ -1011,6 +1023,60 @@ def build_handler(store: VCStore) -> type:
             records = store.list_trust_anchors(tenant, did)
             self._send_json(
                 200, [self._trust_anchor_payload(r) for r in records]
+            )
+
+        def _get_trust_anchor_history(
+            self, tenant: str, did: str, query: str
+        ) -> None:
+            # GET /v1/trust/anchors/{did}/history?limit=&after=：只读
+            # 信任锚点生命周期历史。limit 缺省 50，须为 1..200 的 ASCII
+            # 十进制整数；after 缺省 0，须为非负 ASCII 十进制整数；
+            # 重复/空白/布尔词/小数/符号/Unicode 数字一律 400。未知或
+            # 他租户 DID 404；已有 DID 无历史返回空页，空页 next_after
+            # 保持 after。纯只读：不写任何状态、不记审计。
+            if not did:
+                raise ValidationError("路径缺少 did")
+            params = parse_qs(query, keep_blank_values=True)
+
+            limit_values = params.get("limit")
+            if limit_values is not None:
+                if len(limit_values) != 1:
+                    raise ValidationError("查询参数 limit 只能提供一次")
+                limit = _parse_nonneg_int(limit_values[0], "limit")
+                if not 1 <= limit <= 200:
+                    raise ValidationError(
+                        "查询参数 limit 须在 1 到 200 之间"
+                    )
+            else:
+                limit = 50
+
+            after_values = params.get("after")
+            if after_values is not None:
+                if len(after_values) != 1:
+                    raise ValidationError("查询参数 after 只能提供一次")
+                after = _parse_nonneg_int(after_values[0], "after")
+            else:
+                after = 0
+
+            events, next_after = store.list_trust_anchor_history(
+                tenant, did, after, limit
+            )
+            self._send_json(
+                200,
+                {
+                    "did": did,
+                    "events": [
+                        {
+                            "key_version": event.key_version,
+                            "action": event.action,
+                            "status": event.status,
+                            "updated_at": event.updated_at,
+                            "cursor": event.cursor,
+                        }
+                        for event in events
+                    ],
+                    "next_after": next_after,
+                },
             )
 
         def _put_trust_anchor_status(

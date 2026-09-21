@@ -149,6 +149,25 @@ class TrustAnchorRecord:
 
 
 @dataclass
+class TrustAnchorHistoryEvent:
+    """信任锚点生命周期历史中的一条事件（只读历史查询用）。
+
+    按 (租户, did) 归属；仅新版本注册、轮换目标版本与首次吊销追加。
+    action 沿用既有审计动作名（trust.anchor.registered /
+    trust.anchor.rotated / trust.anchor.revoked）；status 为追加时的
+    版本状态（active/revoked）；active 事件 updated_at 为 None，revoked
+    事件为首次吊销时间（UTC ISO8601 秒精度 Z）。cursor 为租户内跨 DID
+    共享的持久化正整数，按追加顺序单调递增。
+    """
+
+    key_version: int
+    action: str
+    status: str
+    updated_at: Optional[str]
+    cursor: int
+
+
+@dataclass
 class CredentialStatusSyncRecord:
     """一条外部凭证状态同步记录（按租户与 issuer_did#credential_id 双键隔离）。
 

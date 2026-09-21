@@ -44,6 +44,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/trust/anchors` | 注册信任锚点，请求体 `{"did","public_key","key_version"}`（非空字符串、P-256 PEM、非布尔正整数）；返回 201 与 `did`、`public_key`、`key_version`、`status:"active"`、`updated_at:null` |
 | POST | `/v1/trust/anchors/{did}/rotate` | 带前置版本校验的密钥轮换，请求体须恰含 `from_key_version`（非布尔正整数）、`public_key`（P-256 PEM）；目标版本为 `from_key_version+1`；新建 201、同前置同 PEM 幂等重试 200，响应字段同 GET 元素 |
 | GET | `/v1/trust/anchors/{did}` | 返回该 DID 的全部锚点版本数组（按 `key_version` 升序）；未知 DID 404 |
+| GET | `/v1/trust/anchors/{did}/history?limit=&after=` | 只读查询信任锚点生命周期历史；200 恰含 `did`、`events`、`next_after`，事件恰含 `{key_version,action,status,updated_at,cursor}`；仅新版本注册、轮换目标版本（active、`updated_at:null`）与首次吊销（revoked、首次吊销 UTC 秒 Z 时间）追加，幂等重试与失败不追加；`cursor` 为租户内跨 DID 共享的持久化正整数；`limit` 默认 50、限 1–200，`after` 默认 0、须非负，重复/非空 ASCII 数字外取值均 400；未知或跨租户 DID 404，已有 DID 无历史返空页；只读不记审计 |
 | PUT | `/v1/trust/anchors/{did}/{key_version}/status` | 吊销锚点版本，请求体必须恰为 `{"status":"revoked"}`；首次与重复均 200，首次置 UTC 秒精度 `updated_at`，重复保持不变；未知版本 404 |
 | POST | `/v1/trust/verify` | 信任验签，请求体含非空字符串 `issuer_did`、正整数 `issuer_key_version`、非空字符串 `signature`；**缺失、吊销或验签失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
 | POST | `/v1/trust/credentials/verify` | 跨系统凭证验真：验证未在本租户签发或存储的外部凭证，无需登记 DID/凭证；请求体须恰含 `body`、`signature`；**任何失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
@@ -598,6 +599,52 @@ curl -X POST localhost:8080/v1/proofs/zp_<id>/verify \
   事件在同一把锁内经同一次原子写落盘，落盘失败回滚（变更不生效、
   事件不记录）。
 
+#### 信任锚点生命周期历史（只读）
+
+`GET /v1/trust/anchors/{did}/history` 只读返回某 DID 锚点版本的
+生命周期事件，与注册、轮换、吊销、验真及审计协议完全兼容。
+
+- 200 响应恰含 `did`、`events`、`next_after`；`events` 按 `cursor`
+  升序，每项恰含 `key_version`、`action`、`status`、`updated_at`、
+  `cursor`。`action` 沿用对应的既有审计动作名：
+  - 新版本注册（`POST /v1/trust/anchors` 新建）追加
+    `trust.anchor.registered`、`status:"active"`、`updated_at:null`；
+  - 轮换目标版本新建追加 `trust.anchor.rotated`、`status:"active"`、
+    `updated_at:null`；
+  - 版本**首次**吊销追加 `trust.anchor.revoked`、`status:"revoked"`、
+    `updated_at` 为首次吊销的 UTC 秒精度 Z 时间。
+- **幂等重试与任何失败均不追加**：同 DID/版本同 PEM 的注册重试、
+  同前置同 PEM 的轮换重试、重复吊销（这些请求仍按原规则记审计），
+  以及 400/404/409 等失败路径都不产生历史事件。
+- `cursor` 为**租户内持久化正整数**：同一租户内不同 DID 的锚点事件
+  共享同一游标空间，按追加顺序单调递增并跨重启稳定；不同租户各自
+  从 1 计起。
+- `limit` 缺省 **50**，须为 **1–200** 的 ASCII 十进制整数；`after`
+  缺省 **0**，须为**非负** ASCII 十进制整数。二者都**只能出现一次**
+  且须为**非空 ASCII 数字**：重复参数、空白、布尔词、小数、符号、
+  Unicode 数字等一律 **400**。`after` 排除 `cursor` 不大于其值的
+  事件，`next_after` 为本页末项的 `cursor`，**空页等于 `after`**。
+- DID 在本租户已存在但无历史时返回**空页**；未知 DID 或访问他租户
+  DID 返回 **404**（跨租户不可探测）；显式空 `X-Tenant-ID` 为
+  **400**。该接口为纯只读查询，**不记审计**、不触发落盘，锚点列表、
+  验真与注册/轮换/吊销的幂等响应均保持不变。
+- **旧状态兼容**：旧版本状态文件中锚点版本存在但无生命周期历史时，
+  加载时按（租户、DID、版本）稳定顺序补录——每个版本补一条 active
+  事件（行含 `from_key_version` 即经轮换创建，补
+  `trust.anchor.rotated`；否则补 `trust.anchor.registered`，
+  `updated_at` 为 `null`），已吊销版本另补一条
+  `trust.anchor.revoked`，`updated_at` 取该版本行的首次吊销时间；
+  补录 `cursor` 为该租户内新分配的持久化正整数。兼容项随下一次原子
+  写一并落盘，即使加载后无写操作，重启时也按相同顺序重建为**相同
+  cursor**。
+- 注册/轮换/吊销变更时，**锚点、历史、游标与审计事件在同一把锁内
+  经同一次原子写落盘，落盘失败一并回滚**（锚点版本不变、历史不追加、
+  游标不前进、审计不记录）。
+
+```bash
+curl "localhost:8080/v1/trust/anchors/did:web:example.com/history?limit=50&after=0"
+```
+
 ```bash
 curl -X POST localhost:8080/v1/trust/anchors -d '{
   "did":"did:web:example.com",
@@ -772,6 +819,7 @@ python3 tests/credential_expiry_test.py
 python3 tests/tenant_audit_test.py
 python3 tests/trust_anchor_test.py
 python3 tests/trust_anchor_rotate_test.py
+python3 tests/trust_anchor_history_test.py
 python3 tests/predicate_proof_test.py
 python3 tests/holder_binding_test.py
 python3 tests/trust_credential_verify_test.py
@@ -809,7 +857,8 @@ vcbackend/
                KeyVersionStatusRecord / KeyRevocationEvent /
                PresentationRecord / PredicateProofRecord /
                TrustAnchorRecord / CredentialStatusSyncRecord /
-               CredentialStatusHistoryEvent / AuditEvent 数据模型
+               CredentialStatusHistoryEvent / TrustAnchorHistoryEvent /
+               AuditEvent 数据模型
   store.py     多租户文件存储（租户分桶、旧格式迁移）、DID 去重、密钥
                轮换、DID 旧密钥版本吊销（当前版本 409、重复忽略 reason、
                原子审计与验真端签发/持有者密钥吊销判定）、
@@ -818,7 +867,9 @@ vcbackend/
                加载补兼容事件、追加与分页）、凭证签发/验签、选择性披露演示（RFC6901 路径校验、
                claims 投影）、谓词证明（谓词校验/求值、results 重算）、
                消费锁内复查过期，信任锚点注册/吊销/验签/
-               带前置版本校验的轮换、跨系统外部凭证验真（含合并同步状态
+               带前置版本校验的轮换/生命周期历史（租户内跨 DID
+               共享持久化游标、旧锚点加载按版本补注册/轮换/吊销事件、
+               追加与分页）、跨系统外部凭证验真（含合并同步状态
                的只读判定）、外部凭证状态
                同步（双键隔离、严格更新、重放幂等、原子审计）、外部凭证
                状态历史（持久化游标、旧状态兼容补项、追加与查询），以及
@@ -827,6 +878,7 @@ vcbackend/
                /v1/dids/{did}/document、
                /v1/dids/{did}/keys/{ver}/status、
                /v1/dids/{did}/keys/revocations、
+               /v1/trust/anchors/{did}/history、
                /v1/trust/credential-status/{id}/history 与错误映射
   cli.py       did-create / did-show / issue / verify / serve
 tests/e2e_test.py                  端到端测试（默认租户，全协议兼容）
@@ -856,6 +908,15 @@ tests/key_revocation_status_history_test.py DID 密钥版本状态与吊销历�
 tests/tenant_audit_test.py         租户隔离 / 审计 / 过期竞态测试
 tests/trust_anchor_test.py         信任锚点注册/查询/吊销/验签测试
 tests/trust_anchor_rotate_test.py  信任锚点密钥轮换（400/404/409/幂等/审计/重启）
+tests/trust_anchor_history_test.py 信任锚点生命周期历史（注册/轮换 active
+                                   与首次吊销 revoked 事件、动作名沿用审计、
+                                   幂等重试与失败不追加、字段恰含与 cursor
+                                   租户内跨 DID 递增、limit/after 分页与
+                                   空页保持、各类非法参数 400、未知/跨租户
+                                   404、空租户头 400、只读不审计、重启 cursor
+                                   稳定、旧状态按版本补注册/轮换/吊销事件且
+                                   无写重启 cursor 稳定、落盘失败锚点/历史/
+                                   游标/审计共同回滚、列表/验真/幂等响应不变）
 tests/predicate_proof_test.py      谓词证明（prove 字段/400/404、verify 消费/
                                    过期/篡改/跨租户/并发/审计/重启）
 tests/holder_binding_test.py       演示持有者绑定（未绑定兼容、绑定 201 字段/
