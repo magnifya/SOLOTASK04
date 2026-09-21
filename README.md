@@ -43,6 +43,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | PUT | `/v1/trust/anchors/{did}/{key_version}/status` | 吊销锚点版本，请求体必须恰为 `{"status":"revoked"}`；首次与重复均 200，首次置 UTC 秒精度 `updated_at`，重复保持不变；未知版本 404 |
 | POST | `/v1/trust/verify` | 信任验签，请求体含非空字符串 `issuer_did`、正整数 `issuer_key_version`、非空字符串 `signature`；**缺失、吊销或验签失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
 | POST | `/v1/trust/credentials/verify` | 跨系统凭证验真：验证未在本租户签发或存储的外部凭证，无需登记 DID/凭证；请求体须恰含 `body`、`signature`；**任何失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
+| POST | `/v1/trust/credentials/verify-batch` | 批量跨系统凭证验真：请求体恰为 `{"credentials":[项...]}`，数组非空且不超过 100 项，每项规则与单项验真一致；**任何失败均 HTTP 200**，返回 `{"results":[...]}`（长度与顺序与输入一致，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`，不短路）；请求体非法、空数组或超上限时返回 `{"results":[],"reason":"请求..."}` |
 | POST | `/v1/trust/credential-status/sync` | 外部凭证状态同步：请求体须恰含 `body`、`signature`，`body` 须恰含 `issuer_did`、`credential_id`、`status`、`updated_at`、`issuer_key_version`，可选 `reason`；请求/字段非法 400；锚点或签名失败 HTTP 200、`valid:false` 且不写入；首次同步 201、相同重放 200 不重复审计、严格更新替换、同时间不同内容 409 |
 | GET | `/v1/trust/credential-status/{credential_id}?issuer_did=...` | 查询已同步的外部凭证状态；`issuer_did` 须唯一非空；已同步返回 `status`、`reason`、`updated_at`，未同步（含他租户）404 |
 | GET | `/v1/trust/credential-status/{credential_id}/history?issuer_did=...&limit=&after=` | 只读查询外部凭证状态历史（兼容同步）；按 `updated_at` 升序、同值按 `cursor`；缺/重/空 `issuer_did` 400，`limit`/`after` 非法 400，未同步双键（含他租户）404 |
@@ -301,6 +302,20 @@ curl -X POST localhost:8080/v1/proofs/zp_<id>/verify \
   - 签名为 **ES256/SHA-256**，64 字节裸 `R||S` 的无填充 base64url，覆盖
     完整 `body` 的递归排序紧凑 JSON；签名编码非法返回前缀“签名格式错误”，
     密码学验签失败返回前缀“签名校验失败”。成功仅返回 `{"valid":true}`。
+- `POST /v1/trust/credentials/verify-batch` 为批量版本，逐项规则与单项
+  验真完全一致（字段、锚点、签名与原因分类）：
+  - 请求体必须**恰为** `{"credentials":[项...]}`；`credentials` 须为
+    **非空且不超过 100 项**的数组，每项须恰含 `body`（对象）与
+    `signature`（非空字符串）。
+  - 请求体非法（非法 JSON/非对象、缺或多字段、`credentials` 非数组、
+    空数组或超过上限）一律 HTTP 200，返回
+    `{"results":[],"reason":"请求…"}`。
+  - 请求级合法时按输入**顺序逐项校验、失败不短路**，HTTP 200 返回
+    `{"results":[...]}`：长度与顺序与输入一致，成功项为
+    `{"valid":true}`，失败项为 `{"valid":false,"reason":"…"}`，
+    `reason` 区分请求、凭证、锚点、签名格式错误、签名校验失败。
+  - 同样只读：不写凭证、状态或审计；遵守租户缺省 `default`、显式空值
+    400 与跨租户锚点隔离。
 - `POST /v1/trust/anchors/{did}/rotate` 在既有锚点上做带前置版本校验的
   密钥轮换：
   - 请求体必须**恰含** `from_key_version`（非布尔正整数）与 `public_key`
@@ -343,6 +358,9 @@ curl -X POST localhost:8080/v1/trust/credentials/verify \
   -d '{"body":{"credential_id":"vc_ext_1","issuer_did":"did:web:example.com",
        "subject_did":"did:web:subject","claims":{...},"issued_at":"2026-09-21T00:00:00Z",
        "issuer_key_version":1},"signature":"<base64url R||S>"}'
+curl -X POST localhost:8080/v1/trust/credentials/verify-batch \
+  -d '{"credentials":[{"body":{...},"signature":"<base64url R||S>"},
+                       {"body":{...},"signature":"<base64url R||S>"}]}'
 ```
 
 ### 外部凭证状态同步
