@@ -22,6 +22,7 @@
   POST /v1/trust/verify                   用 active 锚点公钥验签
   POST /v1/trust/credentials/verify       跨系统凭证验真（无需登记 DID/凭证）
   POST /v1/trust/credentials/verify-batch 批量跨系统凭证验真（兼容单项规则）
+  POST /v1/trust/credentials/verify-with-status  验真+状态判定合并查询（只读）
   POST /v1/trust/credential-status/sync   同步外部凭证状态（active 锚点验签）
   GET  /v1/trust/credential-status/{id}   查询已同步的外部凭证状态
   GET  /v1/trust/credential-status/{id}/history  查询外部凭证状态历史（只读）
@@ -228,6 +229,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_verify(tenant)
                 elif path == "/v1/trust/credentials/verify":
                     self._post_trust_credentials_verify(tenant)
+                elif path == "/v1/trust/credentials/verify-with-status":
+                    self._post_trust_credentials_verify_with_status(tenant)
                 elif path == "/v1/trust/credentials/verify-batch":
                     self._post_trust_credentials_verify_batch(tenant)
                 elif path == "/v1/trust/credential-status/sync":
@@ -978,6 +981,48 @@ def build_handler(store: VCStore) -> type:
 
             try:
                 valid, reason = store.verify_trust_credential(tenant, data)
+            except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
+                self._send_invalid("验签过程发生内部错误")
+                return
+            payload: Dict[str, Any] = {"valid": valid}
+            if not valid:
+                payload["reason"] = reason or "验签失败"
+            self._send_json(200, payload)
+
+        def _post_trust_credentials_verify_with_status(
+            self, tenant: str
+        ) -> None:
+            # 外部凭证验真 + 状态判定合并查询：与 /v1/trust/credentials/
+            # verify 相同的公开错误协议，任何失败都返回 200 +
+            # {"valid": false, "reason": "<非空中文原因>"}，且保持相同的
+            # 失败优先级（请求 -> 凭证 -> 锚点 -> 签名格式 -> 验签 ->
+            # 过期 -> 状态）。验签通过后按本租户 (issuer_did,
+            # credential_id) 查同步记录判定状态。只读，不写任何状态。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                self._send_invalid("请求体缺失或长度声明非法")
+                return
+            except Exception:  # noqa: BLE001
+                self._send_invalid("请求体读取失败")
+                return
+            if not raw:
+                self._send_invalid("请求体缺失")
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                self._send_invalid("请求体不是合法 UTF-8 文本")
+                return
+            except json.JSONDecodeError:
+                self._send_invalid("请求体不是合法 JSON")
+                return
+
+            try:
+                valid, reason = store.verify_trust_credential_with_status(
+                    tenant, data
+                )
             except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
                 self._send_invalid("验签过程发生内部错误")
                 return

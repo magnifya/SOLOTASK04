@@ -2324,6 +2324,48 @@ class VCStore:
                 return False, CREDENTIAL_EXPIRED_REASON
         return True, ""
 
+    def verify_trust_credential_with_status(
+        self,
+        tenant_id: str,
+        data: Any,
+    ) -> Tuple[bool, str]:
+        """外部凭证验真 + 状态判定合并查询，返回 (是否有效, 失败原因)。
+
+        请求结构、凭证字段、锚点、签名格式、密码学验签与过期检查完全
+        复用 verify_trust_credential（含其失败原因与优先级）。验签通过
+        后按本租户 (issuer_did, credential_id) 查询同步记录：
+          - 未同步 -> (False, "外部凭证状态未同步")；
+          - active -> (True, "")；
+          - revoked -> (False, "外部凭证已吊销：<保存 reason，缺省 未知原因>")；
+          - unknown -> (False, "外部凭证状态未知")。
+        只读：不创建凭证、不修改本地状态、不写同步记录或审计，绝不向上
+        抛异常。
+        """
+        valid, reason = self.verify_trust_credential(tenant_id, data)
+        if not valid:
+            return False, reason
+        body = data["body"]
+        issuer_did = body["issuer_did"]
+        credential_id = body["credential_id"]
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            row = None
+            if bucket is not None:
+                row = (
+                    bucket.get("credential_status_sync", {})
+                    .get(issuer_did, {})
+                    .get(credential_id)
+                )
+        if row is None:
+            return False, "外部凭证状态未同步"
+        status = row["status"]
+        if status == "active":
+            return True, ""
+        if status == "revoked":
+            saved_reason = row.get("reason") or "未知原因"
+            return False, f"外部凭证已吊销：{saved_reason}"
+        return False, "外部凭证状态未知"
+
     def verify_trust_credentials_batch(
         self,
         tenant_id: str,
