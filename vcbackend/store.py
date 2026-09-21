@@ -125,6 +125,59 @@ def _parse_utc_z(text: str) -> datetime:
     )
 
 
+# 凭证有效期字段：仅接受 UTC 秒精度 Z 格式 YYYY-MM-DDTHH:MM:SSZ
+_EXPIRES_AT_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$"
+)
+
+# 过期判定统一原因
+REASON_CREDENTIAL_EXPIRED = "凭证已过期"
+
+
+def _validate_credential_expires_at(value: Any) -> str:
+    """校验凭证 expires_at：非空字符串、严格秒精度 Z 格式且为未来时刻。
+
+    通过时原样返回该字符串（不做重格式化，保证写入正文与参与签名的
+    值与请求一致）；类型/格式/非法时刻/不晚于当前 UTC 时间一律
+    ValidationError（HTTP 400）。
+    """
+    if not isinstance(value, str) or not value:
+        raise ValidationError(
+            "字段 expires_at 必须为 UTC 秒精度 Z 格式"
+            "（YYYY-MM-DDTHH:MM:SSZ）的非空字符串"
+        )
+    if not _EXPIRES_AT_RE.match(value):
+        raise ValidationError(
+            "字段 expires_at 必须为 UTC 秒精度 Z 格式"
+            "（YYYY-MM-DDTHH:MM:SSZ）"
+        )
+    try:
+        expires_at = _parse_utc_z(value)
+    except ValueError:
+        # 形如 2026-13-40T25:61:61Z 的非法日期/时刻
+        raise ValidationError(
+            "字段 expires_at 不是合法时刻，须为 UTC 秒精度 Z 格式"
+            "（YYYY-MM-DDTHH:MM:SSZ）"
+        )
+    if expires_at <= datetime.now(timezone.utc):
+        raise ValidationError("字段 expires_at 必须严格晚于当前时间")
+    return value
+
+
+def _credential_is_expired(expires_at: Any) -> Optional[bool]:
+    """判定凭证是否到期：无 expires_at 恒为 False。
+
+    返回 None 表示值存在但无法按秒精度 Z 格式解析（存储数据异常，
+    调用方按内部错误处理）；否则返回当前 UTC 时间是否 >= expires_at。
+    """
+    if expires_at is None:
+        return False
+    try:
+        return datetime.now(timezone.utc) >= _parse_utc_z(expires_at)
+    except (TypeError, ValueError):
+        return None
+
+
 def _validate_key_handle(value: Any, field: str) -> str:
     """句柄必须为非空字符串且不是 PEM 文本，返回去空白后的句柄。"""
     if not isinstance(value, str) or not value.strip():
@@ -741,14 +794,25 @@ class VCStore:
         issuer_did: str,
         subject_did: str,
         claims: Dict[str, Any],
+        expires_at: Any = None,
     ) -> CredentialRecord:
-        """校验签发者/持有者 DID（限本租户），构造正文并签名，记审计。"""
+        """校验签发者/持有者 DID（限本租户），构造正文并签名，记审计。
+
+        expires_at 为 None 时正文不包含该字段；提供时必须为严格晚于
+        当前 UTC 时间的秒精度 Z 格式串，原样写入正文并参与 ES256
+        规范化签名，非法值抛 ValidationError。
+        """
         if not isinstance(issuer_did, str) or not issuer_did:
             raise ValidationError("缺少字段或字段为空: issuer_did")
         if not isinstance(subject_did, str) or not subject_did:
             raise ValidationError("缺少字段或字段为空: subject_did")
         if not isinstance(claims, dict):
             raise ValidationError("字段 claims 必须为 JSON 对象")
+        normalized_expires_at: Optional[str] = None
+        if expires_at is not None:
+            normalized_expires_at = _validate_credential_expires_at(
+                expires_at
+            )
 
         with self._lock:
             bucket = self._ensure_bucket_locked(tenant_id)
@@ -771,6 +835,9 @@ class VCStore:
                     "issued_at": _utc_now(),
                     "issuer_key_version": int(issuer.get("key_version", 1)),
                 }
+                # 仅在请求提供 expires_at 时写入：未提供不得注入字段
+                if normalized_expires_at is not None:
+                    body["expires_at"] = normalized_expires_at
                 signature = crypto.sign(body, issuer["private_key_pem"])
                 bucket["credentials"][credential_id] = {
                     "body": body,
@@ -938,18 +1005,20 @@ class VCStore:
         """以存储记录为锚校验选择性披露演示，返回 (是否有效, 失败原因)。
 
         校验顺序：请求 -> 资源 ID -> 绑定（含 challenge）-> 已消费 ->
-        过期（当前时间 >= expires_at）-> 投影 -> proof 格式与签名 ->
-        吊销。新演示（存储记录含 challenge）要求请求恰含 presentation
-        与 challenge，且请求 challenge、演示 challenge 与 proof 覆盖的
-        存储 challenge 三者一致；旧演示（无 challenge）只接受恰含
-        presentation 的请求，不做挑战、过期与消费检查。
+        演示过期（当前时间 >= 演示 expires_at）-> 投影 -> proof 格式与
+        签名 -> 凭证有效期 -> 吊销。新演示（存储记录含 challenge）要求
+        请求恰含 presentation 与 challenge，且请求 challenge、演示
+        challenge 与 proof 覆盖的存储 challenge 三者一致；旧演示（无
+        challenge）只接受恰含 presentation 的请求，不做挑战、演示级过期
+        与消费检查，但凭证自身有效期检查对新旧演示均生效。
 
-        验签成功后在消费锁内复查已消费/到期/吊销：复查到期即返回
-        “演示已过期”，不消费、不记审计；未到期并发验证仅一次成功，
-        成功时原子标记已消费并记一次 presentation.consumed（标记与
-        事件同一次原子写，失败回滚不记），跨重启保留；已消费优先于
-        过期与吊销；签名成功但已吊销返回“凭证已吊销：<原因>”且
-        不消费。任何失败均返回非空中文原因，绝不抛异常、不泄露私钥。
+        验签成功后在消费锁内复查已消费/到期/凭证有效期/吊销：复查
+        凭证到期即返回“凭证已过期”，复查演示到期即返回“演示已过期”，
+        均不消费、不记审计；未到期并发验证仅一次成功，成功时原子标记
+        已消费并记一次 presentation.consumed（标记与事件同一次原子写，
+        失败回滚不记），跨重启保留；已消费优先于过期与吊销；签名成功
+        但凭证已过期返回“凭证已过期”、已吊销返回“凭证已吊销：<原因>”，
+        均不消费。任何失败均返回非空中文原因，绝不抛异常、不泄露私钥。
         """
         if not isinstance(presentation, dict):
             return False, "请求不合法: 字段 presentation 必须为 JSON 对象"
@@ -1050,6 +1119,8 @@ class VCStore:
             source_claims = cred["body"].get("claims", {})
             credential_status = cred.get("status")
             revoke_reason = cred.get("revoke_reason")
+            # 凭证自身有效期：演示自身绑定/签名通过后再判定
+            credential_expires_at = cred["body"].get("expires_at")
 
             public_pem = self._public_key_for_version_locked(
                 bucket, issuer_did, stored_version
@@ -1103,15 +1174,20 @@ class VCStore:
         except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
             return False, "验签过程发生内部错误"
 
-        # 签名与锚定均成功后检查凭证状态：已吊销不消费
+        # 签名与锚定均成功后检查凭证有效期与状态：过期/已吊销均不消费
+        expired = _credential_is_expired(credential_expires_at)
+        if expired is None:
+            return False, "验签过程发生内部错误"
+        if expired:
+            return False, REASON_CREDENTIAL_EXPIRED
         if credential_status == "revoked":
             saved_reason = revoke_reason or DEFAULT_REVOKE_REASON
             return False, f"凭证已吊销：{saved_reason}"
 
         if is_replay_protected:
-            # 原子标记已消费：消费锁内复查已消费/到期/吊销，防止
-            # “锁外验签期间演示到期仍被消费”的竞态。并发仅一次成功，
-            # 跨重启保留；复查到期或已吊销均不消费、不记审计。
+            # 原子标记已消费：消费锁内复查已消费/到期/吊销/凭证有效期，
+            # 防止“锁外验签期间凭证到期仍被消费”的竞态。并发仅一次
+            # 成功，跨重启保留；复查到期或已吊销均不消费、不记审计。
             with self._lock:
                 bucket = self._bucket_locked(tenant_id)
                 row = (
@@ -1129,6 +1205,14 @@ class VCStore:
                 if datetime.now(timezone.utc) >= expires_at:
                     return False, "演示已过期"
                 cred = bucket["credentials"].get(credential_id)
+                if cred is not None:
+                    cred_expired = _credential_is_expired(
+                        cred["body"].get("expires_at")
+                    )
+                    if cred_expired is None:
+                        return False, "验签过程发生内部错误"
+                    if cred_expired:
+                        return False, REASON_CREDENTIAL_EXPIRED
                 if cred is not None and cred.get("status") == "revoked":
                     saved_reason = (
                         cred.get("revoke_reason") or DEFAULT_REVOKE_REASON
@@ -1257,9 +1341,10 @@ class VCStore:
         校验顺序：请求 -> 资源 ID -> 绑定（字段集合与各锚定字段、
         请求 challenge、证明 challenge 与 proof 覆盖的存储 challenge
         三者一致）-> 已消费（优先于过期）-> 过期（当前时间 >=
-        expires_at）-> 按存储凭证 claims 与存储 predicates 重算
-        results 并核对 -> proof 格式与签名。验签成功后在消费锁内
-        复查已消费/到期：复查到期即返回“证明已过期”，不消费、不记
+        证明 expires_at）-> 按存储凭证 claims 与存储 predicates 重算
+        results 并核对 -> proof 格式与签名 -> 凭证有效期。验签成功后
+        在消费锁内复查已消费/证明到期/凭证有效期：复查证明到期即返回
+        “证明已过期”，凭证到期即返回“凭证已过期”，均不消费、不记
         审计；未到期并发验证仅一次成功，成功时原子标记已消费并记一次
         proof.consumed（同一次原子写，失败回滚），跨重启保留。
         任何失败均返回非空中文原因，绝不抛异常、不泄露私钥。
@@ -1357,6 +1442,8 @@ class VCStore:
             if cred is None:
                 return False, f"凭证不存在: {credential_id}"
             source_claims = cred["body"].get("claims", {})
+            # 凭证自身有效期：证明自身绑定/签名通过后再判定
+            credential_expires_at = cred["body"].get("expires_at")
 
             public_pem = self._public_key_for_version_locked(
                 bucket, issuer_did, stored_version
@@ -1406,8 +1493,15 @@ class VCStore:
         except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
             return False, "验签过程发生内部错误"
 
-        # 原子标记已消费：消费锁内复查已消费/到期，并发仅一次成功，
-        # 跨重启保留；复查到期不消费、不记审计。
+        # 签名与锚定均成功后检查凭证自身有效期：过期则不消费、不记审计
+        expired = _credential_is_expired(credential_expires_at)
+        if expired is None:
+            return False, "验签过程发生内部错误"
+        if expired:
+            return False, REASON_CREDENTIAL_EXPIRED
+
+        # 原子标记已消费：消费锁内复查已消费/到期/凭证有效期，并发仅
+        # 一次成功，跨重启保留；复查到期不消费、不记审计。
         with self._lock:
             bucket = self._bucket_locked(tenant_id)
             row = (
@@ -1424,6 +1518,15 @@ class VCStore:
                 return False, "验签过程发生内部错误"
             if datetime.now(timezone.utc) >= expires_at:
                 return False, "证明已过期"
+            cred = bucket["credentials"].get(credential_id)
+            if cred is not None:
+                cred_expired = _credential_is_expired(
+                    cred["body"].get("expires_at")
+                )
+                if cred_expired is None:
+                    return False, "验签过程发生内部错误"
+                if cred_expired:
+                    return False, REASON_CREDENTIAL_EXPIRED
             snapshot = self._snapshot_locked()
             try:
                 row["consumed"] = True
@@ -1642,6 +1745,8 @@ class VCStore:
             # 状态在锚定、签名校验成功后才参与判定；active 或无状态维持结果
             credential_status = rec.get("status")
             revoke_reason = rec.get("revoke_reason")
+            # 有效期以存储正文为准（请求值若被篡改会先在签名步失败）
+            credential_expires_at = stored_body.get("expires_at")
 
         if not public_pem:
             return False, (
@@ -1665,7 +1770,17 @@ class VCStore:
         except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
             return False, "验签过程发生内部错误"
 
-        # 签名、锚定均成功后检查状态：revoked 判 valid:false，
+        # 签名、锚定均成功后检查有效期：当前时间 >= expires_at 即过期。
+        # 只读判定，不记审计；正文无 expires_at 的旧凭证不受影响。
+        # 存储值在签发时已严格校验；防御性地把无法解析的值按内部错误处理。
+        if credential_expires_at is not None:
+            expired = _credential_is_expired(credential_expires_at)
+            if expired is None:
+                return False, "验签过程发生内部错误"
+            if expired:
+                return False, REASON_CREDENTIAL_EXPIRED
+
+        # 有效期通过后检查状态：revoked 判 valid:false，
         # active 或历史无状态维持 valid:true
         if credential_status == "revoked":
             saved_reason = revoke_reason or DEFAULT_REVOKE_REASON
@@ -1901,7 +2016,10 @@ class VCStore:
         - body 须含 credential_id/issuer_did/subject_did/claims/issued_at，
           依次为非空字符串、非空字符串、非空字符串、对象、非空字符串；
           issuer_key_version 可省略（按版本 1 查锚点且不得注入签名正文），
-          提供时须为非布尔正整数；其他扩展字段允许且全部参与签名；
+          提供时须为非布尔正整数；expires_at 可选，提供时必须为 UTC
+          秒精度 Z 格式（YYYY-MM-DDTHH:MM:SSZ）串并参与签名，签名成功
+          后当前时间 >= expires_at 返回“凭证已过期”，缺失保持兼容；
+          其他扩展字段允许且全部参与签名；
         - 锚点按本租户 (issuer_did, 版本) 查找，仅 active 的 P-256 公钥
           可用，缺失或 revoked 失败；
         - 签名为 ES256/SHA-256，64 字节裸 R||S 的无填充 base64url，覆盖
@@ -1941,6 +2059,28 @@ class VCStore:
             return False, "凭证缺少字段: claims"
         if not isinstance(body["claims"], dict):
             return False, "凭证字段 claims 必须为 JSON 对象"
+        # expires_at 为可选扩展字段：提供时必须为 UTC 秒精度 Z 格式
+        # （不要求未来时刻——到期凭证是“验签通过但已过期”的业务结论，
+        # 由签名成功后的有效期判定给出）；缺失保持兼容，不注入签名正文。
+        credential_expires_at = body.get("expires_at") if "expires_at" in body else None
+        if "expires_at" in body:
+            if (
+                not isinstance(credential_expires_at, str)
+                or not _EXPIRES_AT_RE.match(credential_expires_at)
+            ):
+                return False, (
+                    "凭证字段 expires_at 必须为 UTC 秒精度 Z 格式"
+                    "（YYYY-MM-DDTHH:MM:SSZ）"
+                )
+            try:
+                external_expiry = _parse_utc_z(credential_expires_at)
+            except ValueError:
+                return False, (
+                    "凭证字段 expires_at 不是合法时刻，须为 UTC 秒精度 Z 格式"
+                    "（YYYY-MM-DDTHH:MM:SSZ）"
+                )
+        else:
+            external_expiry = None
         key_version = 1
         if "issuer_key_version" in body:
             version_obj = body["issuer_key_version"]
@@ -1989,6 +2129,11 @@ class VCStore:
             return False, "签名校验失败，凭证正文或签名可能被改动"
         except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
             return False, "签名校验失败: 验签过程发生内部错误"
+
+        # 6. 请求、凭证字段、锚定与签名均成功后检查有效期：body 含
+        # expires_at 且当前时间 >= 该值即过期；缺失字段保持兼容。
+        if external_expiry is not None and datetime.now(timezone.utc) >= external_expiry:
+            return False, REASON_CREDENTIAL_EXPIRED
         return True, ""
 
     def verify_trust_credentials_batch(

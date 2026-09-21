@@ -27,7 +27,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/dids` | 注册 DID，请求体 `{"method","public_key","key_mode"?}`，返回 201 与 `did`、`public_key`、`key_mode`、`key_handle`、`key_version` |
 | GET | `/v1/dids/{did}` | 返回 `did`、`public_key`、`key_mode`、`key_handle`、`key_version`、`created_at`；不存在 404 |
 | POST | `/v1/dids/{did}/keys/rotate` | 轮换密钥，请求体 `{"key_handle"}`，返回 200 与 `did`、`public_key`、`key_handle`、`key_version` |
-| POST | `/v1/credentials` | 签发凭证，请求体 `{"issuer_did","subject_did","claims"}`，返回 201 与 `credential_id`、`signature`、`issuer_key_version` |
+| POST | `/v1/credentials` | 签发凭证，请求体 `{"issuer_did","subject_did","claims","expires_at"?}`；`expires_at` 可选，提供时须为 UTC 秒精度 Z 格式且严格晚于当前时间（否则 400），原样写入正文并参与签名；返回 201 与 `credential_id`、`signature`、`issuer_key_version` |
 | GET | `/v1/credentials/{credential_id}` | 返回 `credential_id`、`body`、`signature`；不存在 404 |
 | PUT | `/v1/credentials/{credential_id}/status` | 登记状态，请求体必须恰为 `{"status":"active"}`；首次 201、重复 200，均含 `credential_id`、`status`、`updated_at`（重复保持首次值）；已吊销 409 |
 | GET | `/v1/credentials/{credential_id}/status` | 返回 `credential_id`、`status`、`updated_at`；历史无状态按 `active` 返回且 `updated_at` 为 `null`；不存在 404 |
@@ -65,6 +65,7 @@ curl -X POST localhost:8080/v1/dids/did:example:<id>/keys/rotate \
   -d '{"key_handle":"alice-key-v2"}'
 curl -X POST localhost:8080/v1/credentials \
   -d '{"issuer_did":"did:example:<a>","subject_did":"did:example:<b>","claims":{"role":"admin"}}'
+# 可选 "expires_at":"2030-01-01T00:00:00Z"（UTC 秒精度 Z 格式，须晚于当前时间）
 curl localhost:8080/v1/credentials/vc_<id>
 curl -X PUT localhost:8080/v1/credentials/vc_<id>/status \
   -d '{"status":"active"}'
@@ -103,7 +104,8 @@ python3 -m vcbackend.cli verify vc_<id>     # 成功输出 true（退出码 0）
 - 签名覆盖凭证**正文按 key 升序的规范化 JSON**（紧凑序列化、UTF-8、嵌套对象同样递归排序）。
 - 凭证正文包含 `credential_id`、`issuer_did`、`subject_did`、`claims`、`issued_at`
   与整数 `issuer_key_version`（签发时签发者的当前密钥版本，随正文一起签名），
-  对其任一字段（含 claims 内部）的改动都会使验签失败。
+  以及可选的 `expires_at`（见下节），对其任一字段（含 claims 内部）的改动都
+  会使验签失败。
 - `POST /v1/credentials/{credential_id}/verify` 以**存储的** `credential_id`、
   `issuer_did`、`issuer_key_version` 为锚：正文锚定字段与存储不一致即判失败；
   验签公钥按 `issuer_key_version` 从签发者公钥历史中取出。
@@ -118,6 +120,47 @@ python3 -m vcbackend.cli verify vc_<id>     # 成功输出 true（退出码 0）
   密钥（`历史公钥不可用…`）。验签成功返回 200 `{"valid": true}`。
 - 其他路径仍沿用原状态码协议：字段问题 400、资源不存在 404。
 - 旧凭证正文缺 `issuer_key_version` 时按版本 1 验签，签名本身不受影响。
+
+### 凭证有效期
+
+- `POST /v1/credentials` 继续接收 `issuer_did`、`subject_did`、`claims`，
+  并允许可选 `expires_at`：
+  - 未提供时凭证正文**不包含**该字段（旧的无期限凭证完全兼容，系统不
+    注入任何字段）；
+  - 提供时必须是 **UTC 秒精度 Z 格式** `YYYY-MM-DDTHH:MM:SSZ`（不接受
+    毫秒、时区偏移、空格分隔、非零填充或非法日期/时刻），且**严格晚于
+    服务接收时刻**（等于当前时刻也拒绝）；类型错误（含显式 `null`、
+    数字、布尔）一律 **400** 并在 `error` 中说明；
+  - 通过校验的 `expires_at` **原样写入凭证正文**并参与 ES256 规范化
+    签名，GET 凭证原样返回；签发响应字段保持
+    `credential_id`/`signature`/`issuer_key_version` 三个，不新增字段。
+- `POST /v1/credentials/{credential_id}/verify` 在**请求、资源、锚定与
+  签名均成功后**检查有效期：当前时间 **大于等于** `expires_at` 时返回
+  HTTP **200**、`{"valid":false,"reason":"凭证已过期"}`；其余失败
+  （请求/资源不存在/锚定不一致/签名格式或校验失败等）仍**优先返回原
+  分类原因**；未过期或无 `expires_at` 的凭证保持 `{"valid":true}`。
+  过期判定为**只读**操作，**不记审计**。篡改正文中的 `expires_at`
+  （改为未来值或删除字段）无法绕过：签名校验先失败。
+- **选择性披露演示与谓词证明**的 verify 在自身绑定与签名校验成功后，
+  同样检查其引用凭证的有效期：凭证已过期时返回同一原因
+  **“凭证已过期”**，且**不消费、不记消费审计**（重复验证结论一致、
+  记录不被标记已消费）；该检查对新旧格式演示均生效（旧演示无
+  challenge，不做演示级挑战/过期/消费检查，但凭证级有效期仍校验），
+  消费锁内复查同样覆盖凭证到期竞态。其生成接口（`present`/`prove`）
+  继续遵守原协议，不对凭证有效期做前置限制。
+- `POST /v1/trust/credentials/verify`（及批量接口逐项）对**外部凭证**：
+  `body` 含 `expires_at` 时按同一秒精度 Z 格式校验——格式非法返回
+  前缀“凭证字段 expires_at”的原因；格式合法、锚定与签名均成功后，
+  当前时间大于等于该值返回 HTTP 200、`valid:false`、
+  `reason:"凭证已过期"`；`body` 不含该字段时保持兼容。外部验真全程
+  只读，过期不记审计。
+- 有效期随状态文件随凭证正文持久化，**重启后结论一致**。
+
+```bash
+curl -X POST localhost:8080/v1/credentials \
+  -d '{"issuer_did":"did:example:<a>","subject_did":"did:example:<b>",
+       "claims":{"role":"admin"},"expires_at":"2030-01-01T00:00:00Z"}'
+```
 
 ### 凭证状态与吊销
 
@@ -189,12 +232,13 @@ python3 -m vcbackend.cli verify vc_<id>     # 成功输出 true（退出码 0）
   `issuer_did`、`issuer_key_version`、`disclose`，以及请求 `challenge`、
   演示 `challenge` 与 proof 覆盖的存储 `challenge` 三者一致）-> 已消费
   （`演示已消费`，优先于过期与吊销）-> 过期（当前时间大于等于
-  `expires_at`，`演示已过期`）-> 按存储凭证 `claims` 与存储 `disclose`
-  **重算投影**并核对对象 `claims` -> `proof` 格式与签名 -> 吊销。
-  未过期、未吊销且验签成功才进入消费；在**消费锁内复查**已消费、
-  `expires_at` 与吊销状态后标记已消费：若复查时已到期则返回
-  `演示已过期`，**不消费、不记审计**（修复“锁外验签期间到期仍被
-  消费”的竞态）。未到期并发验证仅一次返回 200 `{"valid":true}`
+  演示 `expires_at`，`演示已过期`）-> 按存储凭证 `claims` 与存储 `disclose`
+  **重算投影**并核对对象 `claims` -> `proof` 格式与签名 -> **凭证有效期**
+  （引用凭证已过期返回 `凭证已过期`，新旧演示均校验）-> 吊销。
+  未过期、未吊销且引用凭证未到期才进入消费；在**消费锁内复查**已消费、
+  演示 `expires_at`、**凭证有效期**与吊销状态后标记已消费：若复查时
+  演示已到期则返回 `演示已过期`，引用凭证已到期则返回 `凭证已过期`，
+  **均不消费、不记审计**（修复“锁外验签期间到期仍被消费”的竞态）。未到期并发验证仅一次返回 200 `{"valid":true}`
   （无其他字段）并记一次 `presentation.consumed`，过期或失败不消费，
   消费记录跨重启保留，重复验证返回 `演示已消费`。
 - 凭证已吊销时，演示在签名与锚定全部通过后返回 200、
@@ -238,10 +282,13 @@ curl -X POST localhost:8080/v1/presentations/vp_<id>/verify \
   `{"valid":true}`（无其他字段）。请求体须恰为
   `{"proof":对象,"challenge":串}`。校验顺序：请求 -> 资源 ID ->
   绑定（字段集合与各锚定字段、请求/证明/存储 challenge 三者一致）
-  -> 已消费（`证明已消费`，优先于过期）-> 过期（`证明已过期`）->
+  -> 已消费（`证明已消费`，优先于过期）-> 过期（当前时间大于等于
+  证明 `expires_at`，`证明已过期`）->
   按存储凭证 `claims` 与存储 `predicates` **重算 results** 并核对 ->
-  `proof` 格式与签名。验签成功后在消费锁内复查已消费/到期再标记
-  已消费：**失败不消费**，未到期并发验证仅一次成功并记一次
+  `proof` 格式与签名 -> **凭证有效期**（引用凭证已过期返回
+  `凭证已过期`）。验签成功后在消费锁内复查已消费/证明到期/凭证有效期
+  再标记已消费：**失败不消费**，复查任一类到期均不消费、不记审计；
+  未到期并发验证仅一次成功并记一次
   `proof.consumed`，消费记录跨重启保留。
 - 审计：创建记 `proof.created`、成功消费记 `proof.consumed`，
   `resource_type` 均为 `predicate_proof`、`resource_id` 为
@@ -295,13 +342,22 @@ curl -X POST localhost:8080/v1/proofs/zp_<id>/verify \
     对象、非空字符串；缺失或类型非法返回前缀“凭证”的原因。
   - `issuer_key_version` 可省略：省略时按版本 **1** 查锚点，且**不得注入
     签名正文**（签名覆盖的就是请求中的完整 `body` 原文）；提供时须为
-    非布尔正整数。其他扩展字段允许出现在 `body` 中且**全部参与签名**。
-  - 校验顺序：请求结构 → 凭证字段 → 锚点 → 签名格式 → 密码学验签。
-    锚点按本租户 `(issuer_did, 版本)` 查找，仅 `active` 的 P-256 公钥
-    可用：缺失返回前缀“锚点”的原因，已吊销返回前缀“锚点”的吊销原因。
+    非布尔正整数。`expires_at` 可选：提供时须为 **UTC 秒精度 Z 格式**
+    （`YYYY-MM-DDTHH:MM:SSZ`）串（显式 `null`/非字符串/非法时刻均按
+    凭证字段错误），参与签名；缺失时不注入、保持兼容。其他扩展字段
+    允许出现在 `body` 中且**全部参与签名**。
+  - 校验顺序：请求结构 → 凭证字段 → 锚点 → 签名格式 → 密码学验签 →
+    **有效期**。锚点按本租户 `(issuer_did, 版本)` 查找，仅 `active`
+    的 P-256 公钥可用：缺失返回前缀“锚点”的原因，已吊销返回前缀“锚点”
+    的吊销原因；`expires_at` 格式非法返回前缀“凭证字段 expires_at”
+    的原因。
   - 签名为 **ES256/SHA-256**，64 字节裸 `R||S` 的无填充 base64url，覆盖
     完整 `body` 的递归排序紧凑 JSON；签名编码非法返回前缀“签名格式错误”，
-    密码学验签失败返回前缀“签名校验失败”。成功仅返回 `{"valid":true}`。
+    密码学验签失败返回前缀“签名校验失败”。签名成功后，若 `body` 含
+    `expires_at` 且当前时间大于等于该值，返回
+    `{"valid":false,"reason":"凭证已过期"}`（篡改该值无法绕过，签名会
+    先失败）；未含该字段或未过期则成功仅返回 `{"valid":true}`。全程
+    只读，过期判定不记审计。批量接口逐项继承同一规则。
 - `POST /v1/trust/credentials/verify-batch` 为批量版本，逐项规则与单项
   验真完全一致（字段、锚点、签名与原因分类）：
   - 请求体必须**恰为** `{"credentials":[项...]}`；`credentials` 须为
@@ -489,8 +545,8 @@ curl "localhost:8080/v1/trust/credential-status/vc_ext_1/history?issuer_did=did:
   `resource_id` 为 `<issuer_did>#<credential_id>`；锚点/签名失败、
   400/409、相同重放与更早日均不记。
 
-  验签失败、演示已消费、演示过期、凭证/演示吊销判定等**只读或失败
-  路径不记审计**。
+  验签失败、演示已消费、演示过期、**凭证已过期**、凭证/演示吊销判定等
+  **只读或失败路径不记审计**。
 - `GET /v1/audit?limit=&after=` 返回本租户事件（按 seq 升序）：
   - `limit` 缺省 50，须为非布尔整数且在 1–200；`after` 缺省 0，须为
     非布尔非负整数；重复参数、空白、布尔词、小数、符号等一律 400；
@@ -508,6 +564,7 @@ curl -H 'X-Tenant-ID: acme' 'localhost:8080/v1/audit?limit=50&after=0'
 
 ```bash
 python3 tests/e2e_test.py
+python3 tests/credential_expiry_test.py
 python3 tests/tenant_audit_test.py
 python3 tests/trust_anchor_test.py
 python3 tests/trust_anchor_rotate_test.py
@@ -558,6 +615,10 @@ vcbackend/
                /v1/trust/credential-status/{id}/history 与错误映射
   cli.py       did-create / did-show / issue / verify / serve
 tests/e2e_test.py                  端到端测试（默认租户，全协议兼容）
+tests/credential_expiry_test.py    凭证有效期（签发 expires_at 400/201、
+                                   verify 到期“凭证已过期”/只读不记审计、
+                                   演示与谓词证明拒绝过期凭证不消费、
+                                   外部凭证与批量、重启持久化、旧格式演示）
 tests/tenant_audit_test.py         租户隔离 / 审计 / 过期竞态测试
 tests/trust_anchor_test.py         信任锚点注册/查询/吊销/验签测试
 tests/trust_anchor_rotate_test.py  信任锚点密钥轮换（400/404/409/幂等/审计/重启）

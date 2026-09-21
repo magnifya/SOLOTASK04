@@ -371,11 +371,23 @@ def build_handler(store: VCStore) -> type:
                 raise ValidationError("缺少字段: claims")
             if not isinstance(data["claims"], dict):
                 raise ValidationError("字段 claims 必须为 JSON 对象")
+            # expires_at 可选；显式提供（含 null/非字符串）一律按非法
+            # 拒绝 400，缺省时不得向凭证正文注入该字段。格式与“严格
+            # 晚于当前时间”由 store 校验。
+            expires_at = None
+            if "expires_at" in data:
+                expires_at = data["expires_at"]
+                if not isinstance(expires_at, str) or not expires_at:
+                    raise ValidationError(
+                        "字段 expires_at 必须为 UTC 秒精度 Z 格式"
+                        "（YYYY-MM-DDTHH:MM:SSZ）的非空字符串"
+                    )
             record = store.create_credential(
                 tenant,
                 data["issuer_did"],
                 data["subject_did"],
                 data["claims"],
+                expires_at=expires_at,
             )
             self._send_json(
                 201,
