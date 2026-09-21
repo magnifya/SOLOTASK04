@@ -43,6 +43,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | PUT | `/v1/trust/anchors/{did}/{key_version}/status` | 吊销锚点版本，请求体必须恰为 `{"status":"revoked"}`；首次与重复均 200，首次置 UTC 秒精度 `updated_at`，重复保持不变；未知版本 404 |
 | POST | `/v1/trust/verify` | 信任验签，请求体含非空字符串 `issuer_did`、正整数 `issuer_key_version`、非空字符串 `signature`；**缺失、吊销或验签失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
 | POST | `/v1/trust/credentials/verify` | 跨系统凭证验真：验证未在本租户签发或存储的外部凭证，无需登记 DID/凭证；请求体须恰含 `body`、`signature`；**任何失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
+| POST | `/v1/trust/credentials/verify-batch` | 批量跨系统凭证验真：请求体恰为 `{"credentials":[项...]}`，数组非空且不超过 100 项，每项规则与单项验真完全一致；**恒 HTTP 200**，返回 `{"results":[...]}`（与输入同长同序，失败不短路）；请求体非法/空数组/超上限返回 `{"results":[],"reason":"请求…"}` |
 | POST | `/v1/trust/credential-status/sync` | 外部凭证状态同步：请求体须恰含 `body`、`signature`，`body` 须恰含 `issuer_did`、`credential_id`、`status`、`updated_at`、`issuer_key_version`，可选 `reason`；请求/字段非法 400；锚点或签名失败 HTTP 200、`valid:false` 且不写入；首次同步 201、相同重放 200 不重复审计、严格更新替换、同时间不同内容 409 |
 | GET | `/v1/trust/credential-status/{credential_id}?issuer_did=...` | 查询已同步的外部凭证状态；`issuer_did` 须唯一非空；已同步返回 `status`、`reason`、`updated_at`，未同步（含他租户）404 |
 | GET | `/v1/trust/credential-status/{credential_id}/history?issuer_did=...&limit=&after=` | 只读查询外部凭证状态历史（兼容同步）；按 `updated_at` 升序、同值按 `cursor`；缺/重/空 `issuer_did` 400，`limit`/`after` 非法 400，未同步双键（含他租户）404 |
@@ -301,6 +302,22 @@ curl -X POST localhost:8080/v1/proofs/zp_<id>/verify \
   - 签名为 **ES256/SHA-256**，64 字节裸 `R||S` 的无填充 base64url，覆盖
     完整 `body` 的递归排序紧凑 JSON；签名编码非法返回前缀“签名格式错误”，
     密码学验签失败返回前缀“签名校验失败”。成功仅返回 `{"valid":true}`。
+- `POST /v1/trust/credentials/verify-batch` 为上述单项验真的**批量版本**，
+  每项的字段、锚点与签名规则与单项**完全一致**（含省略 `issuer_key_version`
+  按版本 1 查锚点且不注入签名正文、扩展字段参与签名），逐项顺序校验、
+  **失败不短路**。接口只读，不写凭证、状态或审计。
+  - 请求体必须**恰为** `{"credentials":[项…]}`：`credentials` 必须是
+    **非空且不超过 100 项**的数组；请求体缺失/非法 JSON/非对象、缺
+    `credentials`、含多余字段、`credentials` 非数组、空数组或超过 100 项
+    均返回 **HTTP 200** 与 `{"results":[],"reason":"请求…"}`。
+  - 正常受理时 **HTTP 200** 返回 `{"results":[...]}`：`results` 与输入
+    数组**同长同序**；成功项为 `{"valid":true}`，失败项为
+    `{"valid":false,"reason":"…"}`，`reason` 与单项端点逐字一致，按
+    “请求/凭证/锚点/签名格式错误/签名校验失败”分类。单项本身的结构
+    错误（项非对象、缺 `body`/`signature` 等）只在对应位置产生失败项，
+    不升级为信封错误。
+  - 租户规则同单项：`X-Tenant-ID` 缺省 `default`、显式空值 **400**
+    （在进入批量流程前判定），锚点按租户隔离，跨租户互不可见。
 - `POST /v1/trust/anchors/{did}/rotate` 在既有锚点上做带前置版本校验的
   密钥轮换：
   - 请求体必须**恰含** `from_key_version`（非布尔正整数）与 `public_key`
@@ -343,6 +360,8 @@ curl -X POST localhost:8080/v1/trust/credentials/verify \
   -d '{"body":{"credential_id":"vc_ext_1","issuer_did":"did:web:example.com",
        "subject_did":"did:web:subject","claims":{...},"issued_at":"2026-09-21T00:00:00Z",
        "issuer_key_version":1},"signature":"<base64url R||S>"}'
+curl -X POST localhost:8080/v1/trust/credentials/verify-batch \
+  -d '{"credentials":[{"body":{...},"signature":"<sig1>"},{"body":{...},"signature":"<sig2>"}]}'
 ```
 
 ### 外部凭证状态同步
@@ -495,6 +514,7 @@ python3 tests/trust_anchor_test.py
 python3 tests/trust_anchor_rotate_test.py
 python3 tests/predicate_proof_test.py
 python3 tests/trust_credential_verify_test.py
+python3 tests/trust_credential_verify_batch_test.py
 python3 tests/trust_credential_status_sync_test.py
 python3 tests/trust_credential_status_history_test.py
 ```
@@ -548,6 +568,10 @@ tests/predicate_proof_test.py      谓词证明（prove 字段/400/404、verify 
 tests/trust_credential_verify_test.py  跨系统凭证验真（请求/凭证/锚点/
                                    签名格式/验签分类 reason、省略版本不注入、
                                    扩展字段参与签名、只读不记审计、跨租户/重启）
+tests/trust_credential_verify_batch_test.py  批量跨系统凭证验真（信封非法/
+                                   空数组/超 100 项、results 同长同序、失败不
+                                   短路、五类 reason、项级错误逐项归类、
+                                   与单项一致、上限边界、租户隔离、只读、重启）
 tests/trust_credential_status_sync_test.py  外部凭证状态同步（请求/字段 400、
                                    锚点/签名格式/验签分类 reason、201/200/409、
                                    严格更新与更早日忽略、重放不重复审计、

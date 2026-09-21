@@ -20,6 +20,7 @@
   PUT  /v1/trust/anchors/{did}/{key_version}/status  吊销锚点版本
   POST /v1/trust/verify                   用 active 锚点公钥验签
   POST /v1/trust/credentials/verify       跨系统凭证验真（无需登记 DID/凭证）
+  POST /v1/trust/credentials/verify-batch 批量跨系统凭证验真（逐项复用单项规则）
   POST /v1/trust/credential-status/sync   同步外部凭证状态（active 锚点验签）
   GET  /v1/trust/credential-status/{id}   查询已同步的外部凭证状态
   GET  /v1/trust/credential-status/{id}/history  查询外部凭证状态历史（只读）
@@ -207,6 +208,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_verify(tenant)
                 elif path == "/v1/trust/credentials/verify":
                     self._post_trust_credentials_verify(tenant)
+                elif path == "/v1/trust/credentials/verify-batch":
+                    self._post_trust_credentials_verify_batch(tenant)
                 elif path == "/v1/trust/credential-status/sync":
                     self._post_trust_credential_status_sync(tenant)
                 else:
@@ -909,6 +912,91 @@ def build_handler(store: VCStore) -> type:
             if not valid:
                 payload["reason"] = reason or "验签失败"
             self._send_json(200, payload)
+
+        def _post_trust_credentials_verify_batch(self, tenant: str) -> None:
+            # 批量跨系统凭证验真：与单项相同的公开错误协议，任何请求层
+            # 失败都返回 200 + {"results": [], "reason": "请求…"}，绝不
+            # 返回 4xx/5xx（显式空 X-Tenant-ID 仍在进入前判 400）。
+            # 请求体须恰为 {"credentials": [项…]}：数组非空且不超过
+            # 100 项；每项的结构与凭证校验完全沿用单项端点，逐项顺序
+            # 校验、失败不短路，results 与输入同长同序。只读：不写凭证、
+            # 状态或审计。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 请求体缺失或长度声明非法"}
+                )
+                return
+            except Exception:  # noqa: BLE001
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 请求体读取失败"}
+                )
+                return
+            if not raw:
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 请求体缺失"}
+                )
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 请求体不是合法 UTF-8 文本"}
+                )
+                return
+            except json.JSONDecodeError:
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 请求体不是合法 JSON"}
+                )
+                return
+
+            def batch_invalid(message: str) -> None:
+                self._send_json(
+                    200, {"results": [], "reason": f"请求不合法: {message}"}
+                )
+
+            if not isinstance(data, dict):
+                batch_invalid("请求体必须为 JSON 对象")
+                return
+            if set(data) != {"credentials"}:
+                if "credentials" not in data:
+                    batch_invalid("缺少字段: credentials")
+                else:
+                    extra = sorted(set(data) - {"credentials"})
+                    batch_invalid(f"含多余字段: {', '.join(extra)}")
+                return
+            items = data["credentials"]
+            if not isinstance(items, list):
+                batch_invalid("字段 credentials 必须为数组")
+                return
+            if not items:
+                batch_invalid("字段 credentials 数组不能为空")
+                return
+            if len(items) > 100:
+                batch_invalid("字段 credentials 数组最多包含 100 项")
+                return
+
+            results = []
+            for item in items:
+                # 单项校验（请求结构 -> 凭证字段 -> 锚点 -> 签名格式 ->
+                # 密码学验签）全部由 store 复用，绝不抛异常、不写入；
+                # 逐项顺序执行，任一项失败都不中断后续各项。
+                try:
+                    valid, reason = store.verify_trust_credential(tenant, item)
+                except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
+                    results.append(
+                        {"valid": False, "reason": "验签过程发生内部错误"}
+                    )
+                    continue
+                if valid:
+                    results.append({"valid": True})
+                else:
+                    results.append(
+                        {"valid": False, "reason": reason or "验签失败"}
+                    )
+            self._send_json(200, {"results": results})
 
         def _post_trust_credential_status_sync(self, tenant: str) -> None:
             # 外部凭证状态同步。请求/字段非法由 _read_json 与 store 抛
