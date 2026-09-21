@@ -2957,30 +2957,44 @@ class VCStore:
     ) -> Tuple[bool, str]:
         """验证未在本租户保存的外部选择性披露演示，返回 (是否有效, 失败原因)。
 
-        校验顺序：请求结构 -> 演示字段与 challenge -> 锚点 -> 签名格式 ->
-        密码学验签 -> 期限。
-        - 请求体须恰含 presentation（对象）与 challenge（非空字符串）；
-        - 演示对象须恰为未绑定九字段（presentation_id、credential_id、
-          issuer_did、issuer_key_version、disclose、claims、challenge、
-          expires_at、proof），字段类型沿用原协议；出现任何 holder_*
-          字段即失败；请求 challenge 须等于演示 challenge；
-        - 锚点按本租户 (issuer_did, issuer_key_version) 查找，仅 active
-          的 P-256 公钥可用，缺失或 revoked 失败；
-        - proof 为 ES256/SHA-256，64 字节裸 R||S 的无填充 base64url，
-          覆盖对象中除 proof 外全部字段的递归排序紧凑 JSON；
+        支持两种形态：
+        - 未绑定：请求恰含 presentation、challenge；演示恰为九字段
+          （presentation_id、credential_id、issuer_did、issuer_key_version、
+          disclose、claims、challenge、expires_at、proof），出现任何
+          holder_* 字段即失败；
+        - 持有者绑定：请求恰含 presentation、challenge 及非空字符串
+          source_tenant_id；演示恰为九字段外加 holder_did（非空字符串）、
+          holder_key_version（正整数）、holder_proof（非空字符串）。
+
+        校验顺序：请求结构 -> 演示字段与 challenge -> 签发者锚点与签名 ->
+        持有者锚点与签名（仅绑定）-> 期限。
+        - 请求 challenge 须等于演示 challenge；
+        - 锚点按本租户 (did, key_version) 查找，仅 active 的 P-256 公钥
+          可用，缺失或 revoked 失败；签发者与持有者分别匹配各自 DID/版本；
+        - issuer proof 为 ES256/SHA-256，64 字节裸 R||S 的无填充
+          base64url，覆盖范围沿用本地绑定演示：去掉 proof 与全部
+          holder_* 字段后的八个字段；
+        - holder_proof 同为 ES256，覆盖去掉 proof、holder_proof 的绑定
+          对象（八字段加 holder_did、holder_key_version），并加入
+          tenant_id=source_tenant_id 后按规范化 JSON 验签；
         - expires_at 须为 UTC 秒精度 Z 格式，当前时间达到它即过期。
         只读：不登记 DID/凭证/演示，不写状态、历史或审计，绝不向上抛异常。
         """
-        # 1. 请求结构
+        # 1. 请求结构：未绑定恰含 presentation/challenge；绑定另含
+        # 非空字符串 source_tenant_id。
         if not isinstance(data, dict):
             return False, "请求不合法: 请求体必须为 JSON 对象"
-        if set(data) != {"presentation", "challenge"}:
+        is_holder_bound = "source_tenant_id" in data
+        allowed_fields = {"presentation", "challenge"}
+        if is_holder_bound:
+            allowed_fields.add("source_tenant_id")
+        if set(data) != allowed_fields:
             missing = [
                 f for f in ("presentation", "challenge") if f not in data
             ]
             if missing:
                 return False, f"请求缺少字段: {', '.join(missing)}"
-            extra = sorted(set(data) - {"presentation", "challenge"})
+            extra = sorted(set(data) - allowed_fields)
             return False, f"请求含多余字段: {', '.join(extra)}"
         presentation = data["presentation"]
         request_challenge = data["challenge"]
@@ -2988,9 +3002,18 @@ class VCStore:
             return False, "请求不合法: 字段 presentation 必须为 JSON 对象"
         if not isinstance(request_challenge, str) or not request_challenge:
             return False, "请求不合法: 字段 challenge 必须为非空字符串"
+        source_tenant_id: Optional[str] = None
+        if is_holder_bound:
+            source_value = data["source_tenant_id"]
+            if not isinstance(source_value, str) or not source_value:
+                return False, (
+                    "请求不合法: 字段 source_tenant_id 必须为非空字符串"
+                )
+            source_tenant_id = source_value
 
-        # 2. 演示字段与 challenge：恰为未绑定九字段，类型沿用原协议；
-        # 出现 holder_* 字段即失败。
+        # 2. 演示字段与 challenge：未绑定恰为九字段（出现 holder_* 即
+        # 失败）；绑定恰为九字段外加 holder_did/holder_key_version/
+        # holder_proof，字段类型沿用本地绑定演示。
         required_fields = {
             "presentation_id",
             "credential_id",
@@ -3002,14 +3025,21 @@ class VCStore:
             "expires_at",
             "proof",
         }
-        holder_fields = sorted(
-            key for key in presentation if key.startswith("holder_")
-        )
-        if holder_fields:
-            return False, (
-                "演示字段不合法: 不得包含持有者绑定字段 "
-                f"{', '.join(holder_fields)}"
+        if is_holder_bound:
+            required_fields |= {
+                "holder_did",
+                "holder_key_version",
+                "holder_proof",
+            }
+        else:
+            holder_fields = sorted(
+                key for key in presentation if key.startswith("holder_")
             )
+            if holder_fields:
+                return False, (
+                    "演示字段不合法: 不得包含持有者绑定字段 "
+                    f"{', '.join(holder_fields)}"
+                )
         if set(presentation) != required_fields:
             missing = sorted(required_fields - set(presentation))
             if missing:
@@ -3038,6 +3068,23 @@ class VCStore:
             value = presentation[field]
             if not isinstance(value, str) or not value:
                 return False, f"演示字段 {field} 必须为非空字符串"
+        holder_did_value: Optional[str] = None
+        holder_version_value: Optional[int] = None
+        holder_proof_value: Optional[str] = None
+        if is_holder_bound:
+            holder_did_value = presentation["holder_did"]
+            if not isinstance(holder_did_value, str) or not holder_did_value:
+                return False, "演示字段 holder_did 必须为非空字符串"
+            holder_version_value = presentation["holder_key_version"]
+            if (
+                not isinstance(holder_version_value, int)
+                or isinstance(holder_version_value, bool)
+                or holder_version_value < 1
+            ):
+                return False, "演示字段 holder_key_version 必须为正整数"
+            holder_proof_value = presentation["holder_proof"]
+            if not isinstance(holder_proof_value, str) or not holder_proof_value:
+                return False, "演示字段 holder_proof 必须为非空字符串"
         if request_challenge != presentation["challenge"]:
             return False, "挑战不匹配: 请求 challenge 与演示 challenge 不一致"
 
@@ -3066,9 +3113,15 @@ class VCStore:
                 f"锚点公钥不可用: {issuer_did}#{key_version} 不是合法 P-256 公钥"
             )
 
-        # 4/5. 签名格式与密码学验签：覆盖对象中除 proof 外的全部字段。
+        # 4/5. 签名格式与密码学验签：issuer proof 覆盖范围沿用本地绑定
+        # 演示——去掉 proof 及全部 holder_* 字段后的八个字段（未绑定
+        # 演示本就不含 holder_*，即去掉 proof 的全部字段）。
         proof = presentation["proof"]
-        message = {k: v for k, v in presentation.items() if k != "proof"}
+        message = {
+            k: v
+            for k, v in presentation.items()
+            if k != "proof" and not k.startswith("holder_")
+        }
         try:
             crypto.verify(message, proof, public_pem)
         except crypto.MalformedSignature:
@@ -3077,6 +3130,61 @@ class VCStore:
             return False, "签名校验失败，演示内容或签名可能被改动"
         except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
             return False, "签名校验失败: 验签过程发生内部错误"
+
+        # 5b. 持有者绑定：持有者锚点按本租户 (holder_did,
+        # holder_key_version) 查找，仅 active；holder_proof 覆盖去掉
+        # proof、holder_proof 的绑定对象（含 holder_did、
+        # holder_key_version）并加入 tenant_id=source_tenant_id 后
+        # 规范化验签。跨租户只用验证租户锚点，不访问来源租户任何数据。
+        if is_holder_bound:
+            with self._lock:
+                bucket = self._bucket_locked(tenant_id)
+                holder_anchors = (
+                    bucket["trust_anchors"].get(holder_did_value)
+                    if bucket is not None else None
+                )
+                holder_row = (
+                    holder_anchors.get(str(holder_version_value))
+                    if holder_anchors is not None else None
+                )
+                holder_public_pem = (
+                    holder_row.get("public_key", "")
+                    if holder_row is not None else ""
+                )
+                holder_status = (
+                    holder_row.get("status", "active")
+                    if holder_row is not None else None
+                )
+            holder_ref = f"{holder_did_value}#{holder_version_value}"
+            if holder_row is None:
+                return False, f"持有者锚点不存在: {holder_ref}"
+            if holder_status == "revoked":
+                return False, f"持有者锚点已吊销: {holder_ref}"
+            try:
+                crypto.validate_public_key_pem(holder_public_pem)
+            except (ValueError, TypeError):
+                return False, (
+                    f"持有者锚点公钥不可用: {holder_ref} 不是合法 P-256 公钥"
+                )
+            holder_message = dict(message)
+            holder_message["holder_did"] = holder_did_value
+            holder_message["holder_key_version"] = holder_version_value
+            holder_message["tenant_id"] = source_tenant_id
+            try:
+                crypto.verify(
+                    holder_message, holder_proof_value, holder_public_pem
+                )
+            except crypto.MalformedSignature:
+                return False, (
+                    "签名格式错误: holder_proof 不是合法的 ES256 签名编码"
+                )
+            except crypto.InvalidSignature:
+                return False, (
+                    "签名校验失败: holder_proof 与持有者锚点公钥不匹配，"
+                    "持有者绑定内容可能被改动"
+                )
+            except Exception:  # noqa: BLE001 验签绝不向上抛错
+                return False, "签名校验失败: 验签过程发生内部错误"
 
         # 6. 期限：expires_at 须为 UTC 秒精度 Z 格式；当前时间达到它即
         # 过期。只读，不写任何状态、不记审计。
