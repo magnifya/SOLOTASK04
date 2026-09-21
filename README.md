@@ -26,6 +26,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | --- | --- | --- |
 | POST | `/v1/dids` | 注册 DID，请求体 `{"method","public_key","key_mode"?}`，返回 201 与 `did`、`public_key`、`key_mode`、`key_handle`、`key_version` |
 | GET | `/v1/dids/{did}` | 返回 `did`、`public_key`、`key_mode`、`key_handle`、`key_version`、`created_at`；不存在 404 |
+| GET | `/v1/dids/{did}/document` | 只读 DID 文档：返回 `did`、`current_key_version`、按版本升序的 `verification_methods`（每项 `key_version`、`key_handle`、`public_key` P-256 PEM）与 `document_proof`；可选 `?version=N`（ASCII 十进制正整数，仅该版本并重新生成证明），版本不存在 404，参数非法 400；不暴露私钥、不改变任何状态 |
 | POST | `/v1/dids/{did}/keys/rotate` | 轮换密钥，请求体 `{"key_handle"}`，返回 200 与 `did`、`public_key`、`key_handle`、`key_version` |
 | POST | `/v1/credentials` | 签发凭证，请求体 `{"issuer_did","subject_did","claims"}` 加可选 `expires_at`；提供时必须是 UTC 秒精度 Z 格式 `YYYY-MM-DDTHH:MM:SSZ` 且严格晚于当前时刻（否则 400），仅在提供时写入正文并参与签名；返回 201 与 `credential_id`、`signature`、`issuer_key_version` |
 | GET | `/v1/credentials/{credential_id}` | 返回 `credential_id`、`body`、`signature`；不存在 404 |
@@ -63,6 +64,8 @@ curl -X POST localhost:8080/v1/dids -d '{"method":"example","public_key":"alice-
 curl localhost:8080/v1/dids/did:example:<id>
 curl -X POST localhost:8080/v1/dids/did:example:<id>/keys/rotate \
   -d '{"key_handle":"alice-key-v2"}'
+curl localhost:8080/v1/dids/did:example:<id>/document
+curl "localhost:8080/v1/dids/did:example:<id>/document?version=1"
 curl -X POST localhost:8080/v1/credentials \
   -d '{"issuer_did":"did:example:<a>","subject_did":"did:example:<b>","claims":{"role":"admin"}}'
 # 可选有效期（UTC 秒精度 Z，且必须晚于当前时刻）
@@ -194,6 +197,45 @@ python3 -m vcbackend.cli verify vc_<id>     # 成功输出 true（退出码 0）
   因此旧凭证在轮换后仍可验真。
 - 旧状态文件中缺少密钥元数据的 DID 在加载时自动迁移为 `server`/版本 1：
   历史即原 `public_key`，句柄取 `submitted_public_key`（缺省为原 `public_key`）。
+
+### DID 文档与历史公钥（只读）
+
+`GET /v1/dids/{did}/document` 为密钥轮换前签发物提供历史公钥，纯只读，
+不改变审计、凭证、演示、状态及轮换结果。
+
+- 响应字段恰为 `did`、`current_key_version`、`verification_methods`、
+  `document_proof`：
+  - `current_key_version` 为 DID 当前密钥版本，与注册、轮换及
+    `GET /v1/dids/{did}` 的 `key_version` 一致；
+  - `verification_methods` 按 `key_version` **升序**，每项恰含
+    `key_version`、`key_handle`、`public_key`；`public_key` 为可用于
+    ES256 验签的 P-256 PEM（SubjectPublicKeyInfo），**绝不暴露
+    private_key**；
+  - `document_proof` 为 **ES256**、无填充 base64url 的裸 `R||S` 签名，
+    覆盖**除 `document_proof` 外的整个响应对象**按 key 升序的规范化
+    JSON（紧凑序列化、UTF-8、嵌套递归排序）；签名私钥恒为 **DID 当前
+    版本私钥**。
+- 查询参数 `version` **可选且只能出现一次**：
+  - 缺省时返回全部历史版本；
+  - 提供时须为 **ASCII 十进制正整数**：仅返回该版本的
+    `verification_methods`（单项），`current_key_version` 仍为当前版本，
+    并**重新生成 `document_proof`**（仍由当前版本私钥签发）；
+  - 空值、`0`、符号（`-1`/`+1`）、小数、空白、布尔词、字母或
+    **Unicode 数字**（如阿拉伯-印度数字 `१`）以及重复参数一律 **400**
+    并返回非空 `error`；
+  - 版本不存在（含对未知 DID）返回 **404** 与非空 `error`。
+- 租户规则与其他 `/v1` 接口一致：缺省 `default`，显式空
+  `X-Tenant-ID` 为 **400**，未知 DID 或他租户资源为 **404**。
+- 文档内容（公钥历史）与证明所用私钥均**随状态文件持久化**：
+  `document_proof` 每次请求按当前状态重新生成，但重启后用响应中的
+  当前版本公钥验签结论稳定。旧状态缺密钥元数据时按既有迁移规则公开
+  版本 1，已有接口行为保持不变。
+- 该接口为只读查询，**不记审计**。
+
+```bash
+curl localhost:8080/v1/dids/did:example:<id>/document
+curl "localhost:8080/v1/dids/did:example:<id>/document?version=1"
+```
 
 ### 选择性披露演示
 
@@ -581,6 +623,7 @@ curl -H 'X-Tenant-ID: acme' 'localhost:8080/v1/audit?limit=50&after=0'
 
 ```bash
 python3 tests/e2e_test.py
+python3 tests/did_document_test.py
 python3 tests/credential_expiry_test.py
 python3 tests/tenant_audit_test.py
 python3 tests/trust_anchor_test.py
@@ -622,7 +665,7 @@ vcbackend/
                TrustAnchorRecord / CredentialStatusSyncRecord /
                CredentialStatusHistoryEvent / AuditEvent 数据模型
   store.py     多租户文件存储（租户分桶、旧格式迁移）、DID 去重、密钥
-               轮换、凭证签发/验签、选择性披露演示（RFC6901 路径校验、
+               轮换、DID 文档只读查询（历史公钥与当前版本私钥证明）、凭证签发/验签、选择性披露演示（RFC6901 路径校验、
                claims 投影）、谓词证明（谓词校验/求值、results 重算）、
                消费锁内复查过期，信任锚点注册/吊销/验签/
                带前置版本校验的轮换、跨系统外部凭证验真、外部凭证状态
@@ -630,9 +673,14 @@ vcbackend/
                状态历史（持久化游标、旧状态兼容补项、追加与查询），以及
                全局连续审计事件与状态变更的同一次原子写（失败回滚）
   service.py   标准库 HTTP 路由、X-Tenant-ID 租户解析、/v1/audit、
+               /v1/dids/{did}/document、
                /v1/trust/credential-status/{id}/history 与错误映射
   cli.py       did-create / did-show / issue / verify / serve
 tests/e2e_test.py                  端到端测试（默认租户，全协议兼容）
+tests/did_document_test.py         DID 文档只读接口（字段/升序/不暴露私钥、
+                                   document_proof 恒由当前版本签发、version
+                                   参数 400/404、租户隔离、只读不审计、
+                                   重启验签稳定、旧状态迁移公开版本 1）
 tests/credential_expiry_test.py    凭证有效期（签发 400/不注入/参与签名、
                                    verify 过期原因与优先级/不记审计、演示与
                                    谓词证明拒签不消费、外部凭证验真、重启持久化）

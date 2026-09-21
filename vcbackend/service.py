@@ -3,6 +3,7 @@
 路由：
   POST /v1/dids                           注册 DID
   GET  /v1/dids/{did}                     查询 DID
+  GET  /v1/dids/{did}/document            查询 DID 文档（历史公钥，只读）
   POST /v1/dids/{did}/keys/rotate         轮换 DID 密钥
   POST /v1/credentials                    签发凭证
   GET  /v1/credentials/{credential_id}    查询凭证
@@ -68,6 +69,24 @@ def _parse_nonneg_int(raw: str, field: str) -> int:
     ):
         raise ValidationError(f"查询参数 {field} 必须为非负整数")
     return int(raw)
+
+
+def _parse_positive_int(raw: str, field: str) -> int:
+    """解析正整数字符串：仅接受非全零的 ASCII 十进制数字串。
+
+    拒绝空值、符号/小数/空白/布尔词与 Unicode 数字（如阿拉伯-印度数字），
+    也拒绝 "0" 等非正整数。
+    """
+    if (
+        not isinstance(raw, str)
+        or not raw
+        or any(ch < "0" or ch > "9" for ch in raw)
+    ):
+        raise ValidationError(f"查询参数 {field} 必须为 ASCII 十进制正整数")
+    value = int(raw)
+    if value < 1:
+        raise ValidationError(f"查询参数 {field} 必须为正整数")
+    return value
 
 
 def build_handler(store: VCStore) -> type:
@@ -274,6 +293,13 @@ def build_handler(store: VCStore) -> type:
                 tenant = self._tenant_id()
                 if path == "/v1/audit":
                     self._get_audit(tenant, parsed.query)
+                elif path.startswith("/v1/dids/") and path.endswith(
+                    "/document"
+                ):
+                    did = unquote(
+                        path[len("/v1/dids/") : -len("/document")]
+                    )
+                    self._get_did_document(tenant, did, parsed.query)
                 elif path.startswith("/v1/dids/"):
                     self._get_did(tenant, unquote(path[len("/v1/dids/") :]))
                 elif path.startswith("/v1/credentials/") and path.endswith(
@@ -357,6 +383,28 @@ def build_handler(store: VCStore) -> type:
             record = store.get_did(tenant, did)
             payload = self._did_payload(record)
             payload["created_at"] = record.created_at
+            self._send_json(200, payload)
+
+        def _get_did_document(
+            self, tenant: str, did: str, query: str
+        ) -> None:
+            # GET /v1/dids/{did}/document[?version=N]：只读 DID 文档。
+            # version 可选且只能出现一次；提供时须为 ASCII 十进制正整数
+            # （缺失参数走全量历史；空值、重复、符号、小数、Unicode 数字
+            # 一律 400）。版本不存在或 DID 未知（含他租户）404。
+            # 纯只读：不改变状态与审计。
+            if not did:
+                raise ValidationError("路径缺少 did")
+            params = parse_qs(query, keep_blank_values=True)
+            version_values = params.get("version")
+            version: Optional[int] = None
+            if version_values is not None:
+                if len(version_values) != 1:
+                    raise ValidationError("查询参数 version 只能提供一次")
+                version = _parse_positive_int(
+                    version_values[0], "version"
+                )
+            payload = store.get_did_document(tenant, did, version=version)
             self._send_json(200, payload)
 
         def _post_rotate_key(self, tenant: str, did: str) -> None:

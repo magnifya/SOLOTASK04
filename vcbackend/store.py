@@ -783,6 +783,76 @@ class VCStore:
                 return entry.get("public_key")
         return None
 
+    def get_did_document(
+        self,
+        tenant_id: str,
+        did: str,
+        version: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """只读返回 DID 文档（历史公钥）与当前版本私钥的 ES256 证明。
+
+        - DID 不存在（含他租户资源）抛 NotFoundError；
+        - verification_methods 按 key_version 升序，每项恰含
+          key_version、key_handle、public_key（P-256 PEM），
+          绝不包含 private_key；
+        - version 提供时仅返回该版本；版本不存在抛 NotFoundError；
+          缺省（None）返回全部历史版本；
+        - document_proof 始终用 DID 当前版本私钥对除 document_proof 外
+          的整个响应对象按规范化 JSON 做 ES256 裸 R||S 无填充 base64url
+          签名——即使 version 指向历史版本，证明仍由当前版本密钥重新
+          生成；
+        - 纯只读：不修改任何状态、不记审计、不触发落盘。文档内容与
+          私钥均随状态文件持久化，重启后重新生成的证明验签结论稳定。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            rec = bucket["dids"].get(did) if bucket is not None else None
+            if rec is None:
+                raise NotFoundError(f"DID 不存在: {did}")
+
+            history = sorted(
+                rec.get("key_history", []),
+                key=lambda entry: int(entry.get("version", 0)),
+            )
+            current_version = int(rec.get("key_version", 1))
+            if version is not None:
+                history = [
+                    entry
+                    for entry in history
+                    if int(entry.get("version", 0)) == version
+                ]
+                if not history:
+                    raise NotFoundError(
+                        f"DID {did} 的密钥版本不存在: {version}"
+                    )
+
+            verification_methods = [
+                {
+                    "key_version": int(entry.get("version", 0)),
+                    "key_handle": entry.get("key_handle", ""),
+                    "public_key": entry.get("public_key", ""),
+                }
+                for entry in history
+            ]
+            document: Dict[str, Any] = {
+                "did": did,
+                "current_key_version": current_version,
+                "verification_methods": verification_methods,
+            }
+            # 证明恒由当前版本私钥生成（即使请求的是历史版本）。
+            current_private_pem = self._private_key_for_version_locked(
+                bucket, did, current_version
+            )
+            if not current_private_pem:
+                # 正常不会发生：迁移保证版本 1 存在且当前版本在历史中。
+                raise NotFoundError(
+                    f"DID {did} 当前版本私钥不可用: {current_version}"
+                )
+            document["document_proof"] = crypto.sign(
+                document, current_private_pem
+            )
+            return document
+
     # ------------------------------------------------------------------ #
     # 凭证
     # ------------------------------------------------------------------ #
