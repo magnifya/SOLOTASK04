@@ -2376,24 +2376,15 @@ class VCStore:
         # status 仅可能为 active/revoked/unknown（同步入口已约束）。
         return False, "外部凭证状态未知"
 
-    def verify_trust_credentials_batch(
-        self,
-        tenant_id: str,
+    @staticmethod
+    def _validate_credentials_batch_request(
         data: Any,
-    ) -> Tuple[bool, str, List[Dict[str, Any]]]:
-        """批量验证外部凭证，返回 (请求是否合法, 请求级原因, 逐项结果)。
+    ) -> Tuple[bool, str, List[Any]]:
+        """校验批量验真请求体结构，返回 (是否合法, 请求级原因, 凭证数组)。
 
         请求体须恰为 ``{"credentials": [项...]}``：数组非空且不超过 100
-        项。请求级结构不合法（非对象、字段缺失或多余、credentials 非数组、
-        空数组或超过上限）时返回 ``(False, "请求...", [])``，由调用方回
-        ``{"results": [], "reason": ...}``。
-
-        请求级合法时逐项复用 :meth:`verify_trust_credential`（与单项接口
-        完全一致的字段、锚点、签名规则），按输入顺序收集结果，失败不短
-        路：成功项 ``{"valid": true}``，失败项
-        ``{"valid": false, "reason": ...}``，原因前缀依次为“请求”/“凭证”
-        /“锚点”/“签名格式错误”/“签名校验失败”。只读，不写任何状态、不记
-        审计。
+        项。任何请求级结构不合法（非对象、字段缺失或多余、credentials
+        非数组、空数组或超过上限）都返回 ``(False, "请求...", [])``。
         """
         if not isinstance(data, dict):
             return False, "请求不合法: 请求体必须为 JSON 对象", []
@@ -2414,10 +2405,74 @@ class VCStore:
             return False, (
                 f"请求不合法: credentials 数组不能超过 100 项（当前 {len(credentials)} 项）"
             ), []
+        return True, "", credentials
+
+    def verify_trust_credentials_batch(
+        self,
+        tenant_id: str,
+        data: Any,
+    ) -> Tuple[bool, str, List[Dict[str, Any]]]:
+        """批量验证外部凭证，返回 (请求是否合法, 请求级原因, 逐项结果)。
+
+        请求级结构校验见 :meth:`_validate_credentials_batch_request`，
+        不合法时由调用方回 ``{"results": [], "reason": ...}``。
+
+        请求级合法时逐项复用 :meth:`verify_trust_credential`（与单项接口
+        完全一致的字段、锚点、签名规则），按输入顺序收集结果，失败不短
+        路：成功项 ``{"valid": true}``，失败项
+        ``{"valid": false, "reason": ...}``，原因前缀依次为“请求”/“凭证”
+        /“锚点”/“签名格式错误”/“签名校验失败”。只读，不写任何状态、不记
+        审计。
+        """
+        ok, reason, credentials = self._validate_credentials_batch_request(
+            data
+        )
+        if not ok:
+            return False, reason, []
 
         results: List[Dict[str, Any]] = []
         for item in credentials:  # 顺序校验，失败不短路
             valid, reason = self.verify_trust_credential(tenant_id, item)
+            if valid:
+                results.append({"valid": True})
+            else:
+                results.append(
+                    {"valid": False, "reason": reason or "验签失败"}
+                )
+        return True, "", results
+
+    def verify_trust_credentials_batch_with_status(
+        self,
+        tenant_id: str,
+        data: Any,
+    ) -> Tuple[bool, str, List[Dict[str, Any]]]:
+        """批量验证外部凭证并合并本租户同步状态，返回
+        (请求是否合法, 请求级原因, 逐项结果)。
+
+        请求级结构校验与 :meth:`verify_trust_credentials_batch` 完全一致
+        （恰为 ``{"credentials": [1..100 项]}``），不合法时由调用方回
+        ``{"results": [], "reason": ...}``。
+
+        请求级合法时按输入顺序逐项复用
+        :meth:`verify_trust_credential_with_status`：项级结构或类型错误
+        只写入对应结果（“请求”类原因），不短路、不清空整批；凭证字段、
+        锚点、签名、expires_at 规则与单项接口一致；验签通过后只读合并
+        本租户同步状态（未同步/active/revoked/unknown 的既有约定）。
+        结果与输入等长同序：成功项 ``{"valid": true}``，失败项
+        ``{"valid": false, "reason": ...}``。只读，不写凭证、状态、
+        历史或审计。
+        """
+        ok, reason, credentials = self._validate_credentials_batch_request(
+            data
+        )
+        if not ok:
+            return False, reason, []
+
+        results: List[Dict[str, Any]] = []
+        for item in credentials:  # 顺序校验，失败不短路
+            valid, reason = self.verify_trust_credential_with_status(
+                tenant_id, item
+            )
             if valid:
                 results.append({"valid": True})
             else:
