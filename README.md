@@ -33,7 +33,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | GET | `/v1/credentials/{credential_id}/status` | 返回 `credential_id`、`status`、`updated_at`；历史无状态按 `active` 返回且 `updated_at` 为 `null`；不存在 404 |
 | POST | `/v1/credentials/{credential_id}/revoke` | 吊销凭证；`reason` 可省略（默认“持证人主动吊销”），否则须为字符串且首尾裁剪后非空；返回 200 与 `credential_id`、`status:"revoked"`、`reason`、`revoked_at`、`updated_at`；不存在 404 |
 | POST | `/v1/credentials/{credential_id}/verify` | 验签，请求体 `{"body","signature"}`；**任何失败一律 HTTP 200**，返回 `valid`（失败时附分类中文 `reason`） |
-| POST | `/v1/credentials/{credential_id}/present` | 生成选择性披露演示，请求体恰为 `{"disclose":[路径...]}` 加可选 `challenge`、`expires_in`；成功 201 返回演示对象；字段问题 400、未知凭证 404 |
+| POST | `/v1/credentials/{credential_id}/present` | 生成选择性披露演示，请求体恰为 `{"disclose":[路径...]}` 加可选 `challenge`、`expires_in`、`holder_binding`；成功 201 返回演示对象（绑定时另含 `holder_did`、`holder_key_version`、`holder_proof`）；字段问题 400、未知凭证 404 |
 | POST | `/v1/presentations/{presentation_id}/verify` | 校验演示，新演示请求体恰为 `{"presentation":对象,"challenge":串}`（旧演示恰为 `{"presentation":对象}`）；**任何失败一律 HTTP 200**，成功 `{"valid":true}`，失败附非空中文 `reason` |
 | POST | `/v1/credentials/{credential_id}/prove` | 生成谓词证明，请求体恰为 `{"predicates":[项...]}` 加可选 `challenge`、`expires_in`；成功 201 返回证明对象；字段问题 400、未知凭证 404 |
 | POST | `/v1/proofs/{proof_id}/verify` | 校验谓词证明，请求体恰为 `{"proof":对象,"challenge":串}`；**任何失败一律 HTTP 200**，成功 `{"valid":true}`，失败附非空中文 `reason` |
@@ -78,6 +78,10 @@ curl -X POST localhost:8080/v1/credentials/vc_<id>/verify \
   -d '{"body":{...},"signature":"..."}'
 curl -X POST localhost:8080/v1/credentials/vc_<id>/present \
   -d '{"disclose":["/role","/addr/city"]}'   # [] 为零披露；可附 challenge/expires_in
+# 可选持有者绑定：holder_binding 为 true 时 subject_did 须为本租户已注册 DID，
+# 响应另含 holder_did、holder_key_version、holder_proof
+curl -X POST localhost:8080/v1/credentials/vc_<id>/present \
+  -d '{"disclose":["/role"],"holder_binding":true}'
 curl -X POST localhost:8080/v1/presentations/vp_<id>/verify \
   -d '{"presentation":{...},"challenge":"<演示的 challenge>"}'
 ```
@@ -194,27 +198,42 @@ python3 -m vcbackend.cli verify vc_<id>     # 成功输出 true（退出码 0）
 ### 选择性披露演示
 
 - `POST /v1/credentials/{credential_id}/present` 请求体必须**恰为**
-  `{"disclose":[路径...]}` 加可选 `challenge`、`expires_in`：缺失
-  `disclose`、不是数组、含多余字段一律 400；未知凭证 404。`[]` 表示
+  `{"disclose":[路径...]}` 加可选 `challenge`、`expires_in`、`holder_binding`：
+  缺失 `disclose`、不是数组、含多余字段一律 400；未知凭证 404。`[]` 表示
   **零披露**。`challenge` 须为非空字符串且按 Unicode 码点不超过 256，
   缺省生成 32 位小写 hex；`expires_in` 须为非布尔整数且在 1–86400
-  之间，缺省 300。
+  之间，缺省 300。`holder_binding` 必须为**布尔**，缺省 `false`；
+  为 `true` 时凭证 `subject_did` 必须是**本租户已注册 DID**，否则
+  **400**（未注册或属他租户）。
 - 路径按 [RFC 6901](https://www.rfc-editor.org/rfc/rfc6901) JSON Pointer
   解释，相对于凭证 `claims`：
   - 必须以 `/` 开头并命中实际 `claims` 属性，支持 `~0`/`~1` 转义；
   - **禁止根路径**（零披露请传 `[]`）、**禁止数组索引**（数组只能整值披露）、
     越界/经过非对象叶子均 400；
   - 路径不得重复、不得存在祖先/后代重叠（如 `/a` 与 `/a/b`）。
-- 成功返回 201，字段恰为：
+- 成功返回 201，未绑定（缺省/`false`）字段恰为：
   `presentation_id`（`vp_` 加 32 位小写 hex）、`credential_id`、`issuer_did`、
   `issuer_key_version`（旧凭证缺省按 1）、`disclose`（原样回显）、
   `claims`（**仅含所选值**的投影，未选属性不出现）、`challenge`、
   `expires_at`（UTC 当前时间加 `expires_in` 秒，Z 结尾秒精度）、`proof`。
+  `holder_binding:true` 时**额外**返回三个字段：`holder_did`（即凭证
+  `subject_did`）、`holder_key_version`（生成时持有者的**当前**密钥版本）、
+  `holder_proof`（持有者签名，见下）；其余字段与未绑定完全一致，
+  未绑定流程与旧版本**完全兼容**。
   `challenge` 与 `expires_at` 均写入被签名正文并随演示记录持久化。
-- `proof` 为 **ES256**、无填充 base64url 的裸 `R||S` 签名，覆盖**除 `proof`
-  外按 key 升序规范化 JSON**，使用凭证 `issuer_key_version` 对应的**历史版本
-  私钥**；因此签发者轮换密钥后，旧演示仍可用历史公钥验真。
-- 演示记录随状态文件持久化在 `presentations` 中，**重启后仍可验签**。
+- `proof`（issuer proof）为 **ES256**、无填充 base64url 的裸 `R||S` 签名，
+  覆盖**除 `proof` 外按 key 升序规范化 JSON**，使用凭证
+  `issuer_key_version` 对应的**历史版本私钥**；持有者绑定**不改变**
+  issuer proof 的覆盖范围（不含任何 `holder_*` 字段），因此签发者
+  轮换密钥后，旧演示仍可用历史公钥验真。
+- `holder_proof` 为持有者第二签名：同为 **ES256** 裸 `R||S` 无填充
+  base64url，覆盖**去掉 `proof`、`holder_proof` 后的完整演示对象**
+  （含 `holder_did`、`holder_key_version`）**及 `tenant_id`**，按
+  key 升序规范化 JSON（紧凑序列化、UTF-8）签名；私钥为生成时持有者
+  `holder_key_version` 的当前私钥。绑定信息（holder DID、版本与签名）
+  随演示记录持久化在 `presentations` 中：**重启或持有者密钥轮换后**，
+  verify 按记录的 `holder_key_version` 从持有者公钥历史中取**历史公钥**
+  验签，结论不变。
 - `POST /v1/presentations/{presentation_id}/verify` 采用与凭证验签相同的
   公开错误协议：**任何失败都返回 HTTP 200** 与
   `{"valid":false,"reason":"<非空中文原因>"}`。新演示（存储记录含
@@ -226,13 +245,25 @@ python3 -m vcbackend.cli verify vc_<id>     # 成功输出 true（退出码 0）
   演示 `challenge` 与 proof 覆盖的存储 `challenge` 三者一致）-> 已消费
   （`演示已消费`，优先于过期与吊销）-> 过期（当前时间大于等于
   `expires_at`，`演示已过期`）-> 按存储凭证 `claims` 与存储 `disclose`
-  **重算投影**并核对对象 `claims` -> `proof` 格式与签名 -> 吊销。
-  未过期、未吊销且验签成功才进入消费；在**消费锁内复查**已消费、
-  `expires_at` 与吊销状态后标记已消费：若复查时已到期则返回
-  `演示已过期`，**不消费、不记审计**（修复“锁外验签期间到期仍被
-  消费”的竞态）。未到期并发验证仅一次返回 200 `{"valid":true}`
-  （无其他字段）并记一次 `presentation.consumed`，过期或失败不消费，
-  消费记录跨重启保留，重复验证返回 `演示已消费`。
+  **重算投影**并核对对象 `claims` -> `proof` 格式与签名 -> 持有者绑定
+  校验（仅绑定演示）-> 吊销。
+  **持有者绑定演示**（存储记录含 `holder_did`）的请求结构不变（仍为
+  `{"presentation":对象,"challenge":串}`），对象须**恰为**未绑定字段
+  外加 `holder_did`、`holder_key_version`、`holder_proof`（任一缺失或
+  多余均失败）；校验锚定 `holder_did`（须与存储及凭证 `subject_did`
+  一致）、`holder_key_version`（须与存储一致），并按该版本从持有者
+  公钥历史取**历史公钥**验证 `holder_proof`（覆盖去 `proof`、
+  `holder_proof` 后的对象加 `tenant_id`）。持有者 DID 跨租户/不存在、
+  历史公钥不可用、`holder_proof` 格式错误或双签名任一不通过，均
+  HTTP 200 返回 `valid:false` 与非空中文 `reason`，**不消费**。
+  未过期、未吊销且 **issuer 与持有者双签名均通过**才进入消费；在
+  **消费锁内复查**已消费、`expires_at` 与吊销状态后标记已消费：若
+  复查时已到期则返回 `演示已过期`，**不消费、不记审计**（修复
+  “锁外验签期间到期仍被消费”的竞态）。未到期并发验证仅一次返回
+  200 `{"valid":true}`（无其他字段）并记一次 `presentation.consumed`，
+  过期或失败不消费，消费记录跨重启保留，重复验证返回 `演示已消费`。
+  绑定记录与持有者密钥版本随状态文件持久化，**重启或持有者密钥轮换
+  后仍以历史公钥完成双签名验证**。
 - 凭证已吊销时，演示在签名与锚定全部通过后返回 200、
   `{"valid":false,"reason":"凭证已吊销：<保存的 reason>"}`，且**不消费**；
   签名失败仍优先返回签名类原因。
@@ -555,6 +586,7 @@ python3 tests/tenant_audit_test.py
 python3 tests/trust_anchor_test.py
 python3 tests/trust_anchor_rotate_test.py
 python3 tests/predicate_proof_test.py
+python3 tests/holder_binding_test.py
 python3 tests/trust_credential_verify_test.py
 python3 tests/trust_credential_status_sync_test.py
 python3 tests/trust_credential_status_history_test.py
@@ -609,6 +641,12 @@ tests/trust_anchor_test.py         信任锚点注册/查询/吊销/验签测试
 tests/trust_anchor_rotate_test.py  信任锚点密钥轮换（400/404/409/幂等/审计/重启）
 tests/predicate_proof_test.py      谓词证明（prove 字段/400/404、verify 消费/
                                    过期/篡改/跨租户/并发/审计/重启）
+tests/holder_binding_test.py       演示持有者绑定（未绑定兼容、绑定 201 字段/
+                                   holder_proof 外部验真/issuer proof 不变、
+                                   holder_binding 非布尔 400、未注册 400、
+                                   verify 缺字段/篡改/格式/跨租户/密钥不可用
+                                   valid:false 不消费、过期/吊销、持有者密钥
+                                   轮换后历史公钥验证、并发仅一次、重启持久化）
 tests/trust_credential_verify_test.py  跨系统凭证验真（请求/凭证/锚点/
                                    签名格式/验签分类 reason、省略版本不注入、
                                    扩展字段参与签名、只读不记审计、跨租户/重启）

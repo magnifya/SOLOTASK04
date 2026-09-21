@@ -68,6 +68,14 @@ class PresentationRecord:
     proof: str
     challenge: Optional[str] = None
     expires_at: Optional[str] = None
+    # 可选持有者绑定（holder_binding=true 时写入并持久化）：
+    # holder_did 为持有者（即凭证 subject_did）；holder_key_version 为
+    # 生成绑定时持有者的当前密钥版本；holder_proof 为持有者私钥对
+    # （去掉 proof、holder_proof 后的演示对象 + tenant_id）的 ES256
+    # 裸 R||S 无填充 base64url 签名。未绑定演示三者均为 None。
+    holder_did: Optional[str] = None
+    holder_key_version: Optional[int] = None
+    holder_proof: Optional[str] = None
 
 
 @dataclass

@@ -530,7 +530,10 @@ def build_handler(store: VCStore) -> type:
             data = self._read_json()
             if "disclose" not in data:
                 raise ValidationError("缺少字段: disclose")
-            extra = sorted(set(data) - {"disclose", "challenge", "expires_in"})
+            extra = sorted(
+                set(data)
+                - {"disclose", "challenge", "expires_in", "holder_binding"}
+            )
             if extra:
                 raise ValidationError(f"多余字段: {', '.join(extra)}")
             challenge = None
@@ -553,27 +556,41 @@ def build_handler(store: VCStore) -> type:
                     raise ValidationError(
                         "字段 expires_in 须在 1 到 86400 之间"
                     )
+            # holder_binding 可选：必须为布尔，缺省 false；为 true 时
+            # subject_did 须是本租户已注册 DID（否则由 store 判 400）。
+            holder_binding = False
+            if "holder_binding" in data:
+                holder_binding = data["holder_binding"]
+                if not isinstance(holder_binding, bool):
+                    raise ValidationError("字段 holder_binding 必须为布尔值")
             record = store.create_presentation(
                 tenant,
                 credential_id,
                 data["disclose"],
                 challenge=challenge,
                 expires_in=expires_in,
+                holder_binding=holder_binding,
             )
-            self._send_json(
-                201,
-                {
-                    "presentation_id": record.presentation_id,
-                    "credential_id": record.credential_id,
-                    "issuer_did": record.issuer_did,
-                    "issuer_key_version": record.issuer_key_version,
-                    "disclose": record.disclose,
-                    "claims": record.projection,
-                    "challenge": record.challenge,
-                    "expires_at": record.expires_at,
-                    "proof": record.proof,
-                },
-            )
+            presentation_payload: Dict[str, Any] = {
+                "presentation_id": record.presentation_id,
+                "credential_id": record.credential_id,
+                "issuer_did": record.issuer_did,
+                "issuer_key_version": record.issuer_key_version,
+                "disclose": record.disclose,
+                "claims": record.projection,
+                "challenge": record.challenge,
+                "expires_at": record.expires_at,
+                "proof": record.proof,
+            }
+            # 仅持有者绑定演示返回 holder_did、holder_key_version、
+            # holder_proof；未绑定响应字段集合与旧流程完全一致。
+            if record.holder_did is not None:
+                presentation_payload["holder_did"] = record.holder_did
+                presentation_payload["holder_key_version"] = (
+                    record.holder_key_version
+                )
+                presentation_payload["holder_proof"] = record.holder_proof
+            self._send_json(201, presentation_payload)
 
         def _post_verify_presentation(
             self, tenant: str, presentation_id: str
