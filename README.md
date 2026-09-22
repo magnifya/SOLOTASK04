@@ -49,6 +49,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/trust/verify` | 信任验签，请求体含非空字符串 `issuer_did`、正整数 `issuer_key_version`、非空字符串 `signature`；**缺失、吊销或验签失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
 | POST | `/v1/trust/credentials/verify` | 跨系统凭证验真：验证未在本租户签发或存储的外部凭证，无需登记 DID/凭证；请求体须恰含 `body`、`signature`；**任何失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
 | POST | `/v1/trust/presentations/verify` | 跨系统演示验真：验证其他系统生成且未在本租户保存的演示，无需登记 DID/凭证/演示；请求体须恰为 `{"presentation":对象,"challenge":非空串}`；**任何失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
+| POST | `/v1/trust/proofs/verify` | 跨系统谓词证明验真：验证未在本租户保存的外部谓词证明，原本地 `/v1/proofs/{id}/verify` 不变；请求体须恰含 `proof`、`challenge`、`source_tenant_id`（后两项为非空字符串），proof 恰为 prove 九字段；**任何失败均 HTTP 200** 返回 `valid:false` 与分类中文 reason，成功仅 `{"valid":true}`；只读、不消费、不审计 |
 | POST | `/v1/trust/credentials/verify-batch` | 批量跨系统凭证验真：请求体恰为 `{"credentials":[项...]}`，数组非空且不超过 100 项，每项规则与单项验真一致；**任何失败均 HTTP 200**，返回 `{"results":[...]}`（长度与顺序与输入一致，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`，不短路）；请求体非法、空数组或超上限时返回 `{"results":[],"reason":"请求..."}` |
 | POST | `/v1/trust/credentials/verify-with-status` | 外部凭证验真并合并同步状态（只读）：请求体与验真规则同 `/v1/trust/credentials/verify`；**任何验真/过期失败均 HTTP 200** 返回 `valid:false` 与中文 `reason`；验签通过后按本租户 `(issuer_did, credential_id)` 查同步记录：未同步 `valid:false`/“外部凭证状态未同步”，active 仅 `{"valid":true}`，revoked 为“外部凭证已吊销：<reason>”（无 reason 用“未知原因”），unknown 为“外部凭证状态未知”；不创建凭证、不改状态、不写同步记录或审计 |
 | POST | `/v1/trust/credentials/verify-batch-with-status` | 批量外部凭证验真并合并同步状态（只读）：请求体恰为 `{"credentials":[项...]}`，数组非空且不超过 100 项；请求级非法（缺失、非法 JSON、非对象、字段缺失或多余、credentials 非数组、空数组或超限）统一 HTTP 200 返回 `{"results":[],"reason":"请求..."}`；合法批次逐项复用 `/v1/trust/credentials/verify-with-status` 规则（含同步状态合并），按输入顺序不短路返回 `{"results":[...]}`，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`；不写凭证、状态、历史或审计 |
@@ -545,6 +546,40 @@ curl -X POST localhost:8080/v1/proofs/zp_<id>/verify \
     （非法返回前缀“演示”的原因）；当前时间达到它时返回
     `{"valid":false,"reason":"演示已过期"}`。成功仅返回
     `{"valid":true}`。
+- `POST /v1/trust/proofs/verify` 验证**未在本租户保存的外部谓词证明**：
+  无需登记 DID/凭证/证明，只读、不消费、不写证明/状态/历史/审计，跨租户
+  各自使用本租户锚点，重启后结论一致。原本地
+  `POST /v1/proofs/{proof_id}/verify` 协议保持不变。
+  - 请求体必须**恰含** `proof`（JSON 对象）、`challenge`（非空字符串）、
+    `source_tenant_id`（非空字符串）；缺失、多余字段、请求体缺失/非法
+    JSON/非对象一律按请求错误返回 HTTP 200 +
+    `{"valid":false,"reason":"请求…"}`。
+  - `proof` 必须**恰为** prove 响应九字段：`proof_id`、`credential_id`、
+    `issuer_did`（均为非空字符串）、`issuer_key_version`（非布尔正整数）、
+    `predicates`（非空数组）、`results`（数组）、`challenge`、
+    `expires_at`、`proof`（均为非空字符串）；缺字段、多余字段或类型非法
+    返回前缀“证明”的原因。请求 `challenge` 必须等于证明对象的
+    `challenge`，不一致返回前缀“挑战”的原因。
+  - `results` 必须与 `predicates` **等长且仅含布尔值**；**不按 claims
+    重算 results**（即使结果与谓词语义相反，签名合法即通过）。
+  - `predicates` 每项须**恰含** `path`、`op` 及可选 `value`：
+    `op ∈ {exists,eq,gte,lte}`；`exists` **禁止** `value`，其余 op 必填
+    `value`；`gte`/`lte` 的 `value` 必须为**非布尔数字**。`path` 须以
+    `/` 开头、RFC 6901 转义合法（`~0`/`~1`），且路径**不得重复、不得有
+    祖先/后代重叠**；此处**不校验 claims 命中、不判数组索引路径、不校验
+    命中值类型**。
+  - 校验顺序：请求结构 → 证明字段与挑战 → 锚点 → 签名格式 →
+    密码学验签 → 期限。锚点按**当前租户** `(issuer_did,
+    issuer_key_version)` 查找，仅 `active` 的 P-256 公钥可用：缺失返回
+    前缀“锚点”的原因，已吊销返回前缀“锚点”的吊销原因。
+  - 签名为 **ES256/SHA-256**，64 字节裸 `R||S` 的无填充 base64url，覆盖
+    证明对象中**除 `proof` 外八字段**并加入
+    **`tenant_id=source_tenant_id`** 后的递归排序紧凑 JSON；编码非法返回
+    前缀“签名格式错误”，验签失败返回前缀“签名校验失败”。
+  - `expires_at` 必须为 UTC 秒精度 Z 格式 `YYYY-MM-DDTHH:MM:SSZ`
+    （非法返回前缀“证明”的原因）；当前时间达到它时返回
+    `{"valid":false,"reason":"证明已过期"}`。签名等先置失败仍优先返回
+    各自原因。成功仅返回 `{"valid":true}`。
 - `POST /v1/trust/credentials/verify-batch` 为批量版本，逐项规则与单项
   验真完全一致（字段、锚点、签名与原因分类）：
   - 请求体必须**恰为** `{"credentials":[项...]}`；`credentials` 须为
@@ -688,6 +723,11 @@ curl -X POST localhost:8080/v1/trust/credentials/verify \
 curl -X POST localhost:8080/v1/trust/credentials/verify-batch \
   -d '{"credentials":[{"body":{...},"signature":"<base64url R||S>"},
                        {"body":{...},"signature":"<base64url R||S>"}]}'
+# 外部谓词证明验真（proof 为 prove 响应九字段；签名覆盖除 proof 外八字段
+# 并加入 tenant_id=source_tenant_id 的规范化 JSON）
+curl -X POST localhost:8080/v1/trust/proofs/verify \
+  -d '{"proof":{ ...prove 接口返回的整个证明对象... },
+       "challenge":"<证明的 challenge>","source_tenant_id":"<来源租户>"}'
 ```
 
 ### 外部凭证状态同步
@@ -849,6 +889,7 @@ python3 tests/predicate_proof_test.py
 python3 tests/holder_binding_test.py
 python3 tests/trust_credential_verify_test.py
 python3 tests/trust_presentation_verify_test.py
+python3 tests/trust_proof_verify_test.py
 python3 tests/trust_credential_verify_with_status_test.py
 python3 tests/trust_credential_status_sync_test.py
 python3 tests/trust_credential_status_history_test.py
@@ -897,7 +938,10 @@ vcbackend/
                共享持久化游标、旧锚点加载按版本补注册/轮换/吊销事件、
                追加与分页）、跨系统外部凭证验真（含合并同步状态
                的只读判定）、跨系统外部演示验真（未绑定九字段、
-               挑战一致性与期限判定）、外部凭证状态
+               挑战一致性与期限判定）、跨系统外部谓词证明验真
+               （九字段与 predicates/results 结构校验、不重算 results、
+               tenant_id=source_tenant_id 规范化验签、期限判定，只读不消费）、
+               外部凭证状态
                同步（双键隔离、严格更新、重放幂等、原子审计）、外部凭证
                状态历史（持久化游标、旧状态兼容补项、追加与查询），以及
                全局连续审计事件与状态变更的同一次原子写（失败回滚）
@@ -958,6 +1002,11 @@ tests/trust_credential_verify_test.py  跨系统凭证验真（请求/凭证/锚
 tests/trust_presentation_verify_test.py 跨系统演示验真（请求/演示字段/holder_*
                                    拒绝/挑战/锚点/签名格式/验签/过期分类 reason、
                                    恰九字段与类型、只读不记审计、跨租户/重启）
+tests/trust_proof_verify_test.py   跨系统谓词证明验真（请求/证明九字段/
+                                   predicates 与 results 结构、不重算 results、
+                                   不校验 claims 命中与数组路径、挑战/锚点/
+                                   签名格式/验签 tenant_id/过期分类 reason、
+                                   只读不消费不审计、跨租户/重启）
 tests/trust_credential_verify_with_status_test.py  外部凭证验真并合并状态
                                    判定（未同步/active/revoked/unknown 四分支、
                                    无 reason 用“未知原因”、验真与过期优先级、
