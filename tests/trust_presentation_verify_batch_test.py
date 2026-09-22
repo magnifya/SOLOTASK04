@@ -198,7 +198,7 @@ def main():
         not_obj = "not-an-object"  # 项级请求错误
         with_holder = json.loads(json.dumps(good))
         with_holder["holder_did"] = "did:web:holder.example"  # holder_* 字段
-        with_source = dict(req(good), source_tenant_id="src")  # 绑定形态
+        with_source = dict(req(good), source_tenant_id="src")  # 绑定形态但演示缺 holder_*
         with_extra = dict(req(good), extra=1)  # 其他多余字段
         batch = [
             req(good),
@@ -243,10 +243,10 @@ def main():
               ok and results[8].get("valid") is False
               and results[8].get("reason", "").startswith("演示")
               and "holder" in results[8].get("reason", ""))
-        check("混合批次 source_tenant_id 项 -> 请求",
+        check("混合批次绑定形态但演示缺 holder 字段 -> 演示",
               ok and results[9].get("valid") is False
-              and results[9].get("reason", "").startswith("请求")
-              and "source_tenant_id" in results[9].get("reason", ""))
+              and results[9].get("reason", "").startswith("演示")
+              and "holder" in results[9].get("reason", ""))
         check("混合批次其他多余字段项 -> 请求",
               ok and results[10].get("valid") is False
               and results[10].get("reason", "").startswith("请求"))
@@ -292,7 +292,7 @@ def main():
                       req(good), headers=T1)
         check("单项跨系统演示接口仍正常",
               st == 200 and r == {"valid": True})
-        # 单项接口仍接受持有者绑定形态（批量不接受）
+        # 单项接口接受持有者绑定形态（批量同样接受）
         bound_priv, bound_pub = gen_keypair()
         holder_did = "did:web:holder-batch.example"
         st, _ = _http("POST", f"{base}/v1/trust/anchors",
@@ -320,9 +320,64 @@ def main():
         st, r = verify({"presentations": [
             {"presentation": bound, "challenge": "chal-1",
              "source_tenant_id": "source-tenant"}]}, headers=T1)
-        check("批量接口拒绝持有者绑定形态（项级失败）",
+        check("批量接口接受持有者绑定形态（项级成功）",
+              st == 200 and r == {"results": [{"valid": True}]})
+
+        # 8. 批量混合未绑定与持有者绑定项：等长同序、失败不短路
+        bound_unknown_holder = json.loads(json.dumps(bound))
+        bound_unknown_holder["holder_did"] = "did:web:nobody-holder"
+        st, r = verify({"presentations": [
+            req(good),
+            {"presentation": bound, "challenge": "chal-1",
+             "source_tenant_id": "source-tenant"},
+            {"presentation": bound, "challenge": "chal-2",
+             "source_tenant_id": "source-tenant"},
+            {"presentation": bound_unknown_holder, "challenge": "chal-1",
+             "source_tenant_id": "source-tenant"},
+            {"presentation": bound, "challenge": "chal-1",
+             "source_tenant_id": "other-tenant"},
+            req(good),
+        ]}, headers=T1)
+        ok = st == 200 and set(r) == {"results"} and len(r["results"]) == 6
+        bres = r.get("results", [])
+        check("混合形态批次长度一致", ok)
+        check("混合形态第 1 项未绑定成功", ok and bres[0] == {"valid": True})
+        check("混合形态第 2 项绑定成功", ok and bres[1] == {"valid": True})
+        check("混合形态第 3 项绑定挑战不匹配 -> 挑战",
+              ok and bres[2].get("valid") is False
+              and bres[2].get("reason", "").startswith("挑战"))
+        check("混合形态第 4 项未知持有者锚点 -> 持有者锚点不存在",
+              ok and bres[3].get("valid") is False
+              and bres[3].get("reason", "").startswith("持有者锚点不存在"))
+        check("混合形态第 5 项 tenant_id 不符 -> holder_proof 验签失败",
+              ok and bres[4].get("valid") is False
+              and bres[4].get("reason", "").startswith(
+                  "签名校验失败: holder_proof"))
+        check("混合形态末项未绑定仍成功（不短路）",
+              ok and bres[5] == {"valid": True})
+
+        # source_tenant_id 项级类型/空值错误仍为项级失败（不清空整批）
+        st, r = verify({"presentations": [
+            {"presentation": bound, "challenge": "chal-1",
+             "source_tenant_id": ""},
+            {"presentation": bound, "challenge": "chal-1",
+             "source_tenant_id": 123},
+        ]}, headers=T1)
+        check("绑定项空/非字符串 source_tenant_id -> 项级请求失败",
+              st == 200 and len(r["results"]) == 2
+              and all(item.get("valid") is False
+                      and item.get("reason", "").startswith("请求")
+                      for item in r["results"]))
+
+        # 绑定演示缺任一 holder 字段 -> 项级“演示”失败
+        bound_missing = json.loads(json.dumps(bound))
+        bound_missing.pop("holder_proof")
+        st, r = verify({"presentations": [
+            {"presentation": bound_missing, "challenge": "chal-1",
+             "source_tenant_id": "source-tenant"}]}, headers=T1)
+        check("绑定演示缺 holder_proof -> 项级演示失败",
               st == 200 and r["results"][0].get("valid") is False
-              and r["results"][0]["reason"].startswith("请求"))
+              and r["results"][0].get("reason", "").startswith("演示"))
 
     finally:
         proc.terminate()

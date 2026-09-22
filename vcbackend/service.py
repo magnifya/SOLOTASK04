@@ -26,7 +26,7 @@
   POST /v1/trust/verify                   用 active 锚点公钥验签
   POST /v1/trust/credentials/verify       跨系统凭证验真（无需登记 DID/凭证）
   POST /v1/trust/presentations/verify     跨系统演示验真（无需登记 DID/凭证/演示）
-  POST /v1/trust/presentations/verify-batch 批量跨系统演示验真（仅未绑定形态，不消费）
+  POST /v1/trust/presentations/verify-batch 批量跨系统演示验真（未绑定与持有者绑定形态，不消费）
   POST /v1/trust/proofs/verify            跨系统谓词证明验真（无需登记 DID/凭证/证明，不消费）
   POST /v1/trust/proofs/verify-batch      批量跨系统谓词证明验真（兼容单项规则，不消费）
   POST /v1/trust/credentials/verify-batch 批量跨系统凭证验真（兼容单项规则）
@@ -1268,8 +1268,11 @@ def build_handler(store: VCStore) -> type:
             # 非对象、字段缺失或多余、presentations 非数组、空数组或超过
             # 上限）时返回 {"results": [], "reason": "请求..."}。请求级
             # 合法时返回 {"results": [...]}，长度与顺序与输入一致，逐项
-            # 复用单项未绑定验真规则（不得含 source_tenant_id 或 holder_*
-            # 字段），失败不短路。纯只读，不消费、不登记资源，不写状态、
+            # 复用单项验真规则：未绑定项恰含 presentation 与非空
+            # challenge（演示为九字段、不得含 holder_*）；持有者绑定项
+            # 另须恰含非空 source_tenant_id，演示另含
+            # holder_did/holder_key_version/holder_proof，双锚点双签名；
+            # 失败不短路。纯只读，不消费、不登记资源，不写状态、
             # 历史或审计，仅使用当前租户锚点。
             try:
                 length = int(self.headers.get("Content-Length") or 0)

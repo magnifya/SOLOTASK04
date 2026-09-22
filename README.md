@@ -49,7 +49,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/trust/verify` | 信任验签，请求体含非空字符串 `issuer_did`、正整数 `issuer_key_version`、非空字符串 `signature`；**缺失、吊销或验签失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
 | POST | `/v1/trust/credentials/verify` | 跨系统凭证验真：验证未在本租户签发或存储的外部凭证，无需登记 DID/凭证；请求体须恰含 `body`、`signature`；**任何失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
 | POST | `/v1/trust/presentations/verify` | 跨系统演示验真：验证其他系统生成且未在本租户保存的演示，无需登记 DID/凭证/演示；请求体须恰为 `{"presentation":对象,"challenge":非空串}`；**任何失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
-| POST | `/v1/trust/presentations/verify-batch` | 批量跨系统演示验真：请求体恰为 `{"presentations":[项...]}`，数组非空且不超过 100 项，每项复用单项未绑定演示验真规则（须恰含 `presentation` 对象与非空 `challenge`，不得含 `source_tenant_id` 或其他字段，演示不得含任何 `holder_*` 字段）；**任何失败均 HTTP 200**，返回 `{"results":[...]}`（长度与顺序与输入一致，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`，不短路）；请求级非法（缺失、非法 JSON、非对象、字段缺失或多余、presentations 非数组、空数组或超限）返回 `{"results":[],"reason":"请求..."}`；纯只读、不消费、不审计 |
+| POST | `/v1/trust/presentations/verify-batch` | 批量跨系统演示验真：请求体恰为 `{"presentations":[项...]}`，数组非空且不超过 100 项，每项支持未绑定与持有者绑定两种形态（未绑定项恰含 `presentation` 对象与非空 `challenge`；绑定项另须恰含非空 `source_tenant_id`，演示恰为未绑定九字段加 `holder_did`、`holder_key_version`、`holder_proof`）；**任何失败均 HTTP 200**，返回 `{"results":[...]}`（长度与顺序与输入一致，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`，不短路）；请求级非法（缺失、非法 JSON、非对象、字段缺失或多余、presentations 非数组、空数组或超限）返回 `{"results":[],"reason":"请求..."}`；纯只读、不消费、不审计 |
 | POST | `/v1/trust/proofs/verify` | 跨系统谓词证明验真：验证未在本租户保存的外部谓词证明，原本地 `/v1/proofs/{id}/verify` 不变；请求体须恰含 `proof`、`challenge`、`source_tenant_id`（后两项为非空字符串），proof 恰为 prove 九字段；**任何失败均 HTTP 200** 返回 `valid:false` 与分类中文 reason，成功仅 `{"valid":true}`；只读、不消费、不审计 |
 | POST | `/v1/trust/proofs/verify-batch` | 批量跨系统谓词证明验真：请求体恰为 `{"proofs":[项...]}`，数组非空且不超过 100 项，每项规则与单项验真一致；**任何失败均 HTTP 200**，返回 `{"results":[...]}`（长度与顺序与输入一致，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`，不短路）；请求体非法、空数组或超上限时返回 `{"results":[],"reason":"请求..."}`；只读、不消费、不审计 |
 | POST | `/v1/trust/credentials/verify-batch` | 批量跨系统凭证验真：请求体恰为 `{"credentials":[项...]}`，数组非空且不超过 100 项，每项规则与单项验真一致；**任何失败均 HTTP 200**，返回 `{"results":[...]}`（长度与顺序与输入一致，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`，不短路）；请求体非法、空数组或超上限时返回 `{"results":[],"reason":"请求..."}` |
@@ -553,10 +553,16 @@ curl -X POST localhost:8080/v1/proofs/zp_<id>/verify \
   缺失、非法 JSON、非对象、字段缺失或多余、`presentations` 非数组、
   空数组或超限，统一 HTTP 200 返回
   `{"results":[],"reason":"请求…"}`；显式空 `X-Tenant-ID` 仍返回 400。
-  合法批次按输入顺序逐项处理且**不短路**，每项须恰为单项协议的未绑定
-  形态（恰含 `presentation` 对象与非空 `challenge`，含
-  `source_tenant_id` 或其他字段即项级失败，演示出现任何 `holder_*`
-  字段即失败），字段、挑战、锚点、签名、期限及校验顺序与单项一致。
+  合法批次按输入顺序逐项处理且**不短路**，每项支持两种形态，各自复用
+  单项接口的字段、挑战、锚点、签名、期限及校验顺序：
+  - **未绑定项**：恰含 `presentation` 对象与非空 `challenge`，不得含
+    `source_tenant_id` 或其他字段，演示须恰为未绑定九字段，出现任何
+    `holder_*` 字段即项级失败；
+  - **持有者绑定项**：另须恰含非空字符串 `source_tenant_id`，演示对象
+    恰为未绑定九字段加 `holder_did`（非空字符串）、
+    `holder_key_version`（非布尔正整数）、`holder_proof`（非空字符串）；
+    继续校验签发者与持有者两类锚点与双签名，`source_tenant_id` 作为
+    holder proof 覆盖对象中的 `tenant_id`。
   响应恰为 `{"results":[...]}`，长度和顺序与输入一致：成功项仅
   `{"valid":true}`，失败项恰为
   `{"valid":false,"reason":"非空中文原因"}`。接口纯只读、不消费、不
@@ -763,10 +769,13 @@ curl -X POST localhost:8080/v1/trust/proofs/verify \
 curl -X POST localhost:8080/v1/trust/proofs/verify-batch \
   -d '{"proofs":[{"proof":{...},"challenge":"...","source_tenant_id":"..."},
                    {"proof":{...},"challenge":"...","source_tenant_id":"..."}]}'
-# 批量外部演示验真（逐项为单项未绑定形态，失败不短路）
+# 批量外部演示验真（逐项可为未绑定或持有者绑定形态，失败不短路）
 curl -X POST localhost:8080/v1/trust/presentations/verify-batch \
   -d '{"presentations":[{"presentation":{ ...present 接口返回的九字段演示... },
-                          "challenge":"<演示的 challenge>"}]}'
+                          "challenge":"<演示的 challenge>"},
+                         {"presentation":{ ...十二字段持有者绑定演示... },
+                          "challenge":"<演示的 challenge>",
+                          "source_tenant_id":"<来源租户>"}]}'
 ```
 
 ### 外部凭证状态同步
@@ -977,8 +986,10 @@ vcbackend/
                带前置版本校验的轮换/生命周期历史（租户内跨 DID
                共享持久化游标、旧锚点加载按版本补注册/轮换/吊销事件、
                追加与分页）、跨系统外部凭证验真（含合并同步状态
-               的只读判定）、跨系统外部演示验真（未绑定九字段、
-               挑战一致性与期限判定）、跨系统外部谓词证明验真
+               的只读判定）、跨系统外部演示验真（未绑定九字段与持有者
+               绑定十二字段、挑战一致性、双锚点双签名与期限判定）、
+               批量跨系统外部演示验真（逐项复用单项的未绑定/绑定两种
+               形态、失败不短路、只读不消费）、跨系统外部谓词证明验真
                （九字段与 predicates/results 结构校验、不重算 results、
                tenant_id=source_tenant_id 规范化验签、期限判定，只读不消费）、
                批量跨系统谓词证明验真（逐项复用单项规则、失败不短路、

@@ -2966,8 +2966,8 @@ class VCStore:
         - 持有者绑定：请求恰含 presentation、challenge 及非空字符串
           source_tenant_id；演示恰为九字段外加 holder_did（非空字符串）、
           holder_key_version（正整数）、holder_proof（非空字符串）。
-          仅当 ``allow_holder_bound`` 为真（单项接口）时允许；批量接口
-          逐项目只接受未绑定形态，出现 source_tenant_id 即项级失败。
+          单项接口与批量接口均允许该形态：单项接口通过本方法直接校验，
+          批量接口逐项调用本方法，故两种形态可混现在同一批次中。
 
         校验顺序：请求结构 -> 演示字段与 challenge -> 签发者锚点与签名 ->
         持有者锚点与签名（仅绑定）-> 期限。
@@ -3226,12 +3226,19 @@ class VCStore:
         非数组、空数组或超过上限）时返回 ``(False, "请求...", [])``，由
         调用方回 ``{"results": [], "reason": ...}``。
 
-        请求级合法时逐项复用 :meth:`verify_trust_presentation` 的未绑定
-        形态（单项协议的字段、挑战、锚点、签名与期限规则），按输入顺序
-        收集结果，失败不短路：每一项须恰含 presentation（对象）与非空
-        challenge，含 source_tenant_id 或任何其他字段即项级失败；演示
-        须为未绑定九字段，出现任何 holder_* 字段即失败。成功项
-        ``{"valid": true}``，失败项
+        请求级合法时按输入顺序逐项复用
+        :meth:`verify_trust_presentation`（单项协议），每项支持两种形态、
+        失败不短路：
+        - 未绑定项：恰含 presentation（对象）与非空 challenge，不得含
+          source_tenant_id 或其他字段，演示须为未绑定九字段，出现任何
+          holder_* 字段即失败；
+        - 持有者绑定项：另须恰含非空字符串 source_tenant_id，演示对象恰
+          为未绑定九字段加 holder_did（非空字符串）、holder_key_version
+          （非布尔正整数）、holder_proof（非空字符串），继续校验签发者与
+          持有者两类锚点与双签名，source_tenant_id 作为 holder proof 覆盖
+          对象中的 tenant_id。
+        两种形态各自沿用单项的字段、挑战、锚点、签名、期限及校验顺序。
+        成功项 ``{"valid": true}``，失败项
         ``{"valid": false, "reason": ...}``。纯只读：不消费、不登记
         资源，不写状态、历史或审计，仅使用当前租户锚点。
         """
@@ -3259,7 +3266,7 @@ class VCStore:
         results: List[Dict[str, Any]] = []
         for item in presentations:  # 顺序校验，失败不短路
             valid, reason = self.verify_trust_presentation(
-                tenant_id, item, allow_holder_bound=False
+                tenant_id, item, allow_holder_bound=True
             )
             if valid:
                 results.append({"valid": True})
