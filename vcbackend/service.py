@@ -22,6 +22,7 @@
   POST /v1/credentials/{credential_id}/prove    生成谓词证明
   POST /v1/proofs/{proof_id}/verify             以存储记录为锚校验谓词证明
   POST /v1/trust/anchors                  注册信任锚点（同 DID/版本同 PEM 幂等）
+  GET  /v1/trust/anchors                  跨 DID 只读发现锚点版本（?limit=&after=&status=）
   POST /v1/trust/anchors/{did}/rotate     带前置版本校验的密钥轮换
   GET  /v1/trust/anchors/{did}            查询 DID 的全部锚点版本
   GET  /v1/trust/anchors/{did}/history    查询信任锚点生命周期历史（只读）
@@ -407,6 +408,8 @@ def build_handler(store: VCStore) -> type:
                     self._get_credential(
                         tenant, unquote(path[len("/v1/credentials/") :])
                     )
+                elif path == "/v1/trust/anchors":
+                    self._get_trust_anchor_discovery(tenant, parsed.query)
                 elif path.startswith("/v1/trust/anchors/") and path.endswith(
                     "/history"
                 ):
@@ -1238,6 +1241,76 @@ def build_handler(store: VCStore) -> type:
                             "cursor": event.cursor,
                         }
                         for event in events
+                    ],
+                    "next_after": next_after,
+                },
+            )
+
+        def _get_trust_anchor_discovery(self, tenant: str, query: str) -> None:
+            # GET /v1/trust/anchors?limit=&after=&status=：跨 DID 只读
+            # 发现。查询参数仅允许 limit、after、status：limit 缺省 50、
+            # 须为 1..200 的 ASCII 十进制整数；after 缺省 0、须为非负
+            # ASCII 十进制整数；status 可省略，提供时只能为 active 或
+            # revoked。重复参数、空值、空白、符号、小数、布尔词、Unicode
+            # 数字、越界及未知参数一律 400。响应恰含 anchors、next_after；
+            # 每项恰含 did、public_key、key_version、status、updated_at、
+            # cursor。先按 status 过滤，再按 cursor>after 升序取至多
+            # limit；空结果 next_after 等于 after，无锚点也返回 200 空
+            # 数组。纯只读：不写任何状态、不记审计。
+            params = parse_qs(query, keep_blank_values=True)
+            unknown = sorted(set(params) - {"limit", "after", "status"})
+            if unknown:
+                raise ValidationError(
+                    f"不支持的查询参数: {', '.join(unknown)}"
+                )
+
+            limit_values = params.get("limit")
+            if limit_values is not None:
+                if len(limit_values) != 1:
+                    raise ValidationError("查询参数 limit 只能提供一次")
+                limit = _parse_nonneg_int(limit_values[0], "limit")
+                if not 1 <= limit <= 200:
+                    raise ValidationError(
+                        "查询参数 limit 须在 1 到 200 之间"
+                    )
+            else:
+                limit = 50
+
+            after_values = params.get("after")
+            if after_values is not None:
+                if len(after_values) != 1:
+                    raise ValidationError("查询参数 after 只能提供一次")
+                after = _parse_nonneg_int(after_values[0], "after")
+            else:
+                after = 0
+
+            status_values = params.get("status")
+            status: Optional[str] = None
+            if status_values is not None:
+                if len(status_values) != 1:
+                    raise ValidationError("查询参数 status 只能提供一次")
+                if status_values[0] not in ("active", "revoked"):
+                    raise ValidationError(
+                        "查询参数 status 仅支持 active 或 revoked"
+                    )
+                status = status_values[0]
+
+            anchors, next_after = store.list_trust_anchor_entries(
+                tenant, after, limit, status
+            )
+            self._send_json(
+                200,
+                {
+                    "anchors": [
+                        {
+                            "did": record.did,
+                            "public_key": record.public_key,
+                            "key_version": record.key_version,
+                            "status": record.status,
+                            "updated_at": record.updated_at,
+                            "cursor": record.cursor,
+                        }
+                        for record in anchors
                     ],
                     "next_after": next_after,
                 },

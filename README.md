@@ -47,6 +47,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/trust/anchors` | 注册信任锚点，请求体 `{"did","public_key","key_version"}`（非空字符串、P-256 PEM、非布尔正整数）；返回 201 与 `did`、`public_key`、`key_version`、`status:"active"`、`updated_at:null` |
 | POST | `/v1/trust/anchors/{did}/rotate` | 带前置版本校验的密钥轮换，请求体须恰含 `from_key_version`（非布尔正整数）、`public_key`（P-256 PEM）；目标版本为 `from_key_version+1`；新建 201、同前置同 PEM 幂等重试 200，响应字段同 GET 元素 |
 | GET | `/v1/trust/anchors/{did}` | 返回该 DID 的全部锚点版本数组（按 `key_version` 升序）；未知 DID 404 |
+| GET | `/v1/trust/anchors?limit=&after=&status=` | 只读跨 DID 发现本租户锚点版本；响应恰含 `anchors`、`next_after`，每项恰含 `did`、`public_key`、`key_version`、`status`、`updated_at`、`cursor`；先按 `status`（可省略，或 `active`/`revoked`）过滤，再按 `cursor>after` 升序取至多 `limit`（默认 50、限 1–200，`after` 默认 0 且非负）；无锚点也返回 200 空数组，空结果 `next_after` 等于 `after`；参数仅允许这三个，重复/空值/空白/符号/Unicode 数字/越界/未知参数均 400；只读不记审计 |
 | GET | `/v1/trust/anchors/{did}/history?limit=&after=` | 只读查询信任锚点生命周期历史；200 恰含 `did`、`events`、`next_after`，事件恰含 `{key_version,action,status,updated_at,cursor}`；仅新版本注册、轮换目标版本（active、`updated_at:null`）与首次吊销（revoked、首次吊销 UTC 秒 Z 时间）追加，幂等重试与失败不追加；`cursor` 为租户内跨 DID 共享的持久化正整数；`limit` 默认 50、限 1–200，`after` 默认 0、须非负，重复/非空 ASCII 数字外取值均 400；未知或跨租户 DID 404，已有 DID 无历史返空页；只读不记审计 |
 | PUT | `/v1/trust/anchors/{did}/{key_version}/status` | 吊销锚点版本，请求体必须恰为 `{"status":"revoked"}`；首次与重复均 200，首次置 UTC 秒精度 `updated_at`，重复保持不变；未知版本 404 |
 | POST | `/v1/trust/verify` | 信任验签，请求体含非空字符串 `issuer_did`、正整数 `issuer_key_version`、非空字符串 `signature`；**缺失、吊销或验签失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
@@ -882,6 +883,51 @@ curl -X POST localhost:8080/v1/proofs/zp_<id>/verify \
 
 ```bash
 curl "localhost:8080/v1/trust/anchors/did:web:example.com/history?limit=50&after=0"
+```
+
+#### 信任锚点跨 DID 发现（只读）
+
+`GET /v1/trust/anchors` 在不指定 DID 的情况下，跨本租户全部 DID 只读
+发现锚点版本，与既有按 DID 接口
+（`GET /v1/trust/anchors/{did}`、`.../history`、注册/轮换/吊销）完全
+兼容，路由互不影响。
+
+- 查询参数**仅允许** `limit`、`after`、`status`，出现任何其他参数一律
+  **400**；显式空 `X-Tenant-ID` 仍为 **400**。
+  - `limit` 缺省 **50**，须为 **1–200** 的 ASCII 十进制整数；
+  - `after` 缺省 **0**，须为**非负** ASCII 十进制整数（允许前导零与
+    超大整数，按大整数精确处理）；
+  - `status` 可省略；提供时只能是 `active` 或 `revoked`。
+  - 三个参数都**只能出现一次**且须为**非空 ASCII 数字/合法取值**：
+    重复参数、空值、首尾空白、符号（`-1`/`+1`）、小数、布尔词、
+    Unicode 数字、`limit` 越界及未知参数一律 **400**。
+- 200 响应恰含 `anchors`、`next_after`：
+  - `anchors` 每项恰含 `did`、`public_key`、`key_version`、`status`、
+    `updated_at`、`cursor`，字段含义与按 DID 列表元素相同，另附
+    `cursor`；
+  - `cursor` 为 **JSON 正整数**，在**租户内跨 DID 唯一、单调递增并
+    持久化**，**复用该版本注册/轮换生命周期历史的 active 事件游标**；
+    **吊销不改变 cursor**（吊销版本的 cursor 仍是其 active 事件游标，
+    revoked 事件游标不参与发现）；不同租户各自独立。
+  - 查询顺序：**先按 `status` 过滤当前版本状态**，再在匹配项中按
+    **`cursor > after` 升序**取至多 `limit` 项；
+  - `next_after` 为本页末项 `cursor`，**空结果等于 `after`**；租户下
+    **无任何锚点也返回 200** 与 `{"anchors":[],"next_after":0}`，
+    不返回 404。
+- 该接口为**纯只读**：**不记审计**、不触发落盘或迁移重试，分页结论
+  随状态文件**跨重启稳定**。
+- **旧状态兼容**：加载阶段按 **did 字典序、key_version 升序**为缺失
+  active 历史的版本补游标（已吊销版本同样先补其 active 游标，游标
+  空间与生命周期历史完全一致）；**已有有效游标一律复用**，不重新
+  分配。迁移只在内存中进行并尝试随下一次**原子写**持久化——落盘失败
+  不得部分写入；GET **不触发重试**，此后任一次成功的注册/轮换/吊销
+  原子写会把迁移结果一并落盘；始终无写操作时，重启按相同顺序重建为
+  **相同 cursor**。
+
+```bash
+curl "localhost:8080/v1/trust/anchors?limit=50&after=0"
+curl "localhost:8080/v1/trust/anchors?status=active&limit=200"
+curl "localhost:8080/v1/trust/anchors?status=revoked&after=10"
 ```
 
 ```bash

@@ -54,6 +54,7 @@ from .models import (
     PresentationRecord,
     TrustAnchorRecord,
     TrustAnchorHistoryEvent,
+    TrustAnchorDiscoveryRecord,
 )
 
 # DID method 标识：小写字母开头，仅含小写字母数字与下划线/连字符
@@ -4441,6 +4442,65 @@ class VCStore:
                         cursor=cursor,
                     )
                 )
+            next_after = picked[-1].cursor if picked else after
+            return picked, next_after
+
+    def list_trust_anchor_entries(
+        self,
+        tenant_id: str,
+        after: int = 0,
+        limit: int = 50,
+        status: Optional[str] = None,
+    ) -> Tuple[List[TrustAnchorDiscoveryRecord], int]:
+        """跨 DID 只读发现本租户锚点版本，按页返回。
+
+        - status 给定时先按当前状态（active/revoked）过滤，省略则全部；
+        - 每项 cursor 复用该版本注册/轮换历史的 active 事件游标，租户内
+          跨 DID 唯一、单调递增；吊销不改变 cursor；
+        - 再按 cursor > after 升序取至多 limit 项；
+        - next_after 为本页末项 cursor，空页保持 after。
+        纯只读：不修改任何状态、不记审计、不触发落盘。无锚点的租户
+        返回空页（不抛 404）。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            candidates: List[Tuple[int, str, Dict[str, Any]]] = []
+            if bucket is not None:
+                anchors_map = bucket.get("trust_anchors", {})
+                history_map = bucket.get("trust_anchor_history", {})
+                for did, versions in anchors_map.items():
+                    # 版本 -> active 生命周期事件游标（注册/轮换）。
+                    active_cursor: Dict[int, int] = {}
+                    for event in history_map.get(did, []):
+                        if event.get("status") == "active":
+                            active_cursor[int(event["key_version"])] = int(
+                                event["cursor"]
+                            )
+                    for version_raw, row in versions.items():
+                        version = int(version_raw)
+                        current_status = row.get("status", "active")
+                        if status is not None and current_status != status:
+                            continue
+                        cursor = active_cursor.get(version)
+                        if cursor is None:
+                            # 加载迁移已保证存在；防御性跳过异常数据。
+                            continue
+                        if cursor <= after:
+                            continue
+                        candidates.append((cursor, did, row))
+            candidates.sort(key=lambda item: item[0])
+            picked_rows = candidates[:limit]
+            picked: List[TrustAnchorDiscoveryRecord] = [
+                TrustAnchorDiscoveryRecord(
+                    did=did,
+                    public_key=row["public_key"],
+                    key_version=int(row["key_version"]),
+                    status=row.get("status", "active"),
+                    updated_at=row.get("updated_at"),
+                    cursor=cursor,
+                )
+                for cursor, did, row in picked_rows
+            ]
             next_after = picked[-1].cursor if picked else after
             return picked, next_after
 

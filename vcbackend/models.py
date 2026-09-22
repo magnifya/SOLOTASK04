@@ -183,6 +183,23 @@ class TrustAnchorHistoryEvent:
 
 
 @dataclass
+class TrustAnchorDiscoveryRecord:
+    """跨 DID 发现接口中的一条锚点版本（只读发现查询用）。
+
+    在 TrustAnchorRecord 的基础上附带 cursor：cursor 为租户内跨 DID
+    唯一、单调递增并持久化的 JSON 正整数，复用该版本注册/轮换历史的
+    active 事件游标；吊销不改变 cursor。
+    """
+
+    did: str
+    public_key: str
+    key_version: int
+    status: str
+    updated_at: Optional[str]
+    cursor: int
+
+
+@dataclass
 class CredentialStatusSyncRecord:
     """一条外部凭证状态同步记录（按租户与 issuer_did#credential_id 双键隔离）。
 
