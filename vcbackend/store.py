@@ -46,6 +46,7 @@ from .models import (
     CredentialStatusSyncRecord,
     CredentialStatusHistoryEvent,
     DIDRecord,
+    DIDStatusRecord,
     KeyVersionStatusRecord,
     KeyRevocationEvent,
     PredicateProofRecord,
@@ -86,6 +87,12 @@ DEFAULT_REVOKE_REASON = "持证人主动吊销"
 # 吊销 DID 旧密钥版本时未提供 reason 的默认原因
 DEFAULT_KEY_REVOKE_REASON = "密钥版本主动吊销"
 
+# 停用 DID 时未提供 reason 的默认原因
+DEFAULT_DID_DEACTIVATE_REASON = "DID 主动停用"
+
+# DID 停用时验签类端点返回的统一中文原因前缀
+DID_DEACTIVATED_REASON_PREFIX = "签发DID已停用："
+
 # 凭证（及其演示/谓词证明/外部凭证）到期时的统一中文原因
 CREDENTIAL_EXPIRED_REASON = "凭证已过期"
 
@@ -117,6 +124,7 @@ AUDIT_TRUST_ANCHOR_ROTATED = "trust.anchor.rotated"
 AUDIT_PROOF_CREATED = "proof.created"
 AUDIT_PROOF_CONSUMED = "proof.consumed"
 AUDIT_KEY_REVOKED = "key.revoked"
+AUDIT_DID_DEACTIVATED = "did.deactivated"
 AUDIT_TRUST_CREDENTIAL_STATUS_SYNCED = "trust.credential.status.synced"
 
 
@@ -789,6 +797,108 @@ class VCStore:
             raise NotFoundError(f"DID 不存在: {did}")
         return rec
 
+    @staticmethod
+    def _is_did_deactivated_locked(rec: Optional[Dict[str, Any]]) -> bool:
+        return rec is not None and rec.get("status") == "deactivated"
+
+    # ------------------------------------------------------------------ #
+    # DID 生命周期停用
+    # ------------------------------------------------------------------ #
+    def deactivate_did(
+        self,
+        tenant_id: str,
+        did: str,
+        reason: Any = REASON_UNSET,
+    ) -> DIDStatusRecord:
+        """停用 DID（生命周期终态，不可恢复）。
+
+        - DID 不存在（含他租户资源）抛 NotFoundError（HTTP 404，跨租户
+          不可探测）；
+        - 重复停用时任何 reason（含非法值）均忽略，返回首次停用结果；
+          非法 reason（非字符串或裁剪后为空，含显式 null）仅在首次停用
+          时抛 ValidationError（HTTP 400）；
+        - 首次停用写入 status="deactivated" 与首次原因/UTC 秒精度 Z 时间；
+        - 首次停用与幂等重试均记 did.deactivated（resource_type 为 did、
+          resource_id 为 did）；停用状态与审计在同一把锁内经同一次原子
+          写落盘，失败回滚（状态不变、事件不记录），重启保留。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            rec = bucket["dids"].get(did) if bucket is not None else None
+            if rec is None:
+                raise NotFoundError(f"DID 不存在: {did}")
+
+            if rec.get("status") == "deactivated":
+                snapshot = self._snapshot_locked()
+                try:
+                    # 幂等成功同样每次记录审计；重复请求的 reason 忽略。
+                    self._append_audit_locked(
+                        tenant_id, AUDIT_DID_DEACTIVATED, "did", did
+                    )
+                    self._save_locked()
+                except Exception:
+                    self._restore_locked(snapshot)
+                    raise
+                return DIDStatusRecord(
+                    did=did,
+                    status="deactivated",
+                    reason=rec["deactivate_reason"],
+                    updated_at=rec["deactivated_at"],
+                )
+
+            if reason is REASON_UNSET:
+                final_reason = DEFAULT_DID_DEACTIVATE_REASON
+            else:
+                if not isinstance(reason, str):
+                    raise ValidationError("字段 reason 必须为字符串")
+                final_reason = reason.strip()
+                if not final_reason:
+                    raise ValidationError("字段 reason 裁剪后不能为空")
+
+            now = _utc_now()
+            snapshot = self._snapshot_locked()
+            try:
+                rec["status"] = "deactivated"
+                rec["deactivate_reason"] = final_reason
+                rec["deactivated_at"] = now
+                self._append_audit_locked(
+                    tenant_id, AUDIT_DID_DEACTIVATED, "did", did
+                )
+                self._save_locked()
+            except Exception:
+                self._restore_locked(snapshot)
+                raise
+            return DIDStatusRecord(
+                did=did,
+                status="deactivated",
+                reason=final_reason,
+                updated_at=now,
+            )
+
+    def get_did_status(self, tenant_id: str, did: str) -> DIDStatusRecord:
+        """只读查询 DID 生命周期状态。
+
+        - DID 不存在（含他租户资源）抛 NotFoundError（HTTP 404）；
+        - 活动 DID 返回 status="active"、reason/updated_at 均为 None；
+        - 停用 DID 返回首次停用的裁剪原因与 UTC 秒精度 Z 时间。
+        纯只读：不修改任何状态、不记审计、不触发落盘。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            rec = bucket["dids"].get(did) if bucket is not None else None
+            if rec is None:
+                raise NotFoundError(f"DID 不存在: {did}")
+            if rec.get("status") == "deactivated":
+                return DIDStatusRecord(
+                    did=did,
+                    status="deactivated",
+                    reason=rec.get("deactivate_reason"),
+                    updated_at=rec.get("deactivated_at"),
+                )
+            return DIDStatusRecord(
+                did=did, status="active", reason=None, updated_at=None
+            )
+
     # ------------------------------------------------------------------ #
     # 密钥轮换
     # ------------------------------------------------------------------ #
@@ -807,6 +917,8 @@ class VCStore:
             rec = bucket["dids"].get(did) if bucket is not None else None
             if rec is None:
                 raise NotFoundError(f"DID 不存在: {did}")
+            if rec.get("status") == "deactivated":
+                raise ConflictError(f"DID 已停用，不能轮换密钥: {did}")
             if self._handle_in_use_locked(bucket, handle):
                 raise ValidationError(f"key_handle 已被使用: {handle}")
 
@@ -1161,6 +1273,9 @@ class VCStore:
             subject = bucket["dids"].get(subject_did)
             if subject is None:
                 raise ValidationError(f"subject_did 不存在: {subject_did}")
+            # 已停用 DID 不得再作为 issuer 签发凭证：409 且不写记录。
+            if issuer.get("status") == "deactivated":
+                raise ConflictError(f"签发者 DID 已停用，不能签发凭证: {issuer_did}")
 
             snapshot = self._snapshot_locked()
             try:
@@ -1298,6 +1413,12 @@ class VCStore:
 
             issuer_did = stored_body["issuer_did"]
             version = int(stored_body.get("issuer_key_version", 1))
+            # 签发者 DID 已停用：拒绝生成演示，409 且不留任何记录/审计。
+            issuer_rec = bucket["dids"].get(issuer_did)
+            if self._is_did_deactivated_locked(issuer_rec):
+                raise ConflictError(
+                    f"签发者 DID 已停用，不能生成演示: {issuer_did}"
+                )
             private_pem = self._private_key_for_version_locked(
                 bucket, issuer_did, version
             )
@@ -1585,6 +1706,16 @@ class VCStore:
                 if issuer_entry is not None
                 else None
             )
+            # 签发者 DID 停用状态在锚定与双签名成功后判定；锁内捕获。
+            issuer_did_row = bucket["dids"].get(issuer_did)
+            issuer_did_deactivated = self._is_did_deactivated_locked(
+                issuer_did_row
+            )
+            issuer_did_deactivate_reason = (
+                issuer_did_row.get("deactivate_reason")
+                if issuer_did_row is not None
+                else None
+            )
 
             # 持有者绑定：holder_did 必须等于凭证正文 subject_did，且
             # 持有者为本租户已注册 DID，按 holder_key_version 从其公钥
@@ -1681,6 +1812,15 @@ class VCStore:
             )
             return False, f"签发密钥已吊销：{saved_reason}"
 
+        # 双签名锚定的 issuer 侧已通过：签发者 DID 已停用则 valid:false，
+        # 优先于持有者校验、凭证有效期与凭证吊销（只读，不消费）。
+        if issuer_did_deactivated:
+            saved_reason = (
+                issuer_did_deactivate_reason
+                or DEFAULT_DID_DEACTIVATE_REASON
+            )
+            return False, f"{DID_DEACTIVATED_REASON_PREFIX}{saved_reason}"
+
         if is_holder_bound:
             # 持有者第二签名：覆盖去掉 proof、holder_proof 后的完整演示
             # 对象（此处与 issuer proof 覆盖对象同构，另含 holder_did、
@@ -1772,6 +1912,17 @@ class VCStore:
                         or DEFAULT_KEY_REVOKE_REASON
                     )
                     return False, f"签发密钥已吊销：{saved_reason}"
+                # 锁内复查签发者 DID 停用状态（防锁外验签期间被停用的
+                # 竞态）：停用不消费，优先于有效期/凭证吊销。
+                issuer_row_now = bucket["dids"].get(issuer_did)
+                if self._is_did_deactivated_locked(issuer_row_now):
+                    saved_reason = (
+                        issuer_row_now.get("deactivate_reason")
+                        or DEFAULT_DID_DEACTIVATE_REASON
+                    )
+                    return False, (
+                        f"{DID_DEACTIVATED_REASON_PREFIX}{saved_reason}"
+                    )
                 if is_holder_bound and holder_did_value is not None:
                     holder_entry_now = (
                         self._key_history_entry_by_version_locked(
@@ -1872,6 +2023,12 @@ class VCStore:
 
             issuer_did = stored_body["issuer_did"]
             version = int(stored_body.get("issuer_key_version", 1))
+            # 签发者 DID 已停用：拒绝生成谓词证明，409 且不留记录/审计。
+            issuer_rec = bucket["dids"].get(issuer_did)
+            if self._is_did_deactivated_locked(issuer_rec):
+                raise ConflictError(
+                    f"签发者 DID 已停用，不能生成谓词证明: {issuer_did}"
+                )
             private_pem = self._private_key_for_version_locked(
                 bucket, issuer_did, version
             )
@@ -2050,6 +2207,16 @@ class VCStore:
                 if issuer_entry is not None
                 else None
             )
+            # 签发者 DID 停用状态在锚定与签名成功后判定；锁内捕获。
+            issuer_did_row = bucket["dids"].get(issuer_did)
+            issuer_did_deactivated = self._is_did_deactivated_locked(
+                issuer_did_row
+            )
+            issuer_did_deactivate_reason = (
+                issuer_did_row.get("deactivate_reason")
+                if issuer_did_row is not None
+                else None
+            )
 
         # 按存储的 predicates 从存储凭证 claims 重算结果并核对
         stored_predicates = list(row.get("predicates", []))
@@ -2102,6 +2269,15 @@ class VCStore:
             )
             return False, f"签发密钥已吊销：{saved_reason}"
 
+        # 锚定与签名均成功后检查签发者 DID 是否已停用：valid:false，
+        # 优先于凭证有效期（只读判定，不消费）。
+        if issuer_did_deactivated:
+            saved_reason = (
+                issuer_did_deactivate_reason
+                or DEFAULT_DID_DEACTIVATE_REASON
+            )
+            return False, f"{DID_DEACTIVATED_REASON_PREFIX}{saved_reason}"
+
         # 绑定与签名均成功后检查凭证有效期：凭证已到期直接拒绝，不消费、
         # 不记消费审计（自身绑定/签名失败仍优先返回原分类原因）。
         if _is_expired(credential_expires_at):
@@ -2138,6 +2314,17 @@ class VCStore:
                     or DEFAULT_KEY_REVOKE_REASON
                 )
                 return False, f"签发密钥已吊销：{saved_reason}"
+            # 锁内复查签发者 DID 停用状态（防锁外验签期间被停用的竞态）：
+            # 停用不消费，优先于凭证有效期。
+            issuer_row_now = bucket["dids"].get(issuer_did)
+            if self._is_did_deactivated_locked(issuer_row_now):
+                saved_reason = (
+                    issuer_row_now.get("deactivate_reason")
+                    or DEFAULT_DID_DEACTIVATE_REASON
+                )
+                return False, (
+                    f"{DID_DEACTIVATED_REASON_PREFIX}{saved_reason}"
+                )
             cred = bucket["credentials"].get(credential_id)
             if cred is not None and _is_expired(cred["body"].get("expires_at")):
                 return False, CREDENTIAL_EXPIRED_REASON
@@ -2359,6 +2546,20 @@ class VCStore:
             issuer_entry = self._key_history_entry_by_version_locked(
                 bucket, issuer_did, stored_version
             )
+            # 签发者 DID 的停用判定在锚定与验签成功后进行；锁内捕获状态。
+            issuer_row = (
+                bucket["dids"].get(issuer_did)
+                if issuer_did is not None
+                else None
+            )
+            issuer_did_deactivated = self._is_did_deactivated_locked(
+                issuer_row
+            )
+            issuer_did_deactivate_reason = (
+                issuer_row.get("deactivate_reason")
+                if issuer_row is not None
+                else None
+            )
             # 签发密钥版本的吊销判定在验签成功后进行；锁内捕获状态。
             issuer_key_revoked = (
                 issuer_entry is not None
@@ -2393,11 +2594,20 @@ class VCStore:
         except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
             return False, "验签过程发生内部错误"
 
-        # 验签成功后按“签发密钥 -> 有效期 -> 凭证吊销”顺序判定：
-        # 签发密钥版本被吊销时 valid:false，优先于有效期与凭证吊销。
+        # 验签成功后按“签发密钥 -> 签发者 DID 停用 -> 有效期 -> 凭证吊销”
+        # 顺序判定：签发密钥版本被吊销时 valid:false，沿用原分类协议。
         if issuer_key_revoked:
             saved_reason = issuer_key_revoke_reason or DEFAULT_KEY_REVOKE_REASON
             return False, f"签发密钥已吊销：{saved_reason}"
+
+        # 锚定与签名均成功后检查签发者 DID 是否已停用：valid:false，
+        # 优先于凭证有效期与凭证吊销（只读判定，不记审计）。
+        if issuer_did_deactivated:
+            saved_reason = (
+                issuer_did_deactivate_reason
+                or DEFAULT_DID_DEACTIVATE_REASON
+            )
+            return False, f"{DID_DEACTIVATED_REASON_PREFIX}{saved_reason}"
 
         # 签名、锚定均成功后检查有效期：当前时间 >= expires_at 判
         # valid:false（只读，不记审计）；无 expires_at 的旧凭证无期限。

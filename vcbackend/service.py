@@ -3,6 +3,8 @@
 路由：
   POST /v1/dids                           注册 DID
   GET  /v1/dids/{did}                     查询 DID
+  POST /v1/dids/{did}/deactivate          停用 DID（首次/幂等均 200）
+  GET  /v1/dids/{did}/status              查询 DID 生命周期状态（只读）
   GET  /v1/dids/{did}/document            查询 DID 文档（历史公钥，只读）
   POST /v1/dids/{did}/keys/rotate         轮换 DID 密钥
   POST /v1/dids/{did}/keys/{ver}/revoke   吊销 DID 旧密钥版本
@@ -189,6 +191,13 @@ def build_handler(store: VCStore) -> type:
                     did = unquote(did_raw)
                     key_version = unquote(version_raw) if sep else ""
                     self._post_revoke_key(tenant, did, key_version)
+                elif path.startswith("/v1/dids/") and path.endswith(
+                    "/deactivate"
+                ):
+                    did = unquote(
+                        path[len("/v1/dids/") : -len("/deactivate")]
+                    )
+                    self._post_deactivate_did(tenant, did)
                 elif path.startswith("/v1/credentials/") and path.endswith(
                     "/revoke"
                 ):
@@ -362,6 +371,11 @@ def build_handler(store: VCStore) -> type:
                         self._get_key_version_status(
                             tenant, did, key_version
                         )
+                elif path.startswith("/v1/dids/") and path.endswith("/status"):
+                    did = unquote(
+                        path[len("/v1/dids/") : -len("/status")]
+                    )
+                    self._get_did_status(tenant, did)
                 elif path.startswith("/v1/dids/"):
                     self._get_did(tenant, unquote(path[len("/v1/dids/") :]))
                 elif path.startswith("/v1/credentials/") and path.endswith(
@@ -457,6 +471,54 @@ def build_handler(store: VCStore) -> type:
             payload = self._did_payload(record)
             payload["created_at"] = record.created_at
             self._send_json(200, payload)
+
+        def _post_deactivate_did(self, tenant: str, did: str) -> None:
+            # POST /v1/dids/{did}/deactivate：
+            # 请求体仅允许空体、{} 或恰含可选 reason；reason 提供时由
+            # store 在确认非重复停用后校验（字符串裁剪后非空，否则 400），
+            # 重复停用时任何 reason（含非法值）均忽略并返回首次结果。
+            # 未知或他租户 DID 404。首次停用 200，响应恰含 did、
+            # status:"deactivated"、reason、updated_at。
+            if not did:
+                raise ValidationError("路径缺少 did")
+            data = self._read_optional_json()
+            if data:
+                extra = sorted(set(data) - {"reason"})
+                if extra:
+                    raise ValidationError(f"多余字段: {', '.join(extra)}")
+                if "reason" not in data:
+                    raise ValidationError("请求体非空时必须恰含字段: reason")
+            reason = (
+                data["reason"] if data and "reason" in data else REASON_UNSET
+            )
+            record = store.deactivate_did(tenant, did, reason)
+            self._send_json(
+                200,
+                {
+                    "did": record.did,
+                    "status": record.status,
+                    "reason": record.reason,
+                    "updated_at": record.updated_at,
+                },
+            )
+
+        def _get_did_status(self, tenant: str, did: str) -> None:
+            # GET /v1/dids/{did}/status：只读 DID 生命周期状态。
+            # 活动 DID 返回 status:"active" 且 reason、updated_at 为
+            # null；停用后返回首次原因与 UTC 秒精度 Z 时间。未知或他
+            # 租户 DID 404。纯只读：不改变状态与审计。
+            if not did:
+                raise ValidationError("路径缺少 did")
+            record = store.get_did_status(tenant, did)
+            self._send_json(
+                200,
+                {
+                    "did": record.did,
+                    "status": record.status,
+                    "reason": record.reason,
+                    "updated_at": record.updated_at,
+                },
+            )
 
         def _get_did_document(
             self, tenant: str, did: str, query: str

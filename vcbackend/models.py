@@ -22,6 +22,21 @@ class DIDRecord:
 
 
 @dataclass
+class DIDStatusRecord:
+    """一条 DID 生命周期状态记录（active/deactivated）。
+
+    active 时 reason/updated_at 均为 None；deactivated 时 reason 为首次
+    停用的裁剪后非空原因（缺省“DID 主动停用”），updated_at 为首次停用
+    时间（UTC ISO8601 秒精度 Z 结尾），重复停用保持首次值不变。
+    """
+
+    did: str
+    status: str
+    reason: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+@dataclass
 class KeyVersionStatusRecord:
     """一条 DID 密钥版本吊销记录。
 
