@@ -49,6 +49,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | GET | `/v1/trust/anchors/{did}/history?limit=&after=` | 只读查询信任锚点生命周期历史；200 恰含 `did`、`events`、`next_after`，事件恰含 `{key_version,action,status,updated_at,cursor}`；仅新版本注册、轮换目标版本（active、`updated_at:null`）与首次吊销（revoked、首次吊销 UTC 秒 Z 时间）追加，幂等重试与失败不追加；`cursor` 为租户内跨 DID 共享的持久化正整数；`limit` 默认 50、限 1–200，`after` 默认 0、须非负，重复/非空 ASCII 数字外取值均 400；未知或跨租户 DID 404，已有 DID 无历史返空页；只读不记审计 |
 | PUT | `/v1/trust/anchors/{did}/{key_version}/status` | 吊销锚点版本，请求体必须恰为 `{"status":"revoked"}`；首次与重复均 200，首次置 UTC 秒精度 `updated_at`，重复保持不变；未知版本 404 |
 | POST | `/v1/trust/verify` | 信任验签，请求体含非空字符串 `issuer_did`、正整数 `issuer_key_version`、非空字符串 `signature`；**缺失、吊销或验签失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
+| POST | `/v1/trust/dids/verify-document` | 跨系统 DID 文档验真：未在本租户注册的 DID 仅凭提交文档完成结构、证明与信任判断；请求体恰含 `document` 对象，文档恰含 `did`、`current_key_version`、`verification_methods`、`document_proof`；方法按版本升序无重复、每项含 `key_version`/`key_handle`/P-256 公钥 PEM 且不得出现私钥，`current_key_version` 须为最高版本；证明按既有 ES256 裸签名与规范化 JSON 规则覆盖除 `document_proof` 外的文档，用本租户同 DID/同版本/公钥完全匹配的 active 锚点验签；**请求、字段、锚点、签名格式或验签失败均 HTTP 200** 返回 `valid:false` 与非空中文分类原因，成功仅 `{"valid":true}`；纯只读、不登记资源、不写历史或审计、跨租户不可探测、重启结论稳定 |
 | POST | `/v1/trust/credentials/verify` | 跨系统凭证验真：验证未在本租户签发或存储的外部凭证，无需登记 DID/凭证；请求体须恰含 `body`、`signature`；**任何失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
 | POST | `/v1/trust/presentations/verify` | 跨系统演示验真：验证其他系统生成且未在本租户保存的演示，无需登记 DID/凭证/演示；请求体须恰为 `{"presentation":对象,"challenge":非空串}`；**任何失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
 | POST | `/v1/trust/presentations/verify-batch` | 批量跨系统演示验真：请求体恰为 `{"presentations":[项...]}`，数组非空且不超过 100 项；每项可复用单项未绑定形态（恰含 `presentation` 对象与非空 `challenge`，演示不得含任何 `holder_*` 字段）或持有者绑定形态（另恰含非空 `source_tenant_id`，演示恰为九字段加 `holder_did`、`holder_key_version`、`holder_proof`，双锚点双签名，`source_tenant_id` 作为 holder proof 覆盖的 `tenant_id`）；**任何失败均 HTTP 200**，返回 `{"results":[...]}`（长度与顺序与输入一致，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`，不短路）；请求级非法（缺失、非法 JSON、非对象、字段缺失或多余、presentations 非数组、空数组或超限）返回 `{"results":[],"reason":"请求..."}`；纯只读、不消费、不审计 |
@@ -551,6 +552,35 @@ curl -X POST localhost:8080/v1/proofs/zp_<id>/verify \
   去掉 `signature` 字段后**按 key 升序的规范化 JSON（紧凑序列化、UTF-8、
   嵌套对象递归排序）；公钥取本租户匹配 `(issuer_did, issuer_key_version)`
   的锚点，且仅 `active` 状态参与验签。
+- `POST /v1/trust/dids/verify-document` 验证**未在本租户注册的 DID** 提交
+  的 DID 文档：无需登记 DID，仅凭提交文档完成结构、证明与信任判断，只读、
+  不登记资源、不写历史或审计，跨租户各自使用本租户锚点，重启后结论一致。
+  - 请求体必须**恰含** `document`（JSON 对象）；缺失、多余字段、请求体
+    缺失/非法 JSON/非对象一律按请求错误返回 HTTP 200 +
+    `{"valid":false,"reason":"请求…"}`。
+  - `document` 必须**恰含** `did`（非空字符串）、`current_key_version`
+    （非布尔正整数）、`verification_methods`（非空数组）、`document_proof`
+    （非空字符串）；缺字段、多余字段或类型非法返回前缀“文档”的原因。
+  - `verification_methods` 每项必须**恰含** `key_version`（非布尔正整数）、
+    `key_handle`（非空字符串）与 `public_key`（可解析的 P-256 公钥 PEM）；
+    版本须按 `key_version` **严格升序且无重复**；文档中**不得出现私钥**
+    （含私钥 PEM 标记），违反返回前缀“文档”的原因。
+  - `current_key_version` 必须对应方法列表中的**最高版本**（即末项
+    `key_version`），否则返回“文档字段 current_key_version 必须对应最高
+    密钥版本”。
+  - 校验顺序：请求结构 → 文档结构 → 锚点 → 签名格式 → 密码学验签。锚点按
+    **当前租户** `(did, current_key_version)` 查找，且仅当存在 `active`
+    锚点、其 `public_key` 与文档最高版本方法的公钥**逐字节完全匹配**时才
+    继续；缺失返回前缀“锚点”的不存在原因，公钥不一致返回“锚点公钥与文档
+    公钥不匹配”，已吊销返回前缀“锚点”的吊销原因。
+  - `document_proof` 为 **ES256/SHA-256**、64 字节裸 `R||S` 的无填充
+    base64url，覆盖**除 `document_proof` 外的整个文档**的递归排序紧凑 JSON
+    （与 `GET /v1/dids/{did}/document` 的证明规则一致，由当前版本密钥签发，
+    文档其余方法由该签名背书）；编码非法返回前缀“签名格式错误”，验签失败
+    返回前缀“签名校验失败”。成功仅返回 `{"valid":true}`。
+  - 显式空 `X-Tenant-ID` 仍为 **400**；接口纯只读、不触发落盘，跨租户
+    锚点互不可见、不可探测，结论随锚点状态文件**跨重启持久化**。原有 DID
+    文档、注册、轮换及各类凭证验真接口协议保持不变。
 - `POST /v1/trust/credentials/verify` 验证**未在本租户签发或存储的外部
   凭证**：无需登记 DID/凭证，只读、不写凭证/状态/审计，跨租户各自使用
   本租户锚点，重启后行为不变。
@@ -802,6 +832,9 @@ curl -X PUT localhost:8080/v1/trust/anchors/did:web:example.com/1/status \
 curl -X POST localhost:8080/v1/trust/verify \
   -d '{"issuer_did":"did:web:example.com","issuer_key_version":1,
        "payload":{...},"signature":"<base64url R||S>"}'
+# 跨系统 DID 文档验真（document 可直接取自他系统 GET .../document 响应）
+curl -X POST localhost:8080/v1/trust/dids/verify-document \
+  -d '{"document":{ ...他系统返回的整个 DID 文档对象... }}'
 curl -X POST localhost:8080/v1/trust/credentials/verify \
   -d '{"body":{"credential_id":"vc_ext_1","issuer_did":"did:web:example.com",
        "subject_did":"did:web:subject","claims":{...},"issued_at":"2026-09-21T00:00:00Z",

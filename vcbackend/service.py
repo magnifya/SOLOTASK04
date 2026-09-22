@@ -26,6 +26,7 @@
   GET  /v1/trust/anchors/{did}/history    查询信任锚点生命周期历史（只读）
   PUT  /v1/trust/anchors/{did}/{key_version}/status  吊销锚点版本
   POST /v1/trust/verify                   用 active 锚点公钥验签
+  POST /v1/trust/dids/verify-document     跨系统 DID 文档验真（仅凭提交文档）
   POST /v1/trust/credentials/verify       跨系统凭证验真（无需登记 DID/凭证）
   POST /v1/trust/presentations/verify     跨系统演示验真（无需登记 DID/凭证/演示）
   POST /v1/trust/presentations/verify-batch 批量跨系统演示验真（仅未绑定形态，不消费）
@@ -255,6 +256,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_anchor_rotate(tenant, did)
                 elif path == "/v1/trust/verify":
                     self._post_trust_verify(tenant)
+                elif path == "/v1/trust/dids/verify-document":
+                    self._post_trust_dids_verify_document(tenant)
                 elif path == "/v1/trust/credentials/verify":
                     self._post_trust_credentials_verify(tenant)
                 elif path == "/v1/trust/presentations/verify":
@@ -1253,6 +1256,43 @@ def build_handler(store: VCStore) -> type:
             try:
                 valid, reason = store.verify_trust(tenant, data)
             except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
+                self._send_invalid("验签过程发生内部错误")
+                return
+            payload: Dict[str, Any] = {"valid": valid}
+            if not valid:
+                payload["reason"] = reason or "验签失败"
+            self._send_json(200, payload)
+
+        def _post_trust_dids_verify_document(self, tenant: str) -> None:
+            # 跨系统 DID 文档验真：与其他验签端点相同的公开错误协议，任何
+            # 失败都返回 200 + {"valid": false, "reason": "<非空中文原因>"}。
+            # 请求体须恰含 document（对象）；非法 JSON/非对象/缺失/多余
+            # 字段均为请求类原因。只读，不登记资源、不写历史或审计。
+            # 显式空 X-Tenant-ID 在进入路由前已由 do_POST 判为 400。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                self._send_invalid("请求体缺失或长度声明非法")
+                return
+            except Exception:  # noqa: BLE001
+                self._send_invalid("请求体读取失败")
+                return
+            if not raw:
+                self._send_invalid("请求体缺失")
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                self._send_invalid("请求体不是合法 UTF-8 文本")
+                return
+            except json.JSONDecodeError:
+                self._send_invalid("请求体不是合法 JSON")
+                return
+
+            try:
+                valid, reason = store.verify_trust_did_document(tenant, data)
+            except Exception:  # noqa: BLE001 验真失败绝不暴露内部细节
                 self._send_invalid("验签过程发生内部错误")
                 return
             payload: Dict[str, Any] = {"valid": valid}
