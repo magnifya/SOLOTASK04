@@ -218,6 +218,28 @@ class CredentialStatusHistoryEvent:
 
 
 @dataclass
+class CredentialStatusEvent:
+    """本地凭证状态历史中的一条追加事件（只读历史查询用）。
+
+    按 (租户, credential_id) 归属；仅首次 active 登记与首次吊销各追加
+    一条，重复、失败与只读路径不追加。cursor 为租户内持久化正整数，
+    按追加顺序单调递增；同一租户内不同凭证共享同一游标空间。
+    active 事件 reason/revoked_at 为 None；revoked 事件保存裁剪后的
+    reason 与 revoked_at（UTC ISO8601 秒精度 Z）。audit_seq/
+    audit_timestamp 关联产生该状态变更的审计事件；无法追溯（旧状态
+    补录的兼容项）时为 None。
+    """
+
+    status: str
+    reason: Optional[str]
+    updated_at: Optional[str]
+    revoked_at: Optional[str]
+    cursor: int
+    audit_seq: Optional[int] = None
+    audit_timestamp: Optional[int] = None
+
+
+@dataclass
 class AuditEvent:
     """一条审计事件。
 

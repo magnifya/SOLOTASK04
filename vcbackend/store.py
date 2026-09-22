@@ -26,6 +26,10 @@
 
 凭证状态（active/revoked）登记在凭证行内，随状态文件持久化；
 历史无状态凭证查询时按 active 呈现（updated_at 为空）。
+首次 active 登记与首次吊销各自向 credential_status_events 追加一条
+状态历史事件（按租户共享的持久化正整数游标），与状态、审计同一次
+原子写落盘；旧状态文件中有状态无历史的凭证在加载时按稳定顺序补
+一条 audit 字段为 None 的兼容项。
 """
 
 import copy
@@ -42,6 +46,7 @@ from . import crypto
 from .models import (
     AuditEvent,
     CredentialRecord,
+    CredentialStatusEvent,
     CredentialStatusRecord,
     CredentialStatusSyncRecord,
     CredentialStatusHistoryEvent,
@@ -494,6 +499,7 @@ class VCStore:
             bucket.setdefault("trust_anchors", {})
             bucket.setdefault("credential_status_sync", {})
             bucket.setdefault("credential_status_history", {})
+            bucket.setdefault("credential_status_events", {})
             bucket.setdefault("key_revocations", {})
             bucket.setdefault("trust_anchor_history", {})
             for rec in bucket["dids"].values():
@@ -543,6 +549,21 @@ class VCStore:
                 for event in entries:
                     max_cursor = max(max_cursor, int(event.get("cursor", 0)))
             self._trust_anchor_history_cursors[tenant_id] = max_cursor
+        # 本地凭证状态历史游标：按租户各自维护的持久化正整数
+        # （tenant_id -> cursor），同一租户内不同凭证的状态事件共享
+        # 该游标空间。旧状态文件无该字段时，从各租户已有状态历史项的
+        # 最大 cursor 推导。
+        raw_status_cursors = data.get("credential_status_cursors", {})
+        self._credential_status_cursors: Dict[str, int] = {
+            str(tenant_id): int(cursor)
+            for tenant_id, cursor in raw_status_cursors.items()
+        } if isinstance(raw_status_cursors, dict) else {}
+        for tenant_id, bucket in self._tenants.items():
+            max_cursor = self._credential_status_cursors.get(tenant_id, 0)
+            for entries in bucket.get("credential_status_events", {}).values():
+                for event in entries:
+                    max_cursor = max(max_cursor, int(event.get("cursor", 0)))
+            self._credential_status_cursors[tenant_id] = max_cursor
         # 旧状态文件中已吊销但无历史的密钥版本补一条兼容项（内存态）；
         # 随下一次原子写一并落盘，重启后 cursor 稳定。
         self._backfill_key_revocations_locked()
@@ -552,6 +573,9 @@ class VCStore:
         # 旧状态文件中已有同步状态但无历史的双键补一条兼容项（内存态，
         # audit 字段为 None）；随下一次原子写一并落盘。
         self._backfill_all_history_locked()
+        # 旧状态文件中已登记状态（active/revoked）但无历史的本地凭证补
+        # 一条兼容项（内存态，audit 字段为 None）；随下一次原子写落盘。
+        self._backfill_credential_status_events_locked()
 
     def _save_locked(self) -> None:
         directory = os.path.dirname(os.path.abspath(self.path))
@@ -564,6 +588,7 @@ class VCStore:
             "credential_status_history_cursor": self._history_cursor,
             "key_revocation_cursors": self._key_revocation_cursors,
             "trust_anchor_history_cursors": self._trust_anchor_history_cursors,
+            "credential_status_cursors": self._credential_status_cursors,
         }
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
@@ -579,6 +604,7 @@ class VCStore:
                 self._history_cursor,
                 self._key_revocation_cursors,
                 self._trust_anchor_history_cursors,
+                self._credential_status_cursors,
             )
         )
 
@@ -590,6 +616,7 @@ class VCStore:
             history_cursor,
             key_revocation_cursors,
             trust_anchor_history_cursors,
+            credential_status_cursors,
         ) = copy.deepcopy(snapshot)
         self._tenants = tenants
         self._audit = audit
@@ -597,6 +624,7 @@ class VCStore:
         self._history_cursor = history_cursor
         self._key_revocation_cursors = key_revocation_cursors
         self._trust_anchor_history_cursors = trust_anchor_history_cursors
+        self._credential_status_cursors = credential_status_cursors
 
     # ------------------------------------------------------------------ #
     # 租户桶与审计
@@ -615,6 +643,7 @@ class VCStore:
                 "trust_anchors": {},
                 "credential_status_sync": {},
                 "credential_status_history": {},
+                "credential_status_events": {},
                 "key_revocations": {},
                 "trust_anchor_history": {},
             }
@@ -2374,10 +2403,32 @@ class VCStore:
                     rec["status"] = "active"
                     rec["status_updated_at"] = _utc_now()
                 # 幂等重试（200）同样每次记录审计
-                self._append_audit_locked(
+                event = self._append_audit_locked(
                     tenant_id, AUDIT_STATUS_UPDATED,
                     "credential", credential_id,
                 )
+                if created:
+                    # 仅首次登记追加状态历史；重复登记、冲突与失败路径
+                    # 均不追加。状态、历史、游标与审计在同一次原子写落盘。
+                    entries = (
+                        bucket.setdefault("credential_status_events", {})
+                        .setdefault(credential_id, [])
+                    )
+                    entries.append(
+                        {
+                            "status": "active",
+                            "reason": None,
+                            "updated_at": rec["status_updated_at"],
+                            "revoked_at": None,
+                            "cursor": (
+                                self._next_credential_status_cursor_locked(
+                                    tenant_id
+                                )
+                            ),
+                            "audit_seq": int(event["seq"]),
+                            "audit_timestamp": int(event["timestamp"]),
+                        }
+                    )
                 self._save_locked()
             except Exception:
                 self._restore_locked(snapshot)
@@ -2480,9 +2531,30 @@ class VCStore:
                 rec["status_updated_at"] = now
                 rec["revoked_at"] = now
                 rec["revoke_reason"] = final_reason
-                self._append_audit_locked(
+                event = self._append_audit_locked(
                     tenant_id, AUDIT_CREDENTIAL_REVOKED,
                     "credential", credential_id,
+                )
+                # 仅首次成功吊销追加状态历史；重复吊销与失败路径均不会
+                # 到达此处。状态、历史、游标与审计在同一次原子写落盘。
+                entries = (
+                    bucket.setdefault("credential_status_events", {})
+                    .setdefault(credential_id, [])
+                )
+                entries.append(
+                    {
+                        "status": "revoked",
+                        "reason": final_reason,
+                        "updated_at": now,
+                        "revoked_at": now,
+                        "cursor": (
+                            self._next_credential_status_cursor_locked(
+                                tenant_id
+                            )
+                        ),
+                        "audit_seq": int(event["seq"]),
+                        "audit_timestamp": int(event["timestamp"]),
+                    }
                 )
                 self._save_locked()
             except Exception:
@@ -2495,6 +2567,79 @@ class VCStore:
                 reason=final_reason,
                 revoked_at=now,
             )
+
+    def list_credential_status_events(
+        self,
+        tenant_id: str,
+        credential_id: str,
+        after: int = 0,
+        limit: int = 50,
+    ) -> Tuple[List[CredentialStatusEvent], int]:
+        """只读查询某本地凭证的状态历史，按页返回。
+
+        - 凭证在本租户不存在（含他租户）抛 NotFoundError（HTTP 404）；
+          凭证存在但从未登记状态返回空页；
+        - 仅首次 active 登记与首次吊销各追加一条（重复、失败与只读
+          路径不追加），事件按 updated_at 升序、同 updated_at 按
+          cursor 升序返回；
+        - after 排除 cursor 不大于其值的事件，至多返回 limit 项；
+        - next_after 为本页末项 cursor，空页保持 after。
+
+        audit_seq 为 None 的兼容项（旧状态补录，无法追溯状态变更
+        审计）仍照常按 cursor 返回。
+        纯只读：不修改任何状态、不记审计、不触发落盘。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            rec = (
+                bucket["credentials"].get(credential_id)
+                if bucket is not None else None
+            )
+            if rec is None:
+                raise NotFoundError(f"凭证不存在: {credential_id}")
+            entries = list(
+                bucket.get("credential_status_events", {})
+                .get(credential_id, [])
+            )
+
+            def sort_key(row: Dict[str, Any]) -> Tuple[datetime, int]:
+                updated_at = row.get("updated_at")
+                moment = (
+                    _parse_utc_z(updated_at)
+                    if isinstance(updated_at, str)
+                    else datetime.min.replace(tzinfo=timezone.utc)
+                )
+                return (moment, int(row["cursor"]))
+
+            ordered = sorted(entries, key=sort_key)
+            picked: List[CredentialStatusEvent] = []
+            for row in ordered:
+                if len(picked) >= limit:
+                    break
+                cursor = int(row["cursor"])
+                if cursor <= after:
+                    continue
+                picked.append(
+                    CredentialStatusEvent(
+                        status=row["status"],
+                        reason=row.get("reason"),
+                        updated_at=row.get("updated_at"),
+                        revoked_at=row.get("revoked_at"),
+                        cursor=cursor,
+                        audit_seq=(
+                            int(row["audit_seq"])
+                            if row.get("audit_seq") is not None
+                            else None
+                        ),
+                        audit_timestamp=(
+                            int(row["audit_timestamp"])
+                            if row.get("audit_timestamp") is not None
+                            else None
+                        ),
+                    )
+                )
+            next_after = picked[-1].cursor if picked else after
+            return picked, next_after
 
     def verify_credential(
         self,
@@ -4179,6 +4324,12 @@ class VCStore:
         self._trust_anchor_history_cursors[tenant_id] = cursor
         return cursor
 
+    def _next_credential_status_cursor_locked(self, tenant_id: str) -> int:
+        """分配租户内下一个持久化凭证状态历史游标（正整数，按追加递增）。"""
+        cursor = self._credential_status_cursors.get(tenant_id, 0) + 1
+        self._credential_status_cursors[tenant_id] = cursor
+        return cursor
+
     def _backfill_trust_anchor_history_locked(self) -> None:
         """加载迁移：为缺生命周期历史的旧锚点版本按版本稳定补录。
 
@@ -4327,6 +4478,66 @@ class VCStore:
                                 old_row["issuer_key_version"]
                             ),
                             "cursor": self._next_history_cursor_locked(),
+                            "audit_seq": None,
+                            "audit_timestamp": None,
+                        }
+                    )
+
+    def _backfill_credential_status_events_locked(self) -> None:
+        """加载迁移：为已登记状态但无历史的旧本地凭证补一条兼容项。
+
+        对每个租户内凭证行已带 status（active/revoked）但
+        credential_status_events 中无任何历史项的旧状态，按
+        （租户、credential_id）的稳定顺序补录一条内容取自凭证行的
+        兼容项：active 取 status_updated_at、reason/revoked_at 为
+        None；revoked 取 revoke_reason/revoked_at 与
+        status_updated_at。cursor 为该租户内新分配的持久化正整数，
+        audit_seq/audit_timestamp 均为 None（无法追溯状态变更事件）。
+
+        仅在内存中补录：兼容项随下一次任意原子写一并落盘；若此后无写
+        操作则重启时按相同顺序重建（加载顺序由 sort_keys 落盘决定，
+        cursor 稳定）。
+        """
+        for tenant_id in sorted(self._tenants):
+            bucket = self._tenants[tenant_id]
+            events_map = bucket.setdefault("credential_status_events", {})
+            credentials = bucket.get("credentials", {})
+            for credential_id in sorted(credentials):
+                rec = credentials[credential_id]
+                status = rec.get("status")
+                if status not in ("active", "revoked"):
+                    continue
+                entries = events_map.setdefault(credential_id, [])
+                if entries:
+                    continue
+                if status == "revoked":
+                    entries.append(
+                        {
+                            "status": "revoked",
+                            "reason": rec.get("revoke_reason"),
+                            "updated_at": rec.get("status_updated_at"),
+                            "revoked_at": rec.get("revoked_at"),
+                            "cursor": (
+                                self._next_credential_status_cursor_locked(
+                                    tenant_id
+                                )
+                            ),
+                            "audit_seq": None,
+                            "audit_timestamp": None,
+                        }
+                    )
+                else:
+                    entries.append(
+                        {
+                            "status": "active",
+                            "reason": None,
+                            "updated_at": rec.get("status_updated_at"),
+                            "revoked_at": None,
+                            "cursor": (
+                                self._next_credential_status_cursor_locked(
+                                    tenant_id
+                                )
+                            ),
                             "audit_seq": None,
                             "audit_timestamp": None,
                         }
