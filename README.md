@@ -26,6 +26,8 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | --- | --- | --- |
 | POST | `/v1/dids` | 注册 DID，请求体 `{"method","public_key","key_mode"?}`，返回 201 与 `did`、`public_key`、`key_mode`、`key_handle`、`key_version` |
 | GET | `/v1/dids/{did}` | 返回 `did`、`public_key`、`key_mode`、`key_handle`、`key_version`、`created_at`；不存在 404 |
+| POST | `/v1/dids/{did}/deactivate` | DID 生命周期停用；请求体仅允许空体、`{}` 或恰含可选 `reason`（裁剪后非空字符串，缺省“DID 主动停用”，非法 400），未知或跨租户 DID 404；首次 200 返回恰含 `did`、`status:"deactivated"`、`reason`、`updated_at`，重复请求忽略新 `reason`（含非法值）幂等返回首次结果；首次与幂等均记 `did.deactivated` |
+| GET | `/v1/dids/{did}/status` | 只读 DID 生命周期状态；活动 DID 返回 `status:"active"` 且 `reason`、`updated_at` 为 `null`，停用后返回首次值；未知或跨租户 DID 404；不记审计 |
 | GET | `/v1/dids/{did}/document` | 只读 DID 文档：返回 `did`、`current_key_version`、按版本升序的 `verification_methods`（每项 `key_version`、`key_handle`、`public_key` P-256 PEM）与 `document_proof`；可选 `?version=N`（ASCII 十进制正整数，仅该版本并重新生成证明），版本不存在 404，参数非法 400；不暴露私钥、不改变任何状态 |
 | POST | `/v1/dids/{did}/keys/rotate` | 轮换密钥，请求体 `{"key_handle"}`，返回 200 与 `did`、`public_key`、`key_handle`、`key_version` |
 | POST | `/v1/dids/{did}/keys/{key_version}/revoke` | 吊销旧密钥版本；空体或 `{}` 省略 `reason`，非空须恰含 `reason`（裁剪后非空字符串，非法 400）；`key_version` 须为 ASCII 正整数，DID/版本（含他租户）不存在 404，当前版本 409；旧版本首次 200 返回 `did`、`key_version`、`status:"revoked"`、`reason`、`updated_at`，重复忽略 `reason` 并返回首次结果 |
@@ -305,6 +307,61 @@ python3 -m vcbackend.cli verify vc_<id>     # 成功输出 true（退出码 0）
 ```bash
 curl localhost:8080/v1/dids/did:example:<id>/keys/1/status
 curl "localhost:8080/v1/dids/did:example:<id>/keys/revocations?limit=50&after=0"
+```
+
+### DID 生命周期停用
+
+`POST /v1/dids/{did}/deactivate` 将一个活动 DID 置为生命周期终态
+“deactivated”。停用不删除任何历史：DID 文档、公钥历史/版本状态与既有
+凭证记录均保持可读，仅限制后续写操作与验签结论。
+
+- 请求体**仅允许**空体、`{}` 或恰含可选 `reason`：
+  - 空体或 `{}` 省略 `reason`，缺省“DID 主动停用”；
+  - 非空时必须**恰含** `reason`，多余字段、非空但缺 `reason` 一律 400；
+  - `reason` 提供时必须为字符串且首尾裁剪后非空（显式 `null`、数字、
+    空白串均 400），保存并返回裁剪后的值；非法 JSON/非对象 400。
+- DID 不存在或访问他租户 DID 一律 **404**（跨租户不可探测）；显式空
+  `X-Tenant-ID` 为 **400**。
+- **首次**停用成功 **200**，响应恰含 `did`、`status:"deactivated"`、
+  `reason`、`updated_at`（UTC 秒精度 Z）。
+- **重复停用幂等**：任何 `reason`（包括新的合法原因与非法值）都被
+  忽略，始终 **200** 返回首次的 `reason`/`updated_at`。
+- `GET /v1/dids/{did}/status` 只读返回恰含 `did`、`status`、`reason`、
+  `updated_at`：活动 DID 为 `status:"active"`、`reason`/`updated_at`
+  均 `null`；停用后为首次停用值。未知/他租户 DID 404。该接口**不记
+  审计**、不触发落盘。
+- **停用后的写限制**（均返回 **409** 与非空 `error`，且**不写任何
+  记录/审计**）：
+  - 密钥轮换 `POST /v1/dids/{did}/keys/rotate`；
+  - 以该 DID 为 `issuer_did` 签发凭证 `POST /v1/credentials`；
+  - 为其已签发凭证生成选择性披露演示 `.../present`；
+  - 为其已签发凭证生成谓词证明 `.../prove`。
+- **验签结论**（沿用公开错误协议，**HTTP 200**）：凭证、演示与谓词
+  证明在**锚定与密码学签名均成功之后**检查签发者 DID 状态；已停用时
+  返回 `{"valid":false,"reason":"签发DID已停用：<首次 reason>"}`。
+  - 该判定**优先于凭证有效期与凭证吊销**；请求/资源/锚定/签名格式/
+    签名校验等先置失败仍返回各自原分类原因（如正文被篡改仍返回
+    “签名校验失败…”）。
+  - 与密钥吊销的相对顺序为“**签发密钥吊销 → 签发者 DID 停用 →
+    有效期 → 凭证吊销**”；持有者绑定演示的 DID 停用随签发者 issuer
+    proof 之后判定，失败不进入消费。
+  - 停用导致的失败**不消费**演示/谓词证明（重复验证仍是停用原因而非
+    “已消费”），且**不记审计**；消费锁内复查停用状态以防竞态。
+- 历史 DID 文档、密钥版本状态、密钥吊销历史与既有凭证查询在停用后
+  **完全保持可读**。
+- 审计：首次与幂等停用均记 **`did.deactivated`**（`resource_type`
+  为 `did`、`resource_id` 为 DID 本身）；400/404/409 等失败路径不记。
+  停用标记与审计在同一把锁内经**同一次原子写**落盘，落盘失败回滚
+  （标记不变、事件不记录），**重启后结论稳定**，并遵守
+  `X-Tenant-ID` 租户隔离。
+
+```bash
+# 停用（空体/{} / 恰含 reason 均可）
+curl -X POST localhost:8080/v1/dids/did:example:<id>/deactivate
+curl -X POST localhost:8080/v1/dids/did:example:<id>/deactivate \
+  -d '{"reason":"机构主动注销"}'
+# 查询生命周期状态（活动为 active + null/null）
+curl localhost:8080/v1/dids/did:example:<id>/status
 ```
 
 ### DID 文档与历史公钥（只读）
@@ -886,6 +943,7 @@ curl "localhost:8080/v1/trust/credential-status/vc_ext_1/history?issuer_did=did:
   | 操作 | action | resource_type |
   | --- | --- | --- |
   | DID 注册（含同句柄幂等重试，每次都记） | `did.created` | `did` |
+  | DID 停用（首次与幂等重试均记） | `did.deactivated` | `did` |
   | 签发凭证 | `credential.issued` | `credential` |
   | 密钥轮换 | `key.rotated` | `did` |
   | 密钥版本吊销（首次与幂等重试均记） | `key.revoked` | `did` |
@@ -903,12 +961,13 @@ curl "localhost:8080/v1/trust/credential-status/vc_ext_1/history?issuer_did=did:
   信任锚点审计 `resource_id` 为 `<did>#<key_version>`（轮换取目标版本
   `from_key_version+1`）；注册冲突 409、轮换冲突 409/校验失败 400、
   验签（成功或失败）等只读或失败路径不记审计。密钥版本吊销审计
-  `resource_id` 同样为 `<did>#<key_version>`；400/404/409 不记。外部凭证状态同步审计
+  `resource_id` 同样为 `<did>#<key_version>`；400/404/409 不记。DID
+  停用审计 `resource_id` 为 DID 本身；400/404/409 不记。外部凭证状态同步审计
   `resource_id` 为 `<issuer_did>#<credential_id>`；锚点/签名失败、
   400/409、相同重放与更早日均不记。
 
-  验签失败、演示已消费、演示过期、凭证过期、凭证/演示吊销判定等**只读或失败
-  路径不记审计**。
+  验签失败、演示已消费、演示过期、凭证过期、凭证/演示吊销、签发者 DID
+  停用判定等**只读或失败路径不记审计**。
 - `GET /v1/audit?limit=&after=` 返回本租户事件（按 seq 升序）：
   - `limit` 缺省 50，须为非布尔整数且在 1–200；`after` 缺省 0，须为
     非布尔非负整数；重复参数、空白、布尔词、小数、符号等一律 400；
@@ -927,6 +986,7 @@ curl -H 'X-Tenant-ID: acme' 'localhost:8080/v1/audit?limit=50&after=0'
 ```bash
 python3 tests/e2e_test.py
 python3 tests/did_document_test.py
+python3 tests/did_deactivation_test.py
 python3 tests/key_revocation_test.py
 python3 tests/key_revocation_status_history_test.py
 python3 tests/credential_expiry_test.py
@@ -970,14 +1030,17 @@ seq 跨重启接续，以及落盘失败时内存回滚（变更不生效、审�
 ```
 vcbackend/
   crypto.py    ES256 签名/验签、规范化 JSON、P-256 密钥
-  models.py    DIDRecord / CredentialRecord / CredentialStatusRecord /
+  models.py    DIDRecord / DIDDeactivationRecord / CredentialRecord /
+               CredentialStatusRecord /
                KeyVersionStatusRecord / KeyRevocationEvent /
                PresentationRecord / PredicateProofRecord /
                TrustAnchorRecord / CredentialStatusSyncRecord /
                CredentialStatusHistoryEvent / TrustAnchorHistoryEvent /
                AuditEvent 数据模型
   store.py     多租户文件存储（租户分桶、旧格式迁移）、DID 去重、密钥
-               轮换、DID 旧密钥版本吊销（当前版本 409、重复忽略 reason、
+               轮换、DID 生命周期停用（原子审计、幂等返回首次结果、
+               停用后写操作 409 拦截与验签端签发者 DID 停用判定）、
+               DID 旧密钥版本吊销（当前版本 409、重复忽略 reason、
                原子审计与验真端签发/持有者密钥吊销判定）、
                DID 文档只读查询（历史公钥与当前版本私钥证明）、密钥版本
                状态与吊销历史只读查询（租户内持久化游标、旧吊销状态
@@ -1009,6 +1072,15 @@ tests/did_document_test.py         DID 文档只读接口（字段/升序/不暴
                                    document_proof 恒由当前版本签发、version
                                    参数 400/404、租户隔离、只读不审计、
                                    重启验签稳定、旧状态迁移公开版本 1）
+tests/did_deactivation_test.py     DID 生命周期停用（空体/{}/恰含 reason、
+                                   裁剪非空与默认原因、首次/幂等返回首次值、
+                                   状态 active null/null 与停用首次值、
+                                   400/404/409、轮换/签发/present/prove
+                                   409 不写记录、验签 200/valid:false 停用
+                                   原因优先于有效期与吊销、签名失败按原分类、
+                                   失败不消费、历史文档/公钥/凭证可读、
+                                   did.deactivated 审计与失败不记、租户隔离、
+                                   重启稳定、落盘失败回滚）
 tests/credential_expiry_test.py    凭证有效期（签发 400/不注入/参与签名、
                                    verify 过期原因与优先级/不记审计、演示与
                                    谓词证明拒签不消费、外部凭证验真、重启持久化）

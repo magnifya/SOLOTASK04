@@ -54,6 +54,21 @@ class KeyRevocationEvent:
 
 
 @dataclass
+class DIDDeactivationRecord:
+    """一条 DID 生命周期停用记录。
+
+    did 为被停用的 DID；status 恒为 "deactivated"；reason 为裁剪后
+    非空的停用原因；updated_at 为首次停用时间（UTC ISO8601 秒精度 Z
+    结尾）。重复停用忽略新 reason，始终返回首次结果。
+    """
+
+    did: str
+    status: str
+    reason: str
+    updated_at: str
+
+
+@dataclass
 class CredentialRecord:
     """一条已签发凭证：正文与其 ES256 签名。"""
 
