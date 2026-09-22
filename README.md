@@ -49,6 +49,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/trust/verify` | 信任验签，请求体含非空字符串 `issuer_did`、正整数 `issuer_key_version`、非空字符串 `signature`；**缺失、吊销或验签失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
 | POST | `/v1/trust/credentials/verify` | 跨系统凭证验真：验证未在本租户签发或存储的外部凭证，无需登记 DID/凭证；请求体须恰含 `body`、`signature`；**任何失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
 | POST | `/v1/trust/presentations/verify` | 跨系统演示验真：验证其他系统生成且未在本租户保存的演示，无需登记 DID/凭证/演示；请求体须恰为 `{"presentation":对象,"challenge":非空串}`；**任何失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
+| POST | `/v1/trust/presentations/verify-batch` | 批量跨系统演示验真：请求体恰为 `{"presentations":[项...]}`，数组非空且不超过 100 项，每项复用单项未绑定演示验真规则（须恰含 `presentation` 对象与非空 `challenge`，不得含 `source_tenant_id` 或其他字段，演示不得含任何 `holder_*` 字段）；**任何失败均 HTTP 200**，返回 `{"results":[...]}`（长度与顺序与输入一致，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`，不短路）；请求级非法（缺失、非法 JSON、非对象、字段缺失或多余、presentations 非数组、空数组或超限）返回 `{"results":[],"reason":"请求..."}`；纯只读、不消费、不审计 |
 | POST | `/v1/trust/proofs/verify` | 跨系统谓词证明验真：验证未在本租户保存的外部谓词证明，原本地 `/v1/proofs/{id}/verify` 不变；请求体须恰含 `proof`、`challenge`、`source_tenant_id`（后两项为非空字符串），proof 恰为 prove 九字段；**任何失败均 HTTP 200** 返回 `valid:false` 与分类中文 reason，成功仅 `{"valid":true}`；只读、不消费、不审计 |
 | POST | `/v1/trust/proofs/verify-batch` | 批量跨系统谓词证明验真：请求体恰为 `{"proofs":[项...]}`，数组非空且不超过 100 项，每项规则与单项验真一致；**任何失败均 HTTP 200**，返回 `{"results":[...]}`（长度与顺序与输入一致，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`，不短路）；请求体非法、空数组或超上限时返回 `{"results":[],"reason":"请求..."}`；只读、不消费、不审计 |
 | POST | `/v1/trust/credentials/verify-batch` | 批量跨系统凭证验真：请求体恰为 `{"credentials":[项...]}`，数组非空且不超过 100 项，每项规则与单项验真一致；**任何失败均 HTTP 200**，返回 `{"results":[...]}`（长度与顺序与输入一致，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`，不短路）；请求体非法、空数组或超上限时返回 `{"results":[],"reason":"请求..."}` |
@@ -547,6 +548,19 @@ curl -X POST localhost:8080/v1/proofs/zp_<id>/verify \
     （非法返回前缀“演示”的原因）；当前时间达到它时返回
     `{"valid":false,"reason":"演示已过期"}`。成功仅返回
     `{"valid":true}`。
+- `POST /v1/trust/presentations/verify-batch` 为批量版本：请求体必须
+  **恰为** `{"presentations":[项...]}`，数组非空且不超过 100 项。外层
+  缺失、非法 JSON、非对象、字段缺失或多余、`presentations` 非数组、
+  空数组或超限，统一 HTTP 200 返回
+  `{"results":[],"reason":"请求…"}`；显式空 `X-Tenant-ID` 仍返回 400。
+  合法批次按输入顺序逐项处理且**不短路**，每项须恰为单项协议的未绑定
+  形态（恰含 `presentation` 对象与非空 `challenge`，含
+  `source_tenant_id` 或其他字段即项级失败，演示出现任何 `holder_*`
+  字段即失败），字段、挑战、锚点、签名、期限及校验顺序与单项一致。
+  响应恰为 `{"results":[...]}`，长度和顺序与输入一致：成功项仅
+  `{"valid":true}`，失败项恰为
+  `{"valid":false,"reason":"非空中文原因"}`。接口纯只读、不消费、不
+  登记资源、不写状态/历史/审计，仅使用当前租户锚点，重启后结论稳定。
 - `POST /v1/trust/proofs/verify` 验证**未在本租户保存的外部谓词证明**：
   无需登记 DID/凭证/证明，只读、不消费、不写证明/状态/历史/审计，跨租户
   各自使用本租户锚点，重启后结论一致。原本地
@@ -749,6 +763,10 @@ curl -X POST localhost:8080/v1/trust/proofs/verify \
 curl -X POST localhost:8080/v1/trust/proofs/verify-batch \
   -d '{"proofs":[{"proof":{...},"challenge":"...","source_tenant_id":"..."},
                    {"proof":{...},"challenge":"...","source_tenant_id":"..."}]}'
+# 批量外部演示验真（逐项为单项未绑定形态，失败不短路）
+curl -X POST localhost:8080/v1/trust/presentations/verify-batch \
+  -d '{"presentations":[{"presentation":{ ...present 接口返回的九字段演示... },
+                          "challenge":"<演示的 challenge>"}]}'
 ```
 
 ### 外部凭证状态同步

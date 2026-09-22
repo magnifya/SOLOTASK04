@@ -26,6 +26,7 @@
   POST /v1/trust/verify                   用 active 锚点公钥验签
   POST /v1/trust/credentials/verify       跨系统凭证验真（无需登记 DID/凭证）
   POST /v1/trust/presentations/verify     跨系统演示验真（无需登记 DID/凭证/演示）
+  POST /v1/trust/presentations/verify-batch 批量跨系统演示验真（仅未绑定形态，不消费）
   POST /v1/trust/proofs/verify            跨系统谓词证明验真（无需登记 DID/凭证/证明，不消费）
   POST /v1/trust/proofs/verify-batch      批量跨系统谓词证明验真（兼容单项规则，不消费）
   POST /v1/trust/credentials/verify-batch 批量跨系统凭证验真（兼容单项规则）
@@ -247,6 +248,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_credentials_verify(tenant)
                 elif path == "/v1/trust/presentations/verify":
                     self._post_trust_presentations_verify(tenant)
+                elif path == "/v1/trust/presentations/verify-batch":
+                    self._post_trust_presentations_verify_batch(tenant)
                 elif path == "/v1/trust/proofs/verify":
                     self._post_trust_proofs_verify(tenant)
                 elif path == "/v1/trust/proofs/verify-batch":
@@ -1257,6 +1260,66 @@ def build_handler(store: VCStore) -> type:
             if not valid:
                 payload["reason"] = reason or "验签失败"
             self._send_json(200, payload)
+
+        def _post_trust_presentations_verify_batch(self, tenant: str) -> None:
+            # 批量跨系统演示验真：与单项相同的公开错误协议，任何失败都
+            # 返回 HTTP 200。请求体须恰为 {"presentations": [项...]}，
+            # 数组非空且不超过 100 项；请求体非法（外层缺失、非法 JSON、
+            # 非对象、字段缺失或多余、presentations 非数组、空数组或超过
+            # 上限）时返回 {"results": [], "reason": "请求..."}。请求级
+            # 合法时返回 {"results": [...]}，长度与顺序与输入一致，逐项
+            # 复用单项未绑定验真规则（不得含 source_tenant_id 或 holder_*
+            # 字段），失败不短路。纯只读，不消费、不登记资源，不写状态、
+            # 历史或审计，仅使用当前租户锚点。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                self._send_json(
+                    200,
+                    {"results": [],
+                     "reason": "请求不合法: 请求体缺失或长度声明非法"},
+                )
+                return
+            except Exception:  # noqa: BLE001
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 请求体读取失败"}
+                )
+                return
+            if not raw:
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 请求体缺失"}
+                )
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                self._send_json(
+                    200,
+                    {"results": [], "reason": "请求不合法: 请求体不是合法 UTF-8 文本"},
+                )
+                return
+            except json.JSONDecodeError:
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 请求体不是合法 JSON"}
+                )
+                return
+
+            try:
+                ok, reason, results = store.verify_trust_presentations_batch(
+                    tenant, data
+                )
+            except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 验签过程发生内部错误"}
+                )
+                return
+            if not ok:
+                self._send_json(
+                    200, {"results": [], "reason": reason or "请求不合法"}
+                )
+                return
+            self._send_json(200, {"results": results})
 
         def _post_trust_proofs_verify(self, tenant: str) -> None:
             # 跨系统谓词证明验真：与其他验签端点相同的公开错误协议，任何

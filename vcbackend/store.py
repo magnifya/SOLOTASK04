@@ -2954,6 +2954,7 @@ class VCStore:
         self,
         tenant_id: str,
         data: Any,
+        allow_holder_bound: bool = True,
     ) -> Tuple[bool, str]:
         """验证未在本租户保存的外部选择性披露演示，返回 (是否有效, 失败原因)。
 
@@ -2965,6 +2966,8 @@ class VCStore:
         - 持有者绑定：请求恰含 presentation、challenge 及非空字符串
           source_tenant_id；演示恰为九字段外加 holder_did（非空字符串）、
           holder_key_version（正整数）、holder_proof（非空字符串）。
+          仅当 ``allow_holder_bound`` 为真（单项接口）时允许；批量接口
+          逐项目只接受未绑定形态，出现 source_tenant_id 即项级失败。
 
         校验顺序：请求结构 -> 演示字段与 challenge -> 签发者锚点与签名 ->
         持有者锚点与签名（仅绑定）-> 期限。
@@ -2984,7 +2987,9 @@ class VCStore:
         # 非空字符串 source_tenant_id。
         if not isinstance(data, dict):
             return False, "请求不合法: 请求体必须为 JSON 对象"
-        is_holder_bound = "source_tenant_id" in data
+        is_holder_bound = (
+            allow_holder_bound and "source_tenant_id" in data
+        )
         allowed_fields = {"presentation", "challenge"}
         if is_holder_bound:
             allowed_fields.add("source_tenant_id")
@@ -3207,6 +3212,62 @@ class VCStore:
         if datetime.now(timezone.utc) >= expires_dt:
             return False, "演示已过期"
         return True, ""
+
+    def verify_trust_presentations_batch(
+        self,
+        tenant_id: str,
+        data: Any,
+    ) -> Tuple[bool, str, List[Dict[str, Any]]]:
+        """批量验证外部选择性披露演示，返回
+        (请求是否合法, 请求级原因, 逐项结果)。
+
+        请求体须恰为 ``{"presentations": [项...]}``：数组非空且不超过
+        100 项。请求级结构不合法（非对象、字段缺失或多余、presentations
+        非数组、空数组或超过上限）时返回 ``(False, "请求...", [])``，由
+        调用方回 ``{"results": [], "reason": ...}``。
+
+        请求级合法时逐项复用 :meth:`verify_trust_presentation` 的未绑定
+        形态（单项协议的字段、挑战、锚点、签名与期限规则），按输入顺序
+        收集结果，失败不短路：每一项须恰含 presentation（对象）与非空
+        challenge，含 source_tenant_id 或任何其他字段即项级失败；演示
+        须为未绑定九字段，出现任何 holder_* 字段即失败。成功项
+        ``{"valid": true}``，失败项
+        ``{"valid": false, "reason": ...}``。纯只读：不消费、不登记
+        资源，不写状态、历史或审计，仅使用当前租户锚点。
+        """
+        if not isinstance(data, dict):
+            return False, "请求不合法: 请求体必须为 JSON 对象", []
+        if set(data) != {"presentations"}:
+            missing = [f for f in ("presentations",) if f not in data]
+            if missing:
+                return False, (
+                    f"请求缺少字段: {', '.join(missing)}"
+                ), []
+            extra = sorted(set(data) - {"presentations"})
+            return False, f"请求含多余字段: {', '.join(extra)}", []
+        presentations = data["presentations"]
+        if not isinstance(presentations, list):
+            return False, "请求不合法: 字段 presentations 必须为数组", []
+        if not presentations:
+            return False, "请求不合法: presentations 数组不能为空", []
+        if len(presentations) > 100:
+            return False, (
+                "请求不合法: presentations 数组不能超过 100 项"
+                f"（当前 {len(presentations)} 项）"
+            ), []
+
+        results: List[Dict[str, Any]] = []
+        for item in presentations:  # 顺序校验，失败不短路
+            valid, reason = self.verify_trust_presentation(
+                tenant_id, item, allow_holder_bound=False
+            )
+            if valid:
+                results.append({"valid": True})
+            else:
+                results.append(
+                    {"valid": False, "reason": reason or "验签失败"}
+                )
+        return True, "", results
 
     def verify_trust_proof(
         self,
