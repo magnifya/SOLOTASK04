@@ -254,6 +254,10 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_proofs_verify(tenant)
                 elif path == "/v1/trust/proofs/verify-batch":
                     self._post_trust_proofs_verify_batch(tenant)
+                elif path == "/v1/trust/proofs/verify-with-status":
+                    self._post_trust_proofs_verify_with_status(tenant)
+                elif path == "/v1/trust/proofs/verify-batch-with-status":
+                    self._post_trust_proofs_verify_batch_with_status(tenant)
                 elif path == "/v1/trust/credentials/verify-batch":
                     self._post_trust_credentials_verify_batch(tenant)
                 elif path == "/v1/trust/credentials/verify-batch-with-status":
@@ -1405,6 +1409,109 @@ def build_handler(store: VCStore) -> type:
             try:
                 ok, reason, results = store.verify_trust_proofs_batch(
                     tenant, data
+                )
+            except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 验签过程发生内部错误"}
+                )
+                return
+            if not ok:
+                self._send_json(
+                    200, {"results": [], "reason": reason or "请求不合法"}
+                )
+                return
+            self._send_json(200, {"results": results})
+
+        def _post_trust_proofs_verify_with_status(
+            self, tenant: str
+        ) -> None:
+            # 外部谓词证明验真并合并状态判定：公开错误协议，任何失败都
+            # 返回 200 + {"valid": false, "reason": "<非空中文原因>"}。
+            # 请求体须恰含 proof（对象）、challenge（非空字符串）与
+            # source_tenant_id（非空字符串），解析规则与
+            # /v1/trust/proofs/verify 完全一致；验真通过后由 store 只读
+            # 查询本租户同步状态。纯只读，不消费、不写状态、不记审计。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                self._send_invalid("请求体缺失或长度声明非法")
+                return
+            except Exception:  # noqa: BLE001
+                self._send_invalid("请求体读取失败")
+                return
+            if not raw:
+                self._send_invalid("请求体缺失")
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                self._send_invalid("请求体不是合法 UTF-8 文本")
+                return
+            except json.JSONDecodeError:
+                self._send_invalid("请求体不是合法 JSON")
+                return
+
+            try:
+                valid, reason = store.verify_trust_proof_with_status(
+                    tenant, data
+                )
+            except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
+                self._send_invalid("验签过程发生内部错误")
+                return
+            payload: Dict[str, Any] = {"valid": valid}
+            if not valid:
+                payload["reason"] = reason or "验签失败"
+            self._send_json(200, payload)
+
+        def _post_trust_proofs_verify_batch_with_status(
+            self, tenant: str
+        ) -> None:
+            # 批量外部谓词证明验真并合并本租户状态：与 verify-batch 相同的
+            # 公开错误协议，任何失败都返回 HTTP 200。请求体须恰为
+            # {"proofs": [项...]}，数组非空且不超过 100 项；请求体非法
+            # （含非法 JSON、空数组、超过上限）时返回
+            # {"results": [], "reason": "请求..."}。请求级合法时逐项复用
+            # verify-with-status 规则（验真 + 只读合并同步状态），按输入
+            # 顺序返回 {"results": [...]}，失败不短路。只读，不消费、
+            # 不写任何状态、不记审计。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                self._send_json(
+                    200,
+                    {"results": [],
+                     "reason": "请求不合法: 请求体缺失或长度声明非法"},
+                )
+                return
+            except Exception:  # noqa: BLE001
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 请求体读取失败"}
+                )
+                return
+            if not raw:
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 请求体缺失"}
+                )
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                self._send_json(
+                    200,
+                    {"results": [], "reason": "请求不合法: 请求体不是合法 UTF-8 文本"},
+                )
+                return
+            except json.JSONDecodeError:
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 请求体不是合法 JSON"}
+                )
+                return
+
+            try:
+                ok, reason, results = (
+                    store.verify_trust_proofs_batch_with_status(tenant, data)
                 )
             except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
                 self._send_json(
