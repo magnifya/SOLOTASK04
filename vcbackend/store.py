@@ -3414,6 +3414,55 @@ class VCStore:
             return False, "证明已过期"
         return True, ""
 
+    def verify_trust_proofs_batch(
+        self,
+        tenant_id: str,
+        data: Any,
+    ) -> Tuple[bool, str, List[Dict[str, Any]]]:
+        """批量验证外部谓词证明，返回 (请求是否合法, 请求级原因, 逐项结果)。
+
+        请求体须恰为 ``{"proofs": [项...]}``：数组非空且不超过 100 项。
+        请求级结构不合法（非对象、字段缺失或多余、proofs 非数组、空数组
+        或超过上限）时返回 ``(False, "请求...", [])``，由调用方回
+        ``{"results": [], "reason": ...}``。
+
+        请求级合法时逐项复用 :meth:`verify_trust_proof`（与单项接口完全
+        一致的请求、证明字段、挑战、锚点、签名与期限规则），按输入顺序
+        收集结果，失败不短路：成功项 ``{"valid": true}``，失败项
+        ``{"valid": false, "reason": ...}``。只读，不消费、不登记任何
+        资源、不写状态/历史/审计。
+        """
+        if not isinstance(data, dict):
+            return False, "请求不合法: 请求体必须为 JSON 对象", []
+        if set(data) != {"proofs"}:
+            missing = [f for f in ("proofs",) if f not in data]
+            if missing:
+                return False, (
+                    f"请求缺少字段: {', '.join(missing)}"
+                ), []
+            extra = sorted(set(data) - {"proofs"})
+            return False, f"请求含多余字段: {', '.join(extra)}", []
+        proofs = data["proofs"]
+        if not isinstance(proofs, list):
+            return False, "请求不合法: 字段 proofs 必须为数组", []
+        if not proofs:
+            return False, "请求不合法: proofs 数组不能为空", []
+        if len(proofs) > 100:
+            return False, (
+                f"请求不合法: proofs 数组不能超过 100 项（当前 {len(proofs)} 项）"
+            ), []
+
+        results: List[Dict[str, Any]] = []
+        for item in proofs:  # 顺序校验，失败不短路
+            valid, reason = self.verify_trust_proof(tenant_id, item)
+            if valid:
+                results.append({"valid": True})
+            else:
+                results.append(
+                    {"valid": False, "reason": reason or "验签失败"}
+                )
+        return True, "", results
+
     def rotate_trust_anchor(
         self,
         tenant_id: str,
