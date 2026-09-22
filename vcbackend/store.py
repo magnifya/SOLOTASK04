@@ -3273,6 +3273,113 @@ class VCStore:
                 )
         return True, "", results
 
+    def verify_trust_presentation_with_status(
+        self,
+        tenant_id: str,
+        data: Any,
+    ) -> Tuple[bool, str]:
+        """外部演示验真并合并本地同步状态判定（只读）。
+
+        先按 :meth:`verify_trust_presentation` 的全部规则完成验真
+        （未绑定与持有者绑定两种形态：请求结构 → 演示字段与挑战 →
+        签发者锚点与签名 → 持有者锚点与签名（仅绑定）→ 期限），失败
+        原样返回 ``(False, 原因)``，保持既有优先级与中文原因分类。
+
+        验真通过后按当前租户 ``(issuer_did, credential_id)`` 双键只读
+        查询 ``credential_status_sync`` 同步记录（取自演示对象）：
+          - 未同步（含属他租户）：``(False, "外部凭证状态未同步")``；
+          - active：``(True, "")``；
+          - revoked：``(False, "外部凭证已吊销：<保存的 reason>")``，
+            保存记录无 reason 时用“未知原因”；
+          - unknown：``(False, "外部凭证状态未知")``。
+
+        纯只读：不消费、不登记任何资源、不写状态/历史/审计。
+        """
+        valid, reason = self.verify_trust_presentation(
+            tenant_id, data, allow_holder_bound=True
+        )
+        if not valid:
+            return False, reason
+
+        presentation = data["presentation"]
+        issuer_did = presentation["issuer_did"]
+        credential_id = presentation["credential_id"]
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            row = None
+            if bucket is not None:
+                row = (
+                    bucket.get("credential_status_sync", {})
+                    .get(issuer_did, {})
+                    .get(credential_id)
+                )
+        if row is None:
+            return False, "外部凭证状态未同步"
+        status = row.get("status")
+        if status == "active":
+            return True, ""
+        if status == "revoked":
+            saved_reason = row.get("reason")
+            if not saved_reason:
+                saved_reason = "未知原因"
+            return False, f"外部凭证已吊销：{saved_reason}"
+        # status 仅可能为 active/revoked/unknown（同步入口已约束）。
+        return False, "外部凭证状态未知"
+
+    def verify_trust_presentations_batch_with_status(
+        self,
+        tenant_id: str,
+        data: Any,
+    ) -> Tuple[bool, str, List[Dict[str, Any]]]:
+        """批量验证外部演示并合并本租户同步状态，返回
+        (请求是否合法, 请求级原因, 逐项结果)。
+
+        请求级结构与 :meth:`verify_trust_presentations_batch` 完全一致：
+        请求体须恰为 ``{"presentations": [项...]}``，数组非空且不超过
+        100 项；不合法时返回 ``(False, "请求...", [])``，由调用方回
+        ``{"results": [], "reason": ...}``。
+
+        请求级合法时逐项复用 :meth:`verify_trust_presentation_with_status`
+        （未绑定与持有者绑定两种形态的字段、挑战、双锚点双签名与期限
+        规则，验真通过后只读合并本租户 ``(issuer_did, credential_id)``
+        同步状态），按输入顺序收集结果，失败不短路：成功项
+        ``{"valid": true}``，失败项 ``{"valid": false, "reason": ...}``。
+        纯只读：不消费、不登记任何资源、不写状态/历史/审计。
+        """
+        if not isinstance(data, dict):
+            return False, "请求不合法: 请求体必须为 JSON 对象", []
+        if set(data) != {"presentations"}:
+            missing = [f for f in ("presentations",) if f not in data]
+            if missing:
+                return False, (
+                    f"请求缺少字段: {', '.join(missing)}"
+                ), []
+            extra = sorted(set(data) - {"presentations"})
+            return False, f"请求含多余字段: {', '.join(extra)}", []
+        presentations = data["presentations"]
+        if not isinstance(presentations, list):
+            return False, "请求不合法: 字段 presentations 必须为数组", []
+        if not presentations:
+            return False, "请求不合法: presentations 数组不能为空", []
+        if len(presentations) > 100:
+            return False, (
+                "请求不合法: presentations 数组不能超过 100 项"
+                f"（当前 {len(presentations)} 项）"
+            ), []
+
+        results: List[Dict[str, Any]] = []
+        for item in presentations:  # 顺序校验，失败不短路
+            valid, reason = self.verify_trust_presentation_with_status(
+                tenant_id, item
+            )
+            if valid:
+                results.append({"valid": True})
+            else:
+                results.append(
+                    {"valid": False, "reason": reason or "验签失败"}
+                )
+        return True, "", results
+
     def verify_trust_proof(
         self,
         tenant_id: str,
