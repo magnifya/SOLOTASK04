@@ -243,10 +243,10 @@ def main():
               ok and results[8].get("valid") is False
               and results[8].get("reason", "").startswith("演示")
               and "holder" in results[8].get("reason", ""))
-        check("混合批次 source_tenant_id 项 -> 请求",
+        check("混合批次 source_tenant_id 但演示缺 holder_* -> 演示",
               ok and results[9].get("valid") is False
-              and results[9].get("reason", "").startswith("请求")
-              and "source_tenant_id" in results[9].get("reason", ""))
+              and results[9].get("reason", "").startswith("演示")
+              and "holder" in results[9].get("reason", ""))
         check("混合批次其他多余字段项 -> 请求",
               ok and results[10].get("valid") is False
               and results[10].get("reason", "").startswith("请求"))
@@ -292,7 +292,7 @@ def main():
                       req(good), headers=T1)
         check("单项跨系统演示接口仍正常",
               st == 200 and r == {"valid": True})
-        # 单项接口仍接受持有者绑定形态（批量不接受）
+        # 单项接口仍接受持有者绑定形态（批量同样接受）
         bound_priv, bound_pub = gen_keypair()
         holder_did = "did:web:holder-batch.example"
         st, _ = _http("POST", f"{base}/v1/trust/anchors",
@@ -300,29 +300,133 @@ def main():
                        "key_version": 1},
                       headers=T1)
         check("注册持有者锚点 -> 201", st == 201)
-        bound = json.loads(json.dumps(good))
-        bound["holder_did"] = holder_did
-        bound["holder_key_version"] = 1
-        bound_message = {
-            k: v for k, v in bound.items()
-            if k != "proof" and not k.startswith("holder_")
-        }
-        bound_message["holder_did"] = holder_did
-        bound_message["holder_key_version"] = 1
-        bound_message["tenant_id"] = "source-tenant"
-        bound["holder_proof"] = crypto.sign(bound_message, bound_priv)
+
+        def make_bound(p, h_did=holder_did, h_ver=1, h_priv=bound_priv,
+                       tenant="source-tenant", i_priv=priv2):
+            p = json.loads(json.dumps(p))
+            p["holder_did"] = h_did
+            p["holder_key_version"] = h_ver
+            unsigned = {
+                k: v for k, v in p.items()
+                if k != "proof" and not k.startswith("holder_")
+            }
+            p["proof"] = crypto.sign(unsigned, i_priv)
+            holder_msg = dict(unsigned)
+            holder_msg["holder_did"] = h_did
+            holder_msg["holder_key_version"] = h_ver
+            holder_msg["tenant_id"] = tenant
+            p["holder_proof"] = crypto.sign(holder_msg, h_priv)
+            return p
+
+        bound = make_bound(good)
+        bound_req = {"presentation": bound, "challenge": "chal-1",
+                     "source_tenant_id": "source-tenant"}
         st, r = _http("POST", f"{base}/v1/trust/presentations/verify",
-                      {"presentation": bound, "challenge": "chal-1",
-                       "source_tenant_id": "source-tenant"},
-                      headers=T1)
+                      bound_req, headers=T1)
         check("单项接口持有者绑定形态仍正常",
               st == 200 and r == {"valid": True})
-        st, r = verify({"presentations": [
-            {"presentation": bound, "challenge": "chal-1",
-             "source_tenant_id": "source-tenant"}]}, headers=T1)
-        check("批量接口拒绝持有者绑定形态（项级失败）",
+
+        # 8. 批量同时支持未绑定与持有者绑定项，等长同序、不短路
+        st, r = verify({"presentations": [req(good), bound_req]},
+                       headers=T1)
+        check("批量混合未绑定/绑定项均成功",
+              st == 200
+              and r == {"results": [{"valid": True}, {"valid": True}]})
+
+        def bound_item(p, tenant="source-tenant", challenge="chal-1"):
+            return {"presentation": p, "challenge": challenge,
+                    "source_tenant_id": tenant}
+
+        # 绑定项各类失败：与单项协议同样的分类
+        unknown_holder = make_bound(good, h_did="did:web:nobody-holder-batch")
+        revoked_did = "did:web:holder-batch-revoked"
+        st, _ = _http("POST", f"{base}/v1/trust/anchors",
+                      {"did": revoked_did, "public_key": bound_pub,
+                       "key_version": 1}, headers=T1)
+        check("注册待吊销持有者锚点 -> 201", st == 201)
+        revoked_holder = make_bound(good, h_did=revoked_did)
+        st, _ = _http("PUT",
+                      f"{base}/v1/trust/anchors/{revoked_did}/1/status",
+                      {"status": "revoked"}, headers=T1)
+        check("吊销持有者锚点 -> 200", st == 200)
+        bad_fmt = make_bound(good)
+        bad_fmt["holder_proof"] = "!!!bad!!!"
+        wrong_tenant = make_bound(good, tenant="other-source")
+        expired_bound = make_bound(
+            signed(expires_at="2020-01-01T00:00:00Z"))
+        bad_ver_p = make_bound(good)
+        bad_ver_p["holder_key_version"] = True
+        # 重新签名被 True 改动过的对象：holder_key_version 为布尔属字段
+        # 非法，无需有效签名；直接构造请求即可。
+        bad_ver = bound_item(bad_ver_p)
+        empty_source = bound_item(bound, tenant="")
+        extra_field = dict(bound_req, extra=1)
+        holder_no_source = json.loads(json.dumps(bound))
+        batch2 = [
+            bound_item(bound),                 # 0 成功
+            bound_item(unknown_holder),        # 1 持有者锚点不存在
+            bound_item(revoked_holder),        # 2 持有者锚点已吊销
+            bound_item(bad_fmt),               # 3 holder_proof 格式错误
+            bound_item(wrong_tenant),          # 4 tenant_id 不匹配
+            bound_item(expired_bound),         # 5 演示已过期
+            bad_ver,                           # 6 holder_key_version 布尔
+            empty_source,                      # 7 空 source_tenant_id
+            extra_field,                       # 8 项级多余字段
+            req(holder_no_source),             # 9 演示含 holder_* 但无 source
+            bound_item(bound),                 # 10 成功（不短路）
+        ]
+        st, r = verify({"presentations": batch2}, headers=T1)
+        ok2 = st == 200 and set(r) == {"results"} and len(r["results"]) == 11
+        bres = r.get("results", [])
+        check("绑定混合批次长度一致且顶层仅 results", ok2)
+        check("绑定批次第 1 项成功", ok2 and bres[0] == {"valid": True})
+        check("绑定批次未知持有者锚点",
+              ok2 and bres[1].get("valid") is False
+              and bres[1].get("reason", "").startswith("持有者锚点不存在"))
+        check("绑定批次持有者锚点已吊销",
+              ok2 and bres[2].get("valid") is False
+              and bres[2].get("reason", "").startswith("持有者锚点已吊销"))
+        check("绑定批次 holder_proof 格式错误",
+              ok2 and bres[3].get("valid") is False
+              and bres[3].get("reason", "").startswith(
+                  "签名格式错误: holder_proof"))
+        check("绑定批次 tenant_id 计入 holder_proof",
+              ok2 and bres[4].get("valid") is False
+              and bres[4].get("reason", "").startswith(
+                  "签名校验失败: holder_proof"))
+        check("绑定批次已过期",
+              ok2 and bres[5] == {"valid": False, "reason": "演示已过期"})
+        check("绑定批次 holder_key_version 布尔 -> 演示",
+              ok2 and bres[6].get("valid") is False
+              and bres[6].get("reason", "").startswith("演示"))
+        check("绑定批次空 source_tenant_id -> 请求",
+              ok2 and bres[7].get("valid") is False
+              and bres[7].get("reason", "").startswith("请求"))
+        check("绑定批次项级多余字段 -> 请求",
+              ok2 and bres[8].get("valid") is False
+              and bres[8].get("reason", "").startswith("请求"))
+        check("演示含 holder_* 但未绑定 -> 演示",
+              ok2 and bres[9].get("valid") is False
+              and bres[9].get("reason", "").startswith("演示")
+              and "holder" in bres[9].get("reason", ""))
+        check("绑定批次失败不短路（末项成功）",
+              ok2 and bres[10] == {"valid": True})
+
+        # 跨租户锚点：T2 只有签发者锚点 -> 绑定项持有者锚点失败
+        t2_bound = make_bound(good, i_priv=priv1)
+        st, r = verify({"presentations": [bound_item(t2_bound)]}, headers=T2)
+        check("T2 缺持有者锚点 -> 持有者锚点不存在",
               st == 200 and r["results"][0].get("valid") is False
-              and r["results"][0]["reason"].startswith("请求"))
+              and r["results"][0].get("reason", "").startswith(
+                  "持有者锚点不存在"))
+        # T2 注册持有者锚点后双锚点齐备 -> 绑定项成功
+        st, _ = _http("POST", f"{base}/v1/trust/anchors",
+                      {"did": holder_did, "public_key": bound_pub,
+                       "key_version": 1}, headers=T2)
+        check("T2 注册持有者锚点 -> 201", st == 201)
+        st, r = verify({"presentations": [bound_item(t2_bound)]}, headers=T2)
+        check("T2 双锚点齐备 -> 绑定项成功",
+              st == 200 and r == {"results": [{"valid": True}]})
 
     finally:
         proc.terminate()
@@ -339,10 +443,13 @@ def main():
         assert wait_up(port), "服务重启超时"
         T1 = {"X-Tenant-ID": "tpbp-a"}
         p2 = signed()
+        b2 = make_bound(p2)
         st, r = _http("POST", f"{base}{path}",
-                      {"presentations": [req(p2)]}, headers=T1)
-        check("重启后批量验签结论稳定",
-              st == 200 and r == {"results": [{"valid": True}]})
+                      {"presentations": [req(p2), bound_item(b2)]},
+                      headers=T1)
+        check("重启后批量验签结论稳定（未绑定与绑定）",
+              st == 200
+              and r == {"results": [{"valid": True}, {"valid": True}]})
     finally:
         proc.terminate()
         proc.wait(timeout=10)

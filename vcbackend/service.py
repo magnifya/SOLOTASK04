@@ -1268,9 +1268,12 @@ def build_handler(store: VCStore) -> type:
             # 非对象、字段缺失或多余、presentations 非数组、空数组或超过
             # 上限）时返回 {"results": [], "reason": "请求..."}。请求级
             # 合法时返回 {"results": [...]}，长度与顺序与输入一致，逐项
-            # 复用单项未绑定验真规则（不得含 source_tenant_id 或 holder_*
-            # 字段），失败不短路。纯只读，不消费、不登记资源，不写状态、
-            # 历史或审计，仅使用当前租户锚点。
+            # 复用单项验真规则：未绑定项恰含 presentation/challenge，
+            # 持有者绑定项另须恰含非空 source_tenant_id 且演示多出
+            # holder_did/holder_key_version/holder_proof（双锚点双签名，
+            # source_tenant_id 作为 holder proof 覆盖的 tenant_id），
+            # 失败不短路。纯只读，不消费、不登记资源，不写状态、历史或
+            # 审计，仅使用当前租户锚点。
             try:
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length) if length > 0 else b""
