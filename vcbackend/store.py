@@ -53,6 +53,7 @@ from .models import (
     PredicateProofRecord,
     PresentationRecord,
     TrustAnchorRecord,
+    TrustAnchorDiscoveryItem,
     TrustAnchorHistoryEvent,
 )
 
@@ -4437,6 +4438,69 @@ class VCStore:
                         key_version=int(row["key_version"]),
                         action=row["action"],
                         status=row["status"],
+                        updated_at=row.get("updated_at"),
+                        cursor=cursor,
+                    )
+                )
+            next_after = picked[-1].cursor if picked else after
+            return picked, next_after
+
+    def list_all_trust_anchors(
+        self,
+        tenant_id: str,
+        after: int = 0,
+        limit: int = 50,
+        status: Optional[str] = None,
+    ) -> Tuple[List[TrustAnchorDiscoveryItem], int]:
+        """跨 DID 列举本租户全部锚点版本（发现接口，只读分页）。
+
+        - status 给定时先按版本当前状态（active/revoked）过滤；
+        - 每项 cursor 复用该版本注册/轮换历史的 active 事件 cursor
+          （租户内跨 DID 唯一、单调递增并持久化），吊销不改变它；
+        - 过滤后按 cursor > after 升序至多取 limit 项；
+        - next_after 为本页末项 cursor，空页保持 after；
+        - 无任何锚点（含租户不存在）返回空页而非 404。
+        纯只读：不修改状态、不记审计、不触发落盘。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            candidates: List[Tuple[int, str, Dict[str, Any]]] = []
+            if bucket is not None:
+                anchors_map = bucket.get("trust_anchors", {})
+                history_map = bucket.get("trust_anchor_history", {})
+                for did, rows in anchors_map.items():
+                    active_cursor: Dict[int, int] = {}
+                    for event in history_map.get(did, []):
+                        if event.get("status") == "active":
+                            active_cursor[int(event["key_version"])] = int(
+                                event["cursor"]
+                            )
+                    for row in rows.values():
+                        version = int(row["key_version"])
+                        cursor = active_cursor.get(version)
+                        # 每个版本必在同一原子写中（或加载补录）拥有 active
+                        # 事件；缺失属不变量破坏，跳过而非崩溃。
+                        if cursor is None:
+                            continue
+                        if (
+                            status is not None
+                            and row.get("status", "active") != status
+                        ):
+                            continue
+                        candidates.append((cursor, did, row))
+            candidates.sort(key=lambda item: item[0])
+            picked: List[TrustAnchorDiscoveryItem] = []
+            for cursor, did, row in candidates:
+                if cursor <= after:
+                    continue
+                if len(picked) >= limit:
+                    break
+                picked.append(
+                    TrustAnchorDiscoveryItem(
+                        did=did,
+                        public_key=row["public_key"],
+                        key_version=int(row["key_version"]),
+                        status=row.get("status", "active"),
                         updated_at=row.get("updated_at"),
                         cursor=cursor,
                     )

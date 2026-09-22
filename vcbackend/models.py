@@ -183,6 +183,23 @@ class TrustAnchorHistoryEvent:
 
 
 @dataclass
+class TrustAnchorDiscoveryItem:
+    """跨 DID 发现接口 GET /v1/trust/anchors 返回的单个锚点版本。
+
+    与按 DID 列表元素相比多出 cursor：该值复用该版本注册/轮换历史的
+    active 事件 cursor（租户内跨 DID 唯一、单调递增并持久化），吊销不
+    改变它。
+    """
+
+    did: str
+    public_key: str
+    key_version: int
+    status: str
+    updated_at: Optional[str]
+    cursor: int
+
+
+@dataclass
 class CredentialStatusSyncRecord:
     """一条外部凭证状态同步记录（按租户与 issuer_did#credential_id 双键隔离）。
 

@@ -22,6 +22,7 @@
   POST /v1/credentials/{credential_id}/prove    生成谓词证明
   POST /v1/proofs/{proof_id}/verify             以存储记录为锚校验谓词证明
   POST /v1/trust/anchors                  注册信任锚点（同 DID/版本同 PEM 幂等）
+  GET  /v1/trust/anchors                  跨 DID 发现锚点版本（只读分页，?limit=&after=&status=）
   POST /v1/trust/anchors/{did}/rotate     带前置版本校验的密钥轮换
   GET  /v1/trust/anchors/{did}            查询 DID 的全部锚点版本
   GET  /v1/trust/anchors/{did}/history    查询信任锚点生命周期历史（只读）
@@ -418,6 +419,8 @@ def build_handler(store: VCStore) -> type:
                     self._get_trust_anchor_history(
                         tenant, did, parsed.query
                     )
+                elif path == "/v1/trust/anchors":
+                    self._get_all_trust_anchors(tenant, parsed.query)
                 elif path.startswith("/v1/trust/anchors/"):
                     did = unquote(path[len("/v1/trust/anchors/") :])
                     self._get_trust_anchors(tenant, did)
@@ -1238,6 +1241,74 @@ def build_handler(store: VCStore) -> type:
                             "cursor": event.cursor,
                         }
                         for event in events
+                    ],
+                    "next_after": next_after,
+                },
+            )
+
+        def _get_all_trust_anchors(self, tenant: str, query: str) -> None:
+            # GET /v1/trust/anchors?limit=&after=&status=：跨 DID 只读
+            # 发现接口。查询参数仅允许 limit、after、status：
+            # - limit 缺省 50，须为 1..200 的 ASCII 十进制整数；
+            # - after 缺省 0，须为非负 ASCII 十进制整数；
+            # - status 可省略，提供时只能为 active/revoked；
+            # 重复、空值、空白、符号、小数、布尔词、Unicode 数字、越界
+            # 及未知参数一律 400。
+            # 先按 status 过滤，再按 cursor > after 升序至多取 limit 项；
+            # cursor 复用各版本注册/轮换历史的 active 事件 cursor。
+            # 响应恰含 anchors、next_after；每项恰含 did、public_key、
+            # key_version、status、updated_at、cursor。空结果 next_after
+            # 等于 after；无任何锚点也返回 200 空数组。纯只读：不记审计、
+            # 不触发落盘，重启分页稳定，不影响既有按 DID 路由。
+            params = parse_qs(query, keep_blank_values=True)
+            unknown = sorted(set(params) - {"limit", "after", "status"})
+            if unknown:
+                raise ValidationError(
+                    f"不支持的查询参数: {', '.join(unknown)}"
+                )
+
+            limit_values = params.get("limit")
+            if limit_values is not None:
+                if len(limit_values) != 1:
+                    raise ValidationError("查询参数 limit 只能提供一次")
+                limit = _parse_nonneg_int(limit_values[0], "limit")
+                if not 1 <= limit <= 200:
+                    raise ValidationError(
+                        "查询参数 limit 须在 1 到 200 之间"
+                    )
+            else:
+                limit = 50
+
+            after_values = params.get("after")
+            if after_values is not None:
+                if len(after_values) != 1:
+                    raise ValidationError("查询参数 after 只能提供一次")
+                after = _parse_nonneg_int(after_values[0], "after")
+            else:
+                after = 0
+
+            status_values = params.get("status")
+            if status_values is not None:
+                if len(status_values) != 1:
+                    raise ValidationError("查询参数 status 只能提供一次")
+                status_filter = status_values[0]
+                if status_filter not in ("active", "revoked"):
+                    raise ValidationError(
+                        "查询参数 status 只能为 active 或 revoked"
+                    )
+            else:
+                status_filter = None
+
+            anchors, next_after = store.list_all_trust_anchors(
+                tenant, after, limit, status_filter
+            )
+            self._send_json(
+                200,
+                {
+                    "anchors": [
+                        self._trust_anchor_payload(record)
+                        | {"cursor": record.cursor}
+                        for record in anchors
                     ],
                     "next_after": next_after,
                 },
