@@ -14,6 +14,7 @@
   GET  /v1/credentials/{credential_id}    查询凭证
   PUT  /v1/credentials/{credential_id}/status   登记 active（首次 201/重复 200）
   GET  /v1/credentials/{credential_id}/status   查询状态（无状态按 active）
+  GET  /v1/credentials/{credential_id}/status/history  查询凭证状态历史（只读）
   POST /v1/credentials/{credential_id}/revoke   吊销凭证
   POST /v1/credentials/{credential_id}/verify  以存储记录为锚验签
   POST /v1/credentials/{credential_id}/present 生成选择性披露演示
@@ -385,6 +386,17 @@ def build_handler(store: VCStore) -> type:
                 elif path.startswith("/v1/dids/"):
                     self._get_did(tenant, unquote(path[len("/v1/dids/") :]))
                 elif path.startswith("/v1/credentials/") and path.endswith(
+                    "/status/history"
+                ):
+                    credential_id = unquote(
+                        path[
+                            len("/v1/credentials/") : -len("/status/history")
+                        ]
+                    )
+                    self._get_credential_status_history(
+                        tenant, credential_id, parsed.query
+                    )
+                elif path.startswith("/v1/credentials/") and path.endswith(
                     "/status"
                 ):
                     credential_id = unquote(
@@ -752,6 +764,66 @@ def build_handler(store: VCStore) -> type:
             # 历史无状态按 active 返回，updated_at 为 null
             record = store.get_credential_status(tenant, credential_id)
             self._send_json(200, self._status_payload(record))
+
+        def _get_credential_status_history(
+            self, tenant: str, credential_id: str, query: str
+        ) -> None:
+            # GET /v1/credentials/{credential_id}/status/history
+            # ?limit=&after=：只读本地凭证状态历史。响应恰含
+            # credential_id、events、next_after；事件按 updated_at
+            # 升序、同值按 cursor 升序，每项恰含 status、reason、
+            # updated_at、revoked_at、audit_seq、audit_timestamp、
+            # cursor。未知或他租户凭证 404；有凭证无状态返回空页。
+            # limit 缺省 50，须为 1..200 的 ASCII 十进制整数；after
+            # 缺省 0，须为非负 ASCII 十进制整数；重复/空白/布尔词/
+            # 小数/符号/Unicode 数字一律 400。空页 next_after 保持
+            # after。纯只读：不写任何状态、不记审计。
+            if not credential_id:
+                raise ValidationError("路径缺少 credential_id")
+            params = parse_qs(query, keep_blank_values=True)
+
+            limit_values = params.get("limit")
+            if limit_values is not None:
+                if len(limit_values) != 1:
+                    raise ValidationError("查询参数 limit 只能提供一次")
+                limit = _parse_nonneg_int(limit_values[0], "limit")
+                if not 1 <= limit <= 200:
+                    raise ValidationError(
+                        "查询参数 limit 须在 1 到 200 之间"
+                    )
+            else:
+                limit = 50
+
+            after_values = params.get("after")
+            if after_values is not None:
+                if len(after_values) != 1:
+                    raise ValidationError("查询参数 after 只能提供一次")
+                after = _parse_nonneg_int(after_values[0], "after")
+            else:
+                after = 0
+
+            events, next_after = store.list_credential_status_history(
+                tenant, credential_id, after, limit
+            )
+            self._send_json(
+                200,
+                {
+                    "credential_id": credential_id,
+                    "events": [
+                        {
+                            "status": event.status,
+                            "reason": event.reason,
+                            "updated_at": event.updated_at,
+                            "revoked_at": event.revoked_at,
+                            "audit_seq": event.audit_seq,
+                            "audit_timestamp": event.audit_timestamp,
+                            "cursor": event.cursor,
+                        }
+                        for event in events
+                    ],
+                    "next_after": next_after,
+                },
+            )
 
         def _post_revoke_credential(
             self, tenant: str, credential_id: str

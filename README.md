@@ -37,6 +37,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | GET | `/v1/credentials/{credential_id}` | 返回 `credential_id`、`body`、`signature`；不存在 404 |
 | PUT | `/v1/credentials/{credential_id}/status` | 登记状态，请求体必须恰为 `{"status":"active"}`；首次 201、重复 200，均含 `credential_id`、`status`、`updated_at`（重复保持首次值）；已吊销 409 |
 | GET | `/v1/credentials/{credential_id}/status` | 返回 `credential_id`、`status`、`updated_at`；历史无状态按 `active` 返回且 `updated_at` 为 `null`；不存在 404 |
+| GET | `/v1/credentials/{credential_id}/status/history?limit=&after=` | 只读查询本地凭证状态历史；响应恰含 `credential_id`、`events`、`next_after`，事件恰含 `{status,reason,updated_at,revoked_at,audit_seq,audit_timestamp,cursor}`；仅首次 active 与首次 revoke 各追加一条，重复与失败路径不追加；按 `updated_at`、`cursor` 升序；未知或跨租户凭证 404，有凭证无状态空页；参数规则同其他历史接口，只读不记审计 |
 | POST | `/v1/credentials/{credential_id}/revoke` | 吊销凭证；`reason` 可省略（默认“持证人主动吊销”），否则须为字符串且首尾裁剪后非空；返回 200 与 `credential_id`、`status:"revoked"`、`reason`、`revoked_at`、`updated_at`；不存在 404 |
 | POST | `/v1/credentials/{credential_id}/verify` | 验签，请求体 `{"body","signature"}`；**任何失败一律 HTTP 200**，返回 `valid`（失败时附分类中文 `reason`） |
 | POST | `/v1/credentials/{credential_id}/present` | 生成选择性披露演示，请求体恰为 `{"disclose":[路径...]}` 加可选 `challenge`、`expires_in`、`holder_binding`；成功 201 返回演示对象（绑定时另含 `holder_did`、`holder_key_version`、`holder_proof`）；字段问题 400、未知凭证 404 |
@@ -204,6 +205,58 @@ python3 -m vcbackend.cli verify vc_<id>     # 成功输出 true（退出码 0）
 - verify 在签名与锚定均成功后检查状态：`revoked` 返回 200、
   `{"valid":false,"reason":"凭证已吊销：<保存的 reason>"}`；`active` 或
   无状态维持原结果（签名失败仍优先返回签名类原因）。
+
+#### 凭证状态历史（只读）
+
+`GET /v1/credentials/{credential_id}/status/history` 只读返回本租户
+签发凭证的状态变更历史，与签发、验签、状态登记与吊销协议完全兼容。
+
+- 未知凭证或访问他租户凭证一律 **404**（跨租户不可探测）；显式空
+  `X-Tenant-ID` 为 **400**。凭证在本租户已存在但从未登记状态时返回
+  **空页**（`events:[]`、`next_after` 取 `after`），不因此 404。
+- 200 响应恰含 `credential_id`、`events`、`next_after`。`events` 按
+  **`updated_at` 升序**，同一 `updated_at` 按 **`cursor`** 升序；每项
+  恰含 `status`、`reason`、`updated_at`、`revoked_at`、`audit_seq`、
+  `audit_timestamp`、`cursor`：
+  - **首次 active 登记**（`PUT .../status` 首次 201）追加一条
+    `status:"active"` 事件，`reason`/`revoked_at` 均为 `null`，
+    `updated_at` 为首次登记时间（UTC 秒精度 Z）；
+  - **首次 revoke** 追加一条 `status:"revoked"` 事件，`reason` 为
+    裁剪后的吊销原因，`revoked_at`/`updated_at` 为首次吊销时间
+    （UTC 秒精度 Z，二者相同）；
+  - 重复 active 登记（200）、重复吊销（每次仍记审计）与任何失败路径
+    （首次非法 reason 400、未知凭证 404、已吊销再登记 409）均**不追加**；
+  - 未先登记 active 直接吊销时历史仅含一条 revoked 事件。
+- `audit_seq`/`audit_timestamp` **关联产生该状态变更的审计事件**
+  （active 为 `status.updated`、revoke 为 `credential.revoked`，
+  `resource_type` 均为 `credential`）；旧状态补录的兼容项无法追溯时
+  两者均为 `null`，仍照常返回与分页。
+- `cursor` 为**租户内持久化正整数**：同一租户内不同凭证的状态事件
+  共享同一游标空间，按追加顺序单调递增并跨重启稳定；不同租户各自
+  从 1 计起。
+- `limit` 缺省 **50**，须为 **1–200** 的 ASCII 十进制整数；`after`
+  缺省 **0**，须为**非负** ASCII 十进制整数。二者均**只能出现一次**
+  且须为**非空 ASCII 数字**：重复参数、空白、布尔词、小数、符号、
+  Unicode 数字等一律 **400**。`after` 排除 `cursor` 不大于其值的事件，
+  `next_after` 为本页末项的 `cursor`，**空页等于 `after`**。
+- **旧状态兼容**：旧版本状态文件中凭证已有状态（active/revoked）但
+  无状态历史时，加载时按（租户、credential_id）稳定顺序为每个缺
+  历史的凭证补一条兼容事件，内容取自状态行（active 的
+  reason/revoked_at 为 `null`，revoked 保存裁剪 reason 与 revoked_at），
+  `cursor` 为该租户内新分配的持久化正整数，`audit_seq`/`audit_timestamp`
+  为 `null`；兼容项随下一次原子写一并落盘，即使加载后无写操作，重启
+  时也按相同顺序重建为**相同 cursor**。
+- 首次 active / 首次 revoke 时，**状态、历史、游标与审计事件在同一
+  把锁内经同一次原子写落盘，落盘失败一并回滚**（状态不变、历史不
+  追加、游标不前进、审计不记录）。该历史接口为纯只读查询，**不记
+  审计**、不触发落盘，`GET .../status`、签发、验签与吊销的幂等响应
+  均保持不变。
+
+```bash
+curl -X PUT localhost:8080/v1/credentials/vc_<id>/status -d '{"status":"active"}'
+curl -X POST localhost:8080/v1/credentials/vc_<id>/revoke -d '{"reason":"持证人造假"}'
+curl "localhost:8080/v1/credentials/vc_<id>/status/history?limit=50&after=0"
+```
 
 ### 密钥模型与轮换
 
@@ -1020,6 +1073,7 @@ python3 tests/did_document_test.py
 python3 tests/did_deactivation_test.py
 python3 tests/key_revocation_test.py
 python3 tests/key_revocation_status_history_test.py
+python3 tests/credential_status_history_test.py
 python3 tests/credential_expiry_test.py
 python3 tests/tenant_audit_test.py
 python3 tests/trust_anchor_test.py
@@ -1063,6 +1117,7 @@ seq 跨重启接续，以及落盘失败时内存回滚（变更不生效、审�
 vcbackend/
   crypto.py    ES256 签名/验签、规范化 JSON、P-256 密钥
   models.py    DIDRecord / DIDStatusRecord / CredentialRecord / CredentialStatusRecord /
+               LocalCredentialStatusHistoryEvent /
                KeyVersionStatusRecord / KeyRevocationEvent /
                PresentationRecord / PredicateProofRecord /
                TrustAnchorRecord / CredentialStatusSyncRecord /
@@ -1091,13 +1146,17 @@ vcbackend/
                只读不消费）、
                外部凭证状态
                同步（双键隔离、严格更新、重放幂等、原子审计）、外部凭证
-               状态历史（持久化游标、旧状态兼容补项、追加与查询），以及
+               状态历史（持久化游标、旧状态兼容补项、追加与查询）、
+               本地凭证状态登记/吊销与状态历史（仅首次 active/revoke
+               追加、租户内跨凭证共享持久化游标、旧状态加载补兼容事件、
+               updated_at/cursor 排序与分页、与状态及审计同锁原子落盘），以及
                全局连续审计事件与状态变更的同一次原子写（失败回滚）
   service.py   标准库 HTTP 路由、X-Tenant-ID 租户解析、/v1/audit、
                /v1/dids/{did}/deactivate、/v1/dids/{did}/status、
                /v1/dids/{did}/document、
                /v1/dids/{did}/keys/{ver}/status、
                /v1/dids/{did}/keys/revocations、
+               /v1/credentials/{id}/status/history、
                /v1/trust/anchors/{did}/history、
                /v1/trust/credential-status/{id}/history 与错误映射
   cli.py       did-create / did-show / issue / verify / serve
@@ -1133,6 +1192,18 @@ tests/key_revocation_status_history_test.py DID 密钥版本状态与吊销历�
                                    空页、只读不审计、重启 cursor 稳定、旧吊销
                                    状态补兼容事件且无写重启 cursor 稳定、
                                    首次吊销落盘失败状态/历史/游标/审计全回滚）
+tests/credential_status_history_test.py 本地凭证状态历史（首次 active
+                                   与首次 revoke 各追加、重复与失败路径
+                                   不追加；active null/null、revoked 裁剪
+                                   reason/revoked_at；字段恰含与审计关联、
+                                   updated_at/cursor 排序；cursor 租户内跨
+                                   凭证递增且租户独立；limit/after 分页、
+                                   空页保持与各类非法参数 400；未知/跨租户
+                                   404、有凭证无状态空页、显式空租户头 400、
+                                   只读不审计；重启 cursor 与审计关联稳定；
+                                   旧状态按稳定顺序补兼容事件（audit null）
+                                   且无写重启 cursor 稳定；首次 active/revoke
+                                   落盘失败状态/历史/游标/审计全回滚）
 tests/tenant_audit_test.py         租户隔离 / 审计 / 过期竞态测试
 tests/trust_anchor_test.py         信任锚点注册/查询/吊销/验签测试
 tests/trust_anchor_rotate_test.py  信任锚点密钥轮换（400/404/409/幂等/审计/重启）
