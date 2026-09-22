@@ -4676,3 +4676,186 @@ class VCStore:
                 )
             next_after = picked[-1].cursor if picked else after
             return picked, next_after
+
+    def verify_trust_did_document(
+        self,
+        tenant_id: str,
+        data: Any,
+    ) -> Tuple[bool, str]:
+        """跨系统 DID 文档验真（只读），返回 (是否有效, 失败原因)。
+
+        使未在本租户注册 DID 的系统仅凭提交的 DID 文档完成结构、证明与
+        信任判断。校验顺序：请求结构 -> 文档字段/结构 -> 锚点 ->
+        签名格式 -> 密码学验签。
+
+        - 请求体须恰含 document（JSON 对象）；缺失、多余字段、非法
+          JSON/非对象由 HTTP 层与这里统一归为“请求”类原因；
+        - document 须恰含 did（非空字符串）、current_key_version（非
+          布尔正整数）、verification_methods（数组）、document_proof
+          （非空字符串）；方法按 key_version 严格升序且无重复，每项
+          恰含 key_version（非布尔正整数）、key_handle（非空字符串）、
+          public_key（可解析 P-256 公钥 PEM），文档任何位置不得出现
+          私钥；current_key_version 必须等于最高方法版本；
+        - 锚点按当前租户 (did, current_key_version) 查找，仅 active 且
+          公钥与文档最高版本 public_key 原文完全匹配的锚点可用；
+        - document_proof 为 ES256 裸 R||S 无填充 base64url，覆盖除
+          document_proof 外整个文档的递归排序紧凑 JSON。
+
+        纯只读：不登记资源、不写状态/历史/审计，绝不向上抛异常；跨
+        租户各自使用本租户锚点，结论随状态文件重启后稳定。
+        """
+        # 1. 请求结构：恰含 document，且为 JSON 对象
+        if not isinstance(data, dict):
+            return False, "请求不合法: 请求体必须为 JSON 对象"
+        if set(data) != {"document"}:
+            if "document" not in data:
+                return False, "请求缺少字段: document"
+            extra = sorted(set(data) - {"document"})
+            return False, f"请求含多余字段: {', '.join(extra)}"
+        document = data["document"]
+        if not isinstance(document, dict):
+            return False, "请求不合法: 字段 document 必须为 JSON 对象"
+
+        # 2. 文档顶层字段：恰含四项
+        required = (
+            "did",
+            "current_key_version",
+            "verification_methods",
+            "document_proof",
+        )
+        missing = [f for f in required if f not in document]
+        if missing:
+            return False, f"DID文档缺少字段: {', '.join(missing)}"
+        extra = sorted(set(document) - set(required))
+        if extra:
+            return False, f"DID文档含多余字段: {', '.join(extra)}"
+
+        did = document["did"]
+        if not isinstance(did, str) or not did:
+            return False, "DID文档字段 did 必须为非空字符串"
+
+        current_version = document["current_key_version"]
+        if (
+            not isinstance(current_version, int)
+            or isinstance(current_version, bool)
+            or current_version < 1
+        ):
+            return False, "DID文档字段 current_key_version 必须为非布尔正整数"
+
+        proof = document["document_proof"]
+        if not isinstance(proof, str) or not proof:
+            return False, "DID文档字段 document_proof 必须为非空字符串"
+
+        methods = document["verification_methods"]
+        if not isinstance(methods, list):
+            return False, "DID文档字段 verification_methods 必须为数组"
+        if not methods:
+            return False, "DID文档 verification_methods 必须为非空数组"
+
+        # 3. 逐个校验验证方法：恰含三字段、类型、P-256 公钥 PEM、无私钥
+        method_fields = {"key_version", "key_handle", "public_key"}
+        parsed_versions: List[int] = []
+        highest_public_pem = ""
+        for index, method in enumerate(methods):
+            label = f"第 {index + 1} 个验证方法"
+            if not isinstance(method, dict):
+                return False, f"DID文档{label}必须为 JSON 对象"
+            m_missing = [f for f in method_fields if f not in method]
+            if m_missing:
+                return False, (
+                    f"DID文档{label}缺少字段: {', '.join(m_missing)}"
+                )
+            m_extra = sorted(set(method) - method_fields)
+            if m_extra:
+                return False, (
+                    f"DID文档{label}含多余字段: {', '.join(m_extra)}"
+                )
+            version = method["key_version"]
+            if (
+                not isinstance(version, int)
+                or isinstance(version, bool)
+                or version < 1
+            ):
+                return False, (
+                    f"DID文档{label}的 key_version 必须为非布尔正整数"
+                )
+            handle = method["key_handle"]
+            if not isinstance(handle, str) or not handle:
+                return False, (
+                    f"DID文档{label}的 key_handle 必须为非空字符串"
+                )
+            public_pem = method["public_key"]
+            if not isinstance(public_pem, str) or not public_pem:
+                return False, (
+                    f"DID文档{label}的 public_key 必须为非空字符串 PEM"
+                )
+            try:
+                crypto.validate_public_key_pem(public_pem)
+            except (ValueError, TypeError):
+                return False, (
+                    f"DID文档{label}的 public_key 不是合法的 P-256 公钥 PEM"
+                )
+            parsed_versions.append(version)
+
+        # 文档任何位置都不得携带私钥（PKCS8/PKCS1/SEC1 私钥 PEM 标记）
+        try:
+            serialized = json.dumps(document, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return False, "DID文档含无法序列化的内容"
+        if "PRIVATE KEY-----" in serialized:
+            return False, "DID文档不得包含私钥"
+
+        # 4. 版本须按升序严格递增（无重复）；当前版本须对应最高版本
+        if any(
+            parsed_versions[i] >= parsed_versions[i + 1]
+            for i in range(len(parsed_versions) - 1)
+        ):
+            return False, (
+                "DID文档 verification_methods 必须按 key_version 升序"
+                "且不得重复"
+            )
+        highest_version = parsed_versions[-1]
+        if current_version != highest_version:
+            return False, (
+                "DID文档 current_key_version 必须对应最高密钥版本"
+            )
+        highest_public_pem = methods[-1]["public_key"]
+
+        # 5. 锚点：当前租户同 DID、同版本、active 且公钥原文完全匹配
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            anchors = (
+                bucket["trust_anchors"].get(did)
+                if bucket is not None else None
+            )
+            row = (
+                anchors.get(str(current_version))
+                if anchors is not None else None
+            )
+            anchor_public_pem = (
+                row.get("public_key", "") if row is not None else ""
+            )
+            anchor_status = (
+                row.get("status", "active") if row is not None else None
+            )
+        if row is None:
+            return False, f"锚点不存在: {did}#{current_version}"
+        if anchor_status == "revoked":
+            return False, f"锚点已吊销: {did}#{current_version}"
+        if anchor_public_pem != highest_public_pem:
+            return False, (
+                f"锚点公钥与文档当前版本公钥不匹配: {did}#{current_version}"
+            )
+
+        # 6. 签名格式与密码学验签：证明覆盖除 document_proof 外的整个文档
+        unsigned = {k: v for k, v in document.items() if k != "document_proof"}
+        try:
+            crypto.verify(unsigned, proof, anchor_public_pem)
+        except crypto.MalformedSignature:
+            return False, "签名格式错误: 不是合法的 ES256 签名编码"
+        except crypto.InvalidSignature:
+            return False, "签名校验失败，DID 文档或证明可能被改动"
+        except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
+            return False, "签名校验失败: 验签过程发生内部错误"
+        return True, ""
+

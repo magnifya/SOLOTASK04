@@ -50,6 +50,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | PUT | `/v1/trust/anchors/{did}/{key_version}/status` | 吊销锚点版本，请求体必须恰为 `{"status":"revoked"}`；首次与重复均 200，首次置 UTC 秒精度 `updated_at`，重复保持不变；未知版本 404 |
 | POST | `/v1/trust/verify` | 信任验签，请求体含非空字符串 `issuer_did`、正整数 `issuer_key_version`、非空字符串 `signature`；**缺失、吊销或验签失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
 | POST | `/v1/trust/credentials/verify` | 跨系统凭证验真：验证未在本租户签发或存储的外部凭证，无需登记 DID/凭证；请求体须恰含 `body`、`signature`；**任何失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
+| POST | `/v1/trust/dids/verify-document` | 跨系统 DID 文档验真：未在本租户注册的 DID 仅凭提交文档完成结构、证明与信任判断；请求体恰含 `document` 对象（恰含 `did`、`current_key_version`、`verification_methods`、`document_proof`）；**请求、字段、锚点、签名格式或验签失败均 HTTP 200** 返回 `valid:false` 与非空中文分类原因，成功仅 `{"valid":true}`；纯只读、不登记资源、不写历史或审计 |
 | POST | `/v1/trust/presentations/verify` | 跨系统演示验真：验证其他系统生成且未在本租户保存的演示，无需登记 DID/凭证/演示；请求体须恰为 `{"presentation":对象,"challenge":非空串}`；**任何失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
 | POST | `/v1/trust/presentations/verify-batch` | 批量跨系统演示验真：请求体恰为 `{"presentations":[项...]}`，数组非空且不超过 100 项；每项可复用单项未绑定形态（恰含 `presentation` 对象与非空 `challenge`，演示不得含任何 `holder_*` 字段）或持有者绑定形态（另恰含非空 `source_tenant_id`，演示恰为九字段加 `holder_did`、`holder_key_version`、`holder_proof`，双锚点双签名，`source_tenant_id` 作为 holder proof 覆盖的 `tenant_id`）；**任何失败均 HTTP 200**，返回 `{"results":[...]}`（长度与顺序与输入一致，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`，不短路）；请求级非法（缺失、非法 JSON、非对象、字段缺失或多余、presentations 非数组、空数组或超限）返回 `{"results":[],"reason":"请求..."}`；纯只读、不消费、不审计 |
 | POST | `/v1/trust/proofs/verify` | 跨系统谓词证明验真：验证未在本租户保存的外部谓词证明，原本地 `/v1/proofs/{id}/verify` 不变；请求体须恰含 `proof`、`challenge`、`source_tenant_id`（后两项为非空字符串），proof 恰为 prove 九字段；**任何失败均 HTTP 200** 返回 `valid:false` 与分类中文 reason，成功仅 `{"valid":true}`；只读、不消费、不审计 |
@@ -575,6 +576,45 @@ curl -X POST localhost:8080/v1/proofs/zp_<id>/verify \
   - 签名为 **ES256/SHA-256**，64 字节裸 `R||S` 的无填充 base64url，覆盖
     完整 `body` 的递归排序紧凑 JSON；签名编码非法返回前缀“签名格式错误”，
     密码学验签失败返回前缀“签名校验失败”。成功仅返回 `{"valid":true}`。
+- `POST /v1/trust/dids/verify-document` 为**跨系统 DID 文档验真**：DID
+  无需在本租户注册，依赖方仅凭提交的文档原文即可完成结构、证明与信任
+  判断；不读取本地 DID 注册表，只读、不登记任何资源、不写历史或审计，
+  跨租户各自使用本租户锚点，结论随状态文件重启后稳定。原有
+  `GET /v1/dids/{did}/document`、注册、轮换、吊销与各类凭证/演示/证明
+  验真接口协议均保持不变。
+  - 请求体必须**恰含** `document`（JSON 对象）；缺失、多余字段、请求体
+    缺失/非法 JSON/非对象、`document` 非对象一律按请求错误返回 HTTP 200
+    + `{"valid":false,"reason":"请求…"}`。
+  - `document` 必须**恰含**四个字段：`did`（非空字符串）、
+    `current_key_version`（**非布尔正整数**）、`verification_methods`
+    （非空数组）、`document_proof`（非空字符串）；缺字段或多余字段返回
+    前缀“DID文档”的原因。
+  - `verification_methods` 每项须**恰含** `key_version`（非布尔正整数）、
+    `key_handle`（非空字符串）、`public_key`（可解析的 **P-256 公钥
+    PEM**，SubjectPublicKeyInfo，非 P-256/不可解析均失败）；方法须按
+    `key_version` **严格升序且无重复**。文档序列化后任何位置出现私钥
+    PEM 标记（`PRIVATE KEY-----`）一律失败——提交文档不得携带私钥。
+  - `current_key_version` 必须等于方法中的**最高版本**（不一致返回
+    “DID文档”类原因）。
+  - 信任判断：按**当前租户** `(did, current_key_version)` 查信任锚点，
+    锚点不存在（含他租户未注册，跨租户不可探测）返回前缀“锚点”的
+    原因，已吊销返回前缀“锚点”的吊销原因；锚点 `public_key` 必须与
+    文档最高版本方法的 `public_key` **原文完全匹配**，否则失败。
+  - `document_proof` 遵循与 `GET /v1/dids/{did}/document` 完全相同的
+    **ES256 裸签名和规范化 JSON 规则**：64 字节裸 `R||S` 的无填充
+    base64url，覆盖**除 `document_proof` 外的整个文档**按 key 升序的
+    规范化 JSON（紧凑序列化、UTF-8、嵌套递归排序）；编码非法返回前缀
+    “签名格式错误”，密码学验签失败返回前缀“签名校验失败”。验签公钥
+    即上一步匹配通过的当前版本锚点公钥。
+  - 校验顺序：请求结构 → 文档字段与结构 → 锚点（存在/active/公钥匹配）
+    → 签名格式 → 密码学验签。任何失败均 **HTTP 200** 返回
+    `{"valid":false,"reason":"<非空中文原因>"}`，成功仅返回
+    `{"valid":true}`（无其他字段）；显式空 `X-Tenant-ID` 仍为 **400**。
+
+  ```bash
+  curl -X POST localhost:8080/v1/trust/dids/verify-document \
+    -d '{"document":{ ...GET /v1/dids/{did}/document 返回的整个文档对象... }}'
+  ```
 - `POST /v1/trust/presentations/verify` 验证**其他系统生成且未在本租户
   保存的演示**：无需登记本地 DID/凭证/演示，只读、不写凭证/演示/状态/
   历史/审计，跨租户各自使用本租户锚点，重启后结论一致。
@@ -988,6 +1028,7 @@ python3 tests/trust_anchor_history_test.py
 python3 tests/predicate_proof_test.py
 python3 tests/holder_binding_test.py
 python3 tests/trust_credential_verify_test.py
+python3 tests/trust_did_document_verify_test.py
 python3 tests/trust_presentation_verify_test.py
 python3 tests/trust_proof_verify_test.py
 python3 tests/trust_proof_verify_batch_test.py
@@ -1040,7 +1081,9 @@ vcbackend/
                带前置版本校验的轮换/生命周期历史（租户内跨 DID
                共享持久化游标、旧锚点加载按版本补注册/轮换/吊销事件、
                追加与分页）、跨系统外部凭证验真（含合并同步状态
-               的只读判定）、跨系统外部演示验真（未绑定九字段、
+               的只读判定）、跨系统 DID 文档验真（仅凭提交文档的
+               结构/证明/信任判断、active 锚点同 DID 同版本且公钥
+               原文匹配、只读不登记）、跨系统外部演示验真（未绑定九字段、
                挑战一致性与期限判定）、跨系统外部谓词证明验真
                （九字段与 predicates/results 结构校验、不重算 results、
                tenant_id=source_tenant_id 规范化验签、期限判定，只读不消费）、
@@ -1113,6 +1156,13 @@ tests/holder_binding_test.py       演示持有者绑定（未绑定兼容、绑
 tests/trust_credential_verify_test.py  跨系统凭证验真（请求/凭证/锚点/
                                    签名格式/验签分类 reason、省略版本不注入、
                                    扩展字段参与签名、只读不记审计、跨租户/重启）
+tests/trust_did_document_verify_test.py 跨系统 DID 文档验真（成功与跨系统
+                                   提交原文、请求/文档结构/版本升序无重复/
+                                   非布尔正整数/P-256 PEM/禁止私钥/当前版本
+                                   最高、锚点缺失/跨租户/吊销/公钥不匹配、
+                                   签名格式/验签/证明覆盖范围分类 reason、
+                                   显式空租户头 400、只读不审计不登记、
+                                   重启结论稳定、既有接口不变）
 tests/trust_presentation_verify_test.py 跨系统演示验真（请求/演示字段/holder_*
                                    拒绝/挑战/锚点/签名格式/验签/过期分类 reason、
                                    恰九字段与类型、只读不记审计、跨租户/重启）
