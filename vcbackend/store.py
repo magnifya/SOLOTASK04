@@ -5088,6 +5088,93 @@ class VCStore:
                 ),
             }
 
+    def sync_credential_status_batch(
+        self,
+        tenant_id: str,
+        data: Any,
+    ) -> Tuple[bool, str, List[Dict[str, Any]]]:
+        """批量同步外部凭证状态，返回 (请求是否合法, 请求级原因, 逐项结果)。
+
+        请求体须恰为 ``{"items": [项...]}``：数组非空且不超过 100 项。
+        请求级结构不合法（非对象、字段缺失或多余、items 非数组、空数组
+        或超过上限）时返回 ``(False, "请求...", [])``，由调用方回
+        ``{"results": [], "reason": ...}``。
+
+        请求级合法时逐项复用 :meth:`sync_credential_status`（与单项接口
+        完全一致的字段、锚点、签名与更新规则），按输入顺序收集结果，
+        失败不短路：
+
+          - 成功项 ``{"valid", "http_status", "issuer_did",
+            "credential_id", "status", "reason", "updated_at",
+            "issuer_key_version"}``：首次 201，重放/更早 200，严格更新
+            200 并记审计；
+          - 字段非法 ``{"valid": false, "http_status": 400, "reason"}``；
+          - 同秒冲突 ``{"valid": false, "http_status": 409, "reason"}``；
+          - 锚点/签名失败 ``{"valid": false, "http_status": 200,
+            "reason"}``，不写入。
+
+        每项的状态、审计、历史仍各自原子落盘；绝不改动本租户既有凭证
+        状态。
+        """
+        if not isinstance(data, dict):
+            return False, "请求不合法: 请求体必须为 JSON 对象", []
+        if set(data) != {"items"}:
+            missing = [f for f in ("items",) if f not in data]
+            if missing:
+                return False, (
+                    f"请求缺少字段: {', '.join(missing)}"
+                ), []
+            extra = sorted(set(data) - {"items"})
+            return False, f"请求含多余字段: {', '.join(extra)}", []
+        items = data["items"]
+        if not isinstance(items, list):
+            return False, "请求不合法: 字段 items 必须为数组", []
+        if not items:
+            return False, "请求不合法: items 数组不能为空", []
+        if len(items) > 100:
+            return False, (
+                f"请求不合法: items 数组不能超过 100 项（当前 {len(items)} 项）"
+            ), []
+
+        results: List[Dict[str, Any]] = []
+        for item in items:  # 顺序处理，失败不短路
+            try:
+                result = self.sync_credential_status(tenant_id, item)
+            except ValidationError as exc:
+                results.append(
+                    {"valid": False, "http_status": 400, "reason": str(exc)}
+                )
+                continue
+            except ConflictError as exc:
+                results.append(
+                    {"valid": False, "http_status": 409, "reason": str(exc)}
+                )
+                continue
+            if not result.get("valid"):
+                # 锚点缺失/吊销、签名格式错误、验签失败：不写入
+                results.append(
+                    {
+                        "valid": False,
+                        "http_status": 200,
+                        "reason": result.get("reason") or "验签失败",
+                    }
+                )
+                continue
+            record = result["record"]
+            results.append(
+                {
+                    "valid": True,
+                    "http_status": result["status_code"],
+                    "issuer_did": record.issuer_did,
+                    "credential_id": record.credential_id,
+                    "status": record.status,
+                    "reason": record.reason,
+                    "updated_at": record.updated_at,
+                    "issuer_key_version": record.issuer_key_version,
+                }
+            )
+        return True, "", results
+
     def get_synced_credential_status(
         self, tenant_id: str, issuer_did: str, credential_id: str
     ) -> CredentialStatusSyncRecord:

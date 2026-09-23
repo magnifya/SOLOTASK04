@@ -42,6 +42,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/credentials/verify-with-status 外部凭证验真并合并同步状态（只读）
   POST /v1/trust/credentials/verify-batch-with-status 批量验真并合并同步状态（只读）
   POST /v1/trust/credential-status/sync   同步外部凭证状态（active 锚点验签）
+  POST /v1/trust/credential-status/sync-batch 批量同步外部凭证状态（不短路）
   GET  /v1/trust/credential-status/{id}   查询已同步的外部凭证状态
   GET  /v1/trust/credential-status/{id}/history  查询外部凭证状态历史（只读）
   GET  /v1/audit                          查询本租户审计事件
@@ -294,6 +295,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_credentials_verify_with_status(tenant)
                 elif path == "/v1/trust/credential-status/sync":
                     self._post_trust_credential_status_sync(tenant)
+                elif path == "/v1/trust/credential-status/sync-batch":
+                    self._post_trust_credential_status_sync_batch(tenant)
                 else:
                     self._send_error(404, f"无此路径: {path}")
             except ValidationError as exc:
@@ -2201,6 +2204,66 @@ def build_handler(store: VCStore) -> type:
                     "issuer_key_version": record.issuer_key_version,
                 },
             )
+
+        def _post_trust_credential_status_sync_batch(
+            self, tenant: str
+        ) -> None:
+            # 批量同步外部凭证状态。请求级不合法（缺失、非法 JSON、非
+            # 对象、字段缺失/多余、items 非数组/空/超过 100 项）一律
+            # 200 + {"results": [], "reason": "请求..."}。请求级合法时
+            # 逐项复用单项同步规则，失败不短路：字段错 http_status 400、
+            # 同秒冲突 409、锚点/签名失败 200（不写入）；成功项首次 201、
+            # 重放/更早 200、严格更新 200 并记审计。results 与输入等长
+            # 同序；每项状态/审计/历史原子落盘。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                self._send_json(
+                    200,
+                    {"results": [],
+                     "reason": "请求不合法: 请求体缺失或长度声明非法"},
+                )
+                return
+            except Exception:  # noqa: BLE001
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 请求体读取失败"}
+                )
+                return
+            if not raw:
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 请求体缺失"}
+                )
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                self._send_json(
+                    200,
+                    {"results": [], "reason": "请求不合法: 请求体不是合法 UTF-8 文本"},
+                )
+                return
+            except json.JSONDecodeError:
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 请求体不是合法 JSON"}
+                )
+                return
+
+            try:
+                ok, reason, results = store.sync_credential_status_batch(
+                    tenant, data
+                )
+            except Exception:  # noqa: BLE001 同步失败绝不暴露内部细节
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 同步过程发生内部错误"}
+                )
+                return
+            if not ok:
+                self._send_json(
+                    200, {"results": [], "reason": reason or "请求不合法"}
+                )
+                return
+            self._send_json(200, {"results": results})
 
         def _get_trust_credential_status(
             self, tenant: str, credential_id: str, query: str
