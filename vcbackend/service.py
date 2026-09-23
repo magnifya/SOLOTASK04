@@ -19,6 +19,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/credentials/{credential_id}/revoke   吊销凭证
   POST /v1/credentials/{credential_id}/verify  以存储记录为锚验签
   POST /v1/credentials/{credential_id}/present 生成选择性披露演示
+  POST /v1/credentials/{credential_id}/present-batch 原子批量生成选择性披露演示
   POST /v1/presentations/{presentation_id}/verify  以存储记录为锚校验演示
   POST /v1/credentials/{credential_id}/prove    生成谓词证明
   POST /v1/proofs/{proof_id}/verify             以存储记录为锚校验谓词证明
@@ -67,6 +68,7 @@ from .store import (
     DEFAULT_TENANT,
     EXPIRES_AT_UNSET,
     NotFoundError,
+    PresentationRecord,
     REASON_UNSET,
     ValidationError,
     VCStore,
@@ -227,6 +229,13 @@ def build_handler(store: VCStore) -> type:
                         path[len("/v1/credentials/") : -len("/present")]
                     )
                     self._post_present(tenant, credential_id)
+                elif path.startswith("/v1/credentials/") and path.endswith(
+                    "/present-batch"
+                ):
+                    credential_id = unquote(
+                        path[len("/v1/credentials/") : -len("/present-batch")]
+                    )
+                    self._post_present_batch(tenant, credential_id)
                 elif path.startswith("/v1/credentials/") and path.endswith(
                     "/prove"
                 ):
@@ -976,6 +985,95 @@ def build_handler(store: VCStore) -> type:
                 payload["reason"] = reason or "验签失败"
             self._send_json(200, payload)
 
+        @staticmethod
+        def _presentation_payload(
+            record: PresentationRecord,
+        ) -> Dict[str, Any]:
+            """按对外契约的固定键序组装演示对象。
+
+            未绑定恰为九字段；持有者绑定在末尾追加 holder_did、
+            holder_key_version、holder_proof。
+            """
+            payload: Dict[str, Any] = {
+                "presentation_id": record.presentation_id,
+                "credential_id": record.credential_id,
+                "issuer_did": record.issuer_did,
+                "issuer_key_version": record.issuer_key_version,
+                "disclose": record.disclose,
+                "claims": record.projection,
+                "challenge": record.challenge,
+                "expires_at": record.expires_at,
+                "proof": record.proof,
+            }
+            # 仅持有者绑定演示返回 holder_did、holder_key_version、
+            # holder_proof；未绑定响应字段集合与旧流程完全一致。
+            if record.holder_did is not None:
+                payload["holder_did"] = record.holder_did
+                payload["holder_key_version"] = (
+                    record.holder_key_version
+                )
+                payload["holder_proof"] = record.holder_proof
+            return payload
+
+        @staticmethod
+        def _validate_present_item(
+            item: Any, index: int
+        ) -> Dict[str, Any]:
+            """校验单个演示生成项，返回透传给 store 的关键字参数。
+
+            规则与单项 present 完全一致：项须为对象，恰含 disclose 及
+            可选 challenge、expires_in、holder_binding；challenge 为非空
+            字符串且按 Unicode 码点不超过 256；expires_in 为非布尔整数
+            且在 1..86400；holder_binding 为布尔。index 为从 0 起的项
+            序号，错误信息带从 1 起的中文项号。
+            """
+            where = f"第 {index + 1} 项"
+            if not isinstance(item, dict):
+                raise ValidationError(f"{where}必须为 JSON 对象")
+            if "disclose" not in item:
+                raise ValidationError(f"{where}缺少字段: disclose")
+            extra = sorted(
+                set(item)
+                - {"disclose", "challenge", "expires_in", "holder_binding"}
+            )
+            if extra:
+                raise ValidationError(
+                    f"{where}含多余字段: {', '.join(extra)}"
+                )
+            kwargs: Dict[str, Any] = {"disclose": item["disclose"]}
+            if "challenge" in item:
+                challenge = item["challenge"]
+                if not isinstance(challenge, str) or not challenge:
+                    raise ValidationError(
+                        f"{where}字段 challenge 必须为非空字符串"
+                    )
+                if len(challenge) > 256:
+                    raise ValidationError(
+                        f"{where}字段 challenge 按 Unicode 码点不能超过 256"
+                    )
+                kwargs["challenge"] = challenge
+            if "expires_in" in item:
+                expires_in = item["expires_in"]
+                if not isinstance(expires_in, int) or isinstance(
+                    expires_in, bool
+                ):
+                    raise ValidationError(
+                        f"{where}字段 expires_in 必须为整数"
+                    )
+                if not 1 <= expires_in <= 86400:
+                    raise ValidationError(
+                        f"{where}字段 expires_in 须在 1 到 86400 之间"
+                    )
+                kwargs["expires_in"] = expires_in
+            if "holder_binding" in item:
+                holder_binding = item["holder_binding"]
+                if not isinstance(holder_binding, bool):
+                    raise ValidationError(
+                        f"{where}字段 holder_binding 必须为布尔值"
+                    )
+                kwargs["holder_binding"] = holder_binding
+            return kwargs
+
         def _post_present(self, tenant: str, credential_id: str) -> None:
             # 请求体必须恰为 {"disclose": [...]} 加可选 challenge、
             # expires_in：缺失 disclose、类型非法、重复路径或祖先重叠、
@@ -1027,26 +1125,52 @@ def build_handler(store: VCStore) -> type:
                 expires_in=expires_in,
                 holder_binding=holder_binding,
             )
-            presentation_payload: Dict[str, Any] = {
-                "presentation_id": record.presentation_id,
-                "credential_id": record.credential_id,
-                "issuer_did": record.issuer_did,
-                "issuer_key_version": record.issuer_key_version,
-                "disclose": record.disclose,
-                "claims": record.projection,
-                "challenge": record.challenge,
-                "expires_at": record.expires_at,
-                "proof": record.proof,
-            }
-            # 仅持有者绑定演示返回 holder_did、holder_key_version、
-            # holder_proof；未绑定响应字段集合与旧流程完全一致。
-            if record.holder_did is not None:
-                presentation_payload["holder_did"] = record.holder_did
-                presentation_payload["holder_key_version"] = (
-                    record.holder_key_version
+            self._send_json(201, self._presentation_payload(record))
+
+        def _post_present_batch(
+            self, tenant: str, credential_id: str
+        ) -> None:
+            # 批量选择性披露演示：请求体须恰为
+            # {"presentations": [项...]}，数组非空且不超过 50 项。
+            # 外层缺失/非数组/空/超限、项非对象、缺 disclose 或多余
+            # 字段、challenge/expires_in/holder_binding 类型或范围非法
+            # 一律 400 且不写入任何记录；路径凭证未知（含他租户）404；
+            # 任一项在 store 内失败（disclose 越界/重复/祖先重叠、绑定
+            # subject 非本租户 DID、密钥吊销等）整体回滚，已构建项与
+            # 审计均不落盘。成功 201 返回 {"presentations": [...]}，
+            # 与输入等长、同序，项键序与单项 present 完全一致。
+            data = self._read_json()
+            if "presentations" not in data:
+                raise ValidationError("缺少字段: presentations")
+            extra = sorted(set(data) - {"presentations"})
+            if extra:
+                raise ValidationError(f"多余字段: {', '.join(extra)}")
+            items = data["presentations"]
+            if not isinstance(items, list):
+                raise ValidationError("字段 presentations 必须为数组")
+            if not items:
+                raise ValidationError("presentations 数组不能为空")
+            if len(items) > 50:
+                raise ValidationError(
+                    "presentations 数组不能超过 50 项"
+                    f"（当前 {len(items)} 项）"
                 )
-                presentation_payload["holder_proof"] = record.holder_proof
-            self._send_json(201, presentation_payload)
+            kwargs_list = [
+                self._validate_present_item(item, index)
+                for index, item in enumerate(items)
+            ]
+            records = store.create_presentations_batch(
+                tenant, credential_id, kwargs_list
+            )
+            self._send_json(
+                201,
+                {
+                    "presentations": [
+                        self._presentation_payload(record)
+                        for record in records
+                    ]
+                },
+            )
 
         def _post_verify_presentation(
             self, tenant: str, presentation_id: str
