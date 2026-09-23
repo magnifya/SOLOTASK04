@@ -50,6 +50,7 @@ from .models import (
     DIDStatusRecord,
     KeyVersionStatusRecord,
     KeyRevocationEvent,
+    KeyHistoryEvent,
     PredicateProofRecord,
     PresentationRecord,
     TrustAnchorRecord,
@@ -134,6 +135,13 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace(
         "+00:00", "Z"
     )
+
+
+def _utc_now_pair() -> Tuple[str, int]:
+    """同一时刻的 UTC 秒精度 Z 时间串与 Unix 秒（保证二者对应同一秒）。"""
+    moment = datetime.now(timezone.utc)
+    text = moment.isoformat(timespec="seconds").replace("+00:00", "Z")
+    return text, int(moment.timestamp())
 
 
 def _utc_after(seconds: int) -> str:
@@ -497,6 +505,7 @@ class VCStore:
             bucket.setdefault("credential_status_sync", {})
             bucket.setdefault("credential_status_history", {})
             bucket.setdefault("key_revocations", {})
+            bucket.setdefault("key_history_events", {})
             bucket.setdefault("trust_anchor_history", {})
             bucket.setdefault("local_credential_status_history", {})
             for rec in bucket["dids"].values():
@@ -565,6 +574,22 @@ class VCStore:
                 for event in entries:
                     max_cursor = max(max_cursor, int(event.get("cursor", 0)))
             self._local_credential_status_history_cursors[tenant_id] = max_cursor
+        # DID 密钥生命周期历史游标：按租户各自维护的持久化正整数
+        # （tenant_id -> cursor），同一租户内不同 DID 的密钥生命周期
+        # 事件（active/revoked）共享该游标空间，且与密钥吊销历史
+        # （key_revocation_cursors）相互隔离。旧状态文件无该字段时，
+        # 从各租户已有生命周期历史项的最大 cursor 推导。
+        raw_key_history_cursors = data.get("key_history_cursors", {})
+        self._key_history_cursors: Dict[str, int] = {
+            str(tenant_id): int(cursor)
+            for tenant_id, cursor in raw_key_history_cursors.items()
+        } if isinstance(raw_key_history_cursors, dict) else {}
+        for tenant_id, bucket in self._tenants.items():
+            max_cursor = self._key_history_cursors.get(tenant_id, 0)
+            for entries in bucket.get("key_history_events", {}).values():
+                for event in entries:
+                    max_cursor = max(max_cursor, int(event.get("cursor", 0)))
+            self._key_history_cursors[tenant_id] = max_cursor
         # 旧状态文件中已吊销但无历史的密钥版本补一条兼容项（内存态）；
         # 随下一次原子写一并落盘，重启后 cursor 稳定。
         self._backfill_key_revocations_locked()
@@ -577,6 +602,9 @@ class VCStore:
         # 旧状态文件中本地凭证已有状态（active/revoked）但无状态历史的
         # 按稳定顺序补兼容项（内存态，audit 字段为 None）。
         self._backfill_local_credential_status_history_locked()
+        # 旧状态文件中密钥版本存在但无生命周期历史的按 DID 序、版本序、
+        # 同版本 active 后 revoked 补齐（内存态，audit 字段为 None）。
+        self._backfill_key_history_locked()
 
     def _save_locked(self) -> None:
         directory = os.path.dirname(os.path.abspath(self.path))
@@ -592,6 +620,7 @@ class VCStore:
             "local_credential_status_history_cursors": (
                 self._local_credential_status_history_cursors
             ),
+            "key_history_cursors": self._key_history_cursors,
         }
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
@@ -608,6 +637,7 @@ class VCStore:
                 self._key_revocation_cursors,
                 self._trust_anchor_history_cursors,
                 self._local_credential_status_history_cursors,
+                self._key_history_cursors,
             )
         )
 
@@ -620,6 +650,7 @@ class VCStore:
             key_revocation_cursors,
             trust_anchor_history_cursors,
             local_credential_status_history_cursors,
+            key_history_cursors,
         ) = copy.deepcopy(snapshot)
         self._tenants = tenants
         self._audit = audit
@@ -630,6 +661,7 @@ class VCStore:
         self._local_credential_status_history_cursors = (
             local_credential_status_history_cursors
         )
+        self._key_history_cursors = key_history_cursors
 
     # ------------------------------------------------------------------ #
     # 租户桶与审计
@@ -649,6 +681,7 @@ class VCStore:
                 "credential_status_sync": {},
                 "credential_status_history": {},
                 "key_revocations": {},
+                "key_history_events": {},
                 "trust_anchor_history": {},
                 "local_credential_status_history": {},
             }
@@ -661,12 +694,17 @@ class VCStore:
         action: str,
         resource_type: str,
         resource_id: str,
+        timestamp: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """在锁内追加一条审计事件（须与状态变更同一次原子写落盘）。"""
+        """在锁内追加一条审计事件（须与状态变更同一次原子写落盘）。
+
+        timestamp 给定时使用该 Unix 秒（用于与同一变更的历史事件
+        updated_at 严格同秒）；否则取当前时间。
+        """
         seq = self._audit_seq + 1
         event = {
             "seq": seq,
-            "timestamp": int(time.time()),
+            "timestamp": int(time.time()) if timestamp is None else timestamp,
             "tenant_id": tenant_id,
             "action": action,
             "resource_type": resource_type,
@@ -771,7 +809,7 @@ class VCStore:
                     registered_pub = crypto.public_key_pem_from_private(priv_pem).strip()
 
                 did = f"did:{method}:{uuid.uuid4().hex}"
-                created_at = _utc_now()
+                created_at, created_ts = _utc_now_pair()
                 bucket["dids"][did] = {
                     "method": method,
                     "public_key": registered_pub,
@@ -790,8 +828,28 @@ class VCStore:
                         }
                     ],
                 }
-                self._append_audit_locked(
-                    tenant_id, AUDIT_DID_CREATED, "did", did
+                audit_event = self._append_audit_locked(
+                    tenant_id, AUDIT_DID_CREATED, "did", did,
+                    timestamp=created_ts,
+                )
+                # 新建版本追加一条 active 生命周期事件（v1 为
+                # did.created）；幂等重试不追加，active 历史不改写。
+                bucket.setdefault("key_history_events", {}).setdefault(
+                    did, []
+                ).append(
+                    {
+                        "key_version": 1,
+                        "key_handle": handle,
+                        "public_key": registered_pub,
+                        "action": AUDIT_DID_CREATED,
+                        "status": "active",
+                        "updated_at": created_at,
+                        "cursor": (
+                            self._next_key_history_cursor_locked(tenant_id)
+                        ),
+                        "audit_seq": audit_event["seq"],
+                        "audit_timestamp": audit_event["timestamp"],
+                    }
                 )
                 self._save_locked()
                 return self._did_record(did, bucket["dids"][did])
@@ -961,6 +1019,7 @@ class VCStore:
                 priv_pem = crypto.generate_private_key_pem()
                 pub_pem = crypto.public_key_pem_from_private(priv_pem).strip()
                 new_version = int(rec.get("key_version", 1)) + 1
+                rotated_at, rotated_ts = _utc_now_pair()
                 history: List[Dict[str, Any]] = rec.setdefault("key_history", [])
                 history.append(
                     {
@@ -974,8 +1033,28 @@ class VCStore:
                 rec["key_handle"] = handle
                 rec["public_key"] = pub_pem
                 rec["private_key_pem"] = priv_pem
-                self._append_audit_locked(
-                    tenant_id, AUDIT_KEY_ROTATED, "did", did
+                audit_event = self._append_audit_locked(
+                    tenant_id, AUDIT_KEY_ROTATED, "did", did,
+                    timestamp=rotated_ts,
+                )
+                # 新版本追加一条 active 生命周期事件（key.rotated），
+                # updated_at 为轮换成功时刻；失败回滚不会追加。
+                bucket.setdefault("key_history_events", {}).setdefault(
+                    did, []
+                ).append(
+                    {
+                        "key_version": new_version,
+                        "key_handle": handle,
+                        "public_key": pub_pem,
+                        "action": AUDIT_KEY_ROTATED,
+                        "status": "active",
+                        "updated_at": rotated_at,
+                        "cursor": (
+                            self._next_key_history_cursor_locked(tenant_id)
+                        ),
+                        "audit_seq": audit_event["seq"],
+                        "audit_timestamp": audit_event["timestamp"],
+                    }
                 )
                 self._save_locked()
                 return self._did_record(did, rec)
@@ -1155,18 +1234,19 @@ class VCStore:
                 if not final_reason:
                     raise ValidationError("字段 reason 裁剪后不能为空")
 
-            now = _utc_now()
+            now, now_ts = _utc_now_pair()
             snapshot = self._snapshot_locked()
             try:
                 entry["status"] = "revoked"
                 entry["revoke_reason"] = final_reason
                 entry["revoked_at"] = now
-                self._append_audit_locked(
+                audit_event = self._append_audit_locked(
                     tenant_id, AUDIT_KEY_REVOKED,
                     "did", f"{did}#{key_version}",
+                    timestamp=now_ts,
                 )
                 # 仅首次成功吊销追加历史事件；重复吊销与失败路径均不会
-                # 到达此处。吊销标记、历史与审计在同一次原子写落盘。
+                # 到达此处。吊销标记、两类历史与审计在同一次原子写落盘。
                 revocation_entries = (
                     bucket.setdefault("key_revocations", {})
                     .setdefault(did, [])
@@ -1179,6 +1259,25 @@ class VCStore:
                         "cursor": (
                             self._next_key_revocation_cursor_locked(tenant_id)
                         ),
+                    }
+                )
+                # 密钥生命周期历史追加 revoked 事件（key.revoked），与
+                # active 历史同版本并存，游标空间与吊销历史相互隔离。
+                bucket.setdefault("key_history_events", {}).setdefault(
+                    did, []
+                ).append(
+                    {
+                        "key_version": key_version,
+                        "key_handle": entry.get("key_handle", ""),
+                        "public_key": entry.get("public_key", ""),
+                        "action": AUDIT_KEY_REVOKED,
+                        "status": "revoked",
+                        "updated_at": now,
+                        "cursor": (
+                            self._next_key_history_cursor_locked(tenant_id)
+                        ),
+                        "audit_seq": audit_event["seq"],
+                        "audit_timestamp": audit_event["timestamp"],
                     }
                 )
                 self._save_locked()
@@ -4322,6 +4421,151 @@ class VCStore:
                 entries.sort(
                     key=lambda event: int(event.get("key_version", 0))
                 )
+
+    def _next_key_history_cursor_locked(self, tenant_id: str) -> int:
+        """分配租户内下一个持久化密钥生命周期游标（正整数，递增）。
+
+        与 _next_key_revocation_cursor_locked 的吊销历史游标空间相互
+        隔离，互不复用。
+        """
+        cursor = self._key_history_cursors.get(tenant_id, 0) + 1
+        self._key_history_cursors[tenant_id] = cursor
+        return cursor
+
+    def _backfill_key_history_locked(self) -> None:
+        """加载迁移：为旧状态文件的密钥版本补齐生命周期历史（内存态）。
+
+        对每个租户按 DID 字典序、版本升序，同版本先 active 后 revoked：
+        - 缺 active 事件的版本补一条：v1 补 did.created（updated_at 取
+          DID created_at），其余版本补 key.rotated（updated_at 为
+          None——旧状态不记录轮换时刻）；
+        - 已吊销且缺 revoked 事件的版本再补一条 key.revoked，
+          updated_at 取该版本条目的 revoked_at，缺失时为 None；
+        补录 audit_seq/audit_timestamp 均为 None（无法追溯原始审计），
+        cursor 为该租户内新分配的持久化正整数（与吊销历史隔离）。
+        仅在内存中补录：随下一次原子写一并落盘；若无写操作，重启时按
+        相同顺序重建，cursor 稳定。
+        """
+        for tenant_id in sorted(self._tenants):
+            bucket = self._tenants[tenant_id]
+            history_map = bucket.setdefault("key_history_events", {})
+            dids = bucket.get("dids", {})
+            for did in sorted(dids):
+                rec = dids[did]
+                entries = history_map.setdefault(did, [])
+                known = {
+                    (int(event.get("key_version", 0)), event.get("action"))
+                    for event in entries
+                }
+                versions = sorted(
+                    int(entry.get("version", 0))
+                    for entry in rec.get("key_history", [])
+                )
+                for version in versions:
+                    key_entry = None
+                    for item in rec.get("key_history", []):
+                        if int(item.get("version", 0)) == version:
+                            key_entry = item
+                            break
+                    if key_entry is None:
+                        continue
+                    if version == 1:
+                        active_action = AUDIT_DID_CREATED
+                        active_updated_at = rec.get("created_at")
+                    else:
+                        active_action = AUDIT_KEY_ROTATED
+                        active_updated_at = None
+                    if (version, active_action) not in known:
+                        entries.append(
+                            {
+                                "key_version": version,
+                                "key_handle": key_entry.get("key_handle", ""),
+                                "public_key": key_entry.get("public_key", ""),
+                                "action": active_action,
+                                "status": "active",
+                                "updated_at": active_updated_at,
+                                "cursor": (
+                                    self._next_key_history_cursor_locked(
+                                        tenant_id
+                                    )
+                                ),
+                                "audit_seq": None,
+                                "audit_timestamp": None,
+                            }
+                        )
+                        known.add((version, active_action))
+                    if (
+                        key_entry.get("status") == "revoked"
+                        and (version, AUDIT_KEY_REVOKED) not in known
+                    ):
+                        entries.append(
+                            {
+                                "key_version": version,
+                                "key_handle": key_entry.get("key_handle", ""),
+                                "public_key": key_entry.get("public_key", ""),
+                                "action": AUDIT_KEY_REVOKED,
+                                "status": "revoked",
+                                "updated_at": key_entry.get("revoked_at"),
+                                "cursor": (
+                                    self._next_key_history_cursor_locked(
+                                        tenant_id
+                                    )
+                                ),
+                                "audit_seq": None,
+                                "audit_timestamp": None,
+                            }
+                        )
+                        known.add((version, AUDIT_KEY_REVOKED))
+                entries.sort(
+                    key=lambda event: int(event.get("cursor", 0))
+                )
+
+    def list_key_history(
+        self,
+        tenant_id: str,
+        did: str,
+        after: int = 0,
+        limit: int = 50,
+    ) -> Tuple[List[KeyHistoryEvent], int]:
+        """只读查询某 DID 的密钥生命周期历史，按页返回。
+
+        - DID 在本租户不存在（含他租户）抛 NotFoundError（HTTP 404）；
+          DID 存在但无历史返回空页；
+        - 事件按 cursor 升序；after 排除 cursor 不大于其值的事件，至多
+          返回 limit 项；next_after 为本页末项 cursor，空页保持 after。
+        纯只读：不修改任何状态、不记审计、不触发落盘。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            rec = bucket["dids"].get(did) if bucket is not None else None
+            if rec is None:
+                raise NotFoundError(f"DID 不存在: {did}")
+            entries = sorted(
+                bucket.get("key_history_events", {}).get(did, []),
+                key=lambda event: int(event.get("cursor", 0)),
+            )
+            picked: List[KeyHistoryEvent] = []
+            for row in entries:
+                if len(picked) >= limit:
+                    break
+                cursor = int(row["cursor"])
+                if cursor <= after:
+                    continue
+                picked.append(
+                    KeyHistoryEvent(
+                        key_version=int(row["key_version"]),
+                        key_handle=row["key_handle"],
+                        public_key=row["public_key"],
+                        action=row["action"],
+                        status=row["status"],
+                        updated_at=row.get("updated_at"),
+                        cursor=cursor,
+                        audit_seq=row.get("audit_seq"),
+                        audit_timestamp=row.get("audit_timestamp"),
+                    )
+                )
+            next_after = picked[-1].cursor if picked else after
+            return picked, next_after
 
     def _next_trust_anchor_cursor_locked(self, tenant_id: str) -> int:
         """分配租户内下一个持久化锚点历史游标（正整数，按追加递增）。"""
