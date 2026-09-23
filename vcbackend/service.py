@@ -10,6 +10,7 @@
   POST /v1/dids/{did}/keys/{ver}/revoke   吊销 DID 旧密钥版本
   GET  /v1/dids/{did}/keys/{ver}/status   查询 DID 密钥版本吊销状态（只读）
   GET  /v1/dids/{did}/keys/revocations    查询 DID 密钥吊销历史（只读）
+GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（只读）
   POST /v1/credentials                    签发凭证
   GET  /v1/credentials/{credential_id}    查询凭证
   PUT  /v1/credentials/{credential_id}/status   登记 active（首次 201/重复 200）
@@ -364,12 +365,17 @@ def build_handler(store: VCStore) -> type:
                 elif path.startswith("/v1/dids/") and "/keys/" in path and (
                     path.endswith("/status")
                     or path.endswith("/keys/revocations")
+                    or path.endswith("/keys/history")
                 ):
                     middle = path[len("/v1/dids/") :]
                     did_raw, sep, rest = middle.partition("/keys/")
                     did = unquote(did_raw)
                     if rest == "revocations":
                         self._get_key_revocations(
+                            tenant, did, parsed.query
+                        )
+                    elif rest == "history":
+                        self._get_key_history(
                             tenant, did, parsed.query
                         )
                     else:
@@ -639,6 +645,68 @@ def build_handler(store: VCStore) -> type:
                             "key_version": event.key_version,
                             "reason": event.reason,
                             "updated_at": event.updated_at,
+                            "cursor": event.cursor,
+                        }
+                        for event in events
+                    ],
+                    "next_after": next_after,
+                },
+            )
+
+        def _get_key_history(
+            self, tenant: str, did: str, query: str
+        ) -> None:
+            # GET /v1/dids/{did}/keys/history?limit=&after=：只读密钥
+            # 生命周期历史。响应恰含 did、events、next_after；事件恰含
+            # key_version、key_handle、public_key、action、status、
+            # updated_at、audit_seq、audit_timestamp、cursor，按 cursor
+            # 升序；仅含公钥，绝不暴露私钥。分页参数规则沿用
+            # keys/revocations：limit 缺省 50、须 1..200 的 ASCII 十进制
+            # 整数；after 缺省 0、须非负；重复/空白/布尔词/小数/符号/
+            # Unicode 数字一律 400。未知或他租户 DID 404；已有 DID 无
+            # 历史返回空页，空页 next_after 保持 after。纯只读：不写
+            # 任何状态、不记审计。
+            if not did:
+                raise ValidationError("路径缺少 did")
+            params = parse_qs(query, keep_blank_values=True)
+
+            limit_values = params.get("limit")
+            if limit_values is not None:
+                if len(limit_values) != 1:
+                    raise ValidationError("查询参数 limit 只能提供一次")
+                limit = _parse_nonneg_int(limit_values[0], "limit")
+                if not 1 <= limit <= 200:
+                    raise ValidationError(
+                        "查询参数 limit 须在 1 到 200 之间"
+                    )
+            else:
+                limit = 50
+
+            after_values = params.get("after")
+            if after_values is not None:
+                if len(after_values) != 1:
+                    raise ValidationError("查询参数 after 只能提供一次")
+                after = _parse_nonneg_int(after_values[0], "after")
+            else:
+                after = 0
+
+            events, next_after = store.list_key_lifecycle(
+                tenant, did, after, limit
+            )
+            self._send_json(
+                200,
+                {
+                    "did": did,
+                    "events": [
+                        {
+                            "key_version": event.key_version,
+                            "key_handle": event.key_handle,
+                            "public_key": event.public_key,
+                            "action": event.action,
+                            "status": event.status,
+                            "updated_at": event.updated_at,
+                            "audit_seq": event.audit_seq,
+                            "audit_timestamp": event.audit_timestamp,
                             "cursor": event.cursor,
                         }
                         for event in events

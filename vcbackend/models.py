@@ -69,6 +69,32 @@ class KeyRevocationEvent:
 
 
 @dataclass
+class KeyLifecycleEvent:
+    """DID 密钥生命周期历史中的一条事件（只读历史查询用）。
+
+    按 (租户, did) 归属；新版本创建追加 active（v1 为 did.created，
+    轮换为 key.rotated），首次吊销追加 revoked（key.revoked）；重复、
+    失败与幂等请求不追加，active 历史不改写。action 沿用对应审计动作名。
+    key_handle/public_key 为该版本的句柄与 P-256 公钥 PEM（绝不包含
+    私钥）；updated_at 为 active 的创建/轮换成功时刻或 revoked 的首次
+    吊销时间（UTC ISO8601 秒精度 Z），旧状态补录的非 v1 active 为
+    None；audit_seq/audit_timestamp 关联产生该事件的审计事件，旧状态
+    补录无法追溯时为 None。cursor 为租户内跨 DID 持久递增正整数，与
+    吊销历史游标空间相互隔离。
+    """
+
+    key_version: int
+    key_handle: str
+    public_key: str
+    action: str
+    status: str
+    updated_at: Optional[str]
+    cursor: int
+    audit_seq: Optional[int] = None
+    audit_timestamp: Optional[int] = None
+
+
+@dataclass
 class CredentialRecord:
     """一条已签发凭证：正文与其 ES256 签名。"""
 
