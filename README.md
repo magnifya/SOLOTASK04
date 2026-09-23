@@ -64,6 +64,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/trust/credentials/verify-with-status` | 外部凭证验真并合并同步状态（只读）：请求体与验真规则同 `/v1/trust/credentials/verify`；**任何验真/过期失败均 HTTP 200** 返回 `valid:false` 与中文 `reason`；验签通过后按本租户 `(issuer_did, credential_id)` 查同步记录：未同步 `valid:false`/“外部凭证状态未同步”，active 仅 `{"valid":true}`，revoked 为“外部凭证已吊销：<reason>”（无 reason 用“未知原因”），unknown 为“外部凭证状态未知”；不创建凭证、不改状态、不写同步记录或审计 |
 | POST | `/v1/trust/credentials/verify-batch-with-status` | 批量外部凭证验真并合并同步状态（只读）：请求体恰为 `{"credentials":[项...]}`，数组非空且不超过 100 项；请求级非法（缺失、非法 JSON、非对象、字段缺失或多余、credentials 非数组、空数组或超限）统一 HTTP 200 返回 `{"results":[],"reason":"请求..."}`；合法批次逐项复用 `/v1/trust/credentials/verify-with-status` 规则（含同步状态合并），按输入顺序不短路返回 `{"results":[...]}`，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`；不写凭证、状态、历史或审计 |
 | POST | `/v1/trust/credential-status/sync` | 外部凭证状态同步：请求体须恰含 `body`、`signature`，`body` 须恰含 `issuer_did`、`credential_id`、`status`、`updated_at`、`issuer_key_version`，可选 `reason`；请求/字段非法 400；锚点或签名失败 HTTP 200、`valid:false` 且不写入；首次同步 201、相同重放 200 不重复审计、严格更新替换、同时间不同内容 409 |
+| POST | `/v1/trust/credential-status/sync-batch` | 批量外部凭证状态同步：请求体须恰含 `items`（数组 1–100 项），逐项复用单项规则、失败不短路；请求级非法（缺失/非法 JSON/非对象/字段缺失多余/`items` 非数组·空·超限）返 HTTP 200 `{"results":[],"reason":"请求..."}`；失败项键序 `valid,http_status,reason`（字段错 400、同秒冲突 409、锚点/签名失败 200），成功项键序 `valid,http_status,issuer_did,credential_id,status,reason,updated_at,issuer_key_version`（首次 201、重放/更早 200、更晚 200 并记审计），`results` 与输入等长同序 |
 | GET | `/v1/trust/credential-status/{credential_id}?issuer_did=...` | 查询已同步的外部凭证状态；`issuer_did` 须唯一非空；已同步返回 `status`、`reason`、`updated_at`，未同步（含他租户）404 |
 | GET | `/v1/trust/credential-status/{credential_id}/history?issuer_did=...&limit=&after=` | 只读查询外部凭证状态历史（兼容同步）；按 `updated_at` 升序、同值按 `cursor`；缺/重/空 `issuer_did` 400，`limit`/`after` 非法 400，未同步双键（含他租户）404 |
 | GET | `/v1/audit?limit=&after=` | 查询本租户审计事件，按 seq 升序；返回 `events`、`next_after`，参数校验见下文 |
@@ -1082,6 +1083,45 @@ curl -X POST localhost:8080/v1/trust/credential-status/sync -d '{
 curl "localhost:8080/v1/trust/credential-status/vc_ext_1?issuer_did=did:web:example.com"
 ```
 
+#### 外部凭证状态批量同步
+
+`POST /v1/trust/credential-status/sync-batch` 在一次请求内按顺序同步多条
+外部凭证状态，**逐项复用上面的单项同步规则、失败不短路**。
+
+- 请求体必须**恰为** `{"items":[项,...]}`，`items` 为**非空且不超过
+  100 项**的数组。请求体缺失、非法 JSON、非对象、字段缺失或多余、
+  `items` 非数组/空数组/超过上限，一律返回 **HTTP 200** 与
+  `{"results":[],"reason":"请求..."}`，且**不处理、不写入任何一项**。
+- 请求级合法时返回 **HTTP 200** 与 `{"results":[...]}`，`results` 与
+  输入 `items` **等长、同序**；每一项独立判定，互不影响。
+- **失败项**键序恰为 `valid,http_status,reason`，`reason` 恒为非空中文：
+  字段/请求错误 `http_status=400`；同 `updated_at` 内容不同
+  `http_status=409`；锚点缺失/吊销、签名格式错误、密码学验签失败
+  `http_status=200`（`reason` 前缀依次为“锚点”/“签名格式错误”/
+  “签名校验失败”），且该项**不写入、不记审计**。
+- **成功项**键序恰为 `valid,http_status,issuer_did,credential_id,status,
+  reason,updated_at,issuer_key_version`：首次同步 `http_status=201`，
+  相同重放与被忽略的更早日 `http_status=200`（不重复/不记审计），
+  `updated_at` 更晚的严格更新 `http_status=200` 并记一次
+  `trust.credential.status.synced` 审计。
+- 同一批内各项按顺序生效（后项可见前项已落盘的状态）；每个成功项沿用
+  单项的状态、历史与审计**同一次原子写**，落盘失败仅回滚该项，跨重启
+  保持。批量同步同样不触碰本租户签发凭证的状态。
+- `X-Tenant-ID` 缺省 `default`，显式空值在进入批处理前判 **400**；
+  所有项仅使用当前租户锚点并按本租户双键隔离。
+
+```bash
+curl -X POST localhost:8080/v1/trust/credential-status/sync-batch -d '{
+  "items":[
+    {"body":{"issuer_did":"did:web:example.com","credential_id":"vc_ext_1",
+             "status":"active","updated_at":"2026-09-21T00:00:00Z",
+             "issuer_key_version":1},"signature":"<base64url R||S>"},
+    {"body":{"issuer_did":"did:web:example.com","credential_id":"vc_ext_2",
+             "status":"revoked","updated_at":"2026-09-22T00:00:00Z",
+             "issuer_key_version":1,"reason":"持证人违规"},
+             "signature":"<base64url R||S>"}]}'
+```
+
 #### 外部凭证状态历史（只读）
 
 `GET /v1/trust/credential-status/{credential_id}/history` 在不改变同步
@@ -1387,6 +1427,13 @@ tests/trust_credential_status_sync_test.py  外部凭证状态同步（请求/�
                                    严格更新与更早日忽略、重放不重复审计、
                                    GET 三字段/404、跨租户双键隔离、不改本地
                                    凭证状态、重启持久化、落盘失败回滚）
+tests/trust_credential_status_sync_batch_test.py  外部凭证状态批量同步
+                                   （请求级非法 200+results 空+请求原因、
+                                   items 1–100、逐项 201/200/400/409/验签
+                                   失败不短路、成功/失败键序、同批顺序效应、
+                                   results 等长同序、审计计数、租户隔离、
+                                   不改本地凭证、重启持久化、落盘失败回滚、
+                                   显式空租户 400）
 tests/trust_credential_status_history_test.py  外部凭证状态历史（追加规则：
                                    仅首次/严格更新追加，重放/更早/冲突/验签
                                    失败不追加；字段与审计关联、updated_at/
