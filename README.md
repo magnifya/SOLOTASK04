@@ -42,6 +42,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/credentials/{credential_id}/revoke` | 吊销凭证；`reason` 可省略（默认“持证人主动吊销”），否则须为字符串且首尾裁剪后非空；返回 200 与 `credential_id`、`status:"revoked"`、`reason`、`revoked_at`、`updated_at`；不存在 404 |
 | POST | `/v1/credentials/{credential_id}/verify` | 验签，请求体 `{"body","signature"}`；**任何失败一律 HTTP 200**，返回 `valid`（失败时附分类中文 `reason`） |
 | POST | `/v1/credentials/{credential_id}/present` | 生成选择性披露演示，请求体恰为 `{"disclose":[路径...]}` 加可选 `challenge`、`expires_in`、`holder_binding`；成功 201 返回演示对象（绑定时另含 `holder_did`、`holder_key_version`、`holder_proof`）；字段问题 400、未知凭证 404 |
+| POST | `/v1/credentials/{credential_id}/present-batch` | 批量生成选择性披露演示，请求体恰为 `{"presentations":[项...]}`，项数 1–50；每项恰含 `disclose` 与可选 `challenge`、`expires_in`、`holder_binding`，规则完全沿用 present；请求级或任一项非法 400、未知凭证 404，**整批不写入**；成功 201 返回 `{"presentations":[...]}`，与输入同序，全部记录与审计单原子提交 |
 | POST | `/v1/presentations/{presentation_id}/verify` | 校验演示，新演示请求体恰为 `{"presentation":对象,"challenge":串}`（旧演示恰为 `{"presentation":对象}`）；**任何失败一律 HTTP 200**，成功 `{"valid":true}`，失败附非空中文 `reason` |
 | POST | `/v1/credentials/{credential_id}/prove` | 生成谓词证明，请求体恰为 `{"predicates":[项...]}` 加可选 `challenge`、`expires_in`；成功 201 返回证明对象；字段问题 400、未知凭证 404 |
 | POST | `/v1/proofs/{proof_id}/verify` | 校验谓词证明，请求体恰为 `{"proof":对象,"challenge":串}`；**任何失败一律 HTTP 200**，成功 `{"valid":true}`，失败附非空中文 `reason` |
@@ -111,6 +112,9 @@ curl -X POST localhost:8080/v1/credentials/vc_<id>/present \
 # 响应另含 holder_did、holder_key_version、holder_proof
 curl -X POST localhost:8080/v1/credentials/vc_<id>/present \
   -d '{"disclose":["/role"],"holder_binding":true}'
+# 同一凭证一次批量生成 1–50 条演示（整批原子提交）
+curl -X POST localhost:8080/v1/credentials/vc_<id>/present-batch \
+  -d '{"presentations":[{"disclose":[]},{"disclose":["/role"],"challenge":"c1"}]}'
 curl -X POST localhost:8080/v1/presentations/vp_<id>/verify \
   -d '{"presentation":{...},"challenge":"<演示的 challenge>"}'
 ```
@@ -591,6 +595,53 @@ curl -X POST localhost:8080/v1/credentials/vc_<id>/present \
   -d '{"disclose":["/role","/addr/city"],"challenge":"abc","expires_in":300}'
 curl -X POST localhost:8080/v1/presentations/vp_<id>/verify \
   -d '{"presentation":{ ...上一步返回的整个演示对象... },"challenge":"abc"}'
+```
+
+#### 批量选择性披露演示（present-batch）
+
+`POST /v1/credentials/{credential_id}/present-batch` 对**同一凭证**一次
+生成 1–50 条演示，单项规则与 present 完全一致，适合一次请求为同一持证人
+生成多组不同披露面的演示。
+
+- 请求体必须**恰为** `{"presentations":[项...]}`：缺字段、含多余字段、
+  `presentations` 不是数组、空数组或超过 50 项、请求体缺失/非法
+  JSON/非对象一律 **400** 并返回非空中文 `error`。
+- 每个项必须**恰含** `disclose` 与可选 `challenge`、`expires_in`、
+  `holder_binding`；项不是对象、缺 `disclose`、含多余字段，或任一字段
+  取值非法（规则与 present 相同：`challenge` 为非空串且按 Unicode 码点
+  ≤256、缺省 32 位小写 hex；`expires_in` 为非布尔整数 1–86400、缺省
+  300；`holder_binding` 为布尔、缺省 `false`；`disclose` 为 RFC6901
+  指针数组，禁根、禁数组索引、禁越界、不得重复或祖先/后代重叠，`[]`
+  为零披露）均对整个请求返回 **400**；`holder_binding:true` 项的
+  `subject_did` 必须是**本租户已注册 DID**，否则同样 **400**。错误原因
+  以“第 N 项…”定位（N 自 1 起）。
+- 凭证未知或属他租户返回 **404**；显式空 `X-Tenant-ID` 为 **400**。
+- **原子性**：所有项先在同一把锁内完成校验与 ES256 签名（不修改任何
+  状态），全部成功后才一次性写入全部演示记录，并为每项记一条
+  `presentation.created` 审计（`resource_type:"presentation"`），经
+  **同一次原子写**落盘；任一请求级/项级非法、凭证未知、签发者停用或
+  落盘失败都整体回滚——**不写入任何演示、不记任何审计**。
+- 成功返回 **201** `{"presentations":[...]}`，数组与输入**等长同序**，
+  各项为独立的 `presentation_id`（`vp_` 加 32 位小写 hex）、独立缺省
+  `challenge`/`expires_at`。每项键序固定为
+  `presentation_id`、`credential_id`、`issuer_did`、
+  `issuer_key_version`、`disclose`、`claims`、`challenge`、
+  `expires_at`、`proof`；持有者绑定项在末尾追加 `holder_did`、
+  `holder_key_version`、`holder_proof`。issuer proof 与 holder proof
+  的 ES256 签名覆盖范围、密钥版本选择与 present 完全相同。
+- 生成的演示与单项 present 产物完全等价：后续仍通过
+  `POST /v1/presentations/{presentation_id}/verify` 校验（带
+  `challenge`、一次性消费、过期/吊销判定、双签名），记录、消费标记与
+  审计随状态文件**跨重启持久化**，重启后仍可验签。
+
+```bash
+curl -X POST localhost:8080/v1/credentials/vc_<id>/present-batch -d '{
+  "presentations": [
+    {"disclose": []},
+    {"disclose": ["/role"], "challenge": "ch-1"},
+    {"disclose": ["/addr/city"], "expires_in": 600, "holder_binding": true}
+  ]
+}'
 ```
 
 ### 谓词证明

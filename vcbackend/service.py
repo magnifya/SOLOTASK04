@@ -19,6 +19,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/credentials/{credential_id}/revoke   吊销凭证
   POST /v1/credentials/{credential_id}/verify  以存储记录为锚验签
   POST /v1/credentials/{credential_id}/present 生成选择性披露演示
+  POST /v1/credentials/{credential_id}/present-batch 批量生成选择性披露演示
   POST /v1/presentations/{presentation_id}/verify  以存储记录为锚校验演示
   POST /v1/credentials/{credential_id}/prove    生成谓词证明
   POST /v1/proofs/{proof_id}/verify             以存储记录为锚校验谓词证明
@@ -220,6 +221,15 @@ def build_handler(store: VCStore) -> type:
                     self._post_verify_credential(
                         tenant, credential_id
                     )
+                elif path.startswith("/v1/credentials/") and path.endswith(
+                    "/present-batch"
+                ):
+                    credential_id = unquote(
+                        path[
+                            len("/v1/credentials/") : -len("/present-batch")
+                        ]
+                    )
+                    self._post_present_batch(tenant, credential_id)
                 elif path.startswith("/v1/credentials/") and path.endswith(
                     "/present"
                 ):
@@ -1027,7 +1037,75 @@ def build_handler(store: VCStore) -> type:
                 expires_in=expires_in,
                 holder_binding=holder_binding,
             )
-            presentation_payload: Dict[str, Any] = {
+            self._send_json(
+                201, self._presentation_payload(record)
+            )
+
+        @staticmethod
+        def _parse_presentation_item_options(
+            item: Any, index: int
+        ) -> Tuple[Any, Optional[str], Optional[int], bool]:
+            """校验 present/present-batch 单个请求项并返回
+            (disclose, challenge, expires_in, holder_binding)。
+
+            项必须恰含 disclose 与可选 challenge、expires_in、
+            holder_binding；index 为以 1 起始的项序号，仅用于 400 原因
+            定位。各字段规则沿用单项 present：
+            challenge 非空字符串且按 Unicode 码点不超过 256（None 表示
+            缺省，由 store 生成 32 位小写 hex）；expires_in 为非布尔
+            整数 1..86400（None 表示缺省 300）；holder_binding 为布尔，
+            缺省 False。
+            """
+            where = f"第 {index} 项"
+            if not isinstance(item, dict):
+                raise ValidationError(f"{where}必须为 JSON 对象")
+            if "disclose" not in item:
+                raise ValidationError(f"{where}缺少字段: disclose")
+            extra = sorted(
+                set(item)
+                - {"disclose", "challenge", "expires_in", "holder_binding"}
+            )
+            if extra:
+                raise ValidationError(
+                    f"{where}含多余字段: {', '.join(extra)}"
+                )
+            challenge: Optional[str] = None
+            if "challenge" in item:
+                challenge = item["challenge"]
+                if not isinstance(challenge, str) or not challenge:
+                    raise ValidationError(
+                        f"{where}字段 challenge 必须为非空字符串"
+                    )
+                if len(challenge) > 256:
+                    raise ValidationError(
+                        f"{where}字段 challenge 按 Unicode 码点不能超过 256"
+                    )
+            expires_in: Optional[int] = None
+            if "expires_in" in item:
+                expires_in = item["expires_in"]
+                if not isinstance(expires_in, int) or isinstance(
+                    expires_in, bool
+                ):
+                    raise ValidationError(
+                        f"{where}字段 expires_in 必须为整数"
+                    )
+                if not 1 <= expires_in <= 86400:
+                    raise ValidationError(
+                        f"{where}字段 expires_in 须在 1 到 86400 之间"
+                    )
+            holder_binding = False
+            if "holder_binding" in item:
+                holder_binding = item["holder_binding"]
+                if not isinstance(holder_binding, bool):
+                    raise ValidationError(
+                        f"{where}字段 holder_binding 必须为布尔值"
+                    )
+            return item["disclose"], challenge, expires_in, holder_binding
+
+        @staticmethod
+        def _presentation_payload(record: Any) -> Dict[str, Any]:
+            """按固定键序构造演示响应对象；绑定项末加 holder_* 三字段。"""
+            payload: Dict[str, Any] = {
                 "presentation_id": record.presentation_id,
                 "credential_id": record.credential_id,
                 "issuer_did": record.issuer_did,
@@ -1038,15 +1116,49 @@ def build_handler(store: VCStore) -> type:
                 "expires_at": record.expires_at,
                 "proof": record.proof,
             }
-            # 仅持有者绑定演示返回 holder_did、holder_key_version、
-            # holder_proof；未绑定响应字段集合与旧流程完全一致。
             if record.holder_did is not None:
-                presentation_payload["holder_did"] = record.holder_did
-                presentation_payload["holder_key_version"] = (
-                    record.holder_key_version
+                payload["holder_did"] = record.holder_did
+                payload["holder_key_version"] = record.holder_key_version
+                payload["holder_proof"] = record.holder_proof
+            return payload
+
+        def _post_present_batch(self, tenant: str, credential_id: str) -> None:
+            # POST /v1/credentials/{credential_id}/present-batch：
+            # 请求体恰为 {"presentations": [项...]}，项数 1..50；每项恰含
+            # disclose 与可选 challenge、expires_in、holder_binding，规则
+            # 完全沿用单项 present（[] 为零披露）。请求级或任一项非法均
+            # 400 且整体不写入任何演示/审计；未知凭证 404（同样不写入）。
+            # 成功 201 返回 {"presentations": [...]}，与输入同序，项键序
+            # 固定为九字段、绑定项末加 holder_did、holder_key_version、
+            # holder_proof；全部记录与审计单原子提交，失败回滚。
+            data = self._read_json()
+            if "presentations" not in data:
+                raise ValidationError("缺少字段: presentations")
+            extra = sorted(set(data) - {"presentations"})
+            if extra:
+                raise ValidationError(f"多余字段: {', '.join(extra)}")
+            items = data["presentations"]
+            if not isinstance(items, list):
+                raise ValidationError("字段 presentations 必须为数组")
+            if not 1 <= len(items) <= 50:
+                raise ValidationError(
+                    "字段 presentations 须包含 1 到 50 项"
                 )
-                presentation_payload["holder_proof"] = record.holder_proof
-            self._send_json(201, presentation_payload)
+            specs = [
+                self._parse_presentation_item_options(item, index)
+                for index, item in enumerate(items, start=1)
+            ]
+            records = store.create_presentations_batch(
+                tenant, credential_id, specs
+            )
+            self._send_json(
+                201,
+                {
+                    "presentations": [
+                        self._presentation_payload(record) for record in records
+                    ]
+                },
+            )
 
         def _post_verify_presentation(
             self, tenant: str, presentation_id: str

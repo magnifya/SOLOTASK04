@@ -1491,6 +1491,133 @@ class VCStore:
             holder_proof=row.get("holder_proof"),
         )
 
+    def _build_presentation_row_locked(
+        self,
+        tenant_id: str,
+        bucket: Dict[str, Any],
+        cred: Dict[str, Any],
+        credential_id: str,
+        disclose: Any,
+        challenge: str,
+        expires_in: int,
+        holder_binding: bool,
+    ) -> Dict[str, Any]:
+        """在锁内基于凭证行构造一条演示存储行（含双签名），不写状态/审计。
+
+        供单项 present 与 present-batch 复用：完成 disclose 路径校验、
+        投影、签发者停用/密钥吊销检查、ES256 issuer proof 签名，以及
+        holder_binding 时的持有者绑定校验与 holder_proof 签名。任何输入
+        不合法均抛 ValidationError/ConflictError，且不修改桶状态；
+        expires_at 按各项 expires_in 独立计算。返回可直接写入
+        bucket["presentations"] 的行字典。
+        """
+        stored_body = cred["body"]
+        claims = stored_body.get("claims", {})
+        if not isinstance(claims, dict):
+            raise ValidationError("凭证 claims 不是 JSON 对象，无法披露")
+
+        parsed = _validate_disclose(claims, disclose)
+        projection = _project_claims(claims, parsed)
+
+        issuer_did = stored_body["issuer_did"]
+        version = int(stored_body.get("issuer_key_version", 1))
+        # 签发者 DID 已停用：拒绝生成演示，409 且不留任何记录/审计。
+        issuer_rec = bucket["dids"].get(issuer_did)
+        if self._is_did_deactivated_locked(issuer_rec):
+            raise ConflictError(
+                f"签发者 DID 已停用，不能生成演示: {issuer_did}"
+            )
+        private_pem = self._private_key_for_version_locked(
+            bucket, issuer_did, version
+        )
+        if not private_pem:
+            raise ValidationError(
+                "历史私钥不可用: 签发者 "
+                f"{issuer_did} 密钥版本 {version} 的私钥不存在"
+            )
+        # 签发密钥版本已吊销：拒绝生成，400 且不留任何记录/审计。
+        issuer_entry = self._key_history_entry_by_version_locked(
+            bucket, issuer_did, version
+        )
+        if (
+            issuer_entry is not None
+            and issuer_entry.get("status") == "revoked"
+        ):
+            raise ValidationError(
+                "签发密钥版本已吊销，不能生成演示: "
+                f"{issuer_did}#{version}"
+            )
+
+        # 持有者绑定：subject_did 须为本租户已注册 DID，使用其当前
+        # 密钥版本私钥签名；未绑定不查询、不注入任何 holder_* 字段。
+        holder_did: Optional[str] = None
+        holder_key_version: Optional[int] = None
+        holder_private_pem: Optional[str] = None
+        if holder_binding:
+            holder_did = stored_body.get("subject_did")
+            if not isinstance(holder_did, str) or not holder_did:
+                raise ValidationError(
+                    "凭证缺少合法 subject_did，无法进行持有者绑定"
+                )
+            holder_rec = bucket["dids"].get(holder_did)
+            if holder_rec is None:
+                raise ValidationError(
+                    f"subject_did 不是本租户已注册 DID: {holder_did}"
+                )
+            holder_key_version = int(holder_rec.get("key_version", 1))
+            holder_private_pem = self._private_key_for_version_locked(
+                bucket, holder_did, holder_key_version
+            )
+            if not holder_private_pem:
+                raise ValidationError(
+                    "持有者当前密钥不可用: 持有者 "
+                    f"{holder_did} 密钥版本 {holder_key_version} 的私钥不存在"
+                )
+            # 绑定的持有者密钥版本已吊销：拒绝生成，400 且不留记录。
+            holder_entry = self._key_history_entry_by_version_locked(
+                bucket, holder_did, holder_key_version
+            )
+            if (
+                holder_entry is not None
+                and holder_entry.get("status") == "revoked"
+            ):
+                raise ValidationError(
+                    "持有者密钥版本已吊销，不能生成绑定演示: "
+                    f"{holder_did}#{holder_key_version}"
+                )
+
+        presentation_id = f"vp_{uuid.uuid4().hex}"
+        expires_at = _utc_after(expires_in)
+        disclose_paths = [pointer for pointer, _ in parsed]
+        unsigned: Dict[str, Any] = {
+            "presentation_id": presentation_id,
+            "credential_id": credential_id,
+            "issuer_did": issuer_did,
+            "issuer_key_version": version,
+            "disclose": disclose_paths,
+            "claims": projection,
+            "challenge": challenge,
+            "expires_at": expires_at,
+        }
+        proof = crypto.sign(unsigned, private_pem)
+        row = dict(unsigned)
+        row["proof"] = proof
+        if holder_binding:
+            # holder_proof 覆盖去掉 proof、holder_proof 后的完整
+            # 演示对象（含 holder_did/holder_key_version）及
+            # tenant_id；issuer proof 覆盖范围保持不变。
+            holder_payload = dict(unsigned)
+            holder_payload["holder_did"] = holder_did
+            holder_payload["holder_key_version"] = holder_key_version
+            holder_payload["tenant_id"] = tenant_id
+            holder_proof = crypto.sign(
+                holder_payload, holder_private_pem
+            )
+            row["holder_did"] = holder_did
+            row["holder_key_version"] = holder_key_version
+            row["holder_proof"] = holder_proof
+        return row
+
     def create_presentation(
         self,
         tenant_id: str,
@@ -1524,121 +1651,31 @@ class VCStore:
             challenge = uuid.uuid4().hex
         if expires_in is None:
             expires_in = DEFAULT_EXPIRES_IN
-        expires_at = _utc_after(expires_in)
         with self._lock:
             bucket = self._bucket_locked(tenant_id)
             cred = (
                 bucket["credentials"].get(credential_id)
-                if bucket is not None else None
+                if bucket is not None
+                else None
             )
             if cred is None:
                 raise NotFoundError(f"凭证不存在: {credential_id}")
-            stored_body = cred["body"]
-            claims = stored_body.get("claims", {})
-            if not isinstance(claims, dict):
-                raise ValidationError("凭证 claims 不是 JSON 对象，无法披露")
 
-            parsed = _validate_disclose(claims, disclose)
-            projection = _project_claims(claims, parsed)
-
-            issuer_did = stored_body["issuer_did"]
-            version = int(stored_body.get("issuer_key_version", 1))
-            # 签发者 DID 已停用：拒绝生成演示，409 且不留任何记录/审计。
-            issuer_rec = bucket["dids"].get(issuer_did)
-            if self._is_did_deactivated_locked(issuer_rec):
-                raise ConflictError(
-                    f"签发者 DID 已停用，不能生成演示: {issuer_did}"
-                )
-            private_pem = self._private_key_for_version_locked(
-                bucket, issuer_did, version
+            # 构造行不修改桶状态；校验失败在快照之前抛出，保持既有
+            # 语义（非法请求不触发回滚，调用方持有的 bucket 仍有效）。
+            row = self._build_presentation_row_locked(
+                tenant_id,
+                bucket,
+                cred,
+                credential_id,
+                disclose,
+                challenge,
+                expires_in,
+                holder_binding,
             )
-            if not private_pem:
-                raise ValidationError(
-                    "历史私钥不可用: 签发者 "
-                    f"{issuer_did} 密钥版本 {version} 的私钥不存在"
-                )
-            # 签发密钥版本已吊销：拒绝生成，400 且不留任何记录/审计。
-            issuer_entry = self._key_history_entry_by_version_locked(
-                bucket, issuer_did, version
-            )
-            if (
-                issuer_entry is not None
-                and issuer_entry.get("status") == "revoked"
-            ):
-                raise ValidationError(
-                    "签发密钥版本已吊销，不能生成演示: "
-                    f"{issuer_did}#{version}"
-                )
-
-            # 持有者绑定：subject_did 须为本租户已注册 DID，使用其当前
-            # 密钥版本私钥签名；未绑定不查询、不注入任何 holder_* 字段。
-            holder_did: Optional[str] = None
-            holder_key_version: Optional[int] = None
-            holder_private_pem: Optional[str] = None
-            if holder_binding:
-                holder_did = stored_body.get("subject_did")
-                if not isinstance(holder_did, str) or not holder_did:
-                    raise ValidationError(
-                        "凭证缺少合法 subject_did，无法进行持有者绑定"
-                    )
-                holder_rec = bucket["dids"].get(holder_did)
-                if holder_rec is None:
-                    raise ValidationError(
-                        f"subject_did 不是本租户已注册 DID: {holder_did}"
-                    )
-                holder_key_version = int(holder_rec.get("key_version", 1))
-                holder_private_pem = self._private_key_for_version_locked(
-                    bucket, holder_did, holder_key_version
-                )
-                if not holder_private_pem:
-                    raise ValidationError(
-                        "持有者当前密钥不可用: 持有者 "
-                        f"{holder_did} 密钥版本 {holder_key_version} 的私钥不存在"
-                    )
-                # 绑定的持有者密钥版本已吊销：拒绝生成，400 且不留记录。
-                holder_entry = self._key_history_entry_by_version_locked(
-                    bucket, holder_did, holder_key_version
-                )
-                if (
-                    holder_entry is not None
-                    and holder_entry.get("status") == "revoked"
-                ):
-                    raise ValidationError(
-                        "持有者密钥版本已吊销，不能生成绑定演示: "
-                        f"{holder_did}#{holder_key_version}"
-                    )
-
             snapshot = self._snapshot_locked()
             try:
-                presentation_id = f"vp_{uuid.uuid4().hex}"
-                disclose_paths = [pointer for pointer, _ in parsed]
-                unsigned: Dict[str, Any] = {
-                    "presentation_id": presentation_id,
-                    "credential_id": credential_id,
-                    "issuer_did": issuer_did,
-                    "issuer_key_version": version,
-                    "disclose": disclose_paths,
-                    "claims": projection,
-                    "challenge": challenge,
-                    "expires_at": expires_at,
-                }
-                proof = crypto.sign(unsigned, private_pem)
-                row = dict(unsigned)
-                row["proof"] = proof
-                if holder_binding:
-                    # holder_proof 覆盖去掉 proof、holder_proof 后的完整
-                    # 演示对象（含 holder_did/holder_key_version）及
-                    # tenant_id；issuer proof 覆盖范围保持不变。
-                    holder_payload = dict(unsigned)
-                    holder_payload["holder_did"] = holder_did
-                    holder_payload["holder_key_version"] = holder_key_version
-                    holder_payload["tenant_id"] = tenant_id
-                    holder_proof = crypto.sign(
-                        holder_payload, holder_private_pem
-                    )
-                    row["holder_did"] = holder_did
-                    row["holder_key_version"] = holder_key_version
-                    row["holder_proof"] = holder_proof
+                presentation_id = row["presentation_id"]
                 bucket["presentations"][presentation_id] = row
                 self._append_audit_locked(
                     tenant_id, AUDIT_PRESENTATION_CREATED,
@@ -1646,6 +1683,84 @@ class VCStore:
                 )
                 self._save_locked()
                 return self._presentation_record(row)
+            except Exception:
+                self._restore_locked(snapshot)
+                raise
+
+    def create_presentations_batch(
+        self,
+        tenant_id: str,
+        credential_id: str,
+        specs: List[Tuple[Any, Optional[str], Optional[int], bool]],
+    ) -> List[PresentationRecord]:
+        """对同一凭证一次性生成 1..50 条选择性披露演示，单原子提交。
+
+        specs 每项为 (disclose, challenge, expires_in, holder_binding)，
+        其中 challenge/expires_in 为 None 时分别取缺省（32 位小写 hex、
+        300 秒）；其余规则与 create_presentation 完全一致。所有项先在
+        锁内完成校验与签名（不修改任何状态），全部成功后才一次性写入
+        演示记录并为每项记一条 presentation.created 审计，经同一次
+        原子写落盘：任一项非法（400）、凭证未知（404）或签发者停用
+        （409）均整体失败，不写入任何演示、不记任何审计；落盘失败一并
+        回滚。返回与 specs 同序的 PresentationRecord 列表。
+        """
+        if not specs:
+            raise ValidationError("presentations 至少包含一项")
+        normalized: List[Tuple[Any, str, int, bool]] = []
+        for disclose, challenge, expires_in, holder_binding in specs:
+            normalized.append(
+                (
+                    disclose,
+                    challenge if challenge is not None else uuid.uuid4().hex,
+                    (
+                        expires_in
+                        if expires_in is not None
+                        else DEFAULT_EXPIRES_IN
+                    ),
+                    bool(holder_binding),
+                )
+            )
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            cred = (
+                bucket["credentials"].get(credential_id)
+                if bucket is not None
+                else None
+            )
+            if cred is None:
+                raise NotFoundError(f"凭证不存在: {credential_id}")
+
+            # 先构造全部行：构造过程不修改桶状态，任一项抛错即整体失败，
+            # 不会产生部分写入，也无需回滚。
+            rows = [
+                self._build_presentation_row_locked(
+                    tenant_id,
+                    bucket,
+                    cred,
+                    credential_id,
+                    disclose,
+                    item_challenge,
+                    item_expires_in,
+                    item_holder_binding,
+                )
+                for disclose, item_challenge, item_expires_in, (
+                    item_holder_binding
+                ) in normalized
+            ]
+
+            snapshot = self._snapshot_locked()
+            try:
+                records: List[PresentationRecord] = []
+                for row in rows:
+                    presentation_id = row["presentation_id"]
+                    bucket["presentations"][presentation_id] = row
+                    self._append_audit_locked(
+                        tenant_id, AUDIT_PRESENTATION_CREATED,
+                        "presentation", presentation_id,
+                    )
+                    records.append(self._presentation_record(row))
+                self._save_locked()
+                return records
             except Exception:
                 self._restore_locked(snapshot)
                 raise
