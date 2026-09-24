@@ -5368,6 +5368,58 @@ class VCStore:
                 return False, CREDENTIAL_EXPIRED_REASON
         return True, ""
 
+    def verify_imported_credential_with_status(
+        self,
+        tenant_id: str,
+        issuer_did: str,
+        credential_id: str,
+    ) -> Tuple[bool, str]:
+        """重验一条已落盘导入凭证并合并本租户同步状态（只读）。
+
+        先按 :meth:`verify_imported_credential` 的全部规则重验存储的
+        body 与 signature（未导入、issuer_did 错配或属他租户同样抛
+        NotFoundError；锚点、签名格式、密码学验签、过期结论原样返回，
+        原因恰为“锚点不可用”/“签名格式错误”/“签名校验失败”/
+        “凭证已过期”）。
+
+        重验通过后按当前租户 ``(issuer_did, credential_id)`` 双键只读
+        查询 ``credential_status_sync`` 同步记录：
+          - 未同步（含属他租户）：``(False, "外部凭证状态未同步")``；
+          - active：``(True, "")``；
+          - revoked：``(False, "外部凭证已吊销：<保存的 reason>")``，
+            保存记录无 reason 或 reason 为空串时用“未知原因”；
+          - unknown：``(False, "外部凭证状态未知")``。
+
+        纯只读：不写记录、状态、历史或审计，结论随状态文件跨重启稳定。
+        """
+        valid, reason = self.verify_imported_credential(
+            tenant_id, issuer_did, credential_id
+        )
+        if not valid:
+            return False, reason
+
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            row = None
+            if bucket is not None:
+                row = (
+                    bucket.get("credential_status_sync", {})
+                    .get(issuer_did, {})
+                    .get(credential_id)
+                )
+        if row is None:
+            return False, "外部凭证状态未同步"
+        status = row.get("status")
+        if status == "active":
+            return True, ""
+        if status == "revoked":
+            saved_reason = row.get("reason")
+            if not saved_reason:
+                saved_reason = "未知原因"
+            return False, f"外部凭证已吊销：{saved_reason}"
+        # status 仅可能为 active/revoked/unknown（同步入口已约束）。
+        return False, "外部凭证状态未知"
+
     def verify_imported_credentials_batch_with_status(
         self,
         tenant_id: str,
