@@ -104,6 +104,21 @@ class CredentialRecord:
 
 
 @dataclass
+class ImportedCredentialRecord:
+    """一条从外部系统导入的凭证（按租户与 issuer_did#credential_id 双键隔离）。
+
+    body 为验签通过时提交的完整凭证正文（原样持久化，含全部扩展字段），
+    signature 为对应的 ES256 裸 R||S 无填充 base64url 签名。仅在锚点
+    active 且验签通过后才会写入；同内容重放幂等，不同内容冲突。
+    """
+
+    issuer_did: str
+    credential_id: str
+    body: Dict[str, Any]
+    signature: str
+
+
+@dataclass
 class CredentialStatusRecord:
     """凭证状态登记记录。
 

@@ -45,6 +45,7 @@ from .models import (
     CredentialStatusRecord,
     CredentialStatusSyncRecord,
     CredentialStatusHistoryEvent,
+    ImportedCredentialRecord,
     LocalCredentialStatusHistoryEvent,
     DIDRecord,
     DIDStatusRecord,
@@ -129,6 +130,7 @@ AUDIT_PROOF_CONSUMED = "proof.consumed"
 AUDIT_KEY_REVOKED = "key.revoked"
 AUDIT_DID_DEACTIVATED = "did.deactivated"
 AUDIT_TRUST_CREDENTIAL_STATUS_SYNCED = "trust.credential.status.synced"
+AUDIT_TRUST_CREDENTIAL_IMPORTED = "trust.credential.imported"
 
 
 def _utc_now() -> str:
@@ -504,6 +506,7 @@ class VCStore:
             bucket.setdefault("trust_anchors", {})
             bucket.setdefault("credential_status_sync", {})
             bucket.setdefault("credential_status_history", {})
+            bucket.setdefault("imported_credentials", {})
             bucket.setdefault("key_revocations", {})
             bucket.setdefault("key_lifecycle", {})
             bucket.setdefault("trust_anchor_history", {})
@@ -680,6 +683,7 @@ class VCStore:
                 "trust_anchors": {},
                 "credential_status_sync": {},
                 "credential_status_history": {},
+                "imported_credentials": {},
                 "key_revocations": {},
                 "key_lifecycle": {},
                 "trust_anchor_history": {},
@@ -5277,6 +5281,179 @@ class VCStore:
                     f"{issuer_did}#{credential_id}"
                 )
             return self._sync_status_record(issuer_did, credential_id, row)
+
+    @staticmethod
+    def _imported_record(
+        issuer_did: str, credential_id: str, row: Dict[str, Any]
+    ) -> ImportedCredentialRecord:
+        return ImportedCredentialRecord(
+            issuer_did=issuer_did,
+            credential_id=credential_id,
+            body=row["body"],
+            signature=row["signature"],
+        )
+
+    def import_external_credential(
+        self,
+        tenant_id: str,
+        data: Any,
+    ) -> Dict[str, Any]:
+        """验签并导入一条外部凭证，返回结果字典。
+
+        请求/字段校验与错误分类：
+          - 请求体非对象、非恰含 body/signature、body 非对象、signature
+            非非空字符串，均为请求错误，抛 ValidationError（HTTP 400）；
+          - body 依 /v1/trust/credentials/verify 的规则，必含
+            credential_id/issuer_did/subject_did/claims/issued_at
+            （前四项中三个标识与 issued_at 为非空字符串，claims 为对象），
+            issuer_key_version 可省略（按版本 1），提供时须为非布尔正整数；
+            任何必填缺失或类型错误均抛 ValidationError（HTTP 400）。
+
+        结构与字段合法后复用 :meth:`verify_trust_credential` 的锚点、签名
+        格式、密码学验签与 expires_at 规则：锚点缺失/非 active、签名格式
+        错、验签失败（含过期）一律返回
+        ``{"valid": False, "reason": <非空中文原因>}``，不写入、不记审计。
+
+        验签通过后按 (tenant, issuer_did, credential_id) 双键持久化：
+          - 首次导入 201，记 trust.credential.imported 审计；
+          - 同内容（body 与 signature 均一致）重放 200，回原响应，不替换、
+            不重复审计；
+          - 不同内容（body 或 signature 不一致）抛 ConflictError（409），
+            不写入、不记审计。
+        状态与审计同一次原子写落盘，失败回滚。
+        """
+        # ---- 请求结构（错误 -> 400）----
+        if not isinstance(data, dict):
+            raise ValidationError("请求体必须为 JSON 对象")
+        if set(data) != {"body", "signature"}:
+            missing = [f for f in ("body", "signature") if f not in data]
+            if missing:
+                raise ValidationError(f"缺少字段: {', '.join(missing)}")
+            extra = sorted(set(data) - {"body", "signature"})
+            raise ValidationError(f"多余字段: {', '.join(extra)}")
+        body = data["body"]
+        signature = data["signature"]
+        if not isinstance(body, dict):
+            raise ValidationError("字段 body 必须为 JSON 对象")
+        if not isinstance(signature, str) or not signature:
+            raise ValidationError("字段 signature 必须为非空字符串")
+
+        # ---- body 必填字段（错误 -> 400），规则与单项验真一致 ----
+        required_str = (
+            "credential_id",
+            "issuer_did",
+            "subject_did",
+            "issued_at",
+        )
+        for field in required_str:
+            if field not in body:
+                raise ValidationError(f"body 缺少字段: {field}")
+            value = body[field]
+            if not isinstance(value, str) or not value:
+                raise ValidationError(
+                    f"body 字段 {field} 必须为非空字符串"
+                )
+        if "claims" not in body:
+            raise ValidationError("body 缺少字段: claims")
+        if not isinstance(body["claims"], dict):
+            raise ValidationError("body 字段 claims 必须为 JSON 对象")
+        if "issuer_key_version" in body:
+            version_obj = body["issuer_key_version"]
+            if (
+                not isinstance(version_obj, int)
+                or isinstance(version_obj, bool)
+                or version_obj < 1
+            ):
+                raise ValidationError(
+                    "body 字段 issuer_key_version 必须为正整数"
+                )
+        issuer_did = body["issuer_did"]
+        credential_id = body["credential_id"]
+
+        # ---- 锚点 / 签名格式 / 密码学验签 / 过期（失败 -> 200，不写入）----
+        valid, reason = self.verify_trust_credential(
+            tenant_id, {"body": body, "signature": signature}
+        )
+        if not valid:
+            return {"valid": False, "reason": reason or "验签失败"}
+
+        # ---- 持久化：首次 201、同内容重放 200、不同内容 409 ----
+        with self._lock:
+            bucket = self._ensure_bucket_locked(tenant_id)
+            imported_map = bucket.setdefault("imported_credentials", {})
+            issuer_map = imported_map.setdefault(issuer_did, {})
+            existing = issuer_map.get(credential_id)
+            if existing is not None:
+                identical = (
+                    existing.get("signature") == signature
+                    and _json_equal(existing.get("body"), body)
+                )
+                if identical:
+                    # 同内容重放：200、不替换、不重复审计
+                    return {
+                        "valid": True,
+                        "status_code": 200,
+                        "record": self._imported_record(
+                            issuer_did, credential_id, existing
+                        ),
+                    }
+                # 不同内容：冲突，不写入、不记审计
+                raise ConflictError(
+                    "凭证已导入但提交内容不同: "
+                    f"{issuer_did}#{credential_id}"
+                )
+
+            new_row = {
+                "body": copy.deepcopy(body),
+                "signature": signature,
+            }
+            snapshot = self._snapshot_locked()
+            try:
+                issuer_map[credential_id] = new_row
+                self._append_audit_locked(
+                    tenant_id,
+                    AUDIT_TRUST_CREDENTIAL_IMPORTED,
+                    "trust_imported_credential",
+                    f"{issuer_did}#{credential_id}",
+                )
+                self._save_locked()
+            except Exception:
+                self._restore_locked(snapshot)
+                raise
+            return {
+                "valid": True,
+                "status_code": 201,
+                "record": self._imported_record(
+                    issuer_did, credential_id, new_row
+                ),
+            }
+
+    def get_imported_credential(
+        self,
+        tenant_id: str,
+        issuer_did: str,
+        credential_id: str,
+    ) -> ImportedCredentialRecord:
+        """查询已导入的外部凭证。
+
+        按本租户 (issuer_did, credential_id) 双键查找；未导入、属他租户
+        或 issuer_did 不匹配均抛 NotFoundError（HTTP 404，跨租户不可探测）。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            row = None
+            if bucket is not None:
+                row = (
+                    bucket.get("imported_credentials", {})
+                    .get(issuer_did, {})
+                    .get(credential_id)
+                )
+            if row is None:
+                raise NotFoundError(
+                    "外部凭证未导入: "
+                    f"{issuer_did}#{credential_id}"
+                )
+            return self._imported_record(issuer_did, credential_id, row)
 
     def list_synced_credential_status_history(
         self,
