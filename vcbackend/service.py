@@ -35,6 +35,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/credentials/import-batch 批量导入外部凭证（逐项不短路）
   GET  /v1/trust/credentials/imported/{credential_id}  读取已导入的外部凭证（?issuer_did=）
   POST /v1/trust/credentials/imported/{credential_id}/verify  重启后重新验证已落盘凭证（?issuer_did=，只读）
+  POST /v1/trust/credentials/imported/{credential_id}/verify-with-status  单条重验已导入凭证并合并同步状态（?issuer_did=，只读）
   POST /v1/trust/credentials/imported/verify-batch-with-status 批量重验已导入凭证并合并同步状态（只读）
   POST /v1/trust/dids/verify-document     跨系统 DID 文档验真（仅凭提交文档，只读）
   POST /v1/trust/dids/verify-document-batch 批量跨系统 DID 文档验真（不短路，只读）
@@ -289,6 +290,18 @@ def build_handler(store: VCStore) -> type:
                 elif path == "/v1/trust/credentials/imported/verify-batch-with-status":
                     self._post_trust_imported_credentials_verify_batch_with_status(
                         tenant
+                    )
+                elif path.startswith(
+                    "/v1/trust/credentials/imported/"
+                ) and path.endswith("/verify-with-status"):
+                    credential_id = unquote(
+                        path[
+                            len("/v1/trust/credentials/imported/")
+                            : -len("/verify-with-status")
+                        ]
+                    )
+                    self._post_trust_imported_credential_verify_with_status(
+                        tenant, credential_id, parsed_query
                     )
                 elif path.startswith(
                     "/v1/trust/credentials/imported/"
@@ -1877,6 +1890,69 @@ def build_handler(store: VCStore) -> type:
             try:
                 valid, reason = store.verify_imported_credential(
                     tenant, issuer_did, credential_id
+                )
+            except NotFoundError:
+                raise
+            except Exception:  # noqa: BLE001 验签绝不暴露内部细节
+                self._send_invalid("验签过程发生内部错误")
+                return
+            payload: Dict[str, Any] = {"valid": valid}
+            if not valid:
+                payload["reason"] = reason
+            self._send_json(200, payload)
+
+        def _post_trust_imported_credential_verify_with_status(
+            self, tenant: str, credential_id: str, query: str
+        ) -> None:
+            # POST /v1/trust/credentials/imported/{credential_id}/
+            # verify-with-status?issuer_did=...：重验已落盘凭证并合并
+            # 同步状态。请求层协议与单项 .../verify 完全一致：
+            # issuer_did 须唯一且非空，缺失/重复/空值 -> 400 {error}；
+            # 请求体须恰为 {}，空体/非法 JSON/非对象/含任意字段 ->
+            # 400 {error}；按租户、issuer_did、credential_id 查导入记录，
+            # 未导入/错配/跨租户 -> 404 {error}。重验结论一律 HTTP 200，
+            # 失败响应键序固定为 valid、reason，原因恰为“锚点不可用”
+            # /“签名格式错误”/“签名校验失败”/“凭证已过期”；重验成功后
+            # 只读合并本租户同步状态：未同步“外部凭证状态未同步”、
+            # active 仅 {"valid":true}、revoked
+            # “外部凭证已吊销：<reason>”（空或缺失固定“未知原因”）、
+            # unknown“外部凭证状态未知”。纯只读，不写记录、状态、历史
+            # 或审计，结论跨重启与租户隔离稳定。
+            if not credential_id:
+                raise ValidationError("路径缺少 credential_id")
+            params = parse_qs(query, keep_blank_values=True)
+            values = params.get("issuer_did")
+            if values is None:
+                raise ValidationError("查询参数 issuer_did 必填")
+            if len(values) != 1:
+                raise ValidationError("查询参数 issuer_did 只能提供一次")
+            issuer_did = values[0]
+            if not issuer_did:
+                raise ValidationError(
+                    "查询参数 issuer_did 必须为非空字符串"
+                )
+
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b""
+            except (ValueError, TypeError) as exc:
+                raise ValidationError("请求体长度声明非法") from exc
+            if not raw:
+                raise ValidationError("请求体缺失，必须恰为 {}")
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise ValidationError("请求体不是合法 JSON，必须恰为 {}")
+            if not isinstance(data, dict) or data:
+                raise ValidationError("请求体必须恰为 {}")
+
+            # 未导入/issuer_did 错配/跨租户由 store 抛 NotFoundError
+            # -> 404；其余任何结论均返回 200。
+            try:
+                valid, reason = (
+                    store.verify_imported_credential_with_status(
+                        tenant, issuer_did, credential_id
+                    )
                 )
             except NotFoundError:
                 raise
