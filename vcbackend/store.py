@@ -4990,6 +4990,130 @@ class VCStore:
             key_version = version_obj
         return None, key_version
 
+    @staticmethod
+    def _import_request_parts(
+        data: Any, item_label: str = "请求体"
+    ) -> Tuple[Dict[str, Any], str, int]:
+        """校验单项导入的请求结构与凭证字段。
+
+        规则与 :meth:`import_trust_credential` 的请求/字段部分完全一致：
+        须为恰含 body、signature 的对象；signature 为非空字符串；body
+        字段规则见 :meth:`_credential_body_field_error`。任何不合法均抛
+        ValidationError。item_label 用于非对象分支的中文措辞（单项为
+        “请求体”，批量项为“请求项”）。返回 (body, signature, 锚点版本)。
+        """
+        if not isinstance(data, dict):
+            raise ValidationError(f"{item_label}必须为 JSON 对象")
+        if set(data) != {"body", "signature"}:
+            missing = [f for f in ("body", "signature") if f not in data]
+            if missing:
+                raise ValidationError(f"缺少字段: {', '.join(missing)}")
+            extra = sorted(set(data) - {"body", "signature"})
+            raise ValidationError(f"多余字段: {', '.join(extra)}")
+        body = data["body"]
+        signature = data["signature"]
+        if not isinstance(signature, str) or not signature:
+            raise ValidationError("字段 signature 必须为非空字符串")
+        field_error, key_version = VCStore._credential_body_field_error(body)
+        if field_error is not None:
+            raise ValidationError(field_error)
+        return body, signature, key_version
+
+    @staticmethod
+    def _import_verify_failure_reason(
+        bucket: Optional[Dict[str, Any]],
+        body: Dict[str, Any],
+        signature: str,
+        key_version: int,
+    ) -> Optional[str]:
+        """执行锚点、签名格式/密码学验签与有效期检查。
+
+        规则与 :meth:`import_trust_credential` 完全一致；全部通过返回
+        None，任一失败返回非空中文原因（不写入、不记审计）。
+        """
+        issuer_did = body["issuer_did"]
+        anchors = (
+            bucket["trust_anchors"].get(issuer_did)
+            if bucket is not None
+            else None
+        )
+        anchor_row = (
+            anchors.get(str(key_version))
+            if anchors is not None
+            else None
+        )
+        public_pem = (
+            anchor_row.get("public_key", "")
+            if anchor_row is not None
+            else ""
+        )
+        anchor_status = (
+            anchor_row.get("status", "active")
+            if anchor_row is not None
+            else None
+        )
+        if anchor_row is None:
+            return f"锚点不存在: {issuer_did}#{key_version}"
+        if anchor_status == "revoked":
+            return f"锚点已吊销: {issuer_did}#{key_version}"
+        try:
+            crypto.validate_public_key_pem(public_pem)
+        except (ValueError, TypeError):
+            return (
+                f"锚点公钥不可用: {issuer_did}#{key_version}"
+                " 不是合法 P-256 公钥"
+            )
+
+        # 签名（覆盖完整 body 的规范化 JSON）
+        try:
+            crypto.verify(body, signature, public_pem)
+        except crypto.MalformedSignature:
+            return "签名格式错误: 不是合法的 ES256 签名编码"
+        except crypto.InvalidSignature:
+            return "签名校验失败，凭证正文或签名可能被改动"
+        except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
+            return "签名校验失败: 验签过程发生内部错误"
+
+        # 有效期（规则同 verify：仅 body 提供 expires_at 时检查）
+        if "expires_at" in body:
+            expires_value = body["expires_at"]
+            if (
+                not isinstance(expires_value, str)
+                or not _UTC_Z_SHAPE_RE.match(expires_value)
+            ):
+                return (
+                    "凭证字段 expires_at 必须为 UTC 秒精度 Z 格式"
+                    "（YYYY-MM-DDTHH:MM:SSZ）"
+                )
+            try:
+                expires_dt = _parse_utc_z(expires_value)
+            except ValueError:
+                return (
+                    "凭证字段 expires_at 必须为 UTC 秒精度 Z 格式"
+                    "（YYYY-MM-DDTHH:MM:SSZ）"
+                )
+            if datetime.now(timezone.utc) >= expires_dt:
+                return CREDENTIAL_EXPIRED_REASON
+        return None
+
+    @staticmethod
+    def _import_success_result(
+        status_code: int,
+        issuer_did: str,
+        credential_id: str,
+        body: Dict[str, Any],
+        signature: str,
+    ) -> Dict[str, Any]:
+        """按对外契约的固定键序组装批量导入成功项。"""
+        return {
+            "imported": True,
+            "http_status": status_code,
+            "issuer_did": issuer_did,
+            "credential_id": credential_id,
+            "body": body,
+            "signature": signature,
+        }
+
     def import_trust_credential(
         self,
         tenant_id: str,
@@ -5012,112 +5136,18 @@ class VCStore:
             （HTTP 409），不写入。状态与审计同一次原子写，失败回滚。
         """
         # ---- 请求结构（错误 -> 400）----
-        if not isinstance(data, dict):
-            raise ValidationError("请求体必须为 JSON 对象")
-        if set(data) != {"body", "signature"}:
-            missing = [f for f in ("body", "signature") if f not in data]
-            if missing:
-                raise ValidationError(f"缺少字段: {', '.join(missing)}")
-            extra = sorted(set(data) - {"body", "signature"})
-            raise ValidationError(f"多余字段: {', '.join(extra)}")
-        body = data["body"]
-        signature = data["signature"]
-        if not isinstance(signature, str) or not signature:
-            raise ValidationError("字段 signature 必须为非空字符串")
-
-        # ---- 凭证字段（错误 -> 400）----
-        field_error, key_version = self._credential_body_field_error(body)
-        if field_error is not None:
-            raise ValidationError(field_error)
+        body, signature, key_version = self._import_request_parts(data)
         issuer_did = body["issuer_did"]
         credential_id = body["credential_id"]
 
-        # ---- 锚点（缺失/非 active -> 200 valid:false，不写入）----
+        # ---- 锚点/签名/有效期（失败 -> 200 valid:false，不写入）----
         with self._lock:
             bucket = self._bucket_locked(tenant_id)
-            anchors = (
-                bucket["trust_anchors"].get(issuer_did)
-                if bucket is not None
-                else None
-            )
-            anchor_row = (
-                anchors.get(str(key_version))
-                if anchors is not None
-                else None
-            )
-            public_pem = (
-                anchor_row.get("public_key", "")
-                if anchor_row is not None
-                else ""
-            )
-            anchor_status = (
-                anchor_row.get("status", "active")
-                if anchor_row is not None
-                else None
-            )
-        if anchor_row is None:
-            return {
-                "valid": False,
-                "reason": f"锚点不存在: {issuer_did}#{key_version}",
-            }
-        if anchor_status == "revoked":
-            return {
-                "valid": False,
-                "reason": f"锚点已吊销: {issuer_did}#{key_version}",
-            }
-        try:
-            crypto.validate_public_key_pem(public_pem)
-        except (ValueError, TypeError):
-            return {
-                "valid": False,
-                "reason": (
-                    f"锚点公钥不可用: {issuer_did}#{key_version}"
-                    " 不是合法 P-256 公钥"
-                ),
-            }
-
-        # ---- 签名（覆盖完整 body 的规范化 JSON）----
-        try:
-            crypto.verify(body, signature, public_pem)
-        except crypto.MalformedSignature:
-            return {
-                "valid": False,
-                "reason": "签名格式错误: 不是合法的 ES256 签名编码",
-            }
-        except crypto.InvalidSignature:
-            return {
-                "valid": False,
-                "reason": "签名校验失败，凭证正文或签名可能被改动",
-            }
-        except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
-            return {"valid": False, "reason": "签名校验失败: 验签过程发生内部错误"}
-
-        # ---- 有效期（规则同 verify：仅 body 提供 expires_at 时检查）----
-        if "expires_at" in body:
-            expires_value = body["expires_at"]
-            if (
-                not isinstance(expires_value, str)
-                or not _UTC_Z_SHAPE_RE.match(expires_value)
-            ):
-                return {
-                    "valid": False,
-                    "reason": (
-                        "凭证字段 expires_at 必须为 UTC 秒精度 Z 格式"
-                        "（YYYY-MM-DDTHH:MM:SSZ）"
-                    ),
-                }
-            try:
-                expires_dt = _parse_utc_z(expires_value)
-            except ValueError:
-                return {
-                    "valid": False,
-                    "reason": (
-                        "凭证字段 expires_at 必须为 UTC 秒精度 Z 格式"
-                        "（YYYY-MM-DDTHH:MM:SSZ）"
-                    ),
-                }
-            if datetime.now(timezone.utc) >= expires_dt:
-                return {"valid": False, "reason": CREDENTIAL_EXPIRED_REASON}
+        failure_reason = self._import_verify_failure_reason(
+            bucket, body, signature, key_version
+        )
+        if failure_reason is not None:
+            return {"valid": False, "reason": failure_reason}
 
         # ---- 持久化（双键隔离、重放幂等、内容冲突、原子审计）----
         with self._lock:
@@ -5166,6 +5196,185 @@ class VCStore:
                     issuer_did, credential_id, new_row
                 ),
             }
+
+    def import_trust_credentials_batch(
+        self,
+        tenant_id: str,
+        data: Any,
+    ) -> Tuple[bool, str, List[Dict[str, Any]]]:
+        """批量原子导入外部凭证，返回 (请求是否合法, 请求级原因, 逐项结果)。
+
+        请求体须恰为 ``{"items": [项...]}``：items 为非空数组且 1..50 项。
+        外层非对象、字段缺失或多余、items 非数组/空/超过 50 项时返回
+        ``(False, 非空中文原因, [])``，由 HTTP 层映射为
+        400 ``{"error": ...}``，不写任何记录与审计。
+
+        外层合法时逐项复用 :meth:`import_trust_credential` 的完整契约，
+        按输入顺序收集结果、**失败不短路**：
+
+          - 项非对象/字段错 -> ``imported:false、http_status:400``，reason
+            以“请求”开头；
+          - 锚点缺失/已吊销、公钥不可用、签名格式/密码学验签失败、
+            expires_at 非法或凭证已过期 -> ``imported:false、
+            http_status:200``，reason 复用单项中文原因；
+          - 与已落盘记录或批内较早成功项同 (issuer_did, credential_id)：
+            内容相同首项 201、其后 200；内容不同 409，reason 以“冲突”
+            开头。
+
+        **整批原子**：任一项不成功即整体回滚，所有新凭证行与审计均不落
+        盘；全部成功时把所有首次导入（201）行与其各自的
+        trust.credential.imported 审计在同一次原子写提交
+        （resource_type=imported_credential、
+        resource_id=issuer_did#credential_id），200 重放不替换、不重复
+        审计。results 与输入等长、同序；成功项键序 imported,http_status,
+        issuer_did,credential_id,body,signature，失败项键序
+        imported,http_status,reason。
+        """
+        if not isinstance(data, dict):
+            return False, "请求体必须为 JSON 对象", []
+        if set(data) != {"items"}:
+            if "items" not in data:
+                return False, "缺少字段: items", []
+            extra = sorted(set(data) - {"items"})
+            return False, f"多余字段: {', '.join(extra)}", []
+        items = data["items"]
+        if not isinstance(items, list):
+            return False, "字段 items 必须为数组", []
+        if not items:
+            return False, "items 数组不能为空", []
+        if len(items) > 50:
+            return False, (
+                f"items 数组不能超过 50 项（当前 {len(items)} 项）"
+            ), []
+
+        def request_reason(exc: ValidationError) -> str:
+            msg = str(exc)
+            return msg if msg.startswith("请求") else "请求" + msg
+
+        results: List[Dict[str, Any]] = []
+        # 批内较早成功项暂存：(issuer_did, credential_id) -> 行
+        staged: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        to_commit: List[Tuple[str, str, Dict[str, Any]]] = []
+        all_ok = True
+
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            persisted = (
+                bucket.get("imported_credentials", {})
+                if bucket is not None
+                else {}
+            )
+            for item in items:
+                # 1) 请求结构与凭证字段（-> 400，reason 前缀“请求”）
+                try:
+                    body, signature, key_version = self._import_request_parts(
+                        item, item_label="请求项"
+                    )
+                except ValidationError as exc:
+                    all_ok = False
+                    results.append(
+                        {
+                            "imported": False,
+                            "http_status": 400,
+                            "reason": request_reason(exc),
+                        }
+                    )
+                    continue
+                issuer_did = body["issuer_did"]
+                credential_id = body["credential_id"]
+                key = (issuer_did, credential_id)
+
+                # 2) 锚点/签名/有效期（-> 200 valid:false，复用单项原因）
+                failure_reason = self._import_verify_failure_reason(
+                    bucket, body, signature, key_version
+                )
+                if failure_reason is not None:
+                    all_ok = False
+                    results.append(
+                        {
+                            "imported": False,
+                            "http_status": 200,
+                            "reason": failure_reason,
+                        }
+                    )
+                    continue
+
+                # 3) 双键幂等/冲突：批内暂存行优先，其次已落盘行
+                staged_row = staged.get(key)
+                existing_row = (
+                    staged_row
+                    if staged_row is not None
+                    else persisted.get(issuer_did, {}).get(credential_id)
+                )
+                if existing_row is not None:
+                    if (
+                        existing_row.get("body") == body
+                        and existing_row.get("signature") == signature
+                    ):
+                        # 相同内容重放：200、不替换、不重复审计
+                        results.append(
+                            self._import_success_result(
+                                200,
+                                issuer_did,
+                                credential_id,
+                                copy.deepcopy(existing_row["body"]),
+                                existing_row["signature"],
+                            )
+                        )
+                    else:
+                        all_ok = False
+                        results.append(
+                            {
+                                "imported": False,
+                                "http_status": 409,
+                                "reason": (
+                                    "冲突: 外部凭证已导入且内容不同: "
+                                    f"{issuer_did}#{credential_id}"
+                                ),
+                            }
+                        )
+                    continue
+
+                # 首次导入（201）：仅暂存，待整批成功后统一原子提交
+                new_row = {"body": copy.deepcopy(body), "signature": signature}
+                staged[key] = new_row
+                to_commit.append((issuer_did, credential_id, new_row))
+                results.append(
+                    self._import_success_result(
+                        201,
+                        issuer_did,
+                        credential_id,
+                        copy.deepcopy(body),
+                        signature,
+                    )
+                )
+
+            # 4) 任一项失败：整批回滚，暂存行与审计均不落盘
+            if not all_ok:
+                return True, "", results
+
+            # 全部成功：原子写入所有首次导入行与审计，落盘失败整体回滚
+            write_bucket = self._ensure_bucket_locked(tenant_id)
+            snapshot = self._snapshot_locked()
+            try:
+                imported_map = write_bucket.setdefault(
+                    "imported_credentials", {}
+                )
+                for issuer_did, credential_id, row in to_commit:
+                    imported_map.setdefault(issuer_did, {})[
+                        credential_id
+                    ] = row
+                    self._append_audit_locked(
+                        tenant_id,
+                        AUDIT_TRUST_CREDENTIAL_IMPORTED,
+                        "imported_credential",
+                        f"{issuer_did}#{credential_id}",
+                    )
+                self._save_locked()
+            except Exception:
+                self._restore_locked(snapshot)
+                raise
+            return True, "", results
 
     def get_imported_credential(
         self, tenant_id: str, issuer_did: str, credential_id: str

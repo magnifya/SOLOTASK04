@@ -32,6 +32,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/verify                   用 active 锚点公钥验签
   POST /v1/trust/credentials/verify       跨系统凭证验真（无需登记 DID/凭证）
   POST /v1/trust/credentials/import       导入外部凭证（active 锚点验签后持久化）
+  POST /v1/trust/credentials/import-batch 原子批量导入外部凭证（1..50 项，逐项复用单项契约）
   GET  /v1/trust/credentials/imported/{credential_id}  读取已导入的外部凭证（?issuer_did=）
   POST /v1/trust/credentials/imported/{credential_id}/verify  重启后重新验证已落盘凭证（?issuer_did=，只读）
   POST /v1/trust/dids/verify-document     跨系统 DID 文档验真（仅凭提交文档，只读）
@@ -282,6 +283,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_credentials_verify(tenant)
                 elif path == "/v1/trust/credentials/import":
                     self._post_trust_credentials_import(tenant)
+                elif path == "/v1/trust/credentials/import-batch":
+                    self._post_trust_credentials_import_batch(tenant)
                 elif path.startswith(
                     "/v1/trust/credentials/imported/"
                 ) and path.endswith("/verify"):
@@ -1793,6 +1796,30 @@ def build_handler(store: VCStore) -> type:
                     "signature": record.signature,
                 },
             )
+
+        def _post_trust_credentials_import_batch(self, tenant: str) -> None:
+            # 外部凭证原子批量导入：请求体须恰为
+            # {"items": [项...]}，items 为 1..50 项的数组。
+            # 外层缺失/非法 JSON/非对象、字段缺失或多余、items 非数组/
+            # 空/超过 50 项一律 400 {"error": 非空中文原因}，不写任何
+            # 记录与审计。外层合法即 200 返回 {"results": [...]}，与输入
+            # 等长、同序，逐项复用单项 import 契约且失败不短路：
+            #   - 项非对象/字段错 -> imported:false、http_status:400，
+            #     reason 以“请求”开头；
+            #   - 锚点/签名/expires_at/过期失败 -> imported:false、
+            #     http_status:200，reason 复用单项中文原因；
+            #   - 同 (issuer_did, credential_id) 相同内容首项 201、其后
+            #     200；不同内容 409，reason 以“冲突”开头。
+            # 任一项不成功整批回滚（成功项也不落盘、不记审计）；全部成功
+            # 时所有首次导入行与各自 trust.credential.imported 审计同次
+            # 原子写入。显式空 X-Tenant-ID 在进入本处理前已由路由判 400。
+            data = self._read_json()
+            ok, reason, results = store.import_trust_credentials_batch(
+                tenant, data
+            )
+            if not ok:
+                raise ValidationError(reason or "请求不合法")
+            self._send_json(200, {"results": results})
 
         def _post_trust_imported_credential_verify(
             self, tenant: str, credential_id: str, query: str

@@ -65,6 +65,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/trust/credentials/verify-with-status` | 外部凭证验真并合并同步状态（只读）：请求体与验真规则同 `/v1/trust/credentials/verify`；**任何验真/过期失败均 HTTP 200** 返回 `valid:false` 与中文 `reason`；验签通过后按本租户 `(issuer_did, credential_id)` 查同步记录：未同步 `valid:false`/“外部凭证状态未同步”，active 仅 `{"valid":true}`，revoked 为“外部凭证已吊销：<reason>”（无 reason 用“未知原因”），unknown 为“外部凭证状态未知”；不创建凭证、不改状态、不写同步记录或审计 |
 | POST | `/v1/trust/credentials/verify-batch-with-status` | 批量外部凭证验真并合并同步状态（只读）：请求体恰为 `{"credentials":[项...]}`，数组非空且不超过 100 项；请求级非法（缺失、非法 JSON、非对象、字段缺失或多余、credentials 非数组、空数组或超限）统一 HTTP 200 返回 `{"results":[],"reason":"请求..."}`；合法批次逐项复用 `/v1/trust/credentials/verify-with-status` 规则（含同步状态合并），按输入顺序不短路返回 `{"results":[...]}`，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`；不写凭证、状态、历史或审计 |
 | POST | `/v1/trust/credentials/import` | 导入并持久化外部凭证：请求体须恰含 `body`、`signature`，`body` 规则同 `/v1/trust/credentials/verify`（必含 `credential_id`/`issuer_did`/`subject_did`/`claims`/`issued_at`，可省略 `issuer_key_version`）；请求/字段非法 400 仅 `{error}`；锚点缺失/非 active、签名格式错、验签失败、凭证过期均 HTTP 200 `{"valid":false,"reason":...}`（非空中文）且不写入；首次按 `tenant+issuer_did+credential_id` 保存 201，键序 `imported,issuer_did,credential_id,body,signature` 且 `imported:true`；相同内容重放 200 返回原响应，不同内容 409 仅 `{error}` |
+| POST | `/v1/trust/credentials/import-batch` | 原子批量导入外部凭证：请求体须恰为 `{"items":[项...]}`，`items` 为 1–50 项的数组；外层缺失、非法 JSON、非对象、字段缺失/多余、`items` 非数组/空/超上限均 400 仅 `{"error":非空中文}`；合法即 200 返回 `{"results":[...]}`（与输入等长同序，失败不短路）。每项须恰含 `body`、`signature`，复用单项 import 全部规则（含“凭证字段 expires_at…”与“凭证已过期”状态码）：失败项键序 `imported,http_status,reason`（项非对象/字段错 400 且 `reason` 前缀“请求”，锚点/签名/过期失败 200），成功项键序 `imported,http_status,issuer_did,credential_id,body,signature`；批内同 `(issuer_did,credential_id)` 相同内容首项 201、其后 200，不同内容 409 且 `reason` 前缀“冲突”。**任一项失败整批回滚**：成功项也不落盘、不记审计；全部成功时所有 201 行与其各自 `trust.credential.imported` 审计（`resource_type=imported_credential`、`resource_id=<issuer_did>#<credential_id>`）同一次原子写入，200 重放不替换、不重复审计；按租户隔离，重启后读取/重验一致 |
 | GET | `/v1/trust/credentials/imported/{credential_id}?issuer_did=...` | 读取已导入的外部凭证原文；`issuer_did` 须唯一非空，缺失/重复/空值 400；未导入、跨租户或 `issuer_did` 不匹配 404；成功 200 键序 `issuer_did,credential_id,body,signature`；纯只读、不记审计，重启后可读 |
 | POST | `/v1/trust/credentials/imported/{credential_id}/verify?issuer_did=...` | 重启后重新验证已落盘凭证；请求体须恰为 `{}`，`issuer_did` 须唯一非空，缺失/重复/空值、非法 JSON、非对象或请求体不恰为 `{}` 均 400；未导入、错配或跨租户 404；取存储 body/signature 原文（`issuer_key_version` 缺省按 1）以同 DID/版本 active 锚点做 ES256 验签；锚点缺失或吊销、签名格式错、验签失败、凭证过期均 HTTP 200 返回 `{"valid":false,"reason":...}`（原因恰为“锚点不可用”/“签名格式错误”/“签名校验失败”/“凭证已过期”），成功仅 `{"valid":true}`；纯只读、不写记录/状态/历史/审计，重启及锚点吊销后结论稳定 |
 | POST | `/v1/trust/credential-status/sync` | 外部凭证状态同步：请求体须恰含 `body`、`signature`，`body` 须恰含 `issuer_did`、`credential_id`、`status`、`updated_at`、`issuer_key_version`，可选 `reason`；请求/字段非法 400；锚点或签名失败 HTTP 200、`valid:false` 且不写入；首次同步 201、相同重放 200 不重复审计、严格更新替换、同时间不同内容 409 |
@@ -1196,6 +1197,23 @@ curl "localhost:8080/v1/trust/credential-status/vc_ext_1/history?issuer_did=did:
 - 首次导入记 `trust.credential.imported`，`resource_type` 为
   `imported_credential`、`resource_id` 为 `<issuer_did>#<credential_id>`；
   保存与审计经同一把锁内**同一次原子写**落盘，失败回滚。
+- `POST /v1/trust/credentials/import-batch` 为**原子批量**版本：
+  - 请求体须恰为 `{"items":[项...]}`，`items` 为 **1–50 项**数组。外层
+    缺失、非法 JSON、非对象、字段缺失/多余、`items` 非数组/空/超上限均
+    **400** 且仅 `{"error":"<非空中文原因>"}`，不写任何记录与审计。
+  - 外层合法即 **HTTP 200** 返回 `{"results":[...]}`，与输入**等长、同序**，
+    逐项复用上面单项 import 的全部规则且**失败不短路**。
+  - 失败项键序恰为 `imported,http_status,reason`：项非对象/字段错为
+    **400** 且 `reason` 前缀“请求”；锚点缺失/已吊销、公钥不可用、签名
+    格式/验签失败、`expires_at` 非法或“凭证已过期”为 **200**（复用单项
+    中文原因）。成功项键序恰为
+    `imported,http_status,issuer_did,credential_id,body,signature`。
+  - 批内（及与已落盘记录之间）同 `(issuer_did, credential_id)`：**相同
+    内容首项 201、其后 200**；**不同内容 409** 且 `reason` 前缀“冲突”。
+  - **整批原子**：任一项不成功则此前校验通过的成功项也**整体回滚**，不落
+    盘、不记审计；全部成功时把所有 201 行与各自一条
+    `trust.credential.imported` 审计在**同一次原子写**提交（200 重放不
+    替换、不重复审计）。按租户隔离，记录与结论**重启后读取/重验一致**。
 - `GET /v1/trust/credentials/imported/{credential_id}?issuer_did=...`：
   `issuer_did` 查询参数**必须提供且唯一、非空**（缺失/重复/空值
   **400**）；成功 **200**，响应键序恰为
