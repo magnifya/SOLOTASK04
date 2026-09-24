@@ -33,6 +33,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/credentials/verify       跨系统凭证验真（无需登记 DID/凭证）
   POST /v1/trust/credentials/import       导入外部凭证（active 锚点验签后持久化）
   GET  /v1/trust/credentials/imported/{credential_id}  读取已导入的外部凭证（?issuer_did=）
+  POST /v1/trust/credentials/imported/{credential_id}/verify  重启后重新验证已落盘凭证（?issuer_did=，只读）
   POST /v1/trust/dids/verify-document     跨系统 DID 文档验真（仅凭提交文档，只读）
   POST /v1/trust/dids/verify-document-batch 批量跨系统 DID 文档验真（不短路，只读）
   POST /v1/trust/presentations/verify     跨系统演示验真（无需登记 DID/凭证/演示）
@@ -176,8 +177,9 @@ def build_handler(store: VCStore) -> type:
         # ------------------------------------------------------------ #
         def do_POST(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
             try:
-                path = urlparse(self.path).path.rstrip("/") or "/"
-                # 仅 /v1 路由受租户头约束；其余路径沿用原协议
+                parsed = urlparse(self.path)
+                path = parsed.path.rstrip("/") or "/"
+                parsed_query = parsed.query
                 if not path.startswith("/v1"):
                     self._send_error(404, f"无此路径: {path}")
                     return
@@ -280,6 +282,18 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_credentials_verify(tenant)
                 elif path == "/v1/trust/credentials/import":
                     self._post_trust_credentials_import(tenant)
+                elif path.startswith(
+                    "/v1/trust/credentials/imported/"
+                ) and path.endswith("/verify"):
+                    credential_id = unquote(
+                        path[
+                            len("/v1/trust/credentials/imported/")
+                            : -len("/verify")
+                        ]
+                    )
+                    self._post_trust_imported_credential_verify(
+                        tenant, credential_id, parsed_query
+                    )
                 elif path == "/v1/trust/presentations/verify":
                     self._post_trust_presentations_verify(tenant)
                 elif path == "/v1/trust/presentations/verify-batch":
@@ -1779,6 +1793,62 @@ def build_handler(store: VCStore) -> type:
                     "signature": record.signature,
                 },
             )
+
+        def _post_trust_imported_credential_verify(
+            self, tenant: str, credential_id: str, query: str
+        ) -> None:
+            # POST /v1/trust/credentials/imported/{credential_id}/verify
+            # ?issuer_did=...：重启后重新验证已落盘凭证。
+            # issuer_did 须唯一且非空，缺失/重复/空值 -> 400 {error}；
+            # 请求体须恰为 {}，缺失/非法 JSON/非对象/含任意字段 ->
+            # 400 {error}；按租户、issuer_did、credential_id 查导入记录，
+            # 未导入/错配/跨租户 -> 404。验签结论（含锚点缺失或吊销）
+            # 一律 HTTP 200：成功仅 {"valid":true}，失败为
+            # {"valid":false,"reason":...}。纯只读，不写记录、状态、
+            # 历史或审计。
+            if not credential_id:
+                raise ValidationError("路径缺少 credential_id")
+            params = parse_qs(query, keep_blank_values=True)
+            values = params.get("issuer_did")
+            if values is None:
+                raise ValidationError("查询参数 issuer_did 必填")
+            if len(values) != 1:
+                raise ValidationError("查询参数 issuer_did 只能提供一次")
+            issuer_did = values[0]
+            if not issuer_did:
+                raise ValidationError(
+                    "查询参数 issuer_did 必须为非空字符串"
+                )
+
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b""
+            except (ValueError, TypeError) as exc:
+                raise ValidationError("请求体长度声明非法") from exc
+            if not raw:
+                raise ValidationError("请求体缺失，必须恰为 {}")
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise ValidationError("请求体不是合法 JSON，必须恰为 {}")
+            if not isinstance(data, dict) or data:
+                raise ValidationError("请求体必须恰为 {}")
+
+            # 未导入/issuer_did 错配/跨租户由 store 抛 NotFoundError
+            # -> 404；其余任何验签结论均返回 200。
+            try:
+                valid, reason = store.verify_imported_credential(
+                    tenant, issuer_did, credential_id
+                )
+            except NotFoundError:
+                raise
+            except Exception:  # noqa: BLE001 验签绝不暴露内部细节
+                self._send_invalid("验签过程发生内部错误")
+                return
+            payload: Dict[str, Any] = {"valid": valid}
+            if not valid:
+                payload["reason"] = reason
+            self._send_json(200, payload)
 
         def _post_trust_presentations_verify(self, tenant: str) -> None:
             # 跨系统演示验真：与其他验签端点相同的公开错误协议，任何失败

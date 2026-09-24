@@ -100,6 +100,11 @@ DID_DEACTIVATED_REASON_PREFIX = "签发DID已停用："
 # 凭证（及其演示/谓词证明/外部凭证）到期时的统一中文原因
 CREDENTIAL_EXPIRED_REASON = "凭证已过期"
 
+# 重新验证已落盘的导入凭证时的统一中文原因
+IMPORTED_ANCHOR_UNAVAILABLE_REASON = "锚点不可用"
+IMPORTED_SIGNATURE_MALFORMED_REASON = "签名格式错误"
+IMPORTED_SIGNATURE_INVALID_REASON = "签名校验失败"
+
 # 哨兵：调用方未提供 reason 字段（区别于显式传 None 等非法值）
 REASON_UNSET = object()
 
@@ -5188,6 +5193,106 @@ class VCStore:
             return self._imported_credential_record(
                 issuer_did, credential_id, row
             )
+
+    def verify_imported_credential(
+        self,
+        tenant_id: str,
+        issuer_did: str,
+        credential_id: str,
+    ) -> Tuple[bool, str]:
+        """重新验证一条已落盘的导入凭证，返回 (是否有效, 失败原因)。
+
+        按本租户 (issuer_did, credential_id) 双键取出存储的 body 与
+        signature 原文；未导入、issuer_did 不匹配或属他租户均抛
+        NotFoundError（HTTP 404，存在性不可探测）。issuer_key_version
+        取存储 body 的值，缺失时按版本 1；锚点按本租户
+        (issuer_did, 版本) 查找，仅 active 锚点可用：
+
+          - 锚点缺失或已吊销（或公钥不可用）->
+            (False, "锚点不可用")；
+          - 签名非无填充 base64url 的 64 字节裸 R||S ->
+            (False, "签名格式错误")；
+          - ES256 密码学验签失败（覆盖 body 递归键升序紧凑 UTF-8 JSON）
+            -> (False, "签名校验失败")；
+          - body 含 expires_at 且当前时间已达到 ->
+            (False, "凭证已过期")；
+          - 成功 -> (True, "")。
+
+        纯只读：不写记录、状态、历史或审计，绝不向上抛内部异常；
+        结论随状态文件跨重启稳定。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            row = None
+            if bucket is not None:
+                row = (
+                    bucket.get("imported_credentials", {})
+                    .get(issuer_did, {})
+                    .get(credential_id)
+                )
+            if row is None:
+                raise NotFoundError(
+                    "外部凭证未导入: "
+                    f"{issuer_did}#{credential_id}"
+                )
+            body = copy.deepcopy(row["body"])
+            signature = row["signature"]
+            key_version = 1
+            version_obj = body.get("issuer_key_version") if isinstance(
+                body, dict
+            ) else None
+            if isinstance(version_obj, int) and not isinstance(
+                version_obj, bool
+            ):
+                key_version = version_obj
+            anchors = bucket["trust_anchors"].get(issuer_did)
+            anchor_row = (
+                anchors.get(str(key_version))
+                if anchors is not None else None
+            )
+            public_pem = (
+                anchor_row.get("public_key", "")
+                if anchor_row is not None else ""
+            )
+            anchor_status = (
+                anchor_row.get("status", "active")
+                if anchor_row is not None else None
+            )
+
+        # 锚点：缺失或 revoked（含公钥不可用）统一为“锚点不可用”
+        if anchor_row is None or anchor_status == "revoked":
+            return False, IMPORTED_ANCHOR_UNAVAILABLE_REASON
+        try:
+            crypto.validate_public_key_pem(public_pem)
+        except (ValueError, TypeError):
+            return False, IMPORTED_ANCHOR_UNAVAILABLE_REASON
+
+        # 签名格式与密码学验签：签名覆盖存储 body 原文的规范化 JSON，
+        # 省略 issuer_key_version 时不注入该字段。
+        try:
+            crypto.verify(body, signature, public_pem)
+        except crypto.MalformedSignature:
+            return False, IMPORTED_SIGNATURE_MALFORMED_REASON
+        except crypto.InvalidSignature:
+            return False, IMPORTED_SIGNATURE_INVALID_REASON
+        except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
+            return False, IMPORTED_SIGNATURE_INVALID_REASON
+
+        # 有效期：body 含 expires_at 且当前时间达到（>=）判到期
+        if isinstance(body, dict) and "expires_at" in body:
+            expires_value = body["expires_at"]
+            try:
+                if not isinstance(expires_value, str) or not (
+                    _UTC_Z_SHAPE_RE.match(expires_value)
+                ):
+                    raise ValueError
+                expires_dt = _parse_utc_z(expires_value)
+            except ValueError:
+                # 存储记录均经导入验签，正常不会到达；防御性归为过期判定。
+                return False, CREDENTIAL_EXPIRED_REASON
+            if datetime.now(timezone.utc) >= expires_dt:
+                return False, CREDENTIAL_EXPIRED_REASON
+        return True, ""
 
     def sync_credential_status(
         self,
