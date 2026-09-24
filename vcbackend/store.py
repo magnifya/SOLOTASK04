@@ -49,6 +49,7 @@ from .models import (
     LocalCredentialStatusHistoryEvent,
     DIDRecord,
     DIDStatusRecord,
+    DIDHistoryEvent,
     KeyVersionStatusRecord,
     KeyRevocationEvent,
     KeyLifecycleEvent,
@@ -516,6 +517,7 @@ class VCStore:
             bucket.setdefault("key_lifecycle", {})
             bucket.setdefault("trust_anchor_history", {})
             bucket.setdefault("local_credential_status_history", {})
+            bucket.setdefault("did_history", {})
             for rec in bucket["dids"].values():
                 _migrate_did_row(rec)
         # 外部凭证状态历史游标（租户内持久化正整数，按追加递增）。
@@ -598,6 +600,22 @@ class VCStore:
                 for event in entries:
                     max_cursor = max(max_cursor, int(event.get("cursor", 0)))
             self._local_credential_status_history_cursors[tenant_id] = max_cursor
+        # DID 生命周期历史游标：按租户各自维护的持久化正整数
+        # （tenant_id -> cursor），同一租户内不同 DID 的 did.created/
+        # did.deactivated 事件共享该游标空间，但与其他历史游标空间
+        # （密钥吊销、密钥生命周期、锚点等）相互独立。旧状态文件无该
+        # 字段时，从各租户已有 DID 历史项的最大 cursor 推导。
+        raw_did_cursors = data.get("did_history_cursors", {})
+        self._did_history_cursors: Dict[str, int] = {
+            str(tenant_id): int(cursor)
+            for tenant_id, cursor in raw_did_cursors.items()
+        } if isinstance(raw_did_cursors, dict) else {}
+        for tenant_id, bucket in self._tenants.items():
+            max_cursor = self._did_history_cursors.get(tenant_id, 0)
+            for entries in bucket.get("did_history", {}).values():
+                for event in entries:
+                    max_cursor = max(max_cursor, int(event.get("cursor", 0)))
+            self._did_history_cursors[tenant_id] = max_cursor
         # 旧状态文件中已吊销但无历史的密钥版本补一条兼容项（内存态）；
         # 随下一次原子写一并落盘，重启后 cursor 稳定。
         self._backfill_key_revocations_locked()
@@ -613,6 +631,10 @@ class VCStore:
         # 旧状态文件中本地凭证已有状态（active/revoked）但无状态历史的
         # 按稳定顺序补兼容项（内存态，audit 字段为 None）。
         self._backfill_local_credential_status_history_locked()
+        # 旧状态文件中 DID 已注册/停用但无生命周期历史的按
+        # （created_at, did, 动作）稳定补兼容项（内存态，audit 字段为
+        # None）；重启后 cursor 稳定。
+        self._backfill_did_history_locked()
 
     def _save_locked(self) -> None:
         directory = os.path.dirname(os.path.abspath(self.path))
@@ -629,6 +651,7 @@ class VCStore:
             "local_credential_status_history_cursors": (
                 self._local_credential_status_history_cursors
             ),
+            "did_history_cursors": self._did_history_cursors,
         }
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
@@ -646,6 +669,7 @@ class VCStore:
                 self._key_lifecycle_cursors,
                 self._trust_anchor_history_cursors,
                 self._local_credential_status_history_cursors,
+                self._did_history_cursors,
             )
         )
 
@@ -659,6 +683,7 @@ class VCStore:
             key_lifecycle_cursors,
             trust_anchor_history_cursors,
             local_credential_status_history_cursors,
+            did_history_cursors,
         ) = copy.deepcopy(snapshot)
         self._tenants = tenants
         self._audit = audit
@@ -670,6 +695,7 @@ class VCStore:
         self._local_credential_status_history_cursors = (
             local_credential_status_history_cursors
         )
+        self._did_history_cursors = did_history_cursors
 
     # ------------------------------------------------------------------ #
     # 租户桶与审计
@@ -693,6 +719,7 @@ class VCStore:
                 "key_lifecycle": {},
                 "trust_anchor_history": {},
                 "local_credential_status_history": {},
+                "did_history": {},
             }
             self._tenants[tenant_id] = bucket
         return bucket
@@ -855,6 +882,24 @@ class VCStore:
                         "audit_timestamp": audit_event["timestamp"],
                     }
                 )
+                # DID 生命周期历史另追加一条 did.created（游标空间独立于
+                # 密钥等其他历史）；幂等重试不追加。
+                did_history_entries = (
+                    bucket.setdefault("did_history", {}).setdefault(did, [])
+                )
+                did_history_entries.append(
+                    {
+                        "action": AUDIT_DID_CREATED,
+                        "status": "active",
+                        "reason": None,
+                        "updated_at": created_at,
+                        "cursor": (
+                            self._next_did_history_cursor_locked(tenant_id)
+                        ),
+                        "audit_seq": audit_event["seq"],
+                        "audit_timestamp": audit_event["timestamp"],
+                    }
+                )
                 self._save_locked()
                 return self._did_record(did, bucket["dids"][did])
             except Exception:
@@ -951,14 +996,35 @@ class VCStore:
                 if not final_reason:
                     raise ValidationError("字段 reason 裁剪后不能为空")
 
-            now = _utc_now()
             snapshot = self._snapshot_locked()
             try:
+                audit_event = self._append_audit_locked(
+                    tenant_id, AUDIT_DID_DEACTIVATED, "did", did
+                )
+                # 停用状态、DID 历史事件的 updated_at 统一取审计秒，保证
+                # 与 audit_timestamp 严格同秒。
+                now = _utc_z_from_unix(audit_event["timestamp"])
                 rec["status"] = "deactivated"
                 rec["deactivate_reason"] = final_reason
                 rec["deactivated_at"] = now
-                self._append_audit_locked(
-                    tenant_id, AUDIT_DID_DEACTIVATED, "did", did
+                # 仅首次停用追加 DID 生命周期历史事件（游标空间独立于
+                # 密钥等其他历史）；重复停用不追加。状态、历史与审计在
+                # 同一次原子写落盘。
+                did_history_entries = (
+                    bucket.setdefault("did_history", {}).setdefault(did, [])
+                )
+                did_history_entries.append(
+                    {
+                        "action": AUDIT_DID_DEACTIVATED,
+                        "status": "deactivated",
+                        "reason": final_reason,
+                        "updated_at": now,
+                        "cursor": (
+                            self._next_did_history_cursor_locked(tenant_id)
+                        ),
+                        "audit_seq": audit_event["seq"],
+                        "audit_timestamp": audit_event["timestamp"],
+                    }
                 )
                 self._save_locked()
             except Exception:
@@ -994,6 +1060,121 @@ class VCStore:
             return DIDStatusRecord(
                 did=did, status="active", reason=None, updated_at=None
             )
+
+    def _next_did_history_cursor_locked(self, tenant_id: str) -> int:
+        """分配租户内下一个持久化 DID 历史游标（正整数，递增）。
+
+        与密钥吊销/密钥生命周期/锚点等历史游标空间相互独立：同一租户内
+        不同 DID 的 did.created/did.deactivated 事件共享本游标空间。
+        """
+        cursor = self._did_history_cursors.get(tenant_id, 0) + 1
+        self._did_history_cursors[tenant_id] = cursor
+        return cursor
+
+    def _backfill_did_history_locked(self) -> None:
+        """加载迁移：为旧状态文件补齐 DID 生命周期历史（内存态）。
+
+        对每个租户按 (created_at, did) 稳定顺序遍历已有 DID：
+        - 缺 did.created 事件时补一条：action=did.created、status=active、
+          reason=None、updated_at 取 DID created_at；
+        - 已停用且缺 did.deactivated 事件时再补一条：status=deactivated、
+          reason 取首次停用原因、updated_at 取首次停用时间。
+        补录项 audit_seq/audit_timestamp 均为 None（无法追溯原始审计），
+        cursor 为该租户内新分配的持久化正整数。仅在内存中补录：随下一
+        次原子写一并落盘；若无写操作，重启时按相同（租户、created_at、
+        did、动作）顺序重建，cursor 稳定。
+        """
+        for tenant_id in sorted(self._tenants):
+            bucket = self._tenants[tenant_id]
+            history_map = bucket.setdefault("did_history", {})
+            dids = bucket.get("dids", {})
+            ordered_dids = sorted(
+                dids, key=lambda did: (dids[did].get("created_at") or "", did)
+            )
+            for did in ordered_dids:
+                rec = dids[did]
+                entries = history_map.setdefault(did, [])
+                known = {event.get("action") for event in entries}
+                if AUDIT_DID_CREATED not in known:
+                    entries.append(
+                        {
+                            "action": AUDIT_DID_CREATED,
+                            "status": "active",
+                            "reason": None,
+                            "updated_at": rec.get("created_at"),
+                            "cursor": (
+                                self._next_did_history_cursor_locked(tenant_id)
+                            ),
+                            "audit_seq": None,
+                            "audit_timestamp": None,
+                        }
+                    )
+                    known.add(AUDIT_DID_CREATED)
+                if (
+                    rec.get("status") == "deactivated"
+                    and AUDIT_DID_DEACTIVATED not in known
+                ):
+                    entries.append(
+                        {
+                            "action": AUDIT_DID_DEACTIVATED,
+                            "status": "deactivated",
+                            "reason": rec.get("deactivate_reason"),
+                            "updated_at": rec.get("deactivated_at"),
+                            "cursor": (
+                                self._next_did_history_cursor_locked(tenant_id)
+                            ),
+                            "audit_seq": None,
+                            "audit_timestamp": None,
+                        }
+                    )
+                    known.add(AUDIT_DID_DEACTIVATED)
+                entries.sort(key=lambda event: int(event.get("cursor", 0)))
+
+    def list_did_history(
+        self,
+        tenant_id: str,
+        did: str,
+        after: int = 0,
+        limit: int = 50,
+    ) -> Tuple[List[DIDHistoryEvent], int]:
+        """只读查询某 DID 的生命周期历史（注册/停用），按页返回。
+
+        - DID 在本租户不存在（含他租户）抛 NotFoundError（HTTP 404）；
+          DID 存在但无历史返回空页；
+        - 事件按 cursor 升序；after 排除 cursor 不大于其值的事件，至多
+          返回 limit 项；
+        - next_after 为本页末项 cursor，空页保持 after。
+        纯只读：不修改任何状态、不记审计、不触发落盘。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            rec = bucket["dids"].get(did) if bucket is not None else None
+            if rec is None:
+                raise NotFoundError(f"DID 不存在: {did}")
+            entries = sorted(
+                bucket.get("did_history", {}).get(did, []),
+                key=lambda event: int(event.get("cursor", 0)),
+            )
+            picked: List[DIDHistoryEvent] = []
+            for row in entries:
+                if len(picked) >= limit:
+                    break
+                cursor = int(row["cursor"])
+                if cursor <= after:
+                    continue
+                picked.append(
+                    DIDHistoryEvent(
+                        action=row["action"],
+                        status=row["status"],
+                        reason=row.get("reason"),
+                        updated_at=row.get("updated_at"),
+                        cursor=cursor,
+                        audit_seq=row.get("audit_seq"),
+                        audit_timestamp=row.get("audit_timestamp"),
+                    )
+                )
+            next_after = picked[-1].cursor if picked else after
+            return picked, next_after
 
     # ------------------------------------------------------------------ #
     # 密钥轮换

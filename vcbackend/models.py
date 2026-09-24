@@ -95,6 +95,28 @@ class KeyLifecycleEvent:
 
 
 @dataclass
+class DIDHistoryEvent:
+    """DID 生命周期历史中的一条事件（只读历史查询用）。
+
+    按 (租户, did) 归属；注册追加 did.created（active、reason/updated_at
+    为 None），首次停用追加 did.deactivated（status=deactivated、reason
+    为首次裁剪原因、updated_at 为首次停用 UTC ISO8601 秒精度 Z 时间）。
+    同句柄幂等注册、重复停用与失败路径不追加。audit_seq/audit_timestamp
+    关联产生该事件的审计事件（did.created / did.deactivated），且
+    audit_timestamp 与 updated_at 为同一秒；旧状态补录无法追溯时为 None。
+    cursor 为租户内跨 DID 持久递增正整数，独立于密钥等其他历史游标空间。
+    """
+
+    action: str
+    status: str
+    reason: Optional[str]
+    updated_at: Optional[str]
+    cursor: int
+    audit_seq: Optional[int] = None
+    audit_timestamp: Optional[int] = None
+
+
+@dataclass
 class CredentialRecord:
     """一条已签发凭证：正文与其 ES256 签名。"""
 

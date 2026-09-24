@@ -5,6 +5,7 @@
   GET  /v1/dids/{did}                     查询 DID
   POST /v1/dids/{did}/deactivate          停用 DID（首次/幂等均 200）
   GET  /v1/dids/{did}/status              查询 DID 生命周期状态（只读）
+  GET  /v1/dids/{did}/history             查询 DID 注册与停用历史（只读）
   GET  /v1/dids/{did}/document            查询 DID 文档（历史公钥，只读）
   POST /v1/dids/{did}/keys/rotate         轮换 DID 密钥
   POST /v1/dids/{did}/keys/{ver}/revoke   吊销 DID 旧密钥版本
@@ -443,6 +444,11 @@ def build_handler(store: VCStore) -> type:
                         path[len("/v1/dids/") : -len("/status")]
                     )
                     self._get_did_status(tenant, did)
+                elif path.startswith("/v1/dids/") and path.endswith("/history"):
+                    did = unquote(
+                        path[len("/v1/dids/") : -len("/history")]
+                    )
+                    self._get_did_history(tenant, did, parsed.query)
                 elif path.startswith("/v1/dids/"):
                     self._get_did(tenant, unquote(path[len("/v1/dids/") :]))
                 elif path.startswith("/v1/credentials/") and path.endswith(
@@ -608,6 +614,70 @@ def build_handler(store: VCStore) -> type:
                     "status": record.status,
                     "reason": record.reason,
                     "updated_at": record.updated_at,
+                },
+            )
+
+        def _get_did_history(
+            self, tenant: str, did: str, query: str
+        ) -> None:
+            # GET /v1/dids/{did}/history?limit=&after=：只读 DID 注册与
+            # 停用历史。响应恰含 did、events、next_after；事件恰含
+            # action、status、reason、updated_at、audit_seq、
+            # audit_timestamp、cursor，按 cursor 升序。查询参数仅允许
+            # limit、after：limit 缺省 50，须为 1..200 的非空 ASCII 十
+            # 进制整数；after 缺省 0，须为非空非负 ASCII 十进制整数；
+            # 重复/空白/符号/小数/布尔词/Unicode 数字/未知参数均 400。
+            # 未知或他租户 DID 404；已有 DID 无历史返回空页，空页
+            # next_after 保持 after。纯只读：不写任何状态、不记审计。
+            if not did:
+                raise ValidationError("路径缺少 did")
+            params = parse_qs(query, keep_blank_values=True)
+            unknown = sorted(set(params) - {"limit", "after"})
+            if unknown:
+                raise ValidationError(
+                    f"不支持的查询参数: {', '.join(unknown)}"
+                )
+
+            limit_values = params.get("limit")
+            if limit_values is not None:
+                if len(limit_values) != 1:
+                    raise ValidationError("查询参数 limit 只能提供一次")
+                limit = _parse_nonneg_int(limit_values[0], "limit")
+                if not 1 <= limit <= 200:
+                    raise ValidationError(
+                        "查询参数 limit 须在 1 到 200 之间"
+                    )
+            else:
+                limit = 50
+
+            after_values = params.get("after")
+            if after_values is not None:
+                if len(after_values) != 1:
+                    raise ValidationError("查询参数 after 只能提供一次")
+                after = _parse_nonneg_int(after_values[0], "after")
+            else:
+                after = 0
+
+            events, next_after = store.list_did_history(
+                tenant, did, after, limit
+            )
+            self._send_json(
+                200,
+                {
+                    "did": did,
+                    "events": [
+                        {
+                            "action": event.action,
+                            "status": event.status,
+                            "reason": event.reason,
+                            "updated_at": event.updated_at,
+                            "audit_seq": event.audit_seq,
+                            "audit_timestamp": event.audit_timestamp,
+                            "cursor": event.cursor,
+                        }
+                        for event in events
+                    ],
+                    "next_after": next_after,
                 },
             )
 
