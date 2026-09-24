@@ -35,6 +35,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/credentials/import-batch 批量导入外部凭证（逐项不短路）
   GET  /v1/trust/credentials/imported/{credential_id}  读取已导入的外部凭证（?issuer_did=）
   POST /v1/trust/credentials/imported/{credential_id}/verify  重启后重新验证已落盘凭证（?issuer_did=，只读）
+  POST /v1/trust/credentials/imported/verify-batch-with-status 批量重验已导入凭证并合并同步状态（只读）
   POST /v1/trust/dids/verify-document     跨系统 DID 文档验真（仅凭提交文档，只读）
   POST /v1/trust/dids/verify-document-batch 批量跨系统 DID 文档验真（不短路，只读）
   POST /v1/trust/presentations/verify     跨系统演示验真（无需登记 DID/凭证/演示）
@@ -296,6 +297,13 @@ def build_handler(store: VCStore) -> type:
                     )
                     self._post_trust_imported_credential_verify(
                         tenant, credential_id, parsed_query
+                    )
+                elif path == (
+                    "/v1/trust/credentials/imported/"
+                    "verify-batch-with-status"
+                ):
+                    self._post_trust_imported_credentials_verify_batch_with_status(
+                        tenant
                     )
                 elif path == "/v1/trust/presentations/verify":
                     self._post_trust_presentations_verify(tenant)
@@ -1882,6 +1890,72 @@ def build_handler(store: VCStore) -> type:
             if not valid:
                 payload["reason"] = reason
             self._send_json(200, payload)
+
+        def _post_trust_imported_credentials_verify_batch_with_status(
+            self, tenant: str
+        ) -> None:
+            # 批量重验已导入外部凭证并合并本租户同步状态：任何失败都返回
+            # HTTP 200。请求体须恰为 {"items": [项...]}，数组非空且不超过
+            # 100 项；请求体非法（外层缺失、非法 JSON、非对象、字段缺失或
+            # 多余、items 非数组、空数组或超过上限）时返回
+            # {"results": [], "reason": "请求..."}。请求级合法时逐项：项须
+            # 恰含非空字符串 issuer_did、credential_id，非法项为 400/
+            # “请求项非法”；记录不存在或跨租户为 404/“资源不存在”；重验
+            # 锚点/签名/过期失败为 200 与精确中文原因；验签成功后只读合并
+            # 同步状态。results 等长同序，每项键序固定
+            # valid,http_status,reason，成功为 true/200/null。纯只读，不写
+            # 记录、状态、历史或审计。显式空 X-Tenant-ID 由路由统一判 400。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                self._send_json(
+                    200,
+                    {"results": [],
+                     "reason": "请求不合法: 请求体缺失或长度声明非法"},
+                )
+                return
+            except Exception:  # noqa: BLE001
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 请求体读取失败"}
+                )
+                return
+            if not raw:
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 请求体缺失"}
+                )
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                self._send_json(
+                    200,
+                    {"results": [], "reason": "请求不合法: 请求体不是合法 UTF-8 文本"},
+                )
+                return
+            except json.JSONDecodeError:
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 请求体不是合法 JSON"}
+                )
+                return
+
+            try:
+                ok, reason, results = (
+                    store.verify_imported_credentials_batch_with_status(
+                        tenant, data
+                    )
+                )
+            except Exception:  # noqa: BLE001 只读批处理绝不暴露内部细节
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 重验过程发生内部错误"}
+                )
+                return
+            if not ok:
+                self._send_json(
+                    200, {"results": [], "reason": reason or "请求不合法"}
+                )
+                return
+            self._send_json(200, {"results": results})
 
         def _post_trust_presentations_verify(self, tenant: str) -> None:
             # 跨系统演示验真：与其他验签端点相同的公开错误协议，任何失败
