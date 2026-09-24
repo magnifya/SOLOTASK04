@@ -63,7 +63,9 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
 {"valid": false, "reason": ...}；非法租户头在进入验签流程前判 400。
 """
 
+import errno
 import json
+import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
@@ -2859,22 +2861,108 @@ def build_handler(store: VCStore) -> type:
     return Handler
 
 
+class _ReadyServer(ThreadingHTTPServer):
+    """确定性端口生命周期的 HTTP 服务。
+
+    - allow_reuse_address：退出后同端口立即可再次绑定；
+    - daemon_threads：活动请求线程不阻塞进程退出；
+    - 绑定失败时关闭已创建的监听套接字，不残留监听。
+    """
+
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def server_bind(self) -> None:
+        try:
+            super().server_bind()
+        except OSError:
+            try:
+                self.socket.close()
+            except OSError:
+                pass
+            raise
+
+
+def _oserror_chinese(what: str, exc: OSError) -> str:
+    """把 OSError 映射为单行中文原因。"""
+    code = getattr(exc, "errno", None)
+    if code is not None:
+        if code == errno.EADDRINUSE:
+            return f"{what}地址已被占用"
+        if code == errno.EACCES:
+            return f"{what}权限不足"
+        return f"{what}失败（错误码 {code}）"
+    return f"{what}失败"
+
+
 def run(
     host: str = "127.0.0.1",
     port: int = 8080,
     store_path: Optional[str] = None,
     quiet: bool = False,
 ) -> None:
-    """启动 HTTP 服务（阻塞）。"""
-    store = VCStore(store_path)
+    """启动 HTTP 服务（阻塞至 Ctrl-C 后返回 None）。
+
+    参数非法抛 ValueError；绑定或状态文件 I/O 失败抛 OSError；状态
+    JSON 不可解析抛 ValueError。任何失败路径都不输出 READY 行且不
+    残留监听套接字。绑定成功后向 stdout 输出一行：
+    ``VCBACKEND_READY host=<host> port=<实际端口>``（port=0 时报告
+    内核分配的实际端口），UTF-8 编码并 flush。
+    """
+    # ---- 参数校验（先于任何副作用） -------------------------------- #
+    if not isinstance(host, str) or not host:
+        raise ValueError("host 必须为非空字符串")
+    if isinstance(port, bool) or not isinstance(port, int):
+        raise ValueError("port 必须为整数")
+    if not 0 <= port <= 65535:
+        raise ValueError("port 必须在 0 到 65535 之间")
+    if store_path is not None and not isinstance(store_path, str):
+        raise ValueError("store_path 必须为 None 或字符串")
+
+    # ---- 加载状态文件（先绑定，失败时尚无监听套接字） -------------- #
+    try:
+        store = VCStore(store_path)
+    except (ValueError, TypeError, AttributeError) as exc:
+        # json.JSONDecodeError 本身是 ValueError 子类；损坏的字段值
+        # （int() 失败等）与结构畸形（顶层非对象）同样归为状态不可解析。
+        message = str(exc).strip() or "状态文件内容无法解析"
+        message = message.replace("\r", " ").replace("\n", " ").strip()
+        raise ValueError(f"状态文件不是合法 JSON：{message}") from exc
+    except OSError as exc:
+        raise OSError(
+            f"状态文件读取失败：{_oserror_chinese('读取状态文件', exc)}"
+        ) from exc
+
     handler = build_handler(store)
     if quiet:
         handler.log_message = lambda *args, **kwargs: None  # noqa: E731
-    httpd = ThreadingHTTPServer((host, port), handler)
-    print(f"可验证凭证后端已启动: http://{host}:{port}")
+
+    # ---- 绑定监听端口 ---------------------------------------------- #
+    try:
+        httpd = _ReadyServer((host, port), handler)
+    except OSError as exc:
+        raise OSError(
+            f"监听地址绑定失败：{_oserror_chinese('绑定监听地址', exc)}"
+        ) from exc
+
+    actual_port = int(httpd.server_address[1])
+    try:
+        sys.stdout.buffer.write(
+            f"VCBACKEND_READY host={host} port={actual_port}\n".encode("utf-8")
+        )
+        sys.stdout.buffer.flush()
+    except (AttributeError, OSError):
+        # 极端环境下 stdout 无 buffer（如测试替身）：退回文本接口。
+        print(f"VCBACKEND_READY host={host} port={actual_port}", flush=True)
+
+    # ---- 服务至 Ctrl-C：守护线程承担活动请求，不阻塞退出 ----------- #
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        pass
+        return None
     finally:
-        httpd.server_close()
+        try:
+            httpd.server_close()
+        except OSError:
+            pass
+    return None

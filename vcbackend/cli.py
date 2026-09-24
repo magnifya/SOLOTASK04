@@ -153,7 +153,18 @@ def _cmd_verify(args: argparse.Namespace) -> int:
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
-    serve_run(host=args.host, port=args.port, store_path=args.store, quiet=False)
+    # serve 的启动失败（参数非法 ValueError、绑定/存储 I/O 失败
+    # OSError、状态 JSON 不可解析 ValueError）统一翻译为单行中文
+    # 提示，退出码 1 且不向用户暴露 traceback；Ctrl-C 正常返回 0。
+    try:
+        serve_run(
+            host=args.host, port=args.port, store_path=args.store, quiet=False
+        )
+    except (ValueError, OSError) as exc:
+        reason = str(exc).strip() or "未知启动错误"
+        reason = reason.replace("\r", " ").replace("\n", " ").strip() or "未知启动错误"
+        print(f"服务启动失败：{reason}", file=sys.stderr)
+        return 1
     return 0
 
 
