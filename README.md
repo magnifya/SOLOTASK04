@@ -28,6 +28,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | GET | `/v1/dids/{did}` | 返回 `did`、`public_key`、`key_mode`、`key_handle`、`key_version`、`created_at`；不存在 404 |
 | POST | `/v1/dids/{did}/deactivate` | 停用 DID；空体或 `{}` 省略 `reason`（默认“DID 主动停用”），非空须恰含 `reason`（裁剪后非空字符串，非法 400）；未知或他租户 DID 404；首次 200 返回 `did`、`status:"deactivated"`、`reason`、`updated_at`，重复忽略 `reason`（含非法值）并幂等返回首次结果 |
 | GET | `/v1/dids/{did}/status` | 只读 DID 生命周期状态；200 恰返 `{did,status,reason,updated_at}`，活动为 `active`/`null`/`null`，停用后为首次原因与 UTC 秒精度 Z 时间；未知或他租户 404 |
+| GET | `/v1/dids/{did}/history?limit=&after=` | 只读查询 DID 注册/停用历史；200 恰含 `did`、`events`、`next_after`，事件恰含 `{action,status,reason,updated_at,audit_seq,audit_timestamp,cursor}` 且按 `cursor` 升序；注册为 `did.created`/`active`/`null`/UTC 秒 Z，首次停用为 `did.deactivated`/`deactivated`/首次裁剪 reason/UTC 秒 Z，并关联同秒审计；幂等重试、重复停用与失败不追加；游标租户内跨 DID 持久递增且独立于其他历史；仅允许 `limit`/`after`（缺省 50/0，重复/空白/符号/Unicode 数字/未知参数 400）；未知或跨租户 DID 404，空页 `next_after=after`，只读不记审计 |
 | GET | `/v1/dids/{did}/document` | 只读 DID 文档：返回 `did`、`current_key_version`、按版本升序的 `verification_methods`（每项 `key_version`、`key_handle`、`public_key` P-256 PEM）与 `document_proof`；可选 `?version=N`（ASCII 十进制正整数，仅该版本并重新生成证明），版本不存在 404，参数非法 400；不暴露私钥、不改变任何状态 |
 | POST | `/v1/dids/{did}/keys/rotate` | 轮换密钥，请求体 `{"key_handle"}`，返回 200 与 `did`、`public_key`、`key_handle`、`key_version` |
 | POST | `/v1/dids/{did}/keys/{key_version}/revoke` | 吊销旧密钥版本；空体或 `{}` 省略 `reason`，非空须恰含 `reason`（裁剪后非空字符串，非法 400）；`key_version` 须为 ASCII 正整数，DID/版本（含他租户）不存在 404，当前版本 409；旧版本首次 200 返回 `did`、`key_version`、`status:"revoked"`、`reason`、`updated_at`，重复忽略 `reason` 并返回首次结果 |
@@ -98,6 +99,11 @@ curl "localhost:8080/v1/dids/did:example:<id>/keys/revocations?limit=50&after=0"
 curl "localhost:8080/v1/dids/did:example:<id>/keys/history?limit=50&after=0"
 curl localhost:8080/v1/dids/did:example:<id>/document
 curl "localhost:8080/v1/dids/did:example:<id>/document?version=1"
+# DID 生命周期停用与注册/停用历史（只读）
+curl -X POST localhost:8080/v1/dids/did:example:<id>/deactivate \
+  -d '{"reason":"机构业务终止"}'
+curl localhost:8080/v1/dids/did:example:<id>/status
+curl "localhost:8080/v1/dids/did:example:<id>/history?limit=50&after=0"
 curl -X POST localhost:8080/v1/credentials \
   -d '{"issuer_did":"did:example:<a>","subject_did":"did:example:<b>","claims":{"role":"admin"}}'
 # 可选有效期（UTC 秒精度 Z，且必须晚于当前时刻）
@@ -478,6 +484,54 @@ curl "localhost:8080/v1/dids/did:example:<id>/keys/history?limit=50&after=0"
 curl -X POST localhost:8080/v1/dids/did:example:<id>/deactivate \
   -d '{"reason":"机构业务终止"}'
 curl localhost:8080/v1/dids/did:example:<id>/status
+```
+
+#### DID 注册/停用历史（只读）
+
+`GET /v1/dids/{did}/history?limit=&after=` 只读返回某 DID 的注册与
+停用轨迹，与注册、停用协议完全兼容，游标空间与密钥生命周期、密钥吊销、
+信任锚点及凭证状态等**其他历史相互隔离**。
+
+- 租户规则与其他 `/v1` 接口一致：缺省 `default`，显式空
+  `X-Tenant-ID` 为 **400**；未知 DID 或访问他租户 DID 一律 **404**
+  （跨租户不可探测）。
+- 200 响应**恰含** `did`、`events`、`next_after`；`events` 按
+  **`cursor` 升序**，每项**恰含** `action`、`status`、`reason`、
+  `updated_at`、`audit_seq`、`audit_timestamp`、`cursor`：
+  - **注册事件**：`action:"did.created"`、`status:"active"`、
+    `reason:null`、`updated_at` 为注册成功时刻（UTC 秒精度 Z，与 DID
+    `created_at` 一致），仅**新注册**追加；同句柄幂等重试不追加；
+  - **首次停用事件**：`action:"did.deactivated"`、
+    `status:"deactivated"`、`reason` 为**首次裁剪原因**、`updated_at`
+    为首次停用时刻（UTC 秒精度 Z），仅**首次停用**追加；重复停用（仍记
+    审计）忽略新原因，不追加、不改写；
+  - `audit_seq`/`audit_timestamp` 关联产生该事件的审计动作，
+    `audit_timestamp` 为该审计事件的 Unix 秒，且与 `updated_at` 为
+    **同一秒**；旧状态补录的兼容项二者均为 `null`。
+- **失败路径不追加**：400/404/409 等失败请求均不产生事件。
+- `cursor` 为**租户内跨 DID 持久递增正整数**：同一租户内不同 DID 的
+  DID 历史事件共享同一游标空间，按追加顺序单调递增并跨重启稳定；不同
+  租户各自从 1 计起。
+- 查询参数**仅允许** `limit`、`after`：`limit` 缺省 **50**、须为
+  **1–200** 的非空 ASCII 十进制整数；`after` 缺省 **0**、须为**非空
+  非负** ASCII 十进制整数；二者均只能出现一次，重复、空白、布尔词、
+  小数、符号、Unicode 数字及**未知参数**一律 **400**。`after` 排除
+  `cursor` 不大于其值的事件，`next_after` 为本页末项 `cursor`，
+  **空页等于 `after`**。
+- **旧状态兼容**：旧版本状态文件中 DID 已注册/已停用但无 DID 历史时，
+  加载时按 **（DID `created_at`、did、动作）** 的稳定顺序补录缺失事件
+  （每个 DID 至多补一条 `did.created`；已停用 DID 再补一条
+  `did.deactivated`，内容取首次停用标记），补录项
+  `audit_seq`/`audit_timestamp` 均为 `null`、`cursor` 为该租户内新
+  分配的持久化正整数；兼容项随下一次原子写一并落盘，即使加载后无写
+  操作，重启时也按相同顺序重建为**相同 cursor**。
+- 注册/停用变更时，**DID 状态、历史、游标与审计事件在同一把锁内经
+  同一次原子写落盘，落盘失败一并回滚**（状态不变、历史不追加、游标不
+  前进、审计不记录）。该接口为纯只读查询，**不记审计**、不触发落盘，
+  现有注册、停用、状态与密钥历史等入口行为均保持不变。
+
+```bash
+curl "localhost:8080/v1/dids/did:example:<id>/history?limit=50&after=0"
 ```
 
 ### DID 文档与历史公钥（只读）
@@ -1362,6 +1416,7 @@ curl -H 'X-Tenant-ID: acme' 'localhost:8080/v1/audit?limit=50&after=0'
 python3 tests/e2e_test.py
 python3 tests/did_document_test.py
 python3 tests/did_deactivation_test.py
+python3 tests/did_history_test.py
 python3 tests/key_revocation_test.py
 python3 tests/key_revocation_status_history_test.py
 python3 tests/key_lifecycle_history_test.py
@@ -1472,6 +1527,20 @@ tests/did_deactivation_test.py     DID 生命周期停用（空体/{}与恰含 r
                                    不消费、签名失败原分类优先、历史文档/公钥/
                                    凭证仍可读、跨租户隔离、重启稳定、
                                    落盘失败状态与审计共同回滚）
+tests/did_history_test.py          DID 注册/停用历史（200 恰含
+                                   did/events/next_after、事件恰七字段
+                                   按 cursor 升序；注册 did.created/
+                                   active/null 与首次停用 did.deactivated/
+                                   deactivated/首次裁剪 reason，关联同秒
+                                   审计；幂等/重复停用/失败不追加；游标
+                                   租户内跨 DID 递增、租户独立且与其他
+                                   历史隔离；仅 limit/after、缺省 50/0、
+                                   各类非法与未知参数 400、未知/跨租户
+                                   404、空租户头 400、空页保持 after、
+                                   只读不审计不落盘；重启 cursor 稳定；
+                                   旧状态按 created_at/did/动作 补录且
+                                   audit null、无写重启 cursor 稳定；
+                                   停用落盘失败状态/历史/游标/审计全回滚）
 tests/credential_expiry_test.py    凭证有效期（签发 400/不注入/参与签名、
                                    verify 过期原因与优先级/不记审计、演示与
                                    谓词证明拒签不消费、外部凭证验真、重启持久化）

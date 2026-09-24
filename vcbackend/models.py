@@ -37,6 +37,28 @@ class DIDStatusRecord:
 
 
 @dataclass
+class DIDHistoryEvent:
+    """DID 注册/停用历史中的一条事件（只读历史查询用）。
+
+    按 (租户, did) 归属；仅新注册追加 did.created（status=active、
+    reason=None），首次停用追加 did.deactivated（status=deactivated、
+    reason 为首次裁剪原因）；幂等重试、重复停用与失败路径不追加。
+    updated_at 为事件时刻（UTC ISO8601 秒精度 Z），与关联审计事件的
+    audit_timestamp 严格同秒；audit_seq/audit_timestamp 关联产生该事件
+    的审计事件，旧状态补录无法追溯时为 None。cursor 为租户内跨 DID
+    持久递增正整数，与其他历史游标空间相互隔离。
+    """
+
+    action: str
+    status: str
+    reason: Optional[str]
+    updated_at: str
+    cursor: int
+    audit_seq: Optional[int] = None
+    audit_timestamp: Optional[int] = None
+
+
+@dataclass
 class KeyVersionStatusRecord:
     """一条 DID 密钥版本吊销记录。
 
