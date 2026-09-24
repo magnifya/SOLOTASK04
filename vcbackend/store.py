@@ -5189,6 +5189,95 @@ class VCStore:
                 issuer_did, credential_id, row
             )
 
+    def verify_imported_credential(
+        self, tenant_id: str, issuer_did: str, credential_id: str
+    ) -> Tuple[bool, str]:
+        """重启后对已落盘外部凭证重新验签（纯只读）。
+
+        按本租户 (issuer_did, credential_id) 双键取已导入记录的存储
+        body 与 signature 原文；未导入、issuer_did 错配或属他租户均抛
+        NotFoundError（HTTP 404，存在性不可探测）。
+
+        校验顺序：锚点 -> 签名格式 -> 密码学验签 -> 有效期。
+        - issuer_key_version 缺省按 1（不注入签名正文）；
+        - 同 DID/版本的 active 锚点缺失或已吊销（含公钥不可用）返回
+          (False, "锚点不可用")；
+        - 签名须为无填充 base64url 的 64 字节裸 R||S，格式错误返回
+          (False, "签名格式错误")；对存储 body 的递归键升序紧凑 UTF-8
+          JSON 做 ES256 验签失败返回 (False, "签名校验失败")；
+        - body 存在 expires_at 且当前时刻已达到（>=）返回
+          (False, CREDENTIAL_EXPIRED_REASON)；
+        - 全部通过返回 (True, "")。
+
+        纯只读：不写记录、状态、历史或审计，绝不向上抛密码学异常，
+        也绝不泄露私钥。锚点吊销、服务重启与他租户查询的结论稳定。
+        """
+        # ---- 取存储原文（不存在/错配/跨租户 -> 404）----
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            row = None
+            if bucket is not None:
+                row = (
+                    bucket.get("imported_credentials", {})
+                    .get(issuer_did, {})
+                    .get(credential_id)
+                )
+            if row is None:
+                raise NotFoundError(
+                    "外部凭证未导入: "
+                    f"{issuer_did}#{credential_id}"
+                )
+            body = copy.deepcopy(row["body"])
+            signature = row["signature"]
+            # 已落盘 body 导入时已校验 issuer_key_version（若存在必为
+            # 非布尔正整数）；缺省/异常遗留值均按版本 1，且不注入正文。
+            key_version = body.get("issuer_key_version")
+            if (
+                not isinstance(key_version, int)
+                or isinstance(key_version, bool)
+                or key_version < 1
+            ):
+                key_version = 1
+            anchors = bucket.get("trust_anchors", {}).get(issuer_did)
+            anchor_row = (
+                anchors.get(str(key_version))
+                if anchors is not None
+                else None
+            )
+            public_pem = (
+                anchor_row.get("public_key", "")
+                if anchor_row is not None
+                else ""
+            )
+            anchor_status = (
+                anchor_row.get("status", "active")
+                if anchor_row is not None
+                else None
+            )
+
+        # ---- 锚点：缺失或 revoked（含公钥不可用）统一“锚点不可用”----
+        if anchor_row is None or anchor_status == "revoked":
+            return False, "锚点不可用"
+        try:
+            crypto.validate_public_key_pem(public_pem)
+        except (ValueError, TypeError):
+            return False, "锚点不可用"
+
+        # ---- 签名：覆盖存储 body 的递归键升序紧凑 UTF-8 JSON ----
+        try:
+            crypto.verify(body, signature, public_pem)
+        except crypto.MalformedSignature:
+            return False, "签名格式错误"
+        except crypto.InvalidSignature:
+            return False, "签名校验失败"
+        except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
+            return False, "签名校验失败"
+
+        # ---- 有效期：expires_at 存在且当前时刻已达到（>=）即过期 ----
+        if "expires_at" in body and _is_expired(body.get("expires_at")):
+            return False, CREDENTIAL_EXPIRED_REASON
+        return True, ""
+
     def sync_credential_status(
         self,
         tenant_id: str,
