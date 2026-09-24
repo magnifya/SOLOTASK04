@@ -5167,6 +5167,80 @@ class VCStore:
                 ),
             }
 
+    def import_trust_credentials_batch(
+        self,
+        tenant_id: str,
+        items: List[Any],
+    ) -> List[Dict[str, Any]]:
+        """批量导入外部凭证，逐项复用 :meth:`import_trust_credential`。
+
+        请求级结构（items 字段存在性、数组类型、1..50 长度）由服务层
+        校验；此处逐项处理、失败不短路，结果与输入等长同序：
+
+          - 项非对象或字段非法（缺/多字段、signature 非空字符串、凭证
+            必含字段缺失或类型错误、issuer_key_version 非法）->
+            ``imported:false, http_status:400``，reason 前缀“请求”；
+          - 锚点缺失/非 active、锚点公钥不可用、签名格式错误、密码学
+            验签失败、expires_at 非法或凭证已过期 ->
+            ``imported:false, http_status:200``，reason 沿用单项导入
+            措辞（含“凭证字段 expires_at...”与“凭证已过期”）；
+          - 同双键不同内容（body 或 signature 不一致）->
+            ``imported:false, http_status:409``，reason 前缀“冲突”；
+          - 成功 -> ``imported:true``，首次 201、同内容重放 200，键序
+            imported,http_status,issuer_did,credential_id,body,
+            signature。
+
+        批内同键同内容首 201 后 200、异内容 409（逐项即时落盘，后续
+        项可见前项结果）。失败项不写入、不审计；成功项记录与
+        trust.credential.imported 审计同一次原子写，失败回滚。
+        """
+        results: List[Dict[str, Any]] = []
+        for item in items:  # 顺序处理，失败不短路
+            try:
+                result = self.import_trust_credential(tenant_id, item)
+            except ValidationError as exc:
+                reason = str(exc)
+                if not reason.startswith("请求"):
+                    reason = f"请求不合法: {reason}"
+                results.append(
+                    {
+                        "imported": False,
+                        "http_status": 400,
+                        "reason": reason,
+                    }
+                )
+                continue
+            except ConflictError as exc:
+                results.append(
+                    {
+                        "imported": False,
+                        "http_status": 409,
+                        "reason": f"冲突: {exc}",
+                    }
+                )
+                continue
+            if not result.get("valid"):
+                results.append(
+                    {
+                        "imported": False,
+                        "http_status": 200,
+                        "reason": result.get("reason") or "验签失败",
+                    }
+                )
+                continue
+            record = result["record"]
+            results.append(
+                {
+                    "imported": True,
+                    "http_status": result["status_code"],
+                    "issuer_did": record.issuer_did,
+                    "credential_id": record.credential_id,
+                    "body": record.body,
+                    "signature": record.signature,
+                }
+            )
+        return results
+
     def get_imported_credential(
         self, tenant_id: str, issuer_did: str, credential_id: str
     ) -> ImportedCredentialRecord:

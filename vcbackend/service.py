@@ -32,6 +32,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/verify                   用 active 锚点公钥验签
   POST /v1/trust/credentials/verify       跨系统凭证验真（无需登记 DID/凭证）
   POST /v1/trust/credentials/import       导入外部凭证（active 锚点验签后持久化）
+  POST /v1/trust/credentials/import-batch 批量导入外部凭证（逐项不短路）
   GET  /v1/trust/credentials/imported/{credential_id}  读取已导入的外部凭证（?issuer_did=）
   POST /v1/trust/credentials/imported/{credential_id}/verify  重启后重新验证已落盘凭证（?issuer_did=，只读）
   POST /v1/trust/dids/verify-document     跨系统 DID 文档验真（仅凭提交文档，只读）
@@ -282,6 +283,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_credentials_verify(tenant)
                 elif path == "/v1/trust/credentials/import":
                     self._post_trust_credentials_import(tenant)
+                elif path == "/v1/trust/credentials/import-batch":
+                    self._post_trust_credentials_import_batch(tenant)
                 elif path.startswith(
                     "/v1/trust/credentials/imported/"
                 ) and path.endswith("/verify"):
@@ -1793,6 +1796,36 @@ def build_handler(store: VCStore) -> type:
                     "signature": record.signature,
                 },
             )
+
+        def _post_trust_credentials_import_batch(self, tenant: str) -> None:
+            # 批量导入外部凭证：请求体须恰为 {"items": [项...]}，数组
+            # 非空且不超过 50 项。外层缺失/非法 JSON/非对象/字段错、
+            # items 非数组/空/超限一律 400 {"error": "非空中文原因"}；
+            # 显式空 X-Tenant-ID 在此之前由路由统一判 400。请求级合法
+            # 时 200 返回 {"results": [...]}，与输入等长同序，逐项复用
+            # 单项 import 规则、失败不短路：项非对象/字段错 ->
+            # imported:false + http_status:400 + reason 前缀“请求”；
+            # 锚点/签名/有效期失败 -> http_status:200；同双键异内容
+            # -> http_status:409 + reason 前缀“冲突”。成功项首 201、
+            # 同内容重放 200；批内同键同内容首 201 后 200、异 409。
+            # 失败项不写入、不审计；成功项记录与审计同次原子写。
+            data = self._read_json()
+            if "items" not in data:
+                raise ValidationError("缺少字段: items")
+            extra = sorted(set(data) - {"items"})
+            if extra:
+                raise ValidationError(f"多余字段: {', '.join(extra)}")
+            items = data["items"]
+            if not isinstance(items, list):
+                raise ValidationError("字段 items 必须为数组")
+            if not items:
+                raise ValidationError("items 数组不能为空")
+            if len(items) > 50:
+                raise ValidationError(
+                    f"items 数组不能超过 50 项（当前 {len(items)} 项）"
+                )
+            results = store.import_trust_credentials_batch(tenant, items)
+            self._send_json(200, {"results": results})
 
         def _post_trust_imported_credential_verify(
             self, tenant: str, credential_id: str, query: str
