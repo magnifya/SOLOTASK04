@@ -64,6 +64,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
 """
 
 import json
+import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
@@ -2859,22 +2860,78 @@ def build_handler(store: VCStore) -> type:
     return Handler
 
 
+class _RunnerHTTPServer(ThreadingHTTPServer):
+    """服务端生命周期配置：
+
+    - allow_reuse_address：设置 SO_REUSEADDR，退出后同端口立即可再次
+      serve，不被 TIME_WAIT 拖住；
+    - daemon_threads：每个请求一个守护线程，活动请求不阻塞进程退出。
+    """
+
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def _emit_ready(host: str, port: int) -> None:
+    """输出就绪信号：UTF-8、换行并立即 flush。"""
+    line = f"VCBACKEND_READY host={host} port={port}\n".encode("utf-8")
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is not None:
+        buffer.write(line)
+        buffer.flush()
+    else:  # pragma: no cover - 非常规 stdout（如测试替身）
+        sys.stdout.write(line.decode("utf-8"))
+        sys.stdout.flush()
+
+
 def run(
     host: str = "127.0.0.1",
     port: int = 8080,
     store_path: Optional[str] = None,
     quiet: bool = False,
 ) -> None:
-    """启动 HTTP 服务（阻塞）。"""
-    store = VCStore(store_path)
+    """启动 HTTP 服务（阻塞），Ctrl-C 时返回 None。
+
+    参数校验失败抛 ValueError；状态文件 JSON 不可解析抛 ValueError；
+    状态文件 I/O 或套接字绑定失败抛 OSError。任何失败路径都不输出
+    就绪信号，也不残留监听套接字。
+    """
+    if not isinstance(host, str) or not host:
+        raise ValueError("host 必须为非空字符串")
+    if not isinstance(port, int) or isinstance(port, bool) or not 0 <= port <= 65535:
+        raise ValueError("port 必须为 0 到 65535 之间的整数")
+    if store_path is not None and not isinstance(store_path, str):
+        raise ValueError("store_path 必须为 None 或字符串")
+
+    try:
+        store = VCStore(store_path)
+    except (ValueError, TypeError, AttributeError) as exc:
+        # json.JSONDecodeError 是 ValueError 子类；状态文件 JSON 不可
+        # 解析、字段类型错误或顶层结构损坏统一归为 ValueError。
+        raise ValueError(f"状态文件不是合法 JSON 或内容已损坏: {exc}") from exc
+    except OSError as exc:
+        raise OSError(f"状态文件无法访问或读取失败: {store_path}") from exc
+
     handler = build_handler(store)
     if quiet:
         handler.log_message = lambda *args, **kwargs: None  # noqa: E731
-    httpd = ThreadingHTTPServer((host, port), handler)
-    print(f"可验证凭证后端已启动: http://{host}:{port}")
+
+    httpd: Optional[_RunnerHTTPServer] = None
     try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        pass
+        try:
+            httpd = _RunnerHTTPServer((host, port), handler)
+        except OSError as exc:
+            raise OSError(
+                f"绑定监听地址失败（host={host}, port={port}）: {exc}"
+            ) from exc
+        # port=0 时由内核分配实际端口，就绪信号须报告真实端口。
+        actual_port = httpd.server_address[1]
+        _emit_ready(host, actual_port)
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            # Ctrl-C：确定性关闭并正常返回 None，不向上传播。
+            return None
     finally:
-        httpd.server_close()
+        if httpd is not None:
+            httpd.server_close()

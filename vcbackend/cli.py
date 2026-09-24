@@ -153,7 +153,16 @@ def _cmd_verify(args: argparse.Namespace) -> int:
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
-    serve_run(host=args.host, port=args.port, store_path=args.store, quiet=False)
+    try:
+        serve_run(
+            host=args.host, port=args.port, store_path=args.store, quiet=False
+        )
+    except ValueError as exc:
+        print(f"服务启动失败：{exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"服务启动失败：{exc}", file=sys.stderr)
+        return 1
     return 0
 
 
