@@ -5368,6 +5368,146 @@ class VCStore:
                 return False, CREDENTIAL_EXPIRED_REASON
         return True, ""
 
+    def verify_imported_credentials_batch_with_status(
+        self,
+        tenant_id: str,
+        data: Any,
+    ) -> Tuple[bool, str, List[Dict[str, Any]]]:
+        """批量重验已导入外部凭证并合并本租户同步状态，返回
+        (请求是否合法, 请求级原因, 逐项结果)。
+
+        请求体须恰为 ``{"items": [项...]}``：数组非空且不超过 100 项。
+        请求级结构不合法（非对象、字段缺失或多余、items 非数组、空数组
+        或超过上限）时返回 ``(False, "请求...", [])``，由调用方回
+        ``{"results": [], "reason": ...}``。
+
+        请求级合法时逐项处理，失败不短路。每项须恰含 issuer_did、
+        credential_id，且均为非空字符串，否则该项为
+        ``{"valid": False, "http_status": 400, "reason": "请求项非法"}``。
+        合法项先按本租户 (issuer_did, credential_id) 双键查导入记录：
+        未导入或属他租户为
+        ``{"valid": False, "http_status": 404, "reason": "资源不存在"}``；
+        找到后复用 :meth:`verify_imported_credential` 的重验规则，锚点
+        缺失/吊销、签名格式错、验签失败、过期的 http_status 均为 200，
+        reason 与单项重验一致。重验成功后只读查询本租户
+        ``credential_status_sync`` 同步记录（不随凭证导入创建）：
+          - 未同步：(False, 200, "外部凭证状态未同步")；
+          - active：(True, 200, None)；
+          - revoked：(False, 200, "外部凭证已吊销：<保存 reason>")，
+            reason 为空时用“未知原因”；
+          - unknown：(False, 200, "外部凭证状态未知")。
+        每项结果键序固定为 valid、http_status、reason。纯只读：不写
+        记录、状态、历史或审计，结论随状态文件跨重启稳定。
+        """
+        if not isinstance(data, dict):
+            return False, "请求不合法: 请求体必须为 JSON 对象", []
+        if set(data) != {"items"}:
+            missing = [f for f in ("items",) if f not in data]
+            if missing:
+                return False, (
+                    f"请求缺少字段: {', '.join(missing)}"
+                ), []
+            extra = sorted(set(data) - {"items"})
+            return False, f"请求含多余字段: {', '.join(extra)}", []
+        items = data["items"]
+        if not isinstance(items, list):
+            return False, "请求不合法: 字段 items 必须为数组", []
+        if not items:
+            return False, "请求不合法: items 数组不能为空", []
+        if len(items) > 100:
+            return False, (
+                f"请求不合法: items 数组不能超过 100 项（当前 {len(items)} 项）"
+            ), []
+
+        def item_result(
+            valid: bool, http_status: int, reason: Any
+        ) -> Dict[str, Any]:
+            # 键序固定：valid、http_status、reason。
+            return {
+                "valid": valid,
+                "http_status": http_status,
+                "reason": reason,
+            }
+
+        results: List[Dict[str, Any]] = []
+        for item in items:  # 顺序校验，失败不短路
+            # 每项须恰含 issuer_did、credential_id，均为非空字符串。
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"issuer_did", "credential_id"}
+                or not isinstance(item["issuer_did"], str)
+                or not item["issuer_did"]
+                or not isinstance(item["credential_id"], str)
+                or not item["credential_id"]
+            ):
+                results.append(item_result(False, 400, "请求项非法"))
+                continue
+
+            issuer_did = item["issuer_did"]
+            credential_id = item["credential_id"]
+            with self._lock:
+                bucket = self._bucket_locked(tenant_id)
+                row = None
+                if bucket is not None:
+                    row = (
+                        bucket.get("imported_credentials", {})
+                        .get(issuer_did, {})
+                        .get(credential_id)
+                    )
+            if row is None:
+                # 记录不存在或跨租户：存在性不可探测。
+                results.append(item_result(False, 404, "资源不存在"))
+                continue
+
+            try:
+                valid, reason = self.verify_imported_credential(
+                    tenant_id, issuer_did, credential_id
+                )
+            except NotFoundError:
+                results.append(item_result(False, 404, "资源不存在"))
+                continue
+            except Exception:  # noqa: BLE001 验签绝不暴露内部细节
+                results.append(
+                    item_result(False, 200, "签名校验失败")
+                )
+                continue
+            if not valid:
+                results.append(item_result(False, 200, reason))
+                continue
+
+            with self._lock:
+                bucket = self._bucket_locked(tenant_id)
+                status_row = None
+                if bucket is not None:
+                    status_row = (
+                        bucket.get("credential_status_sync", {})
+                        .get(issuer_did, {})
+                        .get(credential_id)
+                    )
+            if status_row is None:
+                results.append(
+                    item_result(False, 200, "外部凭证状态未同步")
+                )
+                continue
+            status = status_row.get("status")
+            if status == "active":
+                results.append(item_result(True, 200, None))
+            elif status == "revoked":
+                saved_reason = status_row.get("reason")
+                if not saved_reason:
+                    saved_reason = "未知原因"
+                results.append(
+                    item_result(
+                        False, 200, f"外部凭证已吊销：{saved_reason}"
+                    )
+                )
+            else:
+                # status 仅可能为 active/revoked/unknown（同步入口已约束）。
+                results.append(
+                    item_result(False, 200, "外部凭证状态未知")
+                )
+        return True, "", results
+
     def sync_credential_status(
         self,
         tenant_id: str,

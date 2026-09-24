@@ -67,6 +67,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/trust/credentials/import` | 导入并持久化外部凭证：请求体须恰含 `body`、`signature`，`body` 规则同 `/v1/trust/credentials/verify`（必含 `credential_id`/`issuer_did`/`subject_did`/`claims`/`issued_at`，可省略 `issuer_key_version`）；请求/字段非法 400 仅 `{error}`；锚点缺失/非 active、签名格式错、验签失败、凭证过期均 HTTP 200 `{"valid":false,"reason":...}`（非空中文）且不写入；首次按 `tenant+issuer_did+credential_id` 保存 201，键序 `imported,issuer_did,credential_id,body,signature` 且 `imported:true`；相同内容重放 200 返回原响应，不同内容 409 仅 `{error}` |
 | GET | `/v1/trust/credentials/imported/{credential_id}?issuer_did=...` | 读取已导入的外部凭证原文；`issuer_did` 须唯一非空，缺失/重复/空值 400；未导入、跨租户或 `issuer_did` 不匹配 404；成功 200 键序 `issuer_did,credential_id,body,signature`；纯只读、不记审计，重启后可读 |
 | POST | `/v1/trust/credentials/imported/{credential_id}/verify?issuer_did=...` | 重启后重新验证已落盘凭证；请求体须恰为 `{}`，`issuer_did` 须唯一非空，缺失/重复/空值、非法 JSON、非对象或请求体不恰为 `{}` 均 400；未导入、错配或跨租户 404；取存储 body/signature 原文（`issuer_key_version` 缺省按 1）以同 DID/版本 active 锚点做 ES256 验签；锚点缺失或吊销、签名格式错、验签失败、凭证过期均 HTTP 200 返回 `{"valid":false,"reason":...}`（原因恰为“锚点不可用”/“签名格式错误”/“签名校验失败”/“凭证已过期”），成功仅 `{"valid":true}`；纯只读、不写记录/状态/历史/审计，重启及锚点吊销后结论稳定 |
+| POST | `/v1/trust/credentials/imported/verify-batch-with-status` | 批量重验已导入凭证并合并本租户同步状态（只读）：请求体恰为 `{"items":[项...]}`，每项恰含非空字符串 `issuer_did`、`credential_id`，数组非空且不超过 100 项；请求级非法（缺失、非法 JSON、非对象、字段缺失或多余、`items` 非数组·空·超限）统一 HTTP 200 返回 `{"results":[],"reason":"请求..."}`；合法批次等长同序返回 `{"results":[...]}`，每项键序固定 `valid,http_status,reason`：项非法为 `false,400,"请求项非法"`，记录不存在或跨租户为 `false,404,"资源不存在"`，锚点缺失/吊销、签名格式错、验签失败、过期为 `false,200,<单项重验同因>`；重验成功后只读合并同步状态——未同步 `false,200,"外部凭证状态未同步"`，active `true,200,null`，revoked `false,200,"外部凭证已吊销：<reason>"`（空原因用“未知原因”），unknown `false,200,"外部凭证状态未知"`；不写记录/状态/历史/审计，重启结论稳定 |
 | POST | `/v1/trust/credential-status/sync` | 外部凭证状态同步：请求体须恰含 `body`、`signature`，`body` 须恰含 `issuer_did`、`credential_id`、`status`、`updated_at`、`issuer_key_version`，可选 `reason`；请求/字段非法 400；锚点或签名失败 HTTP 200、`valid:false` 且不写入；首次同步 201、相同重放 200 不重复审计、严格更新替换、同时间不同内容 409 |
 | POST | `/v1/trust/credential-status/sync-batch` | 批量外部凭证状态同步：请求体须恰含 `items`（数组 1–100 项），逐项复用单项规则、失败不短路；请求级非法（缺失/非法 JSON/非对象/字段缺失多余/`items` 非数组·空·超限）返 HTTP 200 `{"results":[],"reason":"请求..."}`；失败项键序 `valid,http_status,reason`（字段错 400、同秒冲突 409、锚点/签名失败 200），成功项键序 `valid,http_status,issuer_did,credential_id,status,reason,updated_at,issuer_key_version`（首次 201、重放/更早 200、更晚 200 并记审计），`results` 与输入等长同序 |
 | GET | `/v1/trust/credential-status/{credential_id}?issuer_did=...` | 查询已同步的外部凭证状态；`issuer_did` 须唯一非空；已同步返回 `status`、`reason`、`updated_at`，未同步（含他租户）404 |
@@ -1230,6 +1231,36 @@ curl -X POST "/v1/trust/credentials/imported/vc_ext_1/verify?issuer_did=did:web:
   -H 'Content-Type: application/json' -d '{}'
 ```
 - `X-Tenant-ID` 缺省 `default`，显式空值在进入处理前判 **400**。
+- `POST /v1/trust/credentials/imported/verify-batch-with-status`
+  **批量重验已导入凭证并合并本租户同步状态**，import、GET、单项重验
+  与 CLI 行为均不改变，接口为**纯只读**：
+  - `X-Tenant-ID` 缺省 `default`，显式空值在进入处理前判 **400**。
+  - 请求体**恰为 `{"items":[项...]}`**：每项须恰含 `issuer_did`、
+    `credential_id` 且均为非空字符串；`items` 必须为非空数组且不超过
+    **100** 项。请求体缺失、非法 JSON、非对象、字段缺失或多余、
+    `items` 非数组/空/超 100 项等请求级错误，一律 **HTTP 200** 返回
+    `{"results":[],"reason":"请求..."}`。
+  - 合法批次返回 `{"results":[...]}`，与输入**等长同序**、不短路，无
+    请求级 `reason`；每项键序固定为 `valid,http_status,reason`。
+  - 项非法（非对象、字段缺失或多余、字段非非空字符串）为
+    `{"valid":false,"http_status":400,"reason":"请求项非法"}`；记录
+    不存在或跨租户（存在性不可探测）为
+    `{"valid":false,"http_status":404,"reason":"资源不存在"}`。
+  - 找到记录后复用单项重验规则：锚点缺失/吊销、签名格式错、验签
+    失败、凭证过期均 `http_status=200`，reason 恰为
+    “锚点不可用”/“签名格式错误”/“签名校验失败”/“凭证已过期”。
+  - 重验成功后**只读查询**本租户 `credential_status_sync` 同步记录：
+    未同步 `false,200,"外部凭证状态未同步"`；active
+    `{"valid":true,"http_status":200,"reason":null}`；revoked
+    `false,200,"外部凭证已吊销：<保存 reason>"`（空原因用“未知原因”）；
+    unknown `false,200,"外部凭证状态未知"`。
+  - 不写记录、同步状态、历史或审计；结论随状态文件**跨重启稳定**。
+
+```bash
+curl -X POST localhost:8080/v1/trust/credentials/imported/verify-batch-with-status \
+  -H 'Content-Type: application/json' \
+  -d '{"items":[{"issuer_did":"did:web:example.com","credential_id":"vc_ext_1"}]}'
+```
 
 ```bash
 curl -X POST localhost:8080/v1/trust/credentials/import -d '{

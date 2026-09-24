@@ -35,6 +35,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/credentials/import-batch 批量导入外部凭证（逐项不短路）
   GET  /v1/trust/credentials/imported/{credential_id}  读取已导入的外部凭证（?issuer_did=）
   POST /v1/trust/credentials/imported/{credential_id}/verify  重启后重新验证已落盘凭证（?issuer_did=，只读）
+  POST /v1/trust/credentials/imported/verify-batch-with-status 批量重验已导入凭证并合并同步状态（只读）
   POST /v1/trust/dids/verify-document     跨系统 DID 文档验真（仅凭提交文档，只读）
   POST /v1/trust/dids/verify-document-batch 批量跨系统 DID 文档验真（不短路，只读）
   POST /v1/trust/presentations/verify     跨系统演示验真（无需登记 DID/凭证/演示）
@@ -285,6 +286,10 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_credentials_import(tenant)
                 elif path == "/v1/trust/credentials/import-batch":
                     self._post_trust_credentials_import_batch(tenant)
+                elif path == "/v1/trust/credentials/imported/verify-batch-with-status":
+                    self._post_trust_imported_credentials_verify_batch_with_status(
+                        tenant
+                    )
                 elif path.startswith(
                     "/v1/trust/credentials/imported/"
                 ) and path.endswith("/verify"):
@@ -1882,6 +1887,71 @@ def build_handler(store: VCStore) -> type:
             if not valid:
                 payload["reason"] = reason
             self._send_json(200, payload)
+
+        def _post_trust_imported_credentials_verify_batch_with_status(
+            self, tenant: str
+        ) -> None:
+            # 批量重验已导入外部凭证并合并本租户同步状态：任何请求级失败
+            # 都返回 HTTP 200。请求体须恰为 {"items": [项...]}，数组非空
+            # 且不超过 100 项；请求体非法（缺失、非法 JSON、非对象、字段
+            # 缺失或多余、items 非数组、空数组或超限）时返回
+            # {"results": [], "reason": "请求..."}。合法批次逐项重验本租户
+            # 已导入凭证（不存在/跨租户 404 资源不存在；锚点、签名、过期
+            # 结论 http_status 均为 200），验签成功后只读合并本租户同步
+            # 状态，按输入顺序等长返回 {"results": [...]}，每项键序固定
+            # valid、http_status、reason。纯只读，不写记录、状态、历史或
+            # 审计，结论跨重启稳定。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                self._send_json(
+                    200,
+                    {"results": [],
+                     "reason": "请求不合法: 请求体缺失或长度声明非法"},
+                )
+                return
+            except Exception:  # noqa: BLE001
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 请求体读取失败"}
+                )
+                return
+            if not raw:
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 请求体缺失"}
+                )
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                self._send_json(
+                    200,
+                    {"results": [], "reason": "请求不合法: 请求体不是合法 UTF-8 文本"},
+                )
+                return
+            except json.JSONDecodeError:
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 请求体不是合法 JSON"}
+                )
+                return
+
+            try:
+                ok, reason, results = (
+                    store.verify_imported_credentials_batch_with_status(
+                        tenant, data
+                    )
+                )
+            except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 验签过程发生内部错误"}
+                )
+                return
+            if not ok:
+                self._send_json(
+                    200, {"results": [], "reason": reason or "请求不合法"}
+                )
+                return
+            self._send_json(200, {"results": results})
 
         def _post_trust_presentations_verify(self, tenant: str) -> None:
             # 跨系统演示验真：与其他验签端点相同的公开错误协议，任何失败
