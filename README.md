@@ -64,6 +64,8 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/trust/credentials/verify-batch` | 批量跨系统凭证验真：请求体恰为 `{"credentials":[项...]}`，数组非空且不超过 100 项，每项规则与单项验真一致；**任何失败均 HTTP 200**，返回 `{"results":[...]}`（长度与顺序与输入一致，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`，不短路）；请求体非法、空数组或超上限时返回 `{"results":[],"reason":"请求..."}` |
 | POST | `/v1/trust/credentials/verify-with-status` | 外部凭证验真并合并同步状态（只读）：请求体与验真规则同 `/v1/trust/credentials/verify`；**任何验真/过期失败均 HTTP 200** 返回 `valid:false` 与中文 `reason`；验签通过后按本租户 `(issuer_did, credential_id)` 查同步记录：未同步 `valid:false`/“外部凭证状态未同步”，active 仅 `{"valid":true}`，revoked 为“外部凭证已吊销：<reason>”（无 reason 用“未知原因”），unknown 为“外部凭证状态未知”；不创建凭证、不改状态、不写同步记录或审计 |
 | POST | `/v1/trust/credentials/verify-batch-with-status` | 批量外部凭证验真并合并同步状态（只读）：请求体恰为 `{"credentials":[项...]}`，数组非空且不超过 100 项；请求级非法（缺失、非法 JSON、非对象、字段缺失或多余、credentials 非数组、空数组或超限）统一 HTTP 200 返回 `{"results":[],"reason":"请求..."}`；合法批次逐项复用 `/v1/trust/credentials/verify-with-status` 规则（含同步状态合并），按输入顺序不短路返回 `{"results":[...]}`，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`；不写凭证、状态、历史或审计 |
+| POST | `/v1/trust/credentials/import` | 导入并持久化外部凭证：请求体须恰含 `body`、`signature`，`body` 规则同 `/v1/trust/credentials/verify`（必含 `credential_id`/`issuer_did`/`subject_did`/`claims`/`issued_at`，可省略 `issuer_key_version`）；请求/字段非法 400 仅 `{error}`；锚点缺失/非 active、签名格式错、验签失败、凭证过期均 HTTP 200 `{"valid":false,"reason":...}`（非空中文）且不写入；首次按 `tenant+issuer_did+credential_id` 保存 201，键序 `imported,issuer_did,credential_id,body,signature` 且 `imported:true`；相同内容重放 200 返回原响应，不同内容 409 仅 `{error}` |
+| GET | `/v1/trust/credentials/imported/{credential_id}?issuer_did=...` | 读取已导入的外部凭证原文；`issuer_did` 须唯一非空，缺失/重复/空值 400；未导入、跨租户或 `issuer_did` 不匹配 404；成功 200 键序 `issuer_did,credential_id,body,signature`；纯只读、不记审计，重启后可读 |
 | POST | `/v1/trust/credential-status/sync` | 外部凭证状态同步：请求体须恰含 `body`、`signature`，`body` 须恰含 `issuer_did`、`credential_id`、`status`、`updated_at`、`issuer_key_version`，可选 `reason`；请求/字段非法 400；锚点或签名失败 HTTP 200、`valid:false` 且不写入；首次同步 201、相同重放 200 不重复审计、严格更新替换、同时间不同内容 409 |
 | POST | `/v1/trust/credential-status/sync-batch` | 批量外部凭证状态同步：请求体须恰含 `items`（数组 1–100 项），逐项复用单项规则、失败不短路；请求级非法（缺失/非法 JSON/非对象/字段缺失多余/`items` 非数组·空·超限）返 HTTP 200 `{"results":[],"reason":"请求..."}`；失败项键序 `valid,http_status,reason`（字段错 400、同秒冲突 409、锚点/签名失败 200），成功项键序 `valid,http_status,issuer_did,credential_id,status,reason,updated_at,issuer_key_version`（首次 201、重放/更早 200、更晚 200 并记审计），`results` 与输入等长同序 |
 | GET | `/v1/trust/credential-status/{credential_id}?issuer_did=...` | 查询已同步的外部凭证状态；`issuer_did` 须唯一非空；已同步返回 `status`、`reason`、`updated_at`，未同步（含他租户）404 |
@@ -1160,6 +1162,56 @@ curl -X POST localhost:8080/v1/trust/credential-status/sync-batch -d '{
 curl "localhost:8080/v1/trust/credential-status/vc_ext_1/history?issuer_did=did:web:example.com&limit=50&after=0"
 ```
 
+### 外部凭证导入与读取
+
+在验真通过后，把**外部凭证原文**（完整 `body` 与 `signature`）持久化到
+独立的 `imported_credentials` 命名空间，与本租户签发凭证（`credentials`）、
+外部状态同步（`credential_status_sync`）互不影响；按租户与
+`(issuer_did, credential_id)` 双键隔离，导入内容**一经保存不可变**。
+
+- `POST /v1/trust/credentials/import` 请求体必须**恰为** `{body, signature}`：
+  `body` 为 JSON 对象、`signature` 为非空字符串，规则与
+  `/v1/trust/credentials/verify` 完全一致（必含非空字符串
+  `credential_id`/`issuer_did`/`subject_did`/`issued_at`、对象 `claims`，
+  `issuer_key_version` 可省略按版本 1，其余扩展字段允许且参与签名）。
+  请求体缺失/非法 JSON/非对象、字段缺失或多余、`body`/`signature` 类型
+  错误、凭证必含字段缺失或类型错误，一律 **400**，响应**仅** `{error}`。
+- 签名为 **ES256/SHA-256**、64 字节裸 `R||S` 的无填充 base64url，覆盖
+  **完整 `body`**（省略 `issuer_key_version` 时不注入正文）。公钥取本
+  租户匹配 `(issuer_did, issuer_key_version)` 且 **active** 的锚点；
+  锚点缺失/已吊销、锚点公钥不可用、签名格式错误、密码学验签失败、
+  `expires_at` 已到期，均返回 **HTTP 200** 与
+  `{"valid":false,"reason":...}`（`reason` 为非空中文，前缀依次为
+  **锚点**/**签名格式错误**/**签名校验失败**/“凭证已过期”），且
+  **不写入、不记审计**。
+- 验签通过后按 `(tenant, issuer_did, credential_id)` 双键持久化：
+  - **首次导入**返回 **201**，响应键序恰为
+    `imported,issuer_did,credential_id,body,signature`，`imported` 恒为
+    `true`，`body`/`signature` 为提交原文；
+  - **相同内容重放**（`body` 与 `signature` 全等）返回 **200**，响应体
+    与首次完全一致，不替换、**不重复审计**；
+  - **不同内容**（`body` 或 `signature` 任一不一致）返回 **409**，响应
+    **仅** `{error}`，不写入、不记审计，已保存原文保持不变。
+- 首次导入记 `trust.credential.imported`，`resource_type` 为
+  `imported_credential`、`resource_id` 为 `<issuer_did>#<credential_id>`；
+  保存与审计经同一把锁内**同一次原子写**落盘，失败回滚。
+- `GET /v1/trust/credentials/imported/{credential_id}?issuer_did=...`：
+  `issuer_did` 查询参数**必须提供且唯一、非空**（缺失/重复/空值
+  **400**）；成功 **200**，响应键序恰为
+  `issuer_did,credential_id,body,signature`；未导入、**跨租户**或
+  `issuer_did` 与保存值不匹配一律 **404**（存在性不可探测）。纯只读，
+  不写状态、不记审计；记录随状态文件持久化，**重启后可读**。
+- `X-Tenant-ID` 缺省 `default`，显式空值在进入处理前判 **400**。
+
+```bash
+curl -X POST localhost:8080/v1/trust/credentials/import -d '{
+  "body":{"credential_id":"vc_ext_1","issuer_did":"did:web:example.com",
+          "subject_did":"did:web:subject","claims":{...},
+          "issued_at":"2026-09-21T00:00:00Z","issuer_key_version":1},
+  "signature":"<base64url R||S>"}'
+curl "localhost:8080/v1/trust/credentials/imported/vc_ext_1?issuer_did=did:web:example.com"
+```
+
 ### 多租户与审计日志
 
 - 所有 `/v1` 请求以 `X-Tenant-ID` 头标识租户，缺省 `default`；显式
@@ -1191,13 +1243,16 @@ curl "localhost:8080/v1/trust/credential-status/vc_ext_1/history?issuer_did=did:
   | 信任锚点吊销（首次与幂等重试均记） | `trust.anchor.revoked` | `trust_anchor` |
   | 信任锚点轮换（新建与同前置同 PEM 幂等重试均记） | `trust.anchor.rotated` | `trust_anchor` |
   | 外部凭证状态首次同步 / 严格更新（重放、更早日、失败不记） | `trust.credential.status.synced` | `trust_credential_status` |
+  | 外部凭证首次导入（相同重放、不同内容冲突、锚点/签名失败不记） | `trust.credential.imported` | `imported_credential` |
 
   信任锚点审计 `resource_id` 为 `<did>#<key_version>`（轮换取目标版本
   `from_key_version+1`）；注册冲突 409、轮换冲突 409/校验失败 400、
   验签（成功或失败）等只读或失败路径不记审计。密钥版本吊销审计
   `resource_id` 同样为 `<did>#<key_version>`；400/404/409 不记。外部凭证状态同步审计
   `resource_id` 为 `<issuer_did>#<credential_id>`；锚点/签名失败、
-  400/409、相同重放与更早日均不记。
+  400/409、相同重放与更早日均不记。外部凭证导入审计
+  `resource_id` 同样为 `<issuer_did>#<credential_id>`；锚点/签名失败、
+  400/409 与相同重放不记。
 
   验签失败、演示已消费、演示过期、凭证过期、凭证/演示吊销判定等**只读或失败
   路径不记审计**。

@@ -31,6 +31,8 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   PUT  /v1/trust/anchors/{did}/{key_version}/status  吊销锚点版本
   POST /v1/trust/verify                   用 active 锚点公钥验签
   POST /v1/trust/credentials/verify       跨系统凭证验真（无需登记 DID/凭证）
+  POST /v1/trust/credentials/import       导入外部凭证（active 锚点验签后持久化）
+  GET  /v1/trust/credentials/imported/{credential_id}  读取已导入的外部凭证（?issuer_did=）
   POST /v1/trust/dids/verify-document     跨系统 DID 文档验真（仅凭提交文档，只读）
   POST /v1/trust/dids/verify-document-batch 批量跨系统 DID 文档验真（不短路，只读）
   POST /v1/trust/presentations/verify     跨系统演示验真（无需登记 DID/凭证/演示）
@@ -276,6 +278,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_verify(tenant)
                 elif path == "/v1/trust/credentials/verify":
                     self._post_trust_credentials_verify(tenant)
+                elif path == "/v1/trust/credentials/import":
+                    self._post_trust_credentials_import(tenant)
                 elif path == "/v1/trust/presentations/verify":
                     self._post_trust_presentations_verify(tenant)
                 elif path == "/v1/trust/presentations/verify-batch":
@@ -428,6 +432,17 @@ def build_handler(store: VCStore) -> type:
                     )
                 elif path == "/v1/trust/anchors":
                     self._get_trust_anchor_discovery(tenant, parsed.query)
+                elif path.startswith(
+                    "/v1/trust/credentials/imported/"
+                ):
+                    credential_id = unquote(
+                        path[
+                            len("/v1/trust/credentials/imported/") :
+                        ]
+                    )
+                    self._get_trust_imported_credential(
+                        tenant, credential_id, parsed.query
+                    )
                 elif path.startswith("/v1/trust/anchors/") and path.endswith(
                     "/history"
                 ):
@@ -1738,6 +1753,33 @@ def build_handler(store: VCStore) -> type:
                 payload["reason"] = reason or "验签失败"
             self._send_json(200, payload)
 
+        def _post_trust_credentials_import(self, tenant: str) -> None:
+            # 外部凭证导入：请求体恰为 {body, signature}，body 规则同
+            # /v1/trust/credentials/verify（必含 credential_id/issuer_did/
+            # subject_did/claims/issued_at）。请求/字段非法由 _read_json
+            # 与 store 抛 ValidationError -> 400；不同内容重放由 store 抛
+            # ConflictError -> 409。锚点缺失/非 active、签名格式错误、
+            # 验签失败、凭证过期均按公开错误协议返回
+            # 200 + {"valid":false,"reason":...}（非空中文）且不写入。
+            # 首次按 tenant+issuer_did+credential_id 保存返回 201；相同
+            # 内容重放 200 返回原响应。
+            data = self._read_json()
+            result = store.import_trust_credential(tenant, data)
+            if not result.get("valid"):
+                self._send_invalid(result.get("reason") or "验签失败")
+                return
+            record = result["record"]
+            self._send_json(
+                result["status_code"],
+                {
+                    "imported": True,
+                    "issuer_did": record.issuer_did,
+                    "credential_id": record.credential_id,
+                    "body": record.body,
+                    "signature": record.signature,
+                },
+            )
+
         def _post_trust_presentations_verify(self, tenant: str) -> None:
             # 跨系统演示验真：与其他验签端点相同的公开错误协议，任何失败
             # 都返回 200 + {"valid": false, "reason": "<非空中文原因>"}。
@@ -2420,6 +2462,41 @@ def build_handler(store: VCStore) -> type:
                     "status": record.status,
                     "reason": record.reason,
                     "updated_at": record.updated_at,
+                },
+            )
+
+        def _get_trust_imported_credential(
+            self, tenant: str, credential_id: str, query: str
+        ) -> None:
+            # GET /v1/trust/credentials/imported/{credential_id}
+            # ?issuer_did=...：issuer_did 须唯一且非空，缺失/重复/空值
+            # 一律 400；未导入、跨租户或 issuer_did 不匹配（含他租户
+            # 双键）404，存在性不可探测。成功 200 返回键序
+            # issuer_did,credential_id,body,signature。纯只读，不写状态、
+            # 不记审计。
+            if not credential_id:
+                raise ValidationError("路径缺少 credential_id")
+            params = parse_qs(query, keep_blank_values=True)
+            values = params.get("issuer_did")
+            if values is None:
+                raise ValidationError("查询参数 issuer_did 必填")
+            if len(values) != 1:
+                raise ValidationError("查询参数 issuer_did 只能提供一次")
+            issuer_did = values[0]
+            if not issuer_did:
+                raise ValidationError(
+                    "查询参数 issuer_did 必须为非空字符串"
+                )
+            record = store.get_imported_credential(
+                tenant, issuer_did, credential_id
+            )
+            self._send_json(
+                200,
+                {
+                    "issuer_did": record.issuer_did,
+                    "credential_id": record.credential_id,
+                    "body": record.body,
+                    "signature": record.signature,
                 },
             )
 

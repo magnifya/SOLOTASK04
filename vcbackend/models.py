@@ -243,6 +243,22 @@ class CredentialStatusSyncRecord:
 
 
 @dataclass
+class ImportedCredentialRecord:
+    """一条已导入的外部凭证（按租户与 issuer_did#credential_id 双键隔离）。
+
+    仅在通过本租户 active 信任锚点验签后写入；body 为提交的完整凭证
+    原文（含扩展字段，不注入缺省的 issuer_key_version），signature 为
+    提交时的非空签名串。首次导入后内容不可变：相同内容重放幂等返回，
+    不同内容一律冲突拒绝。
+    """
+
+    issuer_did: str
+    credential_id: str
+    body: Dict[str, Any]
+    signature: str
+
+
+@dataclass
 class CredentialStatusHistoryEvent:
     """外部凭证状态历史中的一条追加事件（只读查询用）。
 
