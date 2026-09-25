@@ -52,6 +52,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | GET | `/v1/trust/anchors/{did}` | 返回该 DID 的全部锚点版本数组（按 `key_version` 升序）；未知 DID 404 |
 | GET | `/v1/trust/anchors/{did}/{key_version}/uses` | 只读返回锚点版本用途白名单；200 按键序恰返 `did`、`key_version`、`uses`（`uses` 按规范序，省略注册或旧记录为全用途）；路径版本非 ASCII 正整数 400，未知或跨租户 404 |
 | PUT | `/v1/trust/anchors/{did}/{key_version}/uses` | 收紧锚点版本用途白名单（无需轮换即可撤销用途）；请求体须恰含 `from_uses`、`uses`（均为非空无重复字符串数组，取值限且按规范序），否则 400；路径版本非 ASCII 正整数 400，未知或跨租户 404，已吊销 409；目标等于当前值幂等 200 且无副作用，否则 `from_uses` 须等于当前值且目标须为其真子集，前置不匹配或扩权均 409，并发不同收紧最多一个成功；200 按键序恰返 `did`、`key_version`、`uses`；实际变更仅记一次 `trust.anchor.uses.updated` 审计（`resource_type:trust_anchor`、`resource_id:<did>#<key_version>`），用途与审计原子落盘、失败回滚、重启保持 |
+| GET | `/v1/trust/anchors/{did}/{key_version}/uses/history?limit=&after=` | 只读查询锚点版本用途变更历史；路径版本须为 ASCII 正整数否则 400；`limit` 默认 50、限 1–200，`after` 默认 0、须非负，重复/空值/空白/符号/小数/布尔词/Unicode 数字/越界/未知参数均 400（仅返非空中文 `error`）；未知或跨租户锚点 404 同形；200 按键序恰返 `did`、`key_version`、`events`、`next_after`，事件按 `cursor` 升序、每项键序恰为 `cursor`、`action`、`from_uses`、`uses`、`updated_at`（用途数组按规范序）；新版本注册/轮换追加 `registered`/`rotated` 事件且 `from_uses:null`，实际收紧追加 `updated` 事件并保存收紧前后数组，幂等、冲突、失败、吊销不追加；`updated_at` 为 UTC 秒精度 Z 串，`cursor` 为租户内跨 DID 持久递增正整数；返 `cursor>after`，空页 `next_after=after`，否则取页末 `cursor`；旧锚点加载时补 `snapshot`（`from_uses`/`updated_at` 为 `null`、`uses` 为当前值），跨重启稳定；锚点、历史、游标与审计原子落盘；只读不记审计 |
 | GET | `/v1/trust/anchors?limit=&after=&status=` | 只读跨 DID 发现本租户锚点版本；响应恰含 `anchors`、`next_after`，每项恰含 `did`、`public_key`、`key_version`、`status`、`updated_at`、`cursor`；先按 `status`（可省略，或 `active`/`revoked`）过滤，再按 `cursor>after` 升序取至多 `limit`（默认 50、限 1–200，`after` 默认 0 且非负）；无锚点也返回 200 空数组，空结果 `next_after` 等于 `after`；参数仅允许这三个，重复/空值/空白/符号/Unicode 数字/越界/未知参数均 400；只读不记审计 |
 | GET | `/v1/trust/anchors/{did}/history?limit=&after=` | 只读查询信任锚点生命周期历史；200 恰含 `did`、`events`、`next_after`，事件恰含 `{key_version,action,status,updated_at,cursor}`；仅新版本注册、轮换目标版本（active、`updated_at:null`）与首次吊销（revoked、首次吊销 UTC 秒 Z 时间）追加，幂等重试与失败不追加；`cursor` 为租户内跨 DID 共享的持久化正整数；`limit` 默认 50、限 1–200，`after` 默认 0、须非负，重复/非空 ASCII 数字外取值均 400；未知或跨租户 DID 404，已有 DID 无历史返空页；只读不记审计 |
 | PUT | `/v1/trust/anchors/{did}/{key_version}/status` | 吊销锚点版本，请求体必须恰为 `{"status":"revoked"}`；首次与重复均 200，首次置 UTC 秒精度 `updated_at`，重复保持不变；未知版本 404 |
@@ -1283,6 +1284,47 @@ curl -X POST localhost:8080/v1/proofs/zp_<id>/verify \
 
 ```bash
 curl "localhost:8080/v1/trust/anchors/did:web:example.com/history?limit=50&after=0"
+```
+
+#### 信任锚点用途历史（只读）
+
+`GET /v1/trust/anchors/{did}/{key_version}/uses/history` 只读返回某锚点
+版本用途白名单的变更历史，与注册、轮换、收紧及审计协议完全兼容。
+
+- 路径 `key_version` 须为 **ASCII 十进制正整数**，否则 **400**；未知或
+  访问他租户锚点版本返回 **404**（跨租户不可探测，错误体与 400 同形，
+  仅含非空中文 `error`）。
+- 查询参数**仅允许** `limit`、`after`：`limit` 缺省 **50**、须为
+  **1–200** 的 ASCII 十进制整数；`after` 缺省 **0**、须为**非负** ASCII
+  十进制整数。二者都**只能出现一次**且须为**非空 ASCII 数字**：重复
+  参数、空值、空白、符号、小数、布尔词、Unicode 数字、越界及未知参数
+  一律 **400**。显式空 `X-Tenant-ID` 仍为 **400**，缺省租户为 `default`。
+- 200 响应按键序恰含 `did`、`key_version`、`events`、`next_after`；
+  `events` 按 `cursor` 升序，每项键序恰为 `cursor`、`action`、
+  `from_uses`、`uses`、`updated_at`，用途数组按规范序。
+  - 新版本注册追加 `trust.anchor.registered`、轮换目标版本新建追加
+    `trust.anchor.rotated`，二者 `from_uses` 均为 `null`、`uses` 为该
+    版本初始用途（轮换继承前置版本用途）；
+  - 收紧**实际生效**时追加 `trust.anchor.uses.updated`，`from_uses`、
+    `uses` 分别保存收紧前后的用途数组；
+  - 注册/轮换的幂等重试、收紧的幂等（目标等于当前值）、400/404/409 等
+    冲突与失败路径、吊销均**不追加**。
+- `updated_at` 为事件追加时刻的 **UTC 秒精度 Z 字符串**；`cursor` 为
+  **租户内跨 DID 持久递增正整数**（用途历史独占的游标空间，与锚点
+  生命周期历史游标相互隔离）。仅返回 `cursor > after` 的事件，至多
+  `limit` 项；空页 `next_after` 等于 `after`，否则取本页末项 `cursor`。
+- **旧状态兼容**：旧版本状态文件中锚点版本存在但无用途历史时，加载时
+  按（租户、DID、版本）稳定顺序补一条 `snapshot` 事件——`from_uses` 与
+  `updated_at` 为 `null`、`uses` 取版本当前用途（旧记录无 `uses` 时为
+  全用途），`action` 按版本来源取 `trust.anchor.registered` /
+  `trust.anchor.rotated`；补录 `cursor` 为该租户内新分配的持久化正整数，
+  跨重启重建为相同 cursor。
+- 注册、轮换、收紧变更时，**锚点、用途历史、游标与审计事件在同一把锁内
+  经同一次原子写落盘，落盘失败一并回滚**。该接口为纯只读查询，**不记
+  审计**、不触发落盘，既有注册/轮换/收紧/吊销/验真入口的协议保持不变。
+
+```bash
+curl "localhost:8080/v1/trust/anchors/did:web:example.com/1/uses/history?limit=50&after=0"
 ```
 
 #### 信任锚点跨 DID 发现（只读）

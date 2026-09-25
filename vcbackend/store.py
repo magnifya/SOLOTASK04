@@ -60,6 +60,7 @@ from .models import (
     TrustAnchorRecord,
     TrustAnchorHistoryEvent,
     TrustAnchorDiscoveryRecord,
+    TrustAnchorUsesHistoryEvent,
 )
 
 # DID method 标识：小写字母开头，仅含小写字母数字与下划线/连字符
@@ -601,6 +602,7 @@ class VCStore:
             bucket.setdefault("key_revocations", {})
             bucket.setdefault("key_lifecycle", {})
             bucket.setdefault("trust_anchor_history", {})
+            bucket.setdefault("trust_anchor_uses_history", {})
             bucket.setdefault("local_credential_status_history", {})
             bucket.setdefault("did_history", {})
             bucket.setdefault("did_deactivation_notices", {})
@@ -668,6 +670,30 @@ class VCStore:
                 for event in entries:
                     max_cursor = max(max_cursor, int(event.get("cursor", 0)))
             self._trust_anchor_history_cursors[tenant_id] = max_cursor
+        # 信任锚点用途历史游标：按租户各自维护的持久化正整数
+        # （tenant_id -> cursor），同一租户内不同 DID、不同版本的用途
+        # 事件共享该游标空间，与锚点生命周期历史游标空间相互隔离。
+        # 旧状态文件无该字段时，从各租户已有用途历史项的最大 cursor 推导。
+        raw_anchor_uses_cursors = data.get(
+            "trust_anchor_uses_history_cursors", {}
+        )
+        self._trust_anchor_uses_history_cursors: Dict[str, int] = {
+            str(tenant_id): int(cursor)
+            for tenant_id, cursor in raw_anchor_uses_cursors.items()
+        } if isinstance(raw_anchor_uses_cursors, dict) else {}
+        for tenant_id, bucket in self._tenants.items():
+            max_cursor = self._trust_anchor_uses_history_cursors.get(
+                tenant_id, 0
+            )
+            for entries_by_version in bucket.get(
+                "trust_anchor_uses_history", {}
+            ).values():
+                for events in entries_by_version.values():
+                    for event in events:
+                        max_cursor = max(
+                            max_cursor, int(event.get("cursor", 0))
+                        )
+            self._trust_anchor_uses_history_cursors[tenant_id] = max_cursor
         # 本租户签发凭证状态历史游标：按租户各自维护的持久化正整数
         # （tenant_id -> cursor），同一租户内不同凭证的状态事件共享
         # 该游标空间。旧状态文件无该字段时，从各租户已有历史项的
@@ -726,6 +752,9 @@ class VCStore:
         # 旧状态文件中已有锚点版本但无生命周期历史的按版本稳定补录
         # （内存态）；随下一次原子写一并落盘，重启后 cursor 稳定。
         self._backfill_trust_anchor_history_locked()
+        # 旧状态文件中已有锚点版本但无用途历史的，按 (租户, DID, 版本)
+        # 稳定顺序补一条 snapshot 兼容事件（内存态）；重启后 cursor 稳定。
+        self._backfill_trust_anchor_uses_history_locked()
         # 旧状态文件中已有同步状态但无历史的双键补一条兼容项（内存态，
         # audit 字段为 None）；随下一次原子写一并落盘。
         self._backfill_all_history_locked()
@@ -752,6 +781,9 @@ class VCStore:
             "key_revocation_cursors": self._key_revocation_cursors,
             "key_lifecycle_cursors": self._key_lifecycle_cursors,
             "trust_anchor_history_cursors": self._trust_anchor_history_cursors,
+            "trust_anchor_uses_history_cursors": (
+                self._trust_anchor_uses_history_cursors
+            ),
             "local_credential_status_history_cursors": (
                 self._local_credential_status_history_cursors
             ),
@@ -775,6 +807,7 @@ class VCStore:
                 self._key_revocation_cursors,
                 self._key_lifecycle_cursors,
                 self._trust_anchor_history_cursors,
+                self._trust_anchor_uses_history_cursors,
                 self._local_credential_status_history_cursors,
                 self._did_history_cursors,
                 self._did_deactivation_event_cursors,
@@ -790,6 +823,7 @@ class VCStore:
             key_revocation_cursors,
             key_lifecycle_cursors,
             trust_anchor_history_cursors,
+            trust_anchor_uses_history_cursors,
             local_credential_status_history_cursors,
             did_history_cursors,
             did_deactivation_event_cursors,
@@ -801,6 +835,9 @@ class VCStore:
         self._key_revocation_cursors = key_revocation_cursors
         self._key_lifecycle_cursors = key_lifecycle_cursors
         self._trust_anchor_history_cursors = trust_anchor_history_cursors
+        self._trust_anchor_uses_history_cursors = (
+            trust_anchor_uses_history_cursors
+        )
         self._local_credential_status_history_cursors = (
             local_credential_status_history_cursors
         )
@@ -828,6 +865,7 @@ class VCStore:
                 "key_revocations": {},
                 "key_lifecycle": {},
                 "trust_anchor_history": {},
+                "trust_anchor_uses_history": {},
                 "local_credential_status_history": {},
                 "did_history": {},
                 "did_deactivation_notices": {},
@@ -3589,6 +3627,22 @@ class VCStore:
                         ),
                     }
                 )
+                # 新版本追加一条用途历史 registered 事件（from_uses 为
+                # None、uses 为初始用途规范序）；幂等重试不追加。
+                self._append_trust_anchor_uses_event_locked(
+                    tenant_id,
+                    bucket,
+                    did,
+                    key_version,
+                    AUDIT_TRUST_ANCHOR_REGISTERED,
+                    None,
+                    (
+                        list(uses_list)
+                        if uses_list is not None
+                        else list(TRUST_ANCHOR_USES)
+                    ),
+                    _utc_now(),
+                )
                 self._save_locked()
                 return self._trust_anchor_record(did, row), True
             except Exception:
@@ -3691,12 +3745,25 @@ class VCStore:
                 )
             snapshot = self._snapshot_locked()
             try:
+                before_uses = list(current)
                 row["uses"] = list(uses_list)
                 self._append_audit_locked(
                     tenant_id,
                     AUDIT_TRUST_ANCHOR_USES_UPDATED,
                     "trust_anchor",
                     f"{did}#{key_version}",
+                )
+                # 实际收紧追加一条用途历史 updated 事件，保存收紧前后
+                # 用途数组；幂等、冲突、吊销均不追加。
+                self._append_trust_anchor_uses_event_locked(
+                    tenant_id,
+                    bucket,
+                    did,
+                    key_version,
+                    AUDIT_TRUST_ANCHOR_USES_UPDATED,
+                    before_uses,
+                    list(uses_list),
+                    _utc_now(),
                 )
                 self._save_locked()
             except Exception:
@@ -5104,6 +5171,23 @@ class VCStore:
                         ),
                     }
                 )
+                # 新版本追加一条用途历史 rotated 事件（from_uses 为
+                # None、uses 为继承自前置版本的用途规范序）；幂等重试
+                # 不追加。
+                self._append_trust_anchor_uses_event_locked(
+                    tenant_id,
+                    bucket,
+                    did,
+                    target_version,
+                    AUDIT_TRUST_ANCHOR_ROTATED,
+                    None,
+                    (
+                        list(from_row["uses"])
+                        if from_row.get("uses") is not None
+                        else list(TRUST_ANCHOR_USES)
+                    ),
+                    _utc_now(),
+                )
                 self._save_locked()
                 return self._trust_anchor_record(did, row), True
             except Exception:
@@ -5349,6 +5433,45 @@ class VCStore:
         self._trust_anchor_history_cursors[tenant_id] = cursor
         return cursor
 
+    def _next_trust_anchor_uses_cursor_locked(self, tenant_id: str) -> int:
+        """分配租户内下一个持久化锚点用途历史游标（正整数，按追加递增）。"""
+        cursor = (
+            self._trust_anchor_uses_history_cursors.get(tenant_id, 0) + 1
+        )
+        self._trust_anchor_uses_history_cursors[tenant_id] = cursor
+        return cursor
+
+    def _append_trust_anchor_uses_event_locked(
+        self,
+        tenant_id: str,
+        bucket: Dict[str, Any],
+        did: str,
+        key_version: int,
+        action: str,
+        from_uses: Optional[List[str]],
+        uses: List[str],
+        updated_at: Optional[str],
+    ) -> None:
+        """在锁内向锚点版本用途历史追加一条事件并分配持久化游标。"""
+        events = (
+            bucket.setdefault("trust_anchor_uses_history", {})
+            .setdefault(did, {})
+            .setdefault(str(key_version), [])
+        )
+        events.append(
+            {
+                "cursor": (
+                    self._next_trust_anchor_uses_cursor_locked(tenant_id)
+                ),
+                "action": action,
+                "from_uses": (
+                    None if from_uses is None else list(from_uses)
+                ),
+                "uses": list(uses),
+                "updated_at": updated_at,
+            }
+        )
+
     def _backfill_trust_anchor_history_locked(self) -> None:
         """加载迁移：为缺生命周期历史的旧锚点版本按版本稳定补录。
 
@@ -5418,6 +5541,48 @@ class VCStore:
                     key=lambda event: int(event.get("cursor", 0))
                 )
 
+    def _backfill_trust_anchor_uses_history_locked(self) -> None:
+        """加载迁移：为缺用途历史的旧锚点版本补一条 snapshot 事件。
+
+        对每个租户的每个 DID，按 key_version 升序检查 trust_anchors 中
+        的每个版本行：该版本用途历史为空时补一条事件——action 沿用版本
+        来源（经轮换创建的行含 from_key_version 补
+        trust.anchor.rotated，否则补 trust.anchor.registered），
+        from_uses/updated_at 均为 None，uses 取版本当前用途（规范序，
+        旧记录无 uses 时为全用途）。补录 cursor 为该租户内新分配的持久
+        化正整数。仅在内存中补录：随下一次原子写一并落盘；若无写操作，
+        重启时按相同（租户、DID、版本）顺序重建，cursor 稳定。
+        """
+        for tenant_id in sorted(self._tenants):
+            bucket = self._tenants[tenant_id]
+            history_map = bucket.setdefault("trust_anchor_uses_history", {})
+            anchors_map = bucket.get("trust_anchors", {})
+            for did in sorted(anchors_map):
+                rows = anchors_map[did]
+                by_version = history_map.setdefault(did, {})
+                for version in sorted(int(ver) for ver in rows):
+                    row = rows[str(version)]
+                    if by_version.get(str(version)):
+                        continue
+                    action = (
+                        AUDIT_TRUST_ANCHOR_ROTATED
+                        if row.get("from_key_version") is not None
+                        else AUDIT_TRUST_ANCHOR_REGISTERED
+                    )
+                    by_version[str(version)] = [
+                        {
+                            "cursor": (
+                                self._next_trust_anchor_uses_cursor_locked(
+                                    tenant_id
+                                )
+                            ),
+                            "action": action,
+                            "from_uses": None,
+                            "uses": _anchor_row_uses(row),
+                            "updated_at": None,
+                        }
+                    ]
+
     def list_trust_anchor_history(
         self,
         tenant_id: str,
@@ -5460,6 +5625,59 @@ class VCStore:
                         status=row["status"],
                         updated_at=row.get("updated_at"),
                         cursor=cursor,
+                    )
+                )
+            next_after = picked[-1].cursor if picked else after
+            return picked, next_after
+
+    def list_trust_anchor_uses_history(
+        self,
+        tenant_id: str,
+        did: str,
+        key_version: int,
+        after: int = 0,
+        limit: int = 50,
+    ) -> Tuple[List[TrustAnchorUsesHistoryEvent], int]:
+        """只读查询某锚点版本的用途历史，按页返回。
+
+        - 锚点版本在本租户不存在（含他租户）抛 NotFoundError（404）；
+          版本存在但无历史返回空页（加载迁移已保证至少有 snapshot）；
+        - 事件按 cursor 升序；after 排除 cursor 不大于其值的事件，至多
+          返回 limit 项；
+        - next_after 为本页末项 cursor，空页保持 after。
+        纯只读：不修改任何状态、不记审计、不触发落盘。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            anchors = (
+                bucket.get("trust_anchors", {}).get(did)
+                if bucket is not None else None
+            )
+            row = anchors.get(str(key_version)) if anchors is not None else None
+            if row is None:
+                raise NotFoundError(
+                    f"信任锚点不存在: {did}#{key_version}"
+                )
+            entries = sorted(
+                bucket.get("trust_anchor_uses_history", {})
+                .get(did, {})
+                .get(str(key_version), []),
+                key=lambda event: int(event.get("cursor", 0)),
+            )
+            picked: List[TrustAnchorUsesHistoryEvent] = []
+            for event_row in entries:
+                if len(picked) >= limit:
+                    break
+                cursor = int(event_row["cursor"])
+                if cursor <= after:
+                    continue
+                picked.append(
+                    TrustAnchorUsesHistoryEvent(
+                        cursor=cursor,
+                        action=event_row["action"],
+                        from_uses=event_row.get("from_uses"),
+                        uses=list(event_row["uses"]),
+                        updated_at=event_row.get("updated_at"),
                     )
                 )
             next_after = picked[-1].cursor if picked else after

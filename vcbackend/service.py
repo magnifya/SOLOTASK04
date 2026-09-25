@@ -30,6 +30,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   GET  /v1/trust/anchors/{did}            查询 DID 的全部锚点版本
   GET  /v1/trust/anchors/{did}/history    查询信任锚点生命周期历史（只读）
   GET  /v1/trust/anchors/{did}/{key_version}/uses  查询锚点版本用途白名单（只读）
+  GET  /v1/trust/anchors/{did}/{key_version}/uses/history  查询锚点版本用途变更历史（只读）
   PUT  /v1/trust/anchors/{did}/{key_version}/uses  收紧锚点版本用途白名单（真子集，幂等）
   PUT  /v1/trust/anchors/{did}/{key_version}/status  吊销锚点版本
   POST /v1/trust/verify                   用 active 锚点公钥验签
@@ -596,6 +597,22 @@ def build_handler(store: VCStore) -> type:
                     self._get_trust_imported_credential(
                         tenant, credential_id, parsed.query
                     )
+                elif path.startswith("/v1/trust/anchors/") and path.endswith(
+                    "/uses/history"
+                ):
+                    rest = path[
+                        len("/v1/trust/anchors/") : -len("/uses/history")
+                    ]
+                    did_raw, sep, version_raw = rest.rpartition("/")
+                    if not sep or not did_raw:
+                        self._send_error(404, f"无此路径: {path}")
+                    else:
+                        self._get_trust_anchor_uses_history(
+                            tenant,
+                            unquote(did_raw),
+                            unquote(version_raw),
+                            parsed.query,
+                        )
                 elif path.startswith("/v1/trust/anchors/") and path.endswith(
                     "/history"
                 ):
@@ -1685,6 +1702,79 @@ def build_handler(store: VCStore) -> type:
                     "did": did,
                     "key_version": int(key_version),
                     "uses": uses,
+                },
+            )
+
+        def _get_trust_anchor_uses_history(
+            self,
+            tenant: str,
+            did: str,
+            key_version: str,
+            query: str,
+        ) -> None:
+            # GET /v1/trust/anchors/{did}/{key_version}/uses/history
+            # ?limit=&after=：只读查询锚点版本的用途历史。路径
+            # key_version 须为 ASCII 十进制正整数；查询参数仅允许
+            # limit、after：limit 缺省 50、须为 1..200 的 ASCII 十进制
+            # 整数；after 缺省 0、须为非负 ASCII 十进制整数；重复参数、
+            # 空值、空白、符号、小数、布尔词、Unicode 数字、越界及未知
+            # 参数一律 400，仅返非空中文 error。未知或他租户锚点 404
+            # 同形。200 按键序恰返 did、key_version、events、next_after；
+            # 事件按 cursor 升序，每项键序恰为 cursor、action、
+            # from_uses、uses、updated_at，uses 按规范序。纯只读：不写
+            # 任何状态、不记审计。
+            if (
+                not key_version
+                or any(ch < "0" or ch > "9" for ch in key_version)
+                or int(key_version) < 1
+            ):
+                raise ValidationError("路径参数 key_version 必须为正整数")
+            params = parse_qs(query, keep_blank_values=True)
+            unknown = sorted(set(params) - {"limit", "after"})
+            if unknown:
+                raise ValidationError(
+                    f"不支持的查询参数: {', '.join(unknown)}"
+                )
+
+            limit_values = params.get("limit")
+            if limit_values is not None:
+                if len(limit_values) != 1:
+                    raise ValidationError("查询参数 limit 只能提供一次")
+                limit = _parse_nonneg_int(limit_values[0], "limit")
+                if not 1 <= limit <= 200:
+                    raise ValidationError(
+                        "查询参数 limit 须在 1 到 200 之间"
+                    )
+            else:
+                limit = 50
+
+            after_values = params.get("after")
+            if after_values is not None:
+                if len(after_values) != 1:
+                    raise ValidationError("查询参数 after 只能提供一次")
+                after = _parse_nonneg_int(after_values[0], "after")
+            else:
+                after = 0
+
+            events, next_after = store.list_trust_anchor_uses_history(
+                tenant, did, int(key_version), after, limit
+            )
+            self._send_json(
+                200,
+                {
+                    "did": did,
+                    "key_version": int(key_version),
+                    "events": [
+                        {
+                            "cursor": event.cursor,
+                            "action": event.action,
+                            "from_uses": event.from_uses,
+                            "uses": event.uses,
+                            "updated_at": event.updated_at,
+                        }
+                        for event in events
+                    ],
+                    "next_after": next_after,
                 },
             )
 

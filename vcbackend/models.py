@@ -1,7 +1,7 @@
 """数据模型定义。"""
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -247,6 +247,26 @@ class TrustAnchorDiscoveryRecord:
     status: str
     updated_at: Optional[str]
     cursor: int
+
+
+@dataclass
+class TrustAnchorUsesHistoryEvent:
+    """信任锚点用途历史中的一条事件（只读用途历史查询用）。
+
+    按 (租户, did, key_version) 归属。新注册与轮换目标版本追加
+    trust.anchor.registered / trust.anchor.rotated 事件，from_uses 为
+    None、uses 为版本初始用途数组（规范序）；收紧实际生效时追加
+    trust.anchor.uses.updated 事件并保存收紧前后用途数组；幂等、冲突、
+    失败与吊销均不追加。updated_at 为追加时刻（UTC 秒精度 Z 字符串），
+    注册/轮换兼容快照为 None；cursor 为租户内跨 DID 持久递增正整数。
+    """
+
+    cursor: int
+    action: str
+    from_uses: Optional[List[str]]
+    uses: List[str]
+    updated_at: Optional[str]
+
 
 
 @dataclass
