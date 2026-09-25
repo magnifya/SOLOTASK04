@@ -7857,6 +7857,67 @@ class VCStore:
             next_after = picked[-1].cursor if picked else after
             return picked, next_after
 
+    def export_receipt_consumptions(
+        self,
+        tenant_id: str,
+        after: int = 0,
+        limit: int = 1000,
+        snapshot: Optional[int] = None,
+    ) -> Tuple[List[ReceiptConsumptionEvent], int, int]:
+        """只读快照导出本租户验真回执消费历史事件（NDJSON 导出用）。
+
+        - 在同一把锁内原子读取租户当前最大游标 max_cursor（无事件为 0）；
+          snapshot 缺省取该 max_cursor，显式提供时须不超过 max_cursor，
+          否则 ValidationError；
+        - after 不得大于生效快照（after <= snapshot），否则
+          ValidationError；
+        - 取 after < cursor <= snapshot 按 cursor 升序至多 limit 项；
+        - 返回 (事件列表, 生效快照, next_after)；next_after 为本页末项
+          cursor，空页保持 after。
+        纯只读：不修改任何状态、不分配游标、不记审计、不触发落盘。
+        """
+        with self._lock:
+            max_cursor = self._receipt_consumption_cursors.get(
+                tenant_id, 0
+            )
+            if snapshot is None:
+                effective_snapshot = max_cursor
+            elif snapshot > max_cursor:
+                raise ValidationError(
+                    "查询参数 snapshot 不得超过当前最大游标"
+                )
+            else:
+                effective_snapshot = snapshot
+            if after > effective_snapshot:
+                raise ValidationError(
+                    "查询参数 after 不得大于 snapshot"
+                )
+            bucket = self._bucket_locked(tenant_id)
+            entries: List[Dict[str, Any]] = []
+            if bucket is not None:
+                entries = list(
+                    bucket.get("receipt_consumption_events", [])
+                )
+            entries.sort(key=lambda event: int(event.get("cursor", 0)))
+            picked: List[ReceiptConsumptionEvent] = []
+            for row in entries:
+                cursor = int(row["cursor"])
+                if cursor <= after or cursor > effective_snapshot:
+                    continue
+                if len(picked) >= limit:
+                    break
+                picked.append(
+                    ReceiptConsumptionEvent(
+                        cursor=cursor,
+                        receipt_id=row["receipt_id"],
+                        verifier_did=row["verifier_did"],
+                        nonce=row["nonce"],
+                        consumed_at=row["consumed_at"],
+                    )
+                )
+            next_after = picked[-1].cursor if picked else after
+            return picked, effective_snapshot, next_after
+
     def consume_credential_receipt(
         self,
         tenant_id: str,
