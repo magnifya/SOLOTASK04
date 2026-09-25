@@ -1,7 +1,7 @@
 """数据模型定义。"""
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -228,6 +228,26 @@ class TrustAnchorHistoryEvent:
     key_version: int
     action: str
     status: str
+    updated_at: Optional[str]
+    cursor: int
+
+
+@dataclass
+class TrustAnchorUsesHistoryEvent:
+    """信任锚点用途历史中的一条事件（只读历史查询用）。
+
+    按 (租户, did, key_version) 归属：新版本注册/轮换追加 registered/
+    rotated（from_uses 为 None、uses 为该版本生效用途，按规范序），实际
+    收紧追加 updated（from_uses/uses 分别为变更前后用途数组），幂等、
+    冲突、失败与吊销均不追加。updated_at 为变更时刻（UTC ISO8601 秒精度
+    Z）；旧锚点加载时补录的 snapshot 事件 from_uses/updated_at 均为
+    None、uses 为当前值。cursor 为租户内跨 DID 持久递增正整数，独立于
+    其他历史游标空间。
+    """
+
+    action: str
+    from_uses: Optional[List[str]]
+    uses: List[str]
     updated_at: Optional[str]
     cursor: int
 
