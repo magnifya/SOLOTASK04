@@ -3687,6 +3687,60 @@ class VCStore:
             )
             return [self._trust_anchor_record(did, row) for row in rows]
 
+    def get_trust_anchor_snapshot(
+        self, tenant_id: str, signer_did: str
+    ) -> Tuple[List[Tuple[TrustAnchorRecord, List[str]]], int, str]:
+        """原子读取本租户全部信任锚点快照及签名 DID 当前私钥。
+
+        供 GET /v1/trust/anchors/snapshot 使用：
+        - 签名 DID 须为本租户活动本地 DID：不存在（含他租户）抛
+          NotFoundError（HTTP 404），已停用抛 ConflictError（HTTP 409）；
+        - 返回 (entries, signer_key_version, private_pem)：entries 为本
+          租户全部锚点（含其用途白名单，无 uses 的旧记录为全用途），按
+          did 的 Unicode 码点、再按 key_version 升序；
+          signer_key_version 为签名 DID 当前密钥版本；private_pem 为其
+          当前版本托管私钥 PEM。
+        纯只读：不修改任何状态、不记审计、不触发落盘。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            rec = (
+                bucket["dids"].get(signer_did)
+                if bucket is not None
+                else None
+            )
+            if rec is None:
+                raise NotFoundError(f"DID 不存在: {signer_did}")
+            if rec.get("status") == "deactivated":
+                raise ConflictError(f"DID 已停用: {signer_did}")
+            signer_key_version = int(rec.get("key_version", 1))
+            private_pem = self._private_key_for_version_locked(
+                bucket, signer_did, signer_key_version
+            )
+            if not private_pem:
+                # 正常不会发生：迁移保证当前版本私钥存在。
+                raise NotFoundError(
+                    f"DID {signer_did} 当前版本私钥不可用: "
+                    f"{signer_key_version}"
+                )
+            anchors_map = (
+                bucket.get("trust_anchors", {})
+                if bucket is not None
+                else {}
+            )
+            entries: List[Tuple[TrustAnchorRecord, List[str]]] = []
+            for did, rows in anchors_map.items():
+                for row in rows.values():
+                    entries.append(
+                        (self._trust_anchor_record(did, row),
+                         _anchor_row_uses(row))
+                    )
+            # Python 字符串默认按 Unicode 码点比较，与 JSON sort_keys 一致。
+            entries.sort(
+                key=lambda pair: (pair[0].did, pair[0].key_version)
+            )
+            return entries, signer_key_version, private_pem
+
     def get_trust_anchor_uses(
         self, tenant_id: str, did: str, key_version: int
     ) -> List[str]:
