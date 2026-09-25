@@ -42,6 +42,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/credentials/receipt/verify  校验验真签名回执（只读）
   POST /v1/trust/credentials/receipt/consume  消费验真签名回执（防重放，首次落盘并审计）
   POST /v1/trust/credentials/receipt/consume-batch  批量消费验真签名回执（逐项不短路，防重放）
+  GET  /v1/trust/credentials/receipt/consumptions  查询验真回执消费历史（只读）
   POST /v1/trust/credentials/import       导入外部凭证（active 锚点验签后持久化）
   POST /v1/trust/credentials/import-batch 批量导入外部凭证（逐项不短路）
   GET  /v1/trust/credentials/imported/{credential_id}  读取已导入的外部凭证（?issuer_did=）
@@ -603,6 +604,10 @@ def build_handler(store: VCStore) -> type:
                     self._get_trust_anchor_snapshot(tenant, parsed.query)
                 elif path == "/v1/trust/dids/deactivations":
                     self._get_trust_did_deactivations(tenant, parsed.query)
+                elif path == "/v1/trust/credentials/receipt/consumptions":
+                    self._get_trust_credential_receipt_consumptions(
+                        tenant, parsed.query
+                    )
                 elif path == "/v1/trust/dids/deactivations/manifest":
                     self._get_trust_did_deactivations_manifest(
                         tenant, parsed.query
@@ -3632,6 +3637,86 @@ def build_handler(store: VCStore) -> type:
                             "reason": "回执已消费",
                         }
             self._send_json(200, {"results": results})
+
+        def _get_trust_credential_receipt_consumptions(
+            self, tenant: str, query: str
+        ) -> None:
+            # GET /v1/trust/credentials/receipt/consumptions：只读查询
+            # 本租户验真回执消费历史。
+            # 查询参数仅允许 limit、after、verifier_did，且均只能出现
+            # 一次：
+            # - limit 缺省 50，须为 1..200 的非空 ASCII 十进制整数；
+            # - after 缺省 0，须为非空非负 ASCII 十进制整数；
+            # - verifier_did 可省略，提供时须为非空字符串。
+            # 空值、重复参数、未知参数一律 400 且仅含非空中文 error。
+            # 先按 verifier_did 精确过滤，再取 cursor > after 的前
+            # limit 项并按 cursor 升序。200 键序恰为 events、next_after；
+            # 事件键序恰为 cursor、receipt_id、verifier_did、nonce、
+            # consumed_at（cursor 为正整数，其余四值为字符串，
+            # consumed_at 为 UTC 秒精度 Z）；空页 next_after 等于 after。
+            # 无任何事件也返回 200 空数组。纯只读：不写状态或审计。
+            params = parse_qs(query, keep_blank_values=True)
+            allowed = {"limit", "after", "verifier_did"}
+            unknown = sorted(set(params) - allowed)
+            if unknown:
+                raise ValidationError(
+                    f"不支持的查询参数: {', '.join(unknown)}"
+                )
+
+            def _single(name: str) -> Optional[str]:
+                values = params.get(name)
+                if values is None:
+                    return None
+                if len(values) != 1:
+                    raise ValidationError(
+                        f"查询参数 {name} 只能提供一次"
+                    )
+                return values[0]
+
+            limit_raw = _single("limit")
+            if limit_raw is not None:
+                limit = _parse_nonneg_int(limit_raw, "limit")
+                if not 1 <= limit <= 200:
+                    raise ValidationError(
+                        "查询参数 limit 须在 1 到 200 之间"
+                    )
+            else:
+                limit = 50
+
+            after_raw = _single("after")
+            if after_raw is not None:
+                after = _parse_nonneg_int(after_raw, "after")
+            else:
+                after = 0
+
+            verifier_did = _single("verifier_did")
+            if verifier_did is not None and not verifier_did:
+                raise ValidationError(
+                    "查询参数 verifier_did 必须为非空字符串"
+                )
+
+            events, next_after = store.list_receipt_consumptions(
+                tenant,
+                after,
+                limit,
+                verifier_did=verifier_did,
+            )
+            self._send_json(
+                200,
+                {
+                    "events": [
+                        {
+                            "cursor": event.cursor,
+                            "receipt_id": event.receipt_id,
+                            "verifier_did": event.verifier_did,
+                            "nonce": event.nonce,
+                            "consumed_at": event.consumed_at,
+                        }
+                        for event in events
+                    ],
+                    "next_after": next_after,
+                },
+            )
 
         @staticmethod
         def _verify_credential_receipt_item(
