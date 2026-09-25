@@ -6419,9 +6419,10 @@ class VCStore:
         任何请求/字段非法均抛 ValidationError（HTTP 400）。
 
         签名覆盖 body 的规范化 JSON，用本租户 (did, key_version) 的
-        active 信任锚点 P-256 公钥验签。锚点缺失/吊销/公钥不可用、
-        签名格式错误、密码学验签失败均不抛异常、不写入，返回
-        {"valid": False, "reason": ...}，原因恰为
+        active 信任锚点 P-256 公钥验签。签名须为严格格式：恰 86 个
+        base64url 字符、解码 64 字节、无填充重编码与原文一致。锚点
+        缺失/吊销/公钥不可用、签名格式错误、密码学验签失败均不抛
+        异常、不写入，返回 {"valid": False, "reason": ...}，原因恰为
         “锚点不可用”/“签名格式错误”/“签名校验失败”。
 
         验签通过后按 (tenant, did) 持久化：首次接受 201；同一 did 的
@@ -6435,57 +6436,57 @@ class VCStore:
         if set(data) != {"body", "signature"}:
             missing = [f for f in ("body", "signature") if f not in data]
             if missing:
-                raise ValidationError(f"缺少字段: {', '.join(missing)}")
+                raise ValidationError(f"请求缺少字段: {', '.join(missing)}")
             extra = sorted(set(data) - {"body", "signature"})
-            raise ValidationError(f"多余字段: {', '.join(extra)}")
+            raise ValidationError(f"请求含多余字段: {', '.join(extra)}")
         body = data["body"]
         signature = data["signature"]
         if not isinstance(body, dict):
-            raise ValidationError("字段 body 必须为 JSON 对象")
+            raise ValidationError("请求字段 body 必须为 JSON 对象")
         if not isinstance(signature, str) or not signature:
-            raise ValidationError("字段 signature 必须为非空字符串")
+            raise ValidationError("请求字段 signature 必须为非空字符串")
 
         # ---- body 字段（错误 -> 400）----
         required = ("did", "key_version", "reason", "deactivated_at")
         for field in required:
             if field not in body:
-                raise ValidationError(f"body 缺少字段: {field}")
+                raise ValidationError(f"请求 body 缺少字段: {field}")
         extra = sorted(set(body) - set(required))
         if extra:
-            raise ValidationError(f"body 含多余字段: {', '.join(extra)}")
+            raise ValidationError(f"请求 body 含多余字段: {', '.join(extra)}")
         did = body["did"]
         key_version = body["key_version"]
         reason = body["reason"]
         deactivated_at = body["deactivated_at"]
         if not isinstance(did, str) or not did:
-            raise ValidationError("body 字段 did 必须为非空字符串")
+            raise ValidationError("请求 body 字段 did 必须为非空字符串")
         if not isinstance(key_version, int) or isinstance(
             key_version, bool
         ) or key_version < 1:
             raise ValidationError(
-                "body 字段 key_version 必须为非布尔正整数"
+                "请求 body 字段 key_version 必须为非布尔正整数"
             )
         if not isinstance(reason, str) or not (
             1 <= len(reason) <= MAX_DEACTIVATION_NOTICE_REASON
         ):
             raise ValidationError(
-                "body 字段 reason 必须为 1 到 "
+                "请求 body 字段 reason 必须为 1 到 "
                 f"{MAX_DEACTIVATION_NOTICE_REASON} 个码点的字符串"
             )
         if reason != reason.strip():
-            raise ValidationError("body 字段 reason 首尾不得含空白")
+            raise ValidationError("请求 body 字段 reason 首尾不得含空白")
         if not isinstance(deactivated_at, str) or not (
             _UTC_Z_SHAPE_RE.match(deactivated_at)
         ):
             raise ValidationError(
-                "body 字段 deactivated_at 必须为 UTC 秒精度 Z 格式"
+                "请求 body 字段 deactivated_at 必须为 UTC 秒精度 Z 格式"
                 "（YYYY-MM-DDTHH:MM:SSZ）"
             )
         try:
             _parse_utc_z(deactivated_at)
         except ValueError:
             raise ValidationError(
-                "body 字段 deactivated_at 必须为 UTC 秒精度 Z 格式"
+                "请求 body 字段 deactivated_at 必须为 UTC 秒精度 Z 格式"
                 "（YYYY-MM-DDTHH:MM:SSZ）"
             )
 
@@ -6526,8 +6527,9 @@ class VCStore:
             }
 
         # ---- 签名（覆盖 body 的规范化 JSON，ES256 裸 R||S 无填充
-        #       base64url）----
+        #       base64url）：锚点检查之后先做严格格式校验，再密码学验签 ----
         try:
+            crypto.validate_raw_signature_format(signature)
             crypto.verify(body, signature, public_pem)
         except crypto.MalformedSignature:
             return {
@@ -6567,7 +6569,7 @@ class VCStore:
                     }
                 # 同一 did 已有不同通告：冲突，不写入
                 raise ConflictError(
-                    f"外部 DID 已存在不同的停用通告: {did}"
+                    f"冲突: 外部 DID 已存在不同的停用通告: {did}"
                 )
 
             new_row = {
@@ -6589,6 +6591,88 @@ class VCStore:
                 "status_code": 201,
                 "record": self._deactivation_notice_record(did, new_row),
             }
+
+    def sync_did_deactivation_notice_batch(
+        self,
+        tenant_id: str,
+        data: Any,
+    ) -> Tuple[bool, str, List[Dict[str, Any]]]:
+        """批量登记外部 DID 停用通告，返回 (请求是否合法, 请求级原因, 逐项结果)。
+
+        请求体须恰为 ``{"items": [项...]}``：数组非空且不超过 100 项。
+        请求级结构不合法（非对象、字段缺失或多余、items 非数组、空数组或
+        超过上限）时返回 ``(False, "请求...", [])``，由调用方回
+        ``{"results": [], "reason": ...}``；请求级非法不写任何状态。
+
+        请求级合法时逐项复用 :meth:`sync_did_deactivation_notice` 的完整
+        单项规则（请求结构、body 字段、锚点、严格签名格式、密码学验签、
+        重放/冲突与原子落盘），按输入顺序收集结果，**失败不短路**：某项
+        的结构/字段错误、锚点/签名失败、同 did 异通告冲突或落盘失败均不
+        影响其余项；批内靠后的项可见靠前项的写入。每项失败结果键序为
+        ``valid,http_status,reason``（项结构/字段错误 400、同 did 异通告
+        409、锚点/签名失败 200、落盘失败 500“存储失败”且仅回滚该项，
+        reason 恒为非空中文）；成功结果键序为
+        ``valid,http_status,did,key_version,reason,deactivated_at``
+        （首次接受 201，完全重放 200）。每个新写项沿用单项的同一次原子
+        落盘，跨重启保持。results 与输入等长、同序。
+        """
+        if not isinstance(data, dict):
+            return False, "请求不合法: 请求体必须为 JSON 对象", []
+        if set(data) != {"items"}:
+            if "items" not in data:
+                return False, "请求缺少字段: items", []
+            extra = sorted(set(data) - {"items"})
+            return False, f"请求含多余字段: {', '.join(extra)}", []
+        items = data["items"]
+        if not isinstance(items, list):
+            return False, "请求不合法: 字段 items 必须为数组", []
+        if not items:
+            return False, "请求不合法: items 数组不能为空", []
+        if len(items) > 100:
+            return False, (
+                f"请求不合法: items 数组不能超过 100 项（当前 {len(items)} 项）"
+            ), []
+
+        results: List[Dict[str, Any]] = []
+        for item in items:  # 顺序处理，失败不短路
+            try:
+                result = self.sync_did_deactivation_notice(tenant_id, item)
+            except ValidationError as exc:
+                results.append(
+                    {"valid": False, "http_status": 400, "reason": str(exc)}
+                )
+                continue
+            except ConflictError as exc:
+                results.append(
+                    {"valid": False, "http_status": 409, "reason": str(exc)}
+                )
+                continue
+            except Exception:  # noqa: BLE001 落盘失败：仅回滚该项并继续
+                results.append(
+                    {"valid": False, "http_status": 500, "reason": "存储失败"}
+                )
+                continue
+            if not result.get("valid"):
+                results.append(
+                    {
+                        "valid": False,
+                        "http_status": 200,
+                        "reason": result.get("reason") or "验签失败",
+                    }
+                )
+                continue
+            record = result["record"]
+            results.append(
+                {
+                    "valid": True,
+                    "http_status": result["status_code"],
+                    "did": record.did,
+                    "key_version": record.key_version,
+                    "reason": record.reason,
+                    "deactivated_at": record.deactivated_at,
+                }
+            )
+        return True, "", results
 
     def get_did_deactivation_notice(
         self,

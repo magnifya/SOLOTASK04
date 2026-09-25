@@ -7,6 +7,7 @@ ES256 即 ECDSA over P-256 与 SHA-256。签名以 JWS 约定编码：
 
 import base64
 import json
+import re
 from typing import Any, Dict
 
 from cryptography.exceptions import InvalidSignature
@@ -25,6 +26,7 @@ __all__ = [
     "public_key_pem_from_private",
     "validate_public_key_pem",
     "validate_signature_format",
+    "validate_raw_signature_format",
     "sign",
     "verify",
 ]
@@ -130,6 +132,31 @@ def validate_signature_format(signature_b64: str) -> None:
         raise MalformedSignature("签名不是合法的 base64url 编码") from exc
     if len(raw) != 64:
         raise MalformedSignature("签名长度不是 64 字节，非合法 ES256 签名")
+
+
+# 严格格式：64 字节裸 R||S 的无填充 base64url 恰为 86 个字符
+_RAW_ES256_B64URL_RE = re.compile(r"[A-Za-z0-9_-]{86}")
+
+
+def validate_raw_signature_format(signature_b64: str) -> None:
+    """严格校验 ES256 裸 R||S 签名的无填充 base64url 编码。
+
+    须恰为 86 个 base64url 字符（拒绝填充与标准 base64 字符）、解码
+    恰为 64 字节，且无填充 base64url 重编码与原文逐字符一致（拒绝
+    非规范尾部位）。仅检查格式，不做密码学验签；格式非法抛
+    MalformedSignature。
+    """
+    if not isinstance(signature_b64, str) or not (
+        _RAW_ES256_B64URL_RE.fullmatch(signature_b64)
+    ):
+        raise MalformedSignature(
+            "签名不是 86 字符的无填充 base64url 编码"
+        )
+    raw = _b64url_decode(signature_b64)
+    if len(raw) != 64:
+        raise MalformedSignature("签名长度不是 64 字节，非合法 ES256 签名")
+    if _b64url(raw) != signature_b64:
+        raise MalformedSignature("签名不是规范的无填充 base64url 编码")
 
 
 def verify(body: Dict[str, Any], signature_b64: str, public_pem: str) -> None:
