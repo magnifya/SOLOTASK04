@@ -33,6 +33,8 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   PUT  /v1/trust/anchors/{did}/{key_version}/uses  收紧锚点版本用途白名单（真子集，幂等）
   GET  /v1/trust/anchors/{did}/{key_version}/uses/history  查询锚点版本用途历史（只读）
   PUT  /v1/trust/anchors/{did}/{key_version}/status  吊销锚点版本
+  GET  /v1/trust/anchors/snapshot      本租户锚点签名快照（?signer_did=，只读）
+  POST /v1/trust/anchors/snapshot/verify  校验锚点快照签名（只读）
   POST /v1/trust/verify                   用 active 锚点公钥验签
   POST /v1/trust/credentials/verify       跨系统凭证验真（无需登记 DID/凭证）
   POST /v1/trust/credentials/import       导入外部凭证（active 锚点验签后持久化）
@@ -93,6 +95,7 @@ from .store import (
     NotFoundError,
     PresentationRecord,
     REASON_UNSET,
+    TRUST_ANCHOR_USES,
     USES_UNSET,
     ValidationError,
     VCStore,
@@ -348,6 +351,8 @@ def build_handler(store: VCStore) -> type:
                     )
                 elif path == "/v1/trust/anchors":
                     self._post_trust_anchors(tenant)
+                elif path == "/v1/trust/anchors/snapshot/verify":
+                    self._post_trust_anchor_snapshot_verify(tenant)
                 elif path.startswith("/v1/trust/anchors/") and path.endswith(
                     "/rotate"
                 ):
@@ -576,6 +581,8 @@ def build_handler(store: VCStore) -> type:
                     )
                 elif path == "/v1/trust/anchors":
                     self._get_trust_anchor_discovery(tenant, parsed.query)
+                elif path == "/v1/trust/anchors/snapshot":
+                    self._get_trust_anchor_snapshot(tenant, parsed.query)
                 elif path == "/v1/trust/dids/deactivations":
                     self._get_trust_did_deactivations(tenant, parsed.query)
                 elif path == "/v1/trust/dids/deactivations/manifest":
@@ -1897,6 +1904,209 @@ def build_handler(store: VCStore) -> type:
                     "next_after": next_after,
                 },
             )
+
+        def _get_trust_anchor_snapshot(self, tenant: str, query: str) -> None:
+            # GET /v1/trust/anchors/snapshot?signer_did=：对本租户全部
+            # 信任锚点生成签名快照。查询参数仅允许唯一非空 signer_did，
+            # 缺失/空值/重复/未知参数一律 400 且仅 {"error"}；签名 DID
+            # 未知（含他租户）404、已停用 409。200 键序 anchors、
+            # signer_did、signer_key_version、signature；anchors 原子
+            # 取本租户锚点并按 did 码点、key_version 升序，项键序 did、
+            # key_version、public_key、status、updated_at、uses（类型
+            # 沿用既有锚点与用途响应）；signature 由签名 DID 当前私钥
+            # 对前三键递归键升序紧凑 UTF-8 JSON 做 ES256 裸 R||S 无填
+            # 充 base64url 签名。纯只读：不写状态、不记审计。
+            params = parse_qs(query, keep_blank_values=True)
+            unknown = sorted(set(params) - {"signer_did"})
+            if unknown:
+                raise ValidationError(
+                    f"不支持的查询参数: {', '.join(unknown)}"
+                )
+            signer_values = params.get("signer_did")
+            if signer_values is None:
+                raise ValidationError("查询参数 signer_did 必填")
+            if len(signer_values) != 1:
+                raise ValidationError("查询参数 signer_did 只能提供一次")
+            signer_did = signer_values[0]
+            if not signer_did:
+                raise ValidationError(
+                    "查询参数 signer_did 必须为非空字符串"
+                )
+
+            key_version, private_pem = (
+                store.get_trust_anchor_snapshot_signer(tenant, signer_did)
+            )
+            anchors = store.list_trust_anchor_snapshot(tenant)
+            signed = {
+                "anchors": anchors,
+                "signer_did": signer_did,
+                "signer_key_version": key_version,
+            }
+            signature = crypto.sign(signed, private_pem)
+            snapshot = dict(signed)
+            snapshot["signature"] = signature
+            self._send_json(200, snapshot)
+
+        def _anchor_snapshot_is_well_formed(self, snapshot: Any) -> bool:
+            # 快照结构校验（“快照非法”）：恰含四键且各键类型/取值合法。
+            if not isinstance(snapshot, dict):
+                return False
+            if set(snapshot) != {
+                "anchors",
+                "signer_did",
+                "signer_key_version",
+                "signature",
+            }:
+                return False
+            anchors = snapshot["anchors"]
+            if not isinstance(anchors, list):
+                return False
+            for item in anchors:
+                if not isinstance(item, dict):
+                    return False
+                if set(item) != {
+                    "did",
+                    "key_version",
+                    "public_key",
+                    "status",
+                    "updated_at",
+                    "uses",
+                }:
+                    return False
+                if not isinstance(item["did"], str) or not item["did"]:
+                    return False
+                key_version = item["key_version"]
+                if (
+                    not isinstance(key_version, int)
+                    or isinstance(key_version, bool)
+                    or key_version < 1
+                ):
+                    return False
+                if (
+                    not isinstance(item["public_key"], str)
+                    or not item["public_key"]
+                ):
+                    return False
+                if item["status"] not in ("active", "revoked"):
+                    return False
+                updated_at = item["updated_at"]
+                if updated_at is not None and not isinstance(
+                    updated_at, str
+                ):
+                    return False
+                uses = item["uses"]
+                if not isinstance(uses, list) or not uses:
+                    return False
+                if any(
+                    not isinstance(use, str) or use not in TRUST_ANCHOR_USES
+                    for use in uses
+                ):
+                    return False
+                if len(set(uses)) != len(uses) or list(uses) != sorted(
+                    uses, key=TRUST_ANCHOR_USES.index
+                ):
+                    return False
+            signer_did = snapshot["signer_did"]
+            if not isinstance(signer_did, str) or not signer_did:
+                return False
+            signer_key_version = snapshot["signer_key_version"]
+            if (
+                not isinstance(signer_key_version, int)
+                or isinstance(signer_key_version, bool)
+                or signer_key_version < 1
+            ):
+                return False
+            signature = snapshot["signature"]
+            if not isinstance(signature, str) or not signature:
+                return False
+            return True
+
+        def _verify_anchor_snapshot_item(
+            self, tenant: str, snapshot: Any
+        ) -> Optional[str]:
+            # 快照验真：按序返回失败原因（快照非法 -> 锚点不可用 ->
+            # 签名格式错误 -> 签名校验失败），成功返回 None。纯只读。
+            # 阶段一：快照键集/类型
+            if not self._anchor_snapshot_is_well_formed(snapshot):
+                return "快照非法"
+
+            anchors = snapshot["anchors"]
+            # 阶段二：anchors 按 did 码点、key_version 严格升序（无重复）
+            keys = [(item["did"], item["key_version"]) for item in anchors]
+            if any(
+                keys[index] >= keys[index + 1]
+                for index in range(len(keys) - 1)
+            ):
+                return "快照非法"
+
+            signer_did = snapshot["signer_did"]
+            signer_key_version = snapshot["signer_key_version"]
+
+            # 阶段三：本租户同 signer_did/版本且含 generic 用途的
+            # active 信任锚点
+            public_pem = store.get_active_trust_anchor_public_key(
+                tenant,
+                signer_did,
+                signer_key_version,
+                required_use="generic",
+            )
+            if public_pem is None:
+                return "锚点不可用"
+            try:
+                crypto.validate_public_key_pem(public_pem)
+            except (ValueError, TypeError):
+                return "锚点不可用"
+
+            signed = {
+                "anchors": anchors,
+                "signer_did": signer_did,
+                "signer_key_version": signer_key_version,
+            }
+            signature = snapshot["signature"]
+
+            # 阶段四：签名格式
+            try:
+                crypto.validate_signature_format_strict(signature)
+            except crypto.MalformedSignature:
+                return "签名格式错误"
+
+            # 阶段五：密码学验签
+            try:
+                crypto.verify(signed, signature, public_pem)
+            except crypto.MalformedSignature:
+                return "签名格式错误"
+            except crypto.InvalidSignature:
+                return "签名校验失败"
+            except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露细节
+                return "签名校验失败"
+            return None
+
+        def _post_trust_anchor_snapshot_verify(self, tenant: str) -> None:
+            # POST /v1/trust/anchors/snapshot/verify：校验锚点快照签名。
+            # 请求体须恰为 {"snapshot": 对象}，否则 400 且仅 {"error"}。
+            # 外层合法后任何失败均 HTTP 200，按顺序返回
+            # {"valid":false,"reason":...}：快照非法（键集/类型、anchors
+            # 顺序/重复）-> 锚点不可用（本租户同 signer_did/版本且含
+            # generic 用途的 active 锚点）-> 签名格式错误 -> 签名校验
+            # 失败。成功仅 {"valid":true}。纯只读、租户隔离、不记审计。
+            data = self._read_json()
+            if set(data) != {"snapshot"}:
+                if "snapshot" not in data:
+                    raise ValidationError("请求缺少字段: snapshot")
+                extra = sorted(set(data) - {"snapshot"})
+                raise ValidationError(
+                    f"请求含多余字段: {', '.join(extra)}"
+                )
+            snapshot = data["snapshot"]
+            if not isinstance(snapshot, dict):
+                raise ValidationError(
+                    "请求不合法: 字段 snapshot 必须为 JSON 对象"
+                )
+            reason = self._verify_anchor_snapshot_item(tenant, snapshot)
+            if reason is not None:
+                self._send_json(200, {"valid": False, "reason": reason})
+                return
+            self._send_json(200, {"valid": True})
 
         def _get_trust_did_deactivations(self, tenant: str, query: str) -> None:
             # GET /v1/trust/dids/deactivations：只读查询本租户外部 DID

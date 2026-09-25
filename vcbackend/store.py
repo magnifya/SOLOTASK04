@@ -7435,6 +7435,30 @@ class VCStore:
             next_after = picked[-1].cursor if picked else after
             return picked, effective_snapshot, next_after
 
+    def _active_did_signer_locked(
+        self, bucket: Optional[Dict[str, Any]], signer_did: str
+    ) -> Tuple[int, str]:
+        """（须持锁）返回本租户活动本地 DID 的（当前密钥版本, 当前私钥 PEM）。"""
+        rec = (
+            bucket["dids"].get(signer_did)
+            if bucket is not None
+            else None
+        )
+        if rec is None:
+            raise NotFoundError(f"DID 不存在: {signer_did}")
+        if rec.get("status") == "deactivated":
+            raise ConflictError(f"DID 已停用: {signer_did}")
+        key_version = int(rec.get("key_version", 1))
+        private_pem = self._private_key_for_version_locked(
+            bucket, signer_did, key_version
+        )
+        if not private_pem:
+            # 正常不会发生：迁移保证当前版本私钥存在。
+            raise NotFoundError(
+                f"DID {signer_did} 当前版本私钥不可用: {key_version}"
+            )
+        return key_version, private_pem
+
     def get_deactivation_manifest_signer(
         self,
         tenant_id: str,
@@ -7449,26 +7473,60 @@ class VCStore:
         纯只读：不修改任何状态、不记审计、不触发落盘。
         """
         with self._lock:
+            return self._active_did_signer_locked(
+                self._bucket_locked(tenant_id), signer_did
+            )
+
+    def get_trust_anchor_snapshot_signer(
+        self,
+        tenant_id: str,
+        signer_did: str,
+    ) -> Tuple[int, str]:
+        """返回本租户活动本地 DID 的（当前密钥版本, 当前私钥 PEM）。
+
+        供信任锚点快照（snapshot）签名使用：
+        - DID 不存在（含他租户资源）抛 NotFoundError（HTTP 404）；
+        - DID 已停用抛 ConflictError（HTTP 409）；
+        - 取该 DID 当前密钥版本的托管私钥。
+        纯只读：不修改任何状态、不记审计、不触发落盘。
+        """
+        with self._lock:
+            return self._active_did_signer_locked(
+                self._bucket_locked(tenant_id), signer_did
+            )
+
+    def list_trust_anchor_snapshot(
+        self, tenant_id: str
+    ) -> List[Dict[str, Any]]:
+        """原子返回本租户全部信任锚点（按 did 码点、key_version 升序）。
+
+        每项恰含 did、key_version、public_key、status、updated_at、
+        uses；uses 按规范序（省略注册或不含 uses 的旧记录为全用途）。
+        无锚点（含租户无任何资源）返回空列表。
+        纯只读：不写状态、不记审计、不触发落盘。
+        """
+        with self._lock:
             bucket = self._bucket_locked(tenant_id)
-            rec = (
-                bucket["dids"].get(signer_did)
-                if bucket is not None
-                else None
+            anchors = (
+                bucket["trust_anchors"] if bucket is not None else {}
             )
-            if rec is None:
-                raise NotFoundError(f"DID 不存在: {signer_did}")
-            if rec.get("status") == "deactivated":
-                raise ConflictError(f"DID 已停用: {signer_did}")
-            key_version = int(rec.get("key_version", 1))
-            private_pem = self._private_key_for_version_locked(
-                bucket, signer_did, key_version
-            )
-            if not private_pem:
-                # 正常不会发生：迁移保证当前版本私钥存在。
-                raise NotFoundError(
-                    f"DID {signer_did} 当前版本私钥不可用: {key_version}"
-                )
-            return key_version, private_pem
+            items: List[Dict[str, Any]] = []
+            for did in sorted(anchors):
+                rows = anchors[did]
+                for row in sorted(
+                    rows.values(), key=lambda r: int(r["key_version"])
+                ):
+                    items.append(
+                        {
+                            "did": did,
+                            "key_version": int(row["key_version"]),
+                            "public_key": row["public_key"],
+                            "status": row.get("status", "active"),
+                            "updated_at": row.get("updated_at"),
+                            "uses": _anchor_row_uses(row),
+                        }
+                    )
+            return items
 
     def get_active_trust_anchor_public_key(
         self,
