@@ -122,6 +122,12 @@ DEACTIVATION_SIGNATURE_INVALID_REASON = IMPORTED_SIGNATURE_INVALID_REASON
 # DID 文档验真命中外部 DID 停用通告时的统一中文原因前缀
 EXTERNAL_DID_DEACTIVATED_REASON_PREFIX = "外部DID已停用："
 
+# 外部凭证/演示/谓词证明验真命中签发 DID 停用通告时的统一中文原因前缀
+EXTERNAL_ISSUER_DID_DEACTIVATED_REASON_PREFIX = "外部签发DID已停用："
+
+# 持有者绑定演示验真命中持有者 DID 停用通告时的统一中文原因前缀
+EXTERNAL_HOLDER_DID_DEACTIVATED_REASON_PREFIX = "外部持有者DID已停用："
+
 # 外部 DID 停用通告 reason 允许的最大 Unicode 码点长度
 MAX_DEACTIVATION_NOTICE_REASON = 256
 
@@ -3669,7 +3675,9 @@ class VCStore:
         - 锚点按本租户 (issuer_did, 版本) 查找，仅 active 的 P-256 公钥
           可用，缺失或 revoked 失败；
         - 签名为 ES256/SHA-256，64 字节裸 R||S 的无填充 base64url，覆盖
-          完整 body（递归排序紧凑 JSON）。
+          完整 body（递归排序紧凑 JSON）；
+        - 原验真成功后按当前租户查 issuer_did 外部停用通告，命中返回
+          “外部签发DID已停用：<reason>”，仅他租户有通告不影响结论。
         只读：不登记 DID/凭证，不写凭证、状态或审计，绝不向上抛异常。
         """
         # 1. 请求结构
@@ -3776,6 +3784,15 @@ class VCStore:
                 )
             if datetime.now(timezone.utc) >= expires_dt:
                 return False, CREDENTIAL_EXPIRED_REASON
+
+        # 7. 原验真成功后、合并凭证状态前查本租户 issuer_did 外部停用
+        #    通告：命中返回“外部签发DID已停用：<reason>”；无通告或仅他
+        #    租户有通告维持原结论。只读，不写状态、不记审计。
+        deactivation_reason = self._external_did_deactivation_reason(
+            tenant_id, issuer_did, EXTERNAL_ISSUER_DID_DEACTIVATED_REASON_PREFIX
+        )
+        if deactivation_reason is not None:
+            return False, deactivation_reason
         return True, ""
 
     def verify_trust_credential_with_status(
@@ -3787,9 +3804,9 @@ class VCStore:
 
         先按 :meth:`verify_trust_credential` 的全部规则完成外部凭证验真
         （请求结构 → 凭证字段 → 锚点 → 签名格式 → 密码学验签 →
-        expires_at），失败原样返回 ``(False, 原因)``，保持既有优先级与
-        中文原因分类；签名覆盖请求提交的完整 ``body``，省略
-        ``issuer_key_version`` 时按版本 1 且不注入正文。
+        expires_at → 签发 DID 停用通告），失败原样返回 ``(False, 原因)``，
+        保持既有优先级与中文原因分类；签名覆盖请求提交的完整 ``body``，
+        省略 ``issuer_key_version`` 时按版本 1 且不注入正文。
 
         验签通过后按当前租户 ``(issuer_did, credential_id)`` 双键只读
         查询 ``credential_status_sync`` 同步记录：
@@ -3964,7 +3981,11 @@ class VCStore:
         - holder_proof 同为 ES256，覆盖去掉 proof、holder_proof 的绑定
           对象（八字段加 holder_did、holder_key_version），并加入
           tenant_id=source_tenant_id 后按规范化 JSON 验签；
-        - expires_at 须为 UTC 秒精度 Z 格式，当前时间达到它即过期。
+        - expires_at 须为 UTC 秒精度 Z 格式，当前时间达到它即过期；
+        - 原验真成功后按当前租户先查 issuer_did 外部停用通告（命中返回
+          “外部签发DID已停用：<reason>”），持有者绑定演示再查
+          holder_did（命中返回“外部持有者DID已停用：<reason>”），
+          仅他租户有通告不影响结论。
         只读：不登记 DID/凭证/演示，不写状态、历史或审计，绝不向上抛异常。
         """
         # 1. 请求结构：未绑定恰含 presentation/challenge；绑定另含
@@ -4195,6 +4216,25 @@ class VCStore:
             )
         if datetime.now(timezone.utc) >= expires_dt:
             return False, "演示已过期"
+
+        # 7. 原验真成功后、合并凭证状态前查本租户外部 DID 停用通告：
+        #    先查签发者 issuer_did，命中返回“外部签发DID已停用：<reason>”；
+        #    持有者绑定演示再查 holder_did，命中返回
+        #    “外部持有者DID已停用：<reason>”。无通告或仅他租户有通告
+        #    维持原结论。只读，不写状态、不记审计。
+        deactivation_reason = self._external_did_deactivation_reason(
+            tenant_id, issuer_did, EXTERNAL_ISSUER_DID_DEACTIVATED_REASON_PREFIX
+        )
+        if deactivation_reason is not None:
+            return False, deactivation_reason
+        if is_holder_bound:
+            deactivation_reason = self._external_did_deactivation_reason(
+                tenant_id,
+                holder_did_value,
+                EXTERNAL_HOLDER_DID_DEACTIVATED_REASON_PREFIX,
+            )
+            if deactivation_reason is not None:
+                return False, deactivation_reason
         return True, ""
 
     def verify_trust_presentations_batch(
@@ -4387,7 +4427,9 @@ class VCStore:
         tenant_id=source_tenant_id 的规范化 JSON）-> 期限。锚点按当前
         租户 (issuer_did, issuer_key_version) 查找，仅 active 的 P-256
         公钥可用。expires_at 须为 UTC 秒精度 Z 格式，到期返回
-        “证明已过期”。只读：不消费、不登记任何资源、不写状态/历史/审计，
+        “证明已过期”。原验真成功后按当前租户查 issuer_did 外部停用
+        通告，命中返回“外部签发DID已停用：<reason>”，仅他租户有通告
+        不影响结论。只读：不消费、不登记任何资源、不写状态/历史/审计，
         绝不向上抛异常。
         """
         # 1. 请求结构：恰含 proof、challenge、source_tenant_id。
@@ -4567,6 +4609,15 @@ class VCStore:
             )
         if datetime.now(timezone.utc) >= expires_dt:
             return False, "证明已过期"
+
+        # 7. 原验真成功后、合并凭证状态前查本租户 issuer_did 外部停用
+        #    通告：命中返回“外部签发DID已停用：<reason>”；无通告或仅他
+        #    租户有通告维持原结论。只读，不写状态、不记审计。
+        deactivation_reason = self._external_did_deactivation_reason(
+            tenant_id, issuer_did, EXTERNAL_ISSUER_DID_DEACTIVATED_REASON_PREFIX
+        )
+        if deactivation_reason is not None:
+            return False, deactivation_reason
         return True, ""
 
     def verify_trust_proof_with_status(
@@ -5721,6 +5772,8 @@ class VCStore:
             -> (False, "签名校验失败")；
           - body 含 expires_at 且当前时间已达到 ->
             (False, "凭证已过期")；
+          - 原验真通过后命中本租户 issuer_did 外部停用通告 ->
+            (False, "外部签发DID已停用：<reason>")；
           - 成功 -> (True, "")。
 
         纯只读：不写记录、状态、历史或审计，绝不向上抛内部异常；
@@ -5797,6 +5850,15 @@ class VCStore:
                 return False, CREDENTIAL_EXPIRED_REASON
             if datetime.now(timezone.utc) >= expires_dt:
                 return False, CREDENTIAL_EXPIRED_REASON
+
+        # 原验真成功后、合并凭证状态前查本租户 issuer_did 外部停用
+        # 通告：命中返回“外部签发DID已停用：<reason>”；无通告或仅他
+        # 租户有通告维持原结论。只读，不写状态、不记审计。
+        deactivation_reason = self._external_did_deactivation_reason(
+            tenant_id, issuer_did, EXTERNAL_ISSUER_DID_DEACTIVATED_REASON_PREFIX
+        )
+        if deactivation_reason is not None:
+            return False, deactivation_reason
         return True, ""
 
     def verify_imported_credential_with_status(
@@ -6734,6 +6796,17 @@ class VCStore:
         if row is None:
             return None
         return self._deactivation_notice_record(did, row)
+
+    def _external_did_deactivation_reason(
+        self, tenant_id: str, did: str, prefix: str
+    ) -> Optional[str]:
+        """只读查询本租户某 DID 的外部停用通告；命中返回
+        ``<prefix><通告 reason>``，未登记（含仅他租户有通告）返回
+        None。不写状态、不记审计。"""
+        notice = self.get_did_deactivation_notice(tenant_id, did)
+        if notice is None:
+            return None
+        return f"{prefix}{notice.reason}"
 
     def _next_did_deactivation_cursor_locked(self, tenant_id: str) -> int:
         """分配租户内下一个持久化停用通告审计游标（正整数，按追加递增）。"""
