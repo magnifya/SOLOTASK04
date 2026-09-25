@@ -7755,6 +7755,64 @@ class VCStore:
                 raise StorageError("存储失败") from exc
             return True, consumed_at
 
+    def consume_credential_receipts_batch(
+        self,
+        tenant_id: str,
+        keys: List[Tuple[str, str, str]],
+    ) -> List[Tuple[bool, Optional[str]]]:
+        """同锁原子批量消费跨系统凭证验真签名回执（防重放）。
+
+        调用方须先逐项完成回执七阶段验真，且 keys 顺序与原批次一致；
+        每项为 ``(verifier_did, nonce, receipt_id)``。整批在同一把锁、
+        同一个快照事务内顺序判定并提交：
+
+        - 历史已存在或批内较早项已占的键判为重放，结果为
+          ``(False, None)``，不写状态、不记审计；
+        - 新键记录 consumed_at（UTC 秒精度 Z）并逐条追加
+          trust.credential.receipt.consumed 审计（resource_type 为
+          credential_receipt、resource_id 为 receipt_id），结果为
+          ``(True, consumed_at)``；
+        - 全部项判完后仅做一次原子落盘：所有新消费标记与审计同次提交；
+          没有新键（全部重放）时不写盘。落盘失败整体回滚内存中的全部
+          新增标记与审计，抛 StorageError，可重试。
+
+        返回与 keys 等长、同序的逐键结果。与单项
+        :meth:`consume_credential_receipt` 共用同一把锁与同一张
+        consumed_receipts 表，故批内、历史与并发单项每键仅一次成功，
+        跨重启保留。
+        """
+        with self._lock:
+            bucket = self._ensure_bucket_locked(tenant_id)
+            snapshot = self._snapshot_locked()
+            outcomes: List[Tuple[bool, Optional[str]]] = []
+            try:
+                for verifier_did, nonce, receipt_id in keys:
+                    by_verifier = bucket["consumed_receipts"].setdefault(
+                        verifier_did, {}
+                    )
+                    if nonce in by_verifier:
+                        # 历史重放或批内较早项已占该键：不写、不审计。
+                        outcomes.append((False, None))
+                        continue
+                    consumed_at = _utc_now()
+                    by_verifier[nonce] = {
+                        "receipt_id": receipt_id,
+                        "consumed_at": consumed_at,
+                    }
+                    self._append_audit_locked(
+                        tenant_id,
+                        AUDIT_TRUST_CREDENTIAL_RECEIPT_CONSUMED,
+                        "credential_receipt",
+                        receipt_id,
+                    )
+                    outcomes.append((True, consumed_at))
+                if any(ok for ok, _ in outcomes):
+                    self._save_locked()
+            except Exception as exc:
+                self._restore_locked(snapshot)
+                raise StorageError("存储失败") from exc
+            return outcomes
+
     def get_trust_anchor_snapshot_signer(
         self,
         tenant_id: str,

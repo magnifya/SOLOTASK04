@@ -41,6 +41,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/credentials/verify-receipt  跨系统凭证验真签名回执（只读）
   POST /v1/trust/credentials/receipt/verify  校验验真签名回执（只读）
   POST /v1/trust/credentials/receipt/consume  消费验真签名回执（防重放，首次落盘并审计）
+  POST /v1/trust/credentials/receipt/consume-batch 批量消费验真签名回执（防重放，逐项不短路、整批原子落盘）
   POST /v1/trust/credentials/import       导入外部凭证（active 锚点验签后持久化）
   POST /v1/trust/credentials/import-batch 批量导入外部凭证（逐项不短路）
   GET  /v1/trust/credentials/imported/{credential_id}  读取已导入的外部凭证（?issuer_did=）
@@ -87,7 +88,7 @@ import re
 import sys
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
 from . import crypto
@@ -392,6 +393,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_credentials_receipt_verify(tenant)
                 elif path == "/v1/trust/credentials/receipt/consume":
                     self._post_trust_credentials_receipt_consume(tenant)
+                elif path == "/v1/trust/credentials/receipt/consume-batch":
+                    self._post_trust_credentials_receipt_consume_batch(tenant)
                 elif path == "/v1/trust/credentials/import":
                     self._post_trust_credentials_import(tenant)
                 elif path == "/v1/trust/credentials/import-batch":
@@ -3472,6 +3475,173 @@ def build_handler(store: VCStore) -> type:
                     "consumed_at": consumed_at,
                 },
             )
+
+        @staticmethod
+        def _valid_receipt_consume_item_shape(item: Any) -> bool:
+            """校验批量消费项的外层结构（与单项 consume 外层规则一致）。
+
+            项须为对象且恰含 receipt、receipt_signature、body、signature、
+            nonce：receipt、body 为 JSON 对象，receipt_signature、
+            signature、nonce 为非空字符串且 nonce 为 1..256 码点。
+            """
+            if not isinstance(item, dict):
+                return False
+            expected_fields = (
+                "receipt",
+                "receipt_signature",
+                "body",
+                "signature",
+                "nonce",
+            )
+            if set(item) != set(expected_fields):
+                return False
+            if not isinstance(item["receipt"], dict):
+                return False
+            if not isinstance(item["body"], dict):
+                return False
+            for field in ("receipt_signature", "signature"):
+                if not isinstance(item[field], str) or not item[field]:
+                    return False
+            nonce = item["nonce"]
+            if not isinstance(nonce, str) or not 1 <= len(nonce) <= 256:
+                return False
+            return True
+
+        def _post_trust_credentials_receipt_consume_batch(
+            self, tenant: str
+        ) -> None:
+            # POST /v1/trust/credentials/receipt/consume-batch：验真并
+            # 批量消费跨系统凭证验真签名回执（防重放）。任何请求级失败
+            # 均 HTTP 200 返 {"results":[],"reason":"请求..."}：
+            # 1) 请求体须恰为 {"items":[项...]}，数组非空且不超过 100
+            #    项；空体、非法 JSON、非对象、键集错误、items 非数组/
+            #    空/超限均判请求级非法；
+            # 2) 合法批次逐项处理、失败不短路：项外层结构非法（规则同
+            #    单项 consume：恰含 receipt、receipt_signature、body、
+            #    signature、nonce 且类型/nonce 合规）返
+            #    {"valid":false,"reason":"请求项非法"}；其余复用单项
+            #    七阶段顺序、reason 及优先级；
+            # 3) 验真通过后按租户以 (verifier_did, nonce) 为唯一键消费：
+            #    批内首项成功，后项或历史重放返
+            #    {"valid":false,"reason":"回执已消费"}；成功项键序为
+            #    valid、receipt_id、consumed_at，取值沿用单项；results
+            #    与输入等长、同序；
+            # 4) 新消费标记与审计在同一把锁内经同一次原子写落盘，落盘
+            #    失败整批回滚并返 500 仅 {"error":"存储失败"}；与单项
+            #    consume 并发每键仅一次成功，重启保持。显式空租户头在
+            #    进入前由路由统一判 400；缺省 default、按租户隔离。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                self._send_json(
+                    200,
+                    {"results": [],
+                     "reason": "请求不合法: 请求体缺失或长度声明非法"},
+                )
+                return
+            except Exception:  # noqa: BLE001
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 请求体读取失败"}
+                )
+                return
+            if not raw:
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 请求体缺失"}
+                )
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                self._send_json(
+                    200,
+                    {"results": [],
+                     "reason": "请求不合法: 请求体不是合法 UTF-8 文本"},
+                )
+                return
+            except json.JSONDecodeError:
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 请求体不是合法 JSON"}
+                )
+                return
+
+            def _request_invalid(reason: str) -> None:
+                self._send_json(200, {"results": [], "reason": reason})
+
+            if not isinstance(data, dict):
+                _request_invalid("请求不合法: 请求体必须为 JSON 对象")
+                return
+            if set(data) != {"items"}:
+                if "items" not in data:
+                    _request_invalid("请求缺少字段: items")
+                    return
+                extra = sorted(set(data) - {"items"})
+                _request_invalid(f"请求含多余字段: {', '.join(extra)}")
+                return
+            items = data["items"]
+            if not isinstance(items, list):
+                _request_invalid("请求不合法: 字段 items 必须为数组")
+                return
+            if not items:
+                _request_invalid("请求不合法: items 数组不能为空")
+                return
+            if len(items) > 100:
+                _request_invalid(
+                    "请求不合法: items 数组不能超过 100 项"
+                    f"（当前 {len(items)} 项）"
+                )
+                return
+
+            # 逐项验真（不短路）：结构非法固定“请求项非法”，七阶段失败
+            # 沿用单项原因；仅全部通过的项进入消费，记录其在批次中的位置。
+            results: List[Optional[Dict[str, Any]]] = [None] * len(items)
+            consume_positions: List[int] = []
+            consume_keys: List[Tuple[str, str, str]] = []
+            for index, item in enumerate(items):
+                if not self._valid_receipt_consume_item_shape(item):
+                    results[index] = {
+                        "valid": False,
+                        "reason": "请求项非法",
+                    }
+                    continue
+                reason = self._verify_credential_receipt_item(tenant, item)
+                if reason is not None:
+                    results[index] = {"valid": False, "reason": reason}
+                    continue
+                receipt = item["receipt"]
+                receipt_id = hashlib.sha256(
+                    crypto.canonicalize(receipt)
+                ).hexdigest()
+                consume_positions.append(index)
+                consume_keys.append(
+                    (receipt["verifier_did"], receipt["nonce"], receipt_id)
+                )
+
+            # 所有验真通过项在同一把锁、同一次原子写内顺序消费：批内/
+            # 历史/并发单项每键仅一次成功；失败整批回滚。
+            if consume_keys:
+                try:
+                    outcomes = store.consume_credential_receipts_batch(
+                        tenant, consume_keys
+                    )
+                except StorageError:
+                    self._send_error(500, "存储失败")
+                    return
+                for position, (consumed, payload), (_, _, receipt_id) in zip(
+                    consume_positions, outcomes, consume_keys
+                ):
+                    if not consumed:
+                        results[position] = {
+                            "valid": False,
+                            "reason": "回执已消费",
+                        }
+                    else:
+                        results[position] = {
+                            "valid": True,
+                            "receipt_id": receipt_id,
+                            "consumed_at": payload,
+                        }
+            self._send_json(200, {"results": results})
 
         @staticmethod
         def _verify_credential_receipt_item(
