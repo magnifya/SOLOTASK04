@@ -129,9 +129,11 @@ class CredentialRecord:
 class CredentialStatusRecord:
     """凭证状态登记记录。
 
-    status 目前为 "active" 或 "revoked"；updated_at 为首次状态登记时间
-    （UTC ISO8601），历史无状态凭证查询时为 None。revoked 时附带
-    reason（裁剪后的吊销原因）与 revoked_at。
+    status 为 "active"、"suspended" 或 "revoked"；updated_at 为最近一次
+    状态变更时间（UTC ISO8601），历史无状态凭证查询时为 None。suspended
+    时附带 reason（裁剪后的暂停原因，1..256 码点）；revoked 时附带
+    reason（裁剪后的吊销原因）与 revoked_at，吊销为不可恢复的终态。
+    suspended 可恢复为 active（reason 清空，updated_at 取恢复时刻）。
     """
 
     credential_id: str
@@ -302,14 +304,17 @@ class CredentialStatusHistoryEvent:
 class LocalCredentialStatusHistoryEvent:
     """本租户签发凭证状态历史中的一条事件（只读历史查询用）。
 
-    按 (租户, credential_id) 归属；仅首次 active 登记与首次 revoke 各
-    追加一条，重复登记/吊销与失败路径不追加。active 事件的
-    reason/revoked_at 均为 None；revoked 事件保存裁剪后的 reason 与
-    revoked_at。updated_at 为状态变更时间（UTC ISO8601 秒精度 Z）。
-    cursor 为租户内持久化正整数，按追加顺序递增，事件按 updated_at
-    升序、同 updated_at 按 cursor 升序排列。audit_seq/audit_timestamp
-    关联产生该状态变更的审计事件（status.updated /
-    credential.revoked）；无法追溯（旧状态补录的兼容项）时为 None。
+    按 (租户, credential_id) 归属；首次 active 登记、暂停（suspended）、
+    恢复（active）与首次 revoke 各追加一条，同状态幂等（active->active、
+    相同原因 suspended->suspended）与失败路径不追加。active/恢复事件的
+    reason/revoked_at 均为 None；suspended 事件保存裁剪后的暂停原因、
+    revoked_at 为 None；revoked 事件保存裁剪后的 reason 与 revoked_at。
+    updated_at 为状态变更时间（UTC ISO8601 秒精度 Z），首次 active 登记
+    与恢复均取当次时刻。cursor 为租户内持久化正整数，按追加顺序递增，
+    事件按 updated_at 升序、同 updated_at 按 cursor 升序排列。
+    audit_seq/audit_timestamp 关联产生该状态变更的审计事件
+    （status.updated / credential.revoked）；无法追溯（旧状态补录的兼容项）
+    时为 None。
     """
 
     status: str

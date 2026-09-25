@@ -24,8 +24,9 @@
 - 旧状态文件里缺少密钥元数据的 DID 在加载时迁移为 server/1，
   历史即原 public_key，句柄取 submitted_public_key 或原 public_key。
 
-凭证状态（active/revoked）登记在凭证行内，随状态文件持久化；
-历史无状态凭证查询时按 active 呈现（updated_at 为空）。
+凭证状态（active/suspended/revoked）登记在凭证行内，随状态文件持久化；
+suspended 可恢复为 active，revoked 为不可恢复终态；历史无状态凭证查询时
+按 active 呈现（updated_at 为空）。
 """
 
 import copy
@@ -1717,6 +1718,13 @@ class VCStore:
 
         issuer_did = stored_body["issuer_did"]
         version = int(stored_body.get("issuer_key_version", 1))
+        # 凭证已暂停：暂停期间禁止生成演示，409 且不留任何记录/审计；
+        # 恢复（suspended -> active）后即可正常生成。已吊销凭证的既有
+        # 行为不变（仍可生成，由 verify 兜底拒绝）。
+        if cred.get("status") == "suspended":
+            raise ConflictError(
+                f"凭证已暂停，不能生成演示: {credential_id}"
+            )
         # 签发者 DID 已停用：拒绝生成演示，409 且不留任何记录/审计。
         issuer_rec = bucket["dids"].get(issuer_did)
         if self._is_did_deactivated_locked(issuer_rec):
@@ -2096,6 +2104,7 @@ class VCStore:
             source_claims = cred["body"].get("claims", {})
             credential_status = cred.get("status")
             revoke_reason = cred.get("revoke_reason")
+            suspend_reason = cred.get("suspend_reason")
             credential_expires_at = cred["body"].get("expires_at")
 
             public_pem = self._public_key_for_version_locked(
@@ -2279,7 +2288,11 @@ class VCStore:
         if _is_expired(credential_expires_at):
             return False, CREDENTIAL_EXPIRED_REASON
 
-        # 签名与锚定均成功后检查凭证状态：已吊销不消费
+        # 签名与锚定均成功后检查凭证状态：已暂停/已吊销均不消费；
+        # 暂停为可恢复态，恢复后同一演示仍可验证通过。
+        if credential_status == "suspended":
+            saved_reason = suspend_reason or "未知原因"
+            return False, f"凭证已暂停：{saved_reason}"
         if credential_status == "revoked":
             saved_reason = revoke_reason or DEFAULT_REVOKE_REASON
             return False, f"凭证已吊销：{saved_reason}"
@@ -2351,6 +2364,11 @@ class VCStore:
                     cred["body"].get("expires_at")
                 ):
                     return False, CREDENTIAL_EXPIRED_REASON
+                if cred is not None and cred.get("status") == "suspended":
+                    saved_reason = (
+                        cred.get("suspend_reason") or "未知原因"
+                    )
+                    return False, f"凭证已暂停：{saved_reason}"
                 if cred is not None and cred.get("status") == "revoked":
                     saved_reason = (
                         cred.get("revoke_reason") or DEFAULT_REVOKE_REASON
@@ -2435,6 +2453,12 @@ class VCStore:
             if self._is_did_deactivated_locked(issuer_rec):
                 raise ConflictError(
                     f"签发者 DID 已停用，不能生成谓词证明: {issuer_did}"
+                )
+            # 凭证已暂停：暂停期间禁止生成谓词证明，409 且不留任何
+            # 记录/审计；恢复（suspended -> active）后即可正常生成。
+            if cred.get("status") == "suspended":
+                raise ConflictError(
+                    f"凭证已暂停，不能生成谓词证明: {credential_id}"
                 )
             private_pem = self._private_key_for_version_locked(
                 bucket, issuer_did, version
@@ -2598,6 +2622,9 @@ class VCStore:
                 return False, f"凭证不存在: {credential_id}"
             source_claims = cred["body"].get("claims", {})
             credential_expires_at = cred["body"].get("expires_at")
+            # 凭证暂停状态在锚定与签名成功后判定；锁内捕获。
+            credential_suspended = cred.get("status") == "suspended"
+            credential_suspend_reason = cred.get("suspend_reason")
 
             public_pem = self._public_key_for_version_locked(
                 bucket, issuer_did, stored_version
@@ -2690,6 +2717,12 @@ class VCStore:
         if _is_expired(credential_expires_at):
             return False, CREDENTIAL_EXPIRED_REASON
 
+        # 有效期之后检查凭证暂停状态：暂停期间证明校验失败且不消费、
+        # 不记审计；恢复（suspended -> active）后同一证明仍可验证通过。
+        if credential_suspended:
+            saved_reason = credential_suspend_reason or "未知原因"
+            return False, f"凭证已暂停：{saved_reason}"
+
         # 原子标记已消费：消费锁内复查已消费/到期，并发仅一次成功，
         # 跨重启保留；复查到期不消费、不记审计。
         with self._lock:
@@ -2735,6 +2768,11 @@ class VCStore:
             cred = bucket["credentials"].get(credential_id)
             if cred is not None and _is_expired(cred["body"].get("expires_at")):
                 return False, CREDENTIAL_EXPIRED_REASON
+            # 锁内复查凭证暂停状态（防锁外验签期间被暂停的竞态）：
+            # 暂停不消费、不记审计，恢复后同一证明仍可验证通过。
+            if cred is not None and cred.get("status") == "suspended":
+                saved_reason = cred.get("suspend_reason") or "未知原因"
+                return False, f"凭证已暂停：{saved_reason}"
             snapshot = self._snapshot_locked()
             try:
                 row["consumed"] = True
@@ -2759,14 +2797,34 @@ class VCStore:
         history = bucket.setdefault("local_credential_status_history", {})
         return history.setdefault(credential_id, [])
 
-    def set_credential_active(
-        self, tenant_id: str, credential_id: str
+    def set_credential_status(
+        self,
+        tenant_id: str,
+        credential_id: str,
+        status: str,
+        reason: Any = REASON_UNSET,
     ) -> Tuple[CredentialStatusRecord, bool]:
-        """登记凭证状态为 active，返回 (状态记录, 是否首次登记)。
+        """登记凭证状态为 active/suspended，返回 (状态记录, 是否首次登记)。
 
-        首次登记 201（created=True），重复登记 200（created=False）且
-        保持首次 updated_at；已 revoked 返回 ConflictError(409)。
-        首次登记与幂等重试均记 status.updated。
+        状态机（revoked 为终态）：
+        - 无状态 -> active：首次 active，201（created=True），追加 active
+          历史事件；
+        - active -> active：幂等 200（created=False），保持首次
+          updated_at，不追加历史，仅记 status.updated；
+        - 无状态/active -> suspended：200，追加带裁剪 reason 的 suspended
+          历史事件（revoked_at 为 None）；
+        - suspended -> active（恢复）：200，追加 active 历史事件
+          （reason/revoked_at 均为 None），updated_at 取恢复时刻；
+        - suspended -> suspended 且裁剪后原因相同：幂等 200，保持首次
+          updated_at，不追加历史，仅记 status.updated；原因不同抛
+          ConflictError(409)，不写任何状态/历史/审计；
+        - 已 revoked：任何目标状态均抛 ConflictError(409)。
+
+        suspended 的 reason 必填，须为字符串且首尾裁剪后为 1..256 个
+        Unicode 码点，否则 ValidationError(400)；active 不接受 reason
+        （由 HTTP 层约束请求体恰含 status）。凭证不存在（含他租户资源）
+        抛 NotFoundError。状态、历史、游标与审计在同一把锁内经同一次
+        原子写落盘，落盘失败一并回滚。
         """
         with self._lock:
             bucket = self._bucket_locked(tenant_id)
@@ -2779,30 +2837,64 @@ class VCStore:
             current = rec.get("status")
             if current == "revoked":
                 raise ConflictError(
-                    f"凭证已吊销，不能登记为 active: {credential_id}"
+                    f"凭证已吊销，不能变更状态: {credential_id}"
                 )
-            created = current != "active"
-            snapshot = self._snapshot_locked()
-            try:
-                if created:
-                    rec["status"] = "active"
-                    rec["status_updated_at"] = _utc_now()
-                # 幂等重试（200）同样每次记录审计
-                event = self._append_audit_locked(
-                    tenant_id, AUDIT_STATUS_UPDATED,
-                    "credential", credential_id,
-                )
-                if created:
-                    # 仅首次 active 登记追加状态历史事件（与状态、游标、
-                    # 审计同一次原子写）；重复登记不追加。
+
+            if status == "suspended":
+                if not isinstance(reason, str):
+                    raise ValidationError("字段 reason 必须为字符串")
+                final_reason = reason.strip()
+                if not 1 <= len(final_reason) <= 256:
+                    raise ValidationError(
+                        "字段 reason 裁剪后须为 1 到 256 个字符"
+                    )
+                if current == "suspended":
+                    if rec.get("suspend_reason") != final_reason:
+                        # 同状态暂停但原因不同：409，不写状态/历史/审计。
+                        raise ConflictError(
+                            "凭证已暂停且暂停原因不同，不能以其他原因重复"
+                            f"暂停: {credential_id}"
+                        )
+                    snapshot = self._snapshot_locked()
+                    try:
+                        # 幂等重试（200）同样每次记录审计，但不追加历史、
+                        # updated_at 保持首次暂停时刻。
+                        self._append_audit_locked(
+                            tenant_id, AUDIT_STATUS_UPDATED,
+                            "credential", credential_id,
+                        )
+                        self._save_locked()
+                    except Exception:
+                        self._restore_locked(snapshot)
+                        raise
+                    return (
+                        CredentialStatusRecord(
+                            credential_id=credential_id,
+                            status="suspended",
+                            updated_at=rec.get("status_updated_at"),
+                            reason=final_reason,
+                        ),
+                        False,
+                    )
+                # 无状态/active -> suspended（200）
+                now = _utc_now()
+                snapshot = self._snapshot_locked()
+                try:
+                    rec["status"] = "suspended"
+                    rec["status_updated_at"] = now
+                    rec["suspend_reason"] = final_reason
+                    event = self._append_audit_locked(
+                        tenant_id, AUDIT_STATUS_UPDATED,
+                        "credential", credential_id,
+                    )
                     entries = self._local_credential_history_entries_locked(
                         bucket, credential_id
                     )
                     entries.append(
                         {
-                            "status": "active",
-                            "reason": None,
-                            "updated_at": rec["status_updated_at"],
+                            "status": "suspended",
+                            "reason": final_reason,
+                            "updated_at": now,
                             "revoked_at": None,
                             "cursor": (
                                 self._next_local_credential_status_cursor_locked(
@@ -2813,6 +2905,73 @@ class VCStore:
                             "audit_timestamp": int(event["timestamp"]),
                         }
                     )
+                    self._save_locked()
+                except Exception:
+                    self._restore_locked(snapshot)
+                    raise
+                return (
+                    CredentialStatusRecord(
+                        credential_id=credential_id,
+                        status="suspended",
+                        updated_at=now,
+                        reason=final_reason,
+                    ),
+                    False,
+                )
+
+            # status == "active"
+            if current == "active":
+                snapshot = self._snapshot_locked()
+                try:
+                    # 幂等重试（200）同样每次记录审计，但不追加历史、
+                    # updated_at 保持首次值。
+                    self._append_audit_locked(
+                        tenant_id, AUDIT_STATUS_UPDATED,
+                        "credential", credential_id,
+                    )
+                    self._save_locked()
+                except Exception:
+                    self._restore_locked(snapshot)
+                    raise
+                return (
+                    CredentialStatusRecord(
+                        credential_id=credential_id,
+                        status="active",
+                        updated_at=rec.get("status_updated_at"),
+                    ),
+                    False,
+                )
+            # 无状态 -> active 为首次登记（201）；suspended -> active 为
+            # 恢复（200），均追加 active 历史事件。
+            created = current != "suspended"
+            now = _utc_now()
+            snapshot = self._snapshot_locked()
+            try:
+                rec["status"] = "active"
+                rec["status_updated_at"] = now
+                rec.pop("suspend_reason", None)
+                event = self._append_audit_locked(
+                    tenant_id, AUDIT_STATUS_UPDATED,
+                    "credential", credential_id,
+                )
+                entries = self._local_credential_history_entries_locked(
+                    bucket, credential_id
+                )
+                entries.append(
+                    {
+                        "status": "active",
+                        "reason": None,
+                        "updated_at": now,
+                        "revoked_at": None,
+                        "cursor": (
+                            self._next_local_credential_status_cursor_locked(
+                                tenant_id
+                            )
+                        ),
+                        "audit_seq": int(event["seq"]),
+                        "audit_timestamp": int(event["timestamp"]),
+                    }
+                )
                 self._save_locked()
             except Exception:
                 self._restore_locked(snapshot)
@@ -2821,10 +2980,18 @@ class VCStore:
                 CredentialStatusRecord(
                     credential_id=credential_id,
                     status="active",
-                    updated_at=rec.get("status_updated_at"),
+                    updated_at=now,
                 ),
                 created,
             )
+
+    def set_credential_active(
+        self, tenant_id: str, credential_id: str
+    ) -> Tuple[CredentialStatusRecord, bool]:
+        """登记凭证状态为 active 的兼容入口（见 :meth:`set_credential_status`）。"""
+        return self.set_credential_status(
+            tenant_id, credential_id, "active"
+        )
 
     def get_credential_status(
         self, tenant_id: str, credential_id: str
@@ -2847,6 +3014,13 @@ class VCStore:
                     credential_id=credential_id,
                     status="active",
                     updated_at=None,
+                )
+            if status == "suspended":
+                return CredentialStatusRecord(
+                    credential_id=credential_id,
+                    status="suspended",
+                    updated_at=rec.get("status_updated_at"),
+                    reason=rec.get("suspend_reason"),
                 )
             return CredentialStatusRecord(
                 credential_id=credential_id,
@@ -3094,6 +3268,7 @@ class VCStore:
             # 状态在锚定、签名校验成功后才参与判定；active 或无状态维持结果
             credential_status = rec.get("status")
             revoke_reason = rec.get("revoke_reason")
+            suspend_reason = rec.get("suspend_reason")
 
         if not public_pem:
             return False, (
@@ -3138,8 +3313,12 @@ class VCStore:
         if _is_expired(stored_body.get("expires_at")):
             return False, CREDENTIAL_EXPIRED_REASON
 
-        # 签名、锚定均成功后检查状态：revoked 判 valid:false，
-        # active 或历史无状态维持 valid:true
+        # 签名、锚定均成功后检查状态：suspended/revoked 判 valid:false，
+        # active 或历史无状态维持 valid:true；暂停/吊销判定在有效期之后，
+        # 过期优先级不变。该判定只读，不记审计。
+        if credential_status == "suspended":
+            saved_reason = suspend_reason or "未知原因"
+            return False, f"凭证已暂停：{saved_reason}"
         if credential_status == "revoked":
             saved_reason = revoke_reason or DEFAULT_REVOKE_REASON
             return False, f"凭证已吊销：{saved_reason}"
@@ -5074,12 +5253,13 @@ class VCStore:
     def _backfill_local_credential_status_history_locked(self) -> None:
         """加载迁移：为有状态但无历史的本地凭证补一条兼容项（内存态）。
 
-        对每个租户内已有状态行（status 为 active/revoked）、但该凭证
-        没有任何状态历史项的旧状态，按 (租户, credential_id) 的稳定顺序
-        补录一条内容取自状态行的兼容事件：active 事件 reason/revoked_at
-        为 None；revoked 事件保存裁剪 reason 与 revoked_at；cursor 为该
-        租户内新分配的持久化正整数，audit_seq/audit_timestamp 均为 None
-        （无法追溯原始审计事件）。
+        对每个租户内已有状态行（status 为 active/revoked/suspended）、但
+        该凭证没有任何状态历史项的旧状态，按 (租户, credential_id) 的
+        稳定顺序补录一条内容取自状态行的兼容事件：active 事件
+        reason/revoked_at 为 None；revoked 事件保存裁剪 reason 与
+        revoked_at；suspended 事件保存暂停原因（suspend_reason，缺省为
+        None）、revoked_at 为 None；cursor 为该租户内新分配的持久化正
+        整数，audit_seq/audit_timestamp 均为 None（无法追溯原始审计事件）。
 
         仅在内存中补录：兼容项随下一次任意原子写一并落盘；若此后无写
         操作则重启时按相同顺序重建，cursor 稳定。
@@ -5092,7 +5272,7 @@ class VCStore:
             for credential_id in sorted(bucket.get("credentials", {})):
                 rec = bucket["credentials"][credential_id]
                 status = rec.get("status")
-                if status not in ("active", "revoked"):
+                if status not in ("active", "revoked", "suspended"):
                     continue
                 entries = history.setdefault(credential_id, [])
                 if entries:
@@ -5100,6 +5280,9 @@ class VCStore:
                 if status == "revoked":
                     reason = rec.get("revoke_reason")
                     revoked_at = rec.get("revoked_at")
+                elif status == "suspended":
+                    reason = rec.get("suspend_reason")
+                    revoked_at = None
                 else:
                     reason = None
                     revoked_at = None
