@@ -939,6 +939,62 @@ curl -X POST localhost:8080/v1/proofs/zp_<id>/verify \
   curl -D - 'localhost:8080/v1/trust/dids/deactivations/export?limit=1000'
   curl 'localhost:8080/v1/trust/dids/deactivations/export?snapshot=42&after=1000&limit=1000'
   ```
+- `GET /v1/trust/dids/deactivations/manifest` 为停用通告导出生成**签名
+  清单**：查询参数取 export 参数（`limit`、`after`、`snapshot`、`did`、
+  `key_version`、`from`、`to`）外加唯一 `signer_did`，八参数均只能出现
+  一次。
+  - **`snapshot` 必填**：须为**非负 ASCII 十进制**整数且**不超过请求时
+    本租户最大 cursor**（无事件仅允许 `0`）；缺失、非 ASCII 数字、
+    Unicode 数字或越界一律 **400**。
+  - **`signer_did` 必填且唯一**：须为非空字符串，指向**本租户已注册的
+    本地 DID**；未知（含他租户，跨租户不可探测）返回 **404**，已停用
+    返回 **409**。
+  - `limit`（1–10000，缺省计算按 1000）、`after`（缺省计算按 0）、
+    `did`、`key_version`、`from`、`to` 的校验规则与 export 完全一致
+    （`from`/`to` 含非 ASCII 数字一律 400）；重复、空值、未知参数、
+    格式或范围非法一律 **400** 且响应**恰为**非空中文 `{"error":...}`。
+  - 成功 **200** 返回键序固定的
+    `{snapshot,filters,count,alg,digest,signer_did,key_version,signature}`：
+    `filters` 键序为 `after`、`limit`、`did`、`key_version`、`from`、
+    `to`，**依序取查询生效值，缺省项为 `null`**（计算仍按 0/1000）；
+    `count` 为非负整数（导出行数）；`alg` 恒为 `"SHA-256"`；`digest`
+    为生效过滤+分页后 **NDJSON 字节的 64 位小写 hex** SHA-256；
+    `key_version` 为签名 DID 的当前密钥版本；`signature` 由**该 DID
+    当前私钥**按既有 ES256 裸 `R||S` 无填充 base64url 规则，签署
+    **前七键**（不含 `signature`）的规范化 JSON，签名字节每次可变。
+  - 接口为**纯只读**、租户隔离、不记审计；清单随状态文件跨重启验真
+    稳定。
+- `POST /v1/trust/dids/deactivations/manifest/verify` 校验导出清单与其
+  NDJSON 内容（只读、公开错误协议）。请求体须恰含 **`manifest`（JSON
+  对象）**与 **`ndjson`（字符串）**；缺失、非法 JSON、非对象、字段缺失
+  或多余、类型错误一律 **400** 且响应**仅** `{error}`。
+  - 合法请求一律 **HTTP 200**：成功仅 `{"valid":true}`；失败返回
+    `{"valid":false,"reason":...}`，按校验顺序 `reason` 依次恰为
+    **“清单非法”**、**“锚点不可用”**、**“签名格式错误”**、
+    **“签名校验失败”**、**“导出内容不匹配”**：
+    1. 清单须恰含八键，`filters` 恰含六键，`snapshot`/`count` 非负整数、
+       `alg` 为 `SHA-256`、`digest` 为 64 位小写 hex、`signer_did` 非空
+       串、`key_version` 正整数、`signature` 非空串，各 filter 取值合法
+       且 `from≤to`（缺省 filter 为 `null`，`after`/`limit` 缺省按
+       0/1000）；
+    2. 按**当前租户同 `signer_did`/`key_version` 的 active 信任锚点**取
+       P-256 公钥，缺失、他租户或已吊销为“锚点不可用”；
+    3. 签名编码须为合法的裸 `R||S` base64url（否则“签名格式错误”）；
+    4. 以锚点公钥对清单前七键规范化 JSON 做 ES256 验签（失败“签名校验
+       失败”）；
+    5. 按 `snapshot`/`filters` 重算 NDJSON，核对提交 `ndjson` 的 **UTF-8
+       字节、行数（count）与 SHA-256 摘要**，任一不符为“导出内容不
+       匹配”。
+  - 纯只读：不写状态、不记审计、不消费；跨租户仅能用本租户锚点，结论
+    随状态文件跨重启稳定。
+
+  ```bash
+  curl -H 'X-Tenant-ID: acme' \
+    "localhost:8080/v1/trust/dids/deactivations/manifest?snapshot=42&signer_did=did:example:<id>"
+  curl -X POST localhost:8080/v1/trust/dids/deactivations/manifest/verify \
+    -H 'Content-Type: application/json' \
+    -d '{"manifest":{ ...上一步返回的清单... },"ndjson":"<export 的 NDJSON 原文>"}'
+  ```
 - `POST /v1/trust/presentations/verify` 验证**其他系统生成且未在本租户
   保存的演示**：无需登记本地 DID/凭证/演示，只读、不写凭证/演示/状态/
   历史/审计，跨租户各自使用本租户锚点，重启后结论一致。
@@ -1577,6 +1633,7 @@ python3 tests/holder_binding_test.py
 python3 tests/trust_credential_verify_test.py
 python3 tests/trust_did_document_verify_test.py
 python3 tests/trust_did_deactivation_sync_test.py
+python3 tests/trust_did_deactivations_manifest_test.py
 python3 tests/trust_presentation_verify_test.py
 python3 tests/trust_proof_verify_test.py
 python3 tests/trust_proof_verify_batch_test.py
@@ -1641,7 +1698,13 @@ vcbackend/
                原文匹配、验真成功后查外部 DID 停用通告、只读不登记）、
                外部 DID 停用通告登记（恰含四字段的 body 校验、active
                锚点 ES256 验签、按租户+did 原子持久化、完全重放幂等、
-               异通告冲突、失败不写入）、跨系统外部演示验真（未绑定九字段、
+               异通告冲突、失败不写入）、停用通告导出清单（本地签名 DID
+               当前私钥对 snapshot/filters/count/alg/digest/signer_did/
+               key_version 前七键规范化 JSON 裸签名、未知 DID 404/停用
+               409/越界 400，只读）与清单验真（清单结构、本租户同 DID/
+               版本 active 锚点、签名格式、ES256 验签、UTF-8 字节/行数/
+               SHA-256 摘要五级校验，固定中文原因，只读跨重启稳定）、
+               跨系统外部演示验真（未绑定九字段、
                挑战一致性与期限判定）、跨系统外部谓词证明验真
                （九字段与 predicates/results 结构校验、不重算 results、
                tenant_id=source_tenant_id 规范化验签、期限判定，只读不消费）、
@@ -1769,6 +1832,17 @@ tests/trust_did_deactivations_test.py 外部 DID 停用通告审计查询（六�
                                    键序与类型、租户隔离、旧通告按
                                    deactivated_at,did 补录、迁移与重启
                                    cursor 稳定）
+tests/trust_did_deactivations_manifest_test.py 停用通告导出清单与验真
+                                   （GET manifest：snapshot 必填/越界 400、
+                                   signer_did 唯一非空、未知 404/停用 409、
+                                   from/to 非 ASCII 数字 400；200 八键与
+                                   filters 六键键序、缺省项 null、count/alg/
+                                   64 位小写 hex digest 与 NDJSON 一致、
+                                   签名字节可变；POST verify：外层错 400
+                                   仅 error，依次清单非法/锚点不可用/签名
+                                   格式错误/签名校验失败/导出内容不匹配，
+                                   成功仅 valid:true；只读不审计、租户
+                                   隔离、跨重启稳定）
 tests/trust_presentation_verify_test.py 跨系统演示验真（请求/演示字段/holder_*
                                    拒绝/挑战/锚点/签名格式/验签/过期分类 reason、
                                    恰九字段与类型、只读不记审计、跨租户/重启）

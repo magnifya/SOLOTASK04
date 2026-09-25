@@ -29,6 +29,7 @@
 """
 
 import copy
+import hashlib
 import json
 import os
 import re
@@ -125,6 +126,14 @@ EXTERNAL_DID_DEACTIVATED_REASON_PREFIX = "外部DID已停用："
 # 外部 DID 停用通告 reason 允许的最大 Unicode 码点长度
 MAX_DEACTIVATION_NOTICE_REASON = 256
 
+# 停用通告清单（manifest）签名算法与验真失败时的统一中文原因
+MANIFEST_ALG = "SHA-256"
+MANIFEST_INVALID_REASON = "清单非法"
+MANIFEST_ANCHOR_UNAVAILABLE_REASON = "锚点不可用"
+MANIFEST_SIGNATURE_MALFORMED_REASON = "签名格式错误"
+MANIFEST_SIGNATURE_INVALID_REASON = "签名校验失败"
+MANIFEST_EXPORT_MISMATCH_REASON = "导出内容不匹配"
+
 # 哨兵：调用方未提供 reason 字段（区别于显式传 None 等非法值）
 REASON_UNSET = object()
 
@@ -187,6 +196,32 @@ def _parse_utc_z(text: str) -> datetime:
 # 凭证 expires_at 的严格形状：YYYY-MM-DDTHH:MM:SSZ（秒精度、无偏移、
 # 无小数秒）；时刻合法性（月/日/时分秒范围）再由 strptime 把关。
 _UTC_Z_SHAPE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+
+def encode_did_deactivation_ndjson(
+    events: List["DidDeactivationEvent"],
+) -> bytes:
+    """把停用通告事件编码为与 export 端点字节一致的 NDJSON。
+
+    每行键序固定为 cursor、did、key_version、reason、deactivated_at，
+    UTF-8 紧凑 JSON、非 ASCII 不转义、LF 结行（末行亦有 LF），空列表
+    为零字节。
+    """
+    return "".join(
+        json.dumps(
+            {
+                "cursor": event.cursor,
+                "did": event.did,
+                "key_version": event.key_version,
+                "reason": event.reason,
+                "deactivated_at": event.deactivated_at,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        + "\n"
+        for event in events
+    ).encode("utf-8")
 
 
 def _validate_future_utc_z(value: Any, field: str) -> str:
@@ -6906,6 +6941,314 @@ class VCStore:
                 )
             next_after = picked[-1].cursor if picked else after
             return picked, effective_snapshot, next_after
+
+    # ------------------------------------------------------------------ #
+    # 外部 DID 停用通告清单（manifest）签名与验真
+    # ------------------------------------------------------------------ #
+    def build_did_deactivation_manifest(
+        self,
+        tenant_id: str,
+        after: Optional[int],
+        limit: Optional[int],
+        snapshot: int,
+        did: Optional[str],
+        key_version: Optional[int],
+        from_time: Optional[str],
+        to_time: Optional[str],
+        signer_did: str,
+    ) -> Dict[str, Any]:
+        """生成停用通告导出清单并以签名 DID 当前私钥 ES256 裸签名。
+
+        - snapshot 必填：调用方已解析的非负整数，且不得超过请求时租户
+          最大 cursor，否则抛 ValidationError（HTTP 400）；
+        - 签名 DID 须为本租户已注册本地 DID：未知（含他租户）抛
+          NotFoundError（HTTP 404），已停用抛 ConflictError（HTTP 409）；
+        - 清单八键固定顺序 snapshot、filters、count、alg、digest、
+          signer_did、key_version、signature；filters 固定顺序 after、
+          limit、did、key_version、from、to，逐项取查询生效值，缺省项
+          为 null（after/limit 缺省时计算仍按 export 缺省 0/1000）；
+        - digest 为生效过滤+分页后 NDJSON 字节的 SHA-256 64 位小写 hex，
+          count 为行数（非负整数），alg 恒为 "SHA-256"；
+        - signature 由签名 DID 当前私钥按既有 ES256 裸 R||S 无填充
+          base64url 规则签署前七键的规范化 JSON。
+        纯只读：不写任何状态、不记审计、不触发落盘。
+        """
+        with self._lock:
+            max_cursor = self._did_deactivation_event_cursors.get(
+                tenant_id, 0
+            )
+            if snapshot > max_cursor:
+                raise ValidationError(
+                    "查询参数 snapshot 不得超过当前最大游标"
+                )
+            bucket = self._bucket_locked(tenant_id)
+            signer = (
+                bucket["dids"].get(signer_did)
+                if bucket is not None
+                else None
+            )
+            if signer is None:
+                raise NotFoundError(f"DID 不存在: {signer_did}")
+            if signer.get("status") == "deactivated":
+                raise ConflictError(f"签名 DID 已停用: {signer_did}")
+            signer_version = int(signer.get("key_version", 1))
+            private_pem: Optional[str] = None
+            for entry in signer.get("key_history", []):
+                if entry.get("version") == signer_version:
+                    private_pem = entry.get("private_key_pem")
+                    break
+            if not private_pem:
+                raise ConflictError(
+                    f"签名 DID 当前私钥不可用: {signer_did}#{signer_version}"
+                )
+
+        effective_after = after if after is not None else 0
+        effective_limit = limit if limit is not None else 1000
+        events, _, _ = self.export_did_deactivation_events(
+            tenant_id,
+            effective_after,
+            effective_limit,
+            snapshot=snapshot,
+            did=did,
+            key_version=key_version,
+            from_time=from_time,
+            to_time=to_time,
+        )
+        ndjson_bytes = encode_did_deactivation_ndjson(events)
+        digest = hashlib.sha256(ndjson_bytes).hexdigest()
+        filters = {
+            "after": after,
+            "limit": limit,
+            "did": did,
+            "key_version": key_version,
+            "from": from_time,
+            "to": to_time,
+        }
+        manifest: Dict[str, Any] = {
+            "snapshot": snapshot,
+            "filters": filters,
+            "count": len(events),
+            "alg": MANIFEST_ALG,
+            "digest": digest,
+            "signer_did": signer_did,
+            "key_version": signer_version,
+        }
+        # 签名覆盖前七键（不含 signature）的规范化 JSON，与既有 ES256
+        # 裸签名规则一致；签名字节每次可变，验真跨重启稳定。
+        manifest["signature"] = crypto.sign(manifest, private_pem)
+        return manifest
+
+    def verify_did_deactivation_manifest(
+        self,
+        tenant_id: str,
+        manifest: Any,
+        ndjson_text: str,
+    ) -> Tuple[bool, str]:
+        """校验停用通告清单（只读），返回 (是否有效, 失败原因)。
+
+        校验顺序固定，失败原因依次为：
+        "清单非法" -> "锚点不可用" -> "签名格式错误" ->
+        "签名校验失败" -> "导出内容不匹配"；成功仅返回 (True, "")。
+        纯只读：不写状态、不记审计，绝不向上抛异常。
+        """
+        # 1. 清单结构与取值
+        try:
+            if not isinstance(manifest, dict):
+                return False, MANIFEST_INVALID_REASON
+            expected_keys = {
+                "snapshot",
+                "filters",
+                "count",
+                "alg",
+                "digest",
+                "signer_did",
+                "key_version",
+                "signature",
+            }
+            if set(manifest) != expected_keys:
+                return False, MANIFEST_INVALID_REASON
+            snapshot_value = manifest["snapshot"]
+            if (
+                not isinstance(snapshot_value, int)
+                or isinstance(snapshot_value, bool)
+                or snapshot_value < 0
+            ):
+                return False, MANIFEST_INVALID_REASON
+            filters_value = manifest["filters"]
+            if not isinstance(filters_value, dict):
+                return False, MANIFEST_INVALID_REASON
+            if set(filters_value) != {
+                "after",
+                "limit",
+                "did",
+                "key_version",
+                "from",
+                "to",
+            }:
+                return False, MANIFEST_INVALID_REASON
+            after_value = filters_value["after"]
+            if after_value is not None and (
+                not isinstance(after_value, int)
+                or isinstance(after_value, bool)
+                or after_value < 0
+            ):
+                return False, MANIFEST_INVALID_REASON
+            limit_value = filters_value["limit"]
+            if limit_value is not None and (
+                not isinstance(limit_value, int)
+                or isinstance(limit_value, bool)
+                or not 1 <= limit_value <= 10000
+            ):
+                return False, MANIFEST_INVALID_REASON
+            did_filter = filters_value["did"]
+            if did_filter is not None and (
+                not isinstance(did_filter, str) or not did_filter
+            ):
+                return False, MANIFEST_INVALID_REASON
+            kv_filter = filters_value["key_version"]
+            if kv_filter is not None and (
+                not isinstance(kv_filter, int)
+                or isinstance(kv_filter, bool)
+                or kv_filter < 1
+            ):
+                return False, MANIFEST_INVALID_REASON
+            from_filter = filters_value["from"]
+            to_filter = filters_value["to"]
+            for time_value in (from_filter, to_filter):
+                if time_value is not None:
+                    if not isinstance(time_value, str) or not (
+                        _UTC_Z_SHAPE_RE.match(time_value)
+                    ):
+                        return False, MANIFEST_INVALID_REASON
+                    try:
+                        _parse_utc_z(time_value)
+                    except ValueError:
+                        return False, MANIFEST_INVALID_REASON
+            if (
+                from_filter is not None
+                and to_filter is not None
+                and from_filter > to_filter
+            ):
+                return False, MANIFEST_INVALID_REASON
+            count_value = manifest["count"]
+            if (
+                not isinstance(count_value, int)
+                or isinstance(count_value, bool)
+                or count_value < 0
+            ):
+                return False, MANIFEST_INVALID_REASON
+            if manifest["alg"] != MANIFEST_ALG:
+                return False, MANIFEST_INVALID_REASON
+            digest_value = manifest["digest"]
+            if not isinstance(digest_value, str) or not (
+                re.fullmatch(r"[0-9a-f]{64}", digest_value)
+            ):
+                return False, MANIFEST_INVALID_REASON
+            signer_did_value = manifest["signer_did"]
+            if not isinstance(signer_did_value, str) or not signer_did_value:
+                return False, MANIFEST_INVALID_REASON
+            signer_version_value = manifest["key_version"]
+            if (
+                not isinstance(signer_version_value, int)
+                or isinstance(signer_version_value, bool)
+                or signer_version_value < 1
+            ):
+                return False, MANIFEST_INVALID_REASON
+            signature_value = manifest["signature"]
+            if not isinstance(signature_value, str) or not signature_value:
+                return False, MANIFEST_INVALID_REASON
+        except Exception:  # noqa: BLE001 结构判定中的任何意外均属清单非法
+            return False, MANIFEST_INVALID_REASON
+
+        # 2. 本租户同 DID/版本 active 锚点
+        try:
+            with self._lock:
+                bucket = self._bucket_locked(tenant_id)
+                anchors = (
+                    bucket["trust_anchors"].get(signer_did_value)
+                    if bucket is not None
+                    else None
+                )
+                anchor_row = (
+                    anchors.get(str(signer_version_value))
+                    if anchors is not None
+                    else None
+                )
+                anchor_status = (
+                    anchor_row.get("status", "active")
+                    if anchor_row is not None
+                    else None
+                )
+                public_pem = (
+                    anchor_row.get("public_key", "")
+                    if anchor_row is not None
+                    else ""
+                )
+            if anchor_row is None or anchor_status == "revoked":
+                return False, MANIFEST_ANCHOR_UNAVAILABLE_REASON
+            crypto.validate_public_key_pem(public_pem)
+        except Exception:  # noqa: BLE001 锚点缺失/吊销/公钥不可用统一归类
+            return False, MANIFEST_ANCHOR_UNAVAILABLE_REASON
+
+        # 签名覆盖提交清单的前七键（按提交原文构造，规范化时递归排序）
+        signed_part = {
+            key: manifest[key]
+            for key in (
+                "snapshot",
+                "filters",
+                "count",
+                "alg",
+                "digest",
+                "signer_did",
+                "key_version",
+            )
+        }
+
+        # 3. 签名格式
+        try:
+            crypto.validate_signature_format(signature_value)
+        except crypto.MalformedSignature:
+            return False, MANIFEST_SIGNATURE_MALFORMED_REASON
+        except Exception:  # noqa: BLE001
+            return False, MANIFEST_SIGNATURE_MALFORMED_REASON
+
+        # 4. 密码学验签
+        try:
+            crypto.verify(signed_part, signature_value, public_pem)
+        except crypto.InvalidSignature:
+            return False, MANIFEST_SIGNATURE_INVALID_REASON
+        except crypto.MalformedSignature:
+            return False, MANIFEST_SIGNATURE_MALFORMED_REASON
+        except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
+            return False, MANIFEST_SIGNATURE_INVALID_REASON
+
+        # 5. UTF-8 摘要及行数：按清单 filters/snapshot 重算 NDJSON 字节；
+        #    filters.after/limit 缺省（null）按 0/1000 生效。
+        try:
+            events, _, _ = self.export_did_deactivation_events(
+                tenant_id,
+                after_value if after_value is not None else 0,
+                limit_value if limit_value is not None else 1000,
+                snapshot=snapshot_value,
+                did=did_filter,
+                key_version=kv_filter,
+                from_time=from_filter,
+                to_time=to_filter,
+            )
+            expected_bytes = encode_did_deactivation_ndjson(events)
+            submitted_bytes = ndjson_text.encode("utf-8")
+        except UnicodeEncodeError:
+            return False, MANIFEST_EXPORT_MISMATCH_REASON
+        except Exception:  # noqa: BLE001 无法按清单重算（如 snapshot 越界）
+            return False, MANIFEST_EXPORT_MISMATCH_REASON
+        if submitted_bytes != expected_bytes:
+            return False, MANIFEST_EXPORT_MISMATCH_REASON
+        line_count = submitted_bytes.count(b"\n")
+        if line_count != count_value or line_count != len(events):
+            return False, MANIFEST_EXPORT_MISMATCH_REASON
+        if hashlib.sha256(submitted_bytes).hexdigest() != digest_value:
+            return False, MANIFEST_EXPORT_MISMATCH_REASON
+        return True, ""
 
     def verify_trust_did_document(
         self,

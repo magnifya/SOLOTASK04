@@ -44,6 +44,8 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/dids/deactivate-sync-batch 批量登记外部 DID 停用通告（逐项不短路）
   GET  /v1/trust/dids/deactivations       查询外部 DID 停用通告审计事件（只读）
   GET  /v1/trust/dids/deactivations/export 确定性 NDJSON 导出停用通告（快照续传，只读）
+  GET  /v1/trust/dids/deactivations/manifest 停用通告导出签名清单（snapshot 必填，本地签名 DID）
+  POST /v1/trust/dids/deactivations/manifest/verify 校验导出清单与 NDJSON（公开错误协议，只读）
   POST /v1/trust/presentations/verify     跨系统演示验真（无需登记 DID/凭证/演示）
   POST /v1/trust/presentations/verify-batch 批量跨系统演示验真（仅未绑定形态，不消费）
   POST /v1/trust/presentations/verify-with-status 外部演示验真并合并同步状态（只读）
@@ -323,6 +325,10 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_dids_deactivate_sync(tenant)
                 elif path == "/v1/trust/dids/deactivate-sync-batch":
                     self._post_trust_dids_deactivate_sync_batch(tenant)
+                elif path == "/v1/trust/dids/deactivations/manifest/verify":
+                    self._post_trust_dids_deactivations_manifest_verify(
+                        tenant
+                    )
                 elif path == "/v1/trust/verify":
                     self._post_trust_verify(tenant)
                 elif path == "/v1/trust/credentials/verify":
@@ -522,6 +528,10 @@ def build_handler(store: VCStore) -> type:
                     self._get_trust_did_deactivations_export(
                         tenant, parsed.query
                     )
+                elif path == "/v1/trust/dids/deactivations/manifest":
+                    self._get_trust_did_deactivations_manifest(
+                        tenant, parsed.query
+                    )
                 elif path.startswith(
                     "/v1/trust/credentials/imported/"
                 ):
@@ -573,6 +583,8 @@ def build_handler(store: VCStore) -> type:
                 self._send_error(400, str(exc))
             except NotFoundError as exc:
                 self._send_error(404, str(exc))
+            except ConflictError as exc:
+                self._send_error(409, str(exc))
             except Exception as exc:  # noqa: BLE001
                 self._send_error(500, f"服务器内部错误: {exc}")
 
@@ -1957,6 +1969,122 @@ def build_handler(store: VCStore) -> type:
             if body:
                 self.wfile.write(body)
 
+        def _get_trust_did_deactivations_manifest(
+            self, tenant: str, query: str
+        ) -> None:
+            # GET /v1/trust/dids/deactivations/manifest：为停用通告导出
+            # 生成签名清单。查询参数取 export 参数（limit、after、
+            # snapshot、did、key_version、from、to）外加唯一 signer_did，
+            # 且均只能出现一次：
+            # - snapshot 必填，须为非负 ASCII 十进制整数且不超过当前最大
+            #   cursor（越界 400）；
+            # - signer_did 必填且唯一，须为非空字符串；签名 DID 未知（含
+            #   他租户）404、已停用 409；
+            # - limit/after/did/key_version/from/to 校验与 export 一致；
+            #   after/limit 缺省时计算按 0/1000 生效，但清单 filters 中缺
+            #   省项记为 null。
+            # 重复/空值/未知参数、格式或范围非法一律 400 且仅含非空中文
+            # {"error": ...}。200 返回键序 snapshot、filters、count、alg、
+            # digest、signer_did、key_version、signature。纯只读。
+            params = parse_qs(query, keep_blank_values=True)
+            allowed = {
+                "limit",
+                "after",
+                "snapshot",
+                "did",
+                "key_version",
+                "from",
+                "to",
+                "signer_did",
+            }
+            unknown = sorted(set(params) - allowed)
+            if unknown:
+                raise ValidationError(
+                    f"不支持的查询参数: {', '.join(unknown)}"
+                )
+
+            def _single(name: str) -> Optional[str]:
+                values = params.get(name)
+                if values is None:
+                    return None
+                if len(values) != 1:
+                    raise ValidationError(
+                        f"查询参数 {name} 只能提供一次"
+                    )
+                return values[0]
+
+            limit_raw = _single("limit")
+            if limit_raw is not None:
+                limit = _parse_nonneg_int(limit_raw, "limit")
+                if not 1 <= limit <= 10000:
+                    raise ValidationError(
+                        "查询参数 limit 须在 1 到 10000 之间"
+                    )
+            else:
+                limit = None
+
+            after_raw = _single("after")
+            if after_raw is not None:
+                after = _parse_nonneg_int(after_raw, "after")
+            else:
+                after = None
+
+            snapshot_raw = _single("snapshot")
+            if snapshot_raw is None:
+                raise ValidationError("查询参数 snapshot 必填")
+            snapshot = _parse_nonneg_int(snapshot_raw, "snapshot")
+
+            signer_did = _single("signer_did")
+            if signer_did is None:
+                raise ValidationError("查询参数 signer_did 必填")
+            if not signer_did:
+                raise ValidationError(
+                    "查询参数 signer_did 必须为非空字符串"
+                )
+
+            did = _single("did")
+            if did is not None and not did:
+                raise ValidationError("查询参数 did 必须为非空字符串")
+
+            key_version_raw = _single("key_version")
+            key_version: Optional[int] = None
+            if key_version_raw is not None:
+                key_version = _parse_positive_int(
+                    key_version_raw, "key_version"
+                )
+
+            from_raw = _single("from")
+            from_time = (
+                _parse_utc_z_query(from_raw, "from")
+                if from_raw is not None
+                else None
+            )
+            to_raw = _single("to")
+            to_time = (
+                _parse_utc_z_query(to_raw, "to")
+                if to_raw is not None
+                else None
+            )
+            if (
+                from_time is not None
+                and to_time is not None
+                and from_time > to_time
+            ):
+                raise ValidationError("查询参数 from 不得晚于 to")
+
+            manifest = store.build_did_deactivation_manifest(
+                tenant,
+                after,
+                limit,
+                snapshot,
+                did,
+                key_version,
+                from_time,
+                to_time,
+                signer_did,
+            )
+            self._send_json(200, manifest)
+
         def _put_trust_anchor_status(
             self, tenant: str, did: str, key_version: str
         ) -> None:
@@ -2199,6 +2327,44 @@ def build_handler(store: VCStore) -> type:
                 )
                 return
             self._send_json(200, {"results": results})
+
+        def _post_trust_dids_deactivations_manifest_verify(
+            self, tenant: str
+        ) -> None:
+            # POST /v1/trust/dids/deactivations/manifest/verify：校验导出
+            # 清单与其 NDJSON 内容。请求体须恰含 manifest（JSON 对象）与
+            # ndjson（字符串）；缺失、非法 JSON、非对象、字段缺失或多余、
+            # 类型错误均 400 且仅含非空中文 {"error": ...}。
+            # 合法请求一律 HTTP 200：成功仅 {"valid": true}；失败为
+            # {"valid": false, "reason": ...}，reason 依次为“清单非法”、
+            # “锚点不可用”、“签名格式错误”、“签名校验失败”、
+            # “导出内容不匹配”。纯只读：不写状态、不记审计。
+            data = self._read_json()
+            if set(data) != {"manifest", "ndjson"}:
+                missing = [
+                    f for f in ("manifest", "ndjson") if f not in data
+                ]
+                if missing:
+                    raise ValidationError(f"缺少字段: {', '.join(missing)}")
+                extra = sorted(set(data) - {"manifest", "ndjson"})
+                raise ValidationError(f"多余字段: {', '.join(extra)}")
+            manifest = data["manifest"]
+            ndjson_text = data["ndjson"]
+            if not isinstance(manifest, dict):
+                raise ValidationError("字段 manifest 必须为 JSON 对象")
+            if not isinstance(ndjson_text, str):
+                raise ValidationError("字段 ndjson 必须为字符串")
+
+            try:
+                valid, reason = store.verify_did_deactivation_manifest(
+                    tenant, manifest, ndjson_text
+                )
+            except Exception:  # noqa: BLE001 校验失败绝不暴露内部细节
+                valid, reason = False, "导出内容不匹配"
+            if valid:
+                self._send_json(200, {"valid": True})
+            else:
+                self._send_invalid(reason or "导出内容不匹配")
 
         def _post_trust_verify(self, tenant: str) -> None:
             # 与凭证/演示 verify 相同的公开错误协议：任何失败都返回
