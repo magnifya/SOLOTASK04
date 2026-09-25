@@ -42,6 +42,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/credentials/receipt/verify  校验验真签名回执（只读）
   POST /v1/trust/credentials/receipt/consume  消费验真签名回执（防重放，首次落盘并审计）
   POST /v1/trust/credentials/receipt/consume-batch  批量消费验真签名回执（逐项不短路，防重放）
+  GET  /v1/trust/credentials/receipt/consumptions  查询验真回执消费历史（?limit=&after=&verifier_did=，只读）
   POST /v1/trust/credentials/import       导入外部凭证（active 锚点验签后持久化）
   POST /v1/trust/credentials/import-batch 批量导入外部凭证（逐项不短路）
   GET  /v1/trust/credentials/imported/{credential_id}  读取已导入的外部凭证（?issuer_did=）
@@ -609,6 +610,10 @@ def build_handler(store: VCStore) -> type:
                     )
                 elif path == "/v1/trust/dids/deactivations/export":
                     self._get_trust_did_deactivations_export(
+                        tenant, parsed.query
+                    )
+                elif path == "/v1/trust/credentials/receipt/consumptions":
+                    self._get_trust_receipt_consumptions(
                         tenant, parsed.query
                     )
                 elif path.startswith(
@@ -3632,6 +3637,71 @@ def build_handler(store: VCStore) -> type:
                             "reason": "回执已消费",
                         }
             self._send_json(200, {"results": results})
+
+        def _get_trust_receipt_consumptions(
+            self, tenant: str, query: str
+        ) -> None:
+            # GET /v1/trust/credentials/receipt/consumptions?limit=&after=
+            # &verifier_did=：只读分页查询本租户验真回执消费历史。
+            # 查询参数仅允许 limit、after、verifier_did 且各至多一次；
+            # limit 缺省 50、限 1–200，after 缺省 0，二者须为非空
+            # ASCII 十进制（after 非负）；verifier_did 可省略，提供时
+            # 须非空。缺失/空值/重复/非法/未知参数一律 400 且仅
+            # {"error": 非空中文}。成功 200 按键序恰返 events、
+            # next_after；先按 verifier_did 精确过滤，再取
+            # cursor>after 的前 limit 项按 cursor 升序，每项按键序恰
+            # 含 cursor（正整数）、receipt_id、verifier_did、nonce、
+            # consumed_at（UTC 秒精度 Z）；空页 next_after=after，
+            # 否则为末项 cursor。纯只读：不写状态、不记审计。
+            params = parse_qs(query, keep_blank_values=True)
+            unknown = sorted(
+                set(params) - {"limit", "after", "verifier_did"}
+            )
+            if unknown:
+                raise ValidationError(
+                    f"不支持的查询参数: {', '.join(unknown)}"
+                )
+
+            limit_values = params.get("limit")
+            if limit_values is None:
+                limit = 50
+            else:
+                if len(limit_values) != 1:
+                    raise ValidationError("查询参数 limit 只能提供一次")
+                limit = _parse_positive_int(limit_values[0], "limit")
+                if limit > 200:
+                    raise ValidationError(
+                        "查询参数 limit 必须在 1 到 200 之间"
+                    )
+
+            after_values = params.get("after")
+            if after_values is None:
+                after = 0
+            else:
+                if len(after_values) != 1:
+                    raise ValidationError("查询参数 after 只能提供一次")
+                after = _parse_nonneg_int(after_values[0], "after")
+
+            verifier_values = params.get("verifier_did")
+            if verifier_values is None:
+                verifier_did: Optional[str] = None
+            else:
+                if len(verifier_values) != 1:
+                    raise ValidationError(
+                        "查询参数 verifier_did 只能提供一次"
+                    )
+                verifier_did = verifier_values[0]
+                if not verifier_did:
+                    raise ValidationError(
+                        "查询参数 verifier_did 必须为非空字符串"
+                    )
+
+            events, next_after = store.list_receipt_consumptions(
+                tenant, after, limit, verifier_did
+            )
+            self._send_json(
+                200, {"events": events, "next_after": next_after}
+            )
 
         @staticmethod
         def _verify_credential_receipt_item(
