@@ -122,6 +122,13 @@ DEACTIVATION_SIGNATURE_INVALID_REASON = IMPORTED_SIGNATURE_INVALID_REASON
 # DID 文档验真命中外部 DID 停用通告时的统一中文原因前缀
 EXTERNAL_DID_DEACTIVATED_REASON_PREFIX = "外部DID已停用："
 
+# 外部凭证/演示/谓词证明验真命中 issuer_did 外部停用通告时的统一
+# 中文原因前缀
+EXTERNAL_ISSUER_DID_DEACTIVATED_REASON_PREFIX = "外部签发DID已停用："
+
+# 持有者绑定演示验真命中 holder_did 外部停用通告时的统一中文原因前缀
+EXTERNAL_HOLDER_DID_DEACTIVATED_REASON_PREFIX = "外部持有者DID已停用："
+
 # 外部 DID 停用通告 reason 允许的最大 Unicode 码点长度
 MAX_DEACTIVATION_NOTICE_REASON = 256
 
@@ -3669,7 +3676,10 @@ class VCStore:
         - 锚点按本租户 (issuer_did, 版本) 查找，仅 active 的 P-256 公钥
           可用，缺失或 revoked 失败；
         - 签名为 ES256/SHA-256，64 字节裸 R||S 的无填充 base64url，覆盖
-          完整 body（递归排序紧凑 JSON）。
+          完整 body（递归排序紧凑 JSON）；
+        - 原验真成功后按当前租户只读查询 issuer_did 的外部 DID 停用
+          通告，命中返回“外部签发DID已停用：<reason>”，无通告或仅他
+          租户有通告时维持原结论。
         只读：不登记 DID/凭证，不写凭证、状态或审计，绝不向上抛异常。
         """
         # 1. 请求结构
@@ -3776,6 +3786,16 @@ class VCStore:
                 )
             if datetime.now(timezone.utc) >= expires_dt:
                 return False, CREDENTIAL_EXPIRED_REASON
+
+        # 7. 外部 DID 停用通告：原验真成功后按当前租户只读查询
+        #    issuer_did 通告，命中返回“外部签发DID已停用：<reason>”；
+        #    无通告或仅他租户有通告时维持原结论。只读，不写任何状态。
+        notice = self.get_did_deactivation_notice(tenant_id, issuer_did)
+        if notice is not None:
+            return False, (
+                f"{EXTERNAL_ISSUER_DID_DEACTIVATED_REASON_PREFIX}"
+                f"{notice.reason}"
+            )
         return True, ""
 
     def verify_trust_credential_with_status(
@@ -3787,9 +3807,11 @@ class VCStore:
 
         先按 :meth:`verify_trust_credential` 的全部规则完成外部凭证验真
         （请求结构 → 凭证字段 → 锚点 → 签名格式 → 密码学验签 →
-        expires_at），失败原样返回 ``(False, 原因)``，保持既有优先级与
-        中文原因分类；签名覆盖请求提交的完整 ``body``，省略
-        ``issuer_key_version`` 时按版本 1 且不注入正文。
+        expires_at → issuer_did 外部 DID 停用通告），失败原样返回
+        ``(False, 原因)``，保持既有优先级与中文原因分类；签名覆盖请求
+        提交的完整 ``body``，省略 ``issuer_key_version`` 时按版本 1 且
+        不注入正文。停用通告命中（“外部签发DID已停用：<reason>”）在
+        合并同步状态之前判定。
 
         验签通过后按当前租户 ``(issuer_did, credential_id)`` 双键只读
         查询 ``credential_status_sync`` 同步记录：
@@ -3843,10 +3865,11 @@ class VCStore:
         ``{"results": [], "reason": ...}``。
 
         请求级合法时逐项复用 :meth:`verify_trust_credential`（与单项接口
-        完全一致的字段、锚点、签名规则），按输入顺序收集结果，失败不短
+        完全一致的字段、锚点、签名规则及 issuer_did 外部 DID 停用通告
+        检查），按输入顺序收集结果，失败不短
         路：成功项 ``{"valid": true}``，失败项
         ``{"valid": false, "reason": ...}``，原因前缀依次为“请求”/“凭证”
-        /“锚点”/“签名格式错误”/“签名校验失败”。只读，不写任何状态、不记
+        /“锚点”/“签名格式错误”/“签名校验失败”/“外部签发DID已停用”。只读，不写任何状态、不记
         审计。
         """
         if not isinstance(data, dict):
@@ -3894,7 +3917,8 @@ class VCStore:
         ``{"results": [], "reason": ...}``。
 
         请求级合法时逐项复用 :meth:`verify_trust_credential_with_status`
-        （与单项验真一致的字段、锚点、签名、expires_at 规则，验签通过后
+        （与单项验真一致的字段、锚点、签名、expires_at 规则及 issuer_did
+        外部 DID 停用通告检查，通告判定后
         只读合并本租户 ``(issuer_did, credential_id)`` 同步状态），按输入
         顺序收集结果，失败不短路：成功项 ``{"valid": true}``，失败项
         ``{"valid": false, "reason": ...}``。只读，不写凭证、状态、同步
@@ -3954,7 +3978,7 @@ class VCStore:
           字段仍失败，绑定项须恰含 source_tenant_id）。
 
         校验顺序：请求结构 -> 演示字段与 challenge -> 签发者锚点与签名 ->
-        持有者锚点与签名（仅绑定）-> 期限。
+        持有者锚点与签名（仅绑定）-> 期限 -> 外部 DID 停用通告。
         - 请求 challenge 须等于演示 challenge；
         - 锚点按本租户 (did, key_version) 查找，仅 active 的 P-256 公钥
           可用，缺失或 revoked 失败；签发者与持有者分别匹配各自 DID/版本；
@@ -3964,7 +3988,11 @@ class VCStore:
         - holder_proof 同为 ES256，覆盖去掉 proof、holder_proof 的绑定
           对象（八字段加 holder_did、holder_key_version），并加入
           tenant_id=source_tenant_id 后按规范化 JSON 验签；
-        - expires_at 须为 UTC 秒精度 Z 格式，当前时间达到它即过期。
+        - expires_at 须为 UTC 秒精度 Z 格式，当前时间达到它即过期；
+        - 原验真成功后按当前租户只读查询外部 DID 停用通告：先查
+          issuer_did，命中返回“外部签发DID已停用：<reason>”；持有者
+          绑定演示再查 holder_did，命中返回“外部持有者DID已停用：
+          <reason>”；无通告或仅他租户有通告时维持原结论。
         只读：不登记 DID/凭证/演示，不写状态、历史或审计，绝不向上抛异常。
         """
         # 1. 请求结构：未绑定恰含 presentation/challenge；绑定另含
@@ -4195,6 +4223,27 @@ class VCStore:
             )
         if datetime.now(timezone.utc) >= expires_dt:
             return False, "演示已过期"
+
+        # 7. 外部 DID 停用通告：原验真成功后按当前租户只读查询，先查
+        #    issuer_did（命中返回“外部签发DID已停用：<reason>”），持有
+        #    者绑定演示再查 holder_did（命中返回“外部持有者DID已停用：
+        #    <reason>”）；无通告或仅他租户有通告时维持原结论。只读，
+        #    不写任何状态。
+        notice = self.get_did_deactivation_notice(tenant_id, issuer_did)
+        if notice is not None:
+            return False, (
+                f"{EXTERNAL_ISSUER_DID_DEACTIVATED_REASON_PREFIX}"
+                f"{notice.reason}"
+            )
+        if is_holder_bound:
+            holder_notice = self.get_did_deactivation_notice(
+                tenant_id, holder_did_value
+            )
+            if holder_notice is not None:
+                return False, (
+                    f"{EXTERNAL_HOLDER_DID_DEACTIVATED_REASON_PREFIX}"
+                    f"{holder_notice.reason}"
+                )
         return True, ""
 
     def verify_trust_presentations_batch(
@@ -4218,7 +4267,9 @@ class VCStore:
         九字段外加 holder_did（非空字符串）、holder_key_version（正整数）
         与 holder_proof（非空字符串），并继续校验签发者与持有者两类
         锚点和双签名，source_tenant_id 作为 holder proof 覆盖对象中的
-        tenant_id。成功项 ``{"valid": true}``，失败项
+        tenant_id；验真成功后逐项按当前租户只读查询外部 DID 停用通告
+        （先 issuer_did 后 holder_did，仅绑定项查后者）。成功项
+        ``{"valid": true}``，失败项
         ``{"valid": false, "reason": ...}``。纯只读：不消费、不登记
         资源，不写状态、历史或审计，仅使用当前租户锚点。
         """
@@ -4265,8 +4316,11 @@ class VCStore:
 
         先按 :meth:`verify_trust_presentation` 的全部规则完成验真
         （未绑定与持有者绑定两种形态：请求结构 → 演示字段与挑战 →
-        签发者锚点与签名 → 持有者锚点与签名（仅绑定）→ 期限），失败
-        原样返回 ``(False, 原因)``，保持既有优先级与中文原因分类。
+        签发者锚点与签名 → 持有者锚点与签名（仅绑定）→ 期限 →
+        外部 DID 停用通告），失败原样返回 ``(False, 原因)``，保持
+        既有优先级与中文原因分类；停用通告命中（“外部签发DID已停用：
+        <reason>”/“外部持有者DID已停用：<reason>”）在合并同步状态
+        之前判定。
 
         验真通过后按当前租户 ``(issuer_did, credential_id)`` 双键只读
         查询 ``credential_status_sync`` 同步记录（取自演示对象）：
@@ -4324,7 +4378,8 @@ class VCStore:
 
         请求级合法时逐项复用 :meth:`verify_trust_presentation_with_status`
         （未绑定与持有者绑定两种形态的字段、挑战、双锚点双签名与期限
-        规则，验真通过后只读合并本租户 ``(issuer_did, credential_id)``
+        规则及外部 DID 停用通告检查，通告判定后只读合并本租户
+        ``(issuer_did, credential_id)``
         同步状态），按输入顺序收集结果，失败不短路：成功项
         ``{"valid": true}``，失败项 ``{"valid": false, "reason": ...}``。
         纯只读：不消费、不登记任何资源、不写状态/历史/审计。
@@ -4384,11 +4439,14 @@ class VCStore:
 
         校验顺序：请求 -> 证明字段与挑战 -> 锚点 -> 签名格式 ->
         ES256 验签（覆盖除 proof 外八字段并加入
-        tenant_id=source_tenant_id 的规范化 JSON）-> 期限。锚点按当前
+        tenant_id=source_tenant_id 的规范化 JSON）-> 期限 ->
+        外部 DID 停用通告。锚点按当前
         租户 (issuer_did, issuer_key_version) 查找，仅 active 的 P-256
         公钥可用。expires_at 须为 UTC 秒精度 Z 格式，到期返回
-        “证明已过期”。只读：不消费、不登记任何资源、不写状态/历史/审计，
-        绝不向上抛异常。
+        “证明已过期”。原验真成功后按当前租户只读查询 issuer_did 的
+        外部 DID 停用通告，命中返回“外部签发DID已停用：<reason>”，
+        无通告或仅他租户有通告时维持原结论。只读：不消费、不登记任何
+        资源、不写状态/历史/审计，绝不向上抛异常。
         """
         # 1. 请求结构：恰含 proof、challenge、source_tenant_id。
         if not isinstance(data, dict):
@@ -4567,6 +4625,16 @@ class VCStore:
             )
         if datetime.now(timezone.utc) >= expires_dt:
             return False, "证明已过期"
+
+        # 7. 外部 DID 停用通告：原验真成功后按当前租户只读查询
+        #    issuer_did 通告，命中返回“外部签发DID已停用：<reason>”；
+        #    无通告或仅他租户有通告时维持原结论。只读，不写任何状态。
+        notice = self.get_did_deactivation_notice(tenant_id, issuer_did)
+        if notice is not None:
+            return False, (
+                f"{EXTERNAL_ISSUER_DID_DEACTIVATED_REASON_PREFIX}"
+                f"{notice.reason}"
+            )
         return True, ""
 
     def verify_trust_proof_with_status(
@@ -4577,8 +4645,10 @@ class VCStore:
         """外部谓词证明验真并合并本地同步状态判定（只读）。
 
         先按 :meth:`verify_trust_proof` 的全部规则完成验真（请求结构 →
-        证明字段与挑战 → 锚点 → 签名格式 → ES256 验签 → 期限），失败
-        原样返回 ``(False, 原因)``，保持既有优先级与中文原因分类。
+        证明字段与挑战 → 锚点 → 签名格式 → ES256 验签 → 期限 →
+        issuer_did 外部 DID 停用通告），失败原样返回
+        ``(False, 原因)``，保持既有优先级与中文原因分类；停用通告命中
+        （“外部签发DID已停用：<reason>”）在合并同步状态之前判定。
 
         验真通过后按当前租户 ``(issuer_did, credential_id)`` 双键只读
         查询 ``credential_status_sync`` 同步记录：
@@ -4632,7 +4702,8 @@ class VCStore:
         ``{"results": [], "reason": ...}``。
 
         请求级合法时逐项复用 :meth:`verify_trust_proof`（与单项接口完全
-        一致的请求、证明字段、挑战、锚点、签名与期限规则），按输入顺序
+        一致的请求、证明字段、挑战、锚点、签名、期限规则及 issuer_did
+        外部 DID 停用通告检查），按输入顺序
         收集结果，失败不短路：成功项 ``{"valid": true}``，失败项
         ``{"valid": false, "reason": ...}``。只读，不消费、不登记任何
         资源、不写状态/历史/审计。
@@ -4682,8 +4753,9 @@ class VCStore:
         ``{"results": [], "reason": ...}``。
 
         请求级合法时逐项复用 :meth:`verify_trust_proof_with_status`
-        （与单项验真一致的请求、证明字段、挑战、锚点、签名与期限规则，
-        验真通过后只读合并本租户 ``(issuer_did, credential_id)`` 同步
+        （与单项验真一致的请求、证明字段、挑战、锚点、签名、期限规则
+        及 issuer_did 外部 DID 停用通告检查，通告判定后只读合并本租户
+        ``(issuer_did, credential_id)`` 同步
         状态），按输入顺序收集结果，失败不短路：成功项
         ``{"valid": true}``，失败项 ``{"valid": false, "reason": ...}``。
         只读，不消费、不登记任何资源、不写状态/历史/审计。
@@ -5721,6 +5793,10 @@ class VCStore:
             -> (False, "签名校验失败")；
           - body 含 expires_at 且当前时间已达到 ->
             (False, "凭证已过期")；
+          - 原重验成功后按当前租户只读查询 issuer_did 的外部 DID 停用
+            通告，命中 ->
+            (False, "外部签发DID已停用：<reason>")，无通告或仅他租户
+            有通告时维持原结论；
           - 成功 -> (True, "")。
 
         纯只读：不写记录、状态、历史或审计，绝不向上抛内部异常；
@@ -5797,6 +5873,17 @@ class VCStore:
                 return False, CREDENTIAL_EXPIRED_REASON
             if datetime.now(timezone.utc) >= expires_dt:
                 return False, CREDENTIAL_EXPIRED_REASON
+
+        # 外部 DID 停用通告：原重验成功后、（with-status 入口）合并
+        # 凭证状态前，按当前租户只读查询 issuer_did 通告，命中返回
+        # “外部签发DID已停用：<reason>”；无通告或仅他租户有通告时
+        # 维持原结论。只读，不写任何状态。
+        notice = self.get_did_deactivation_notice(tenant_id, issuer_did)
+        if notice is not None:
+            return False, (
+                f"{EXTERNAL_ISSUER_DID_DEACTIVATED_REASON_PREFIX}"
+                f"{notice.reason}"
+            )
         return True, ""
 
     def verify_imported_credential_with_status(
@@ -5811,7 +5898,9 @@ class VCStore:
         body 与 signature（未导入、issuer_did 错配或属他租户同样抛
         NotFoundError；锚点、签名格式、密码学验签、过期结论原样返回，
         原因恰为“锚点不可用”/“签名格式错误”/“签名校验失败”/
-        “凭证已过期”）。
+        “凭证已过期”）。重验成功后、合并同步状态前按当前租户只读
+        查询 issuer_did 的外部 DID 停用通告，命中返回
+        “外部签发DID已停用：<reason>”，未命中才进入同步状态合并。
 
         重验通过后按当前租户 ``(issuer_did, credential_id)`` 双键只读
         查询 ``credential_status_sync`` 同步记录：
@@ -5872,7 +5961,11 @@ class VCStore:
         ``{"valid": False, "http_status": 404, "reason": "资源不存在"}``；
         找到后复用 :meth:`verify_imported_credential` 的重验规则，锚点
         缺失/吊销、签名格式错、验签失败、过期的 http_status 均为 200，
-        reason 与单项重验一致。重验成功后只读查询本租户
+        reason 与单项重验一致。重验成功后、合并同步状态前命中本租户
+        issuer_did 外部 DID 停用通告的项为
+        ``{"valid": False, "http_status": 200,
+        "reason": "外部签发DID已停用：<reason>"}``（键序不变）。未命中
+        通告的项重验成功后只读查询本租户
         ``credential_status_sync`` 同步记录（不随凭证导入创建）：
           - 未同步：(False, 200, "外部凭证状态未同步")；
           - active：(True, 200, None)；
