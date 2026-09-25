@@ -657,7 +657,10 @@ class VCStore:
             for entries in bucket.get("key_revocations", {}).values():
                 for event in entries:
                     max_cursor = max(max_cursor, int(event.get("cursor", 0)))
-            self._key_revocation_cursors[tenant_id] = max_cursor
+            # 无既有游标且无历史事件的租户不落零值游标键，保持与
+            # 内存态（仅实际分配游标的租户有键）逐键一致。
+            if max_cursor:
+                self._key_revocation_cursors[tenant_id] = max_cursor
         # DID 密钥生命周期历史游标：按租户各自维护的持久化正整数
         # （tenant_id -> cursor），同一租户内不同 DID 的生命周期事件
         # （did.created/key.rotated/key.revoked）共享该游标空间，但与
@@ -673,7 +676,8 @@ class VCStore:
             for entries in bucket.get("key_lifecycle", {}).values():
                 for event in entries:
                     max_cursor = max(max_cursor, int(event.get("cursor", 0)))
-            self._key_lifecycle_cursors[tenant_id] = max_cursor
+            if max_cursor:
+                self._key_lifecycle_cursors[tenant_id] = max_cursor
         # 信任锚点生命周期历史游标：按租户各自维护的持久化正整数
         # （tenant_id -> cursor），同一租户内不同 DID 的锚点事件共享
         # 该游标空间。旧状态文件无该字段时，从各租户已有锚点历史项的
@@ -688,7 +692,8 @@ class VCStore:
             for entries in bucket.get("trust_anchor_history", {}).values():
                 for event in entries:
                     max_cursor = max(max_cursor, int(event.get("cursor", 0)))
-            self._trust_anchor_history_cursors[tenant_id] = max_cursor
+            if max_cursor:
+                self._trust_anchor_history_cursors[tenant_id] = max_cursor
         # 信任锚点用途历史游标：按租户各自维护的持久化正整数
         # （tenant_id -> cursor），同一租户内跨 DID 的用途事件
         # （registered/rotated/updated/snapshot）共享该游标空间，与其他
@@ -711,7 +716,10 @@ class VCStore:
                         max_cursor = max(
                             max_cursor, int(event.get("cursor", 0))
                         )
-            self._trust_anchor_uses_history_cursors[tenant_id] = max_cursor
+            if max_cursor:
+                self._trust_anchor_uses_history_cursors[tenant_id] = (
+                    max_cursor
+                )
         # 本租户签发凭证状态历史游标：按租户各自维护的持久化正整数
         # （tenant_id -> cursor），同一租户内不同凭证的状态事件共享
         # 该游标空间。旧状态文件无该字段时，从各租户已有历史项的
@@ -730,7 +738,10 @@ class VCStore:
             ).values():
                 for event in entries:
                     max_cursor = max(max_cursor, int(event.get("cursor", 0)))
-            self._local_credential_status_history_cursors[tenant_id] = max_cursor
+            if max_cursor:
+                self._local_credential_status_history_cursors[tenant_id] = (
+                    max_cursor
+                )
         # DID 生命周期历史游标：按租户各自维护的持久化正整数
         # （tenant_id -> cursor），同一租户内不同 DID 的 did.created/
         # did.deactivated 事件共享该游标空间，但与其他历史游标空间
@@ -746,7 +757,8 @@ class VCStore:
             for entries in bucket.get("did_history", {}).values():
                 for event in entries:
                     max_cursor = max(max_cursor, int(event.get("cursor", 0)))
-            self._did_history_cursors[tenant_id] = max_cursor
+            if max_cursor:
+                self._did_history_cursors[tenant_id] = max_cursor
         # 外部 DID 停用通告审计历史游标：按租户各自维护的持久化正整数
         # （tenant_id -> cursor），同一租户内跨 DID 的停用通告事件共享
         # 该游标空间，仅首次接受通告时追加；与其他历史游标空间相互独立。
@@ -760,7 +772,8 @@ class VCStore:
             max_cursor = self._did_deactivation_event_cursors.get(tenant_id, 0)
             for event in bucket.get("did_deactivation_events", []):
                 max_cursor = max(max_cursor, int(event.get("cursor", 0)))
-            self._did_deactivation_event_cursors[tenant_id] = max_cursor
+            if max_cursor:
+                self._did_deactivation_event_cursors[tenant_id] = max_cursor
         # 可签名锚点变更流游标：按租户各自维护的持久化正整数
         # （tenant_id -> cursor），同一租户内跨 DID 的锚点变更事件
         # （registered/rotated/revoked/uses.updated/snapshot）共享该游标
@@ -775,7 +788,8 @@ class VCStore:
             max_cursor = self._trust_anchor_change_cursors.get(tenant_id, 0)
             for event in bucket.get("trust_anchor_change_events", []):
                 max_cursor = max(max_cursor, int(event.get("cursor", 0)))
-            self._trust_anchor_change_cursors[tenant_id] = max_cursor
+            if max_cursor:
+                self._trust_anchor_change_cursors[tenant_id] = max_cursor
         # 旧状态文件中已吊销但无历史的密钥版本补一条兼容项（内存态）；
         # 随下一次原子写一并落盘，重启后 cursor 稳定。
         self._backfill_key_revocations_locked()
