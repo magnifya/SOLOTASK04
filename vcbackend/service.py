@@ -44,6 +44,8 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/dids/deactivate-sync-batch 批量登记外部 DID 停用通告（逐项不短路）
   GET  /v1/trust/dids/deactivations       查询外部 DID 停用通告审计事件（只读）
   GET  /v1/trust/dids/deactivations/export 确定性 NDJSON 导出停用通告（快照续传，只读）
+  GET  /v1/trust/dids/deactivations/manifest 停用通告导出清单（签名摘要，只读）
+  POST /v1/trust/dids/deactivations/manifest/verify 校验停用通告清单与 NDJSON 内容（只读）
   POST /v1/trust/presentations/verify     跨系统演示验真（无需登记 DID/凭证/演示）
   POST /v1/trust/presentations/verify-batch 批量跨系统演示验真（仅未绑定形态，不消费）
   POST /v1/trust/presentations/verify-with-status 外部演示验真并合并同步状态（只读）
@@ -69,6 +71,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
 """
 
 import errno
+import hashlib
 import json
 import re
 import sys
@@ -77,6 +80,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
+from . import crypto
 from .store import (
     CHALLENGE_UNSET,
     ConflictError,
@@ -92,6 +96,34 @@ from .store import (
 
 def _json_dumps(payload: Any) -> bytes:
     return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def _deactivation_event_obj(event: Any) -> Dict[str, Any]:
+    return {
+        "cursor": event.cursor,
+        "did": event.did,
+        "key_version": event.key_version,
+        "reason": event.reason,
+        "deactivated_at": event.deactivated_at,
+    }
+
+
+def _deactivation_ndjson_bytes(events: Any) -> bytes:
+    """按导出端点的确定性规则将事件编码为 NDJSON 字节。
+
+    每行键序固定为 cursor、did、key_version、reason、deactivated_at，
+    UTF-8 紧凑 JSON、非 ASCII 不转义、LF 结行（末行亦有 LF）；空列表
+    为零字节。digest 与导出内容必须共用本函数以保证字节一致。
+    """
+    return "".join(
+        json.dumps(
+            _deactivation_event_obj(event),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        + "\n"
+        for event in events
+    ).encode("utf-8")
 
 
 def _parse_nonneg_int(raw: str, field: str) -> int:
@@ -128,6 +160,9 @@ def _parse_positive_int(raw: str, field: str) -> int:
 
 # 查询参数中 UTC 秒精度 Z 时间的严格形状（定宽补零、无小数、无偏移）。
 _UTC_Z_QUERY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+# SHA-256 摘要的 64 位小写十六进制串。
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _parse_utc_z_query(raw: str, field: str) -> str:
@@ -323,6 +358,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_dids_deactivate_sync(tenant)
                 elif path == "/v1/trust/dids/deactivate-sync-batch":
                     self._post_trust_dids_deactivate_sync_batch(tenant)
+                elif path == "/v1/trust/dids/deactivations/manifest/verify":
+                    self._post_trust_did_deactivations_manifest_verify(tenant)
                 elif path == "/v1/trust/verify":
                     self._post_trust_verify(tenant)
                 elif path == "/v1/trust/credentials/verify":
@@ -518,6 +555,10 @@ def build_handler(store: VCStore) -> type:
                     self._get_trust_anchor_discovery(tenant, parsed.query)
                 elif path == "/v1/trust/dids/deactivations":
                     self._get_trust_did_deactivations(tenant, parsed.query)
+                elif path == "/v1/trust/dids/deactivations/manifest":
+                    self._get_trust_did_deactivations_manifest(
+                        tenant, parsed.query
+                    )
                 elif path == "/v1/trust/dids/deactivations/export":
                     self._get_trust_did_deactivations_export(
                         tenant, parsed.query
@@ -571,6 +612,8 @@ def build_handler(store: VCStore) -> type:
                     self._send_error(404, f"无此路径: {path}")
             except ValidationError as exc:
                 self._send_error(400, str(exc))
+            except ConflictError as exc:
+                self._send_error(409, str(exc))
             except NotFoundError as exc:
                 self._send_error(404, str(exc))
             except Exception as exc:  # noqa: BLE001
@@ -1931,21 +1974,7 @@ def build_handler(store: VCStore) -> type:
                     to_time=to_time,
                 )
             )
-            body = "".join(
-                json.dumps(
-                    {
-                        "cursor": event.cursor,
-                        "did": event.did,
-                        "key_version": event.key_version,
-                        "reason": event.reason,
-                        "deactivated_at": event.deactivated_at,
-                    },
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
-                + "\n"
-                for event in events
-            ).encode("utf-8")
+            body = _deactivation_ndjson_bytes(events)
             self.send_response(200)
             self.send_header(
                 "Content-Type", "application/x-ndjson; charset=utf-8"
@@ -1956,6 +1985,380 @@ def build_handler(store: VCStore) -> type:
             self.end_headers()
             if body:
                 self.wfile.write(body)
+
+        def _parse_deactivation_manifest_query(
+            self, query: str
+        ) -> Dict[str, Any]:
+            # 清单查询参数：export 七参数（after/limit/snapshot/did/
+            # key_version/from/to）加唯一 signer_did，其中 snapshot 必填。
+            # 返回各参数的“显式生效值”（缺省为 None）与解析后的 limit/
+            # after/snapshot。任何空值、重复、未知参数、格式或范围非法均
+            # 抛 ValidationError（HTTP 400，仅含非空中文 error）。
+            params = parse_qs(query, keep_blank_values=True)
+            allowed = {
+                "after",
+                "limit",
+                "snapshot",
+                "did",
+                "key_version",
+                "from",
+                "to",
+                "signer_did",
+            }
+            unknown = sorted(set(params) - allowed)
+            if unknown:
+                raise ValidationError(
+                    f"不支持的查询参数: {', '.join(unknown)}"
+                )
+
+            def _single(name: str) -> Optional[str]:
+                values = params.get(name)
+                if values is None:
+                    return None
+                if len(values) != 1:
+                    raise ValidationError(
+                        f"查询参数 {name} 只能提供一次"
+                    )
+                return values[0]
+
+            limit_raw = _single("limit")
+            limit_provided = limit_raw is not None
+            if limit_raw is not None:
+                limit = _parse_nonneg_int(limit_raw, "limit")
+                if not 1 <= limit <= 10000:
+                    raise ValidationError(
+                        "查询参数 limit 须在 1 到 10000 之间"
+                    )
+            else:
+                limit = 1000
+
+            after_raw = _single("after")
+            after_provided = after_raw is not None
+            after = (
+                _parse_nonneg_int(after_raw, "after")
+                if after_raw is not None
+                else 0
+            )
+
+            snapshot_raw = _single("snapshot")
+            if snapshot_raw is None:
+                raise ValidationError("查询参数 snapshot 必填")
+            snapshot = _parse_nonneg_int(snapshot_raw, "snapshot")
+
+            did = _single("did")
+            if did is not None and not did:
+                raise ValidationError("查询参数 did 必须为非空字符串")
+
+            key_version_raw = _single("key_version")
+            key_version: Optional[int] = None
+            if key_version_raw is not None:
+                key_version = _parse_positive_int(
+                    key_version_raw, "key_version"
+                )
+
+            from_raw = _single("from")
+            from_time = (
+                _parse_utc_z_query(from_raw, "from")
+                if from_raw is not None
+                else None
+            )
+            to_raw = _single("to")
+            to_time = (
+                _parse_utc_z_query(to_raw, "to")
+                if to_raw is not None
+                else None
+            )
+            if (
+                from_time is not None
+                and to_time is not None
+                and from_time > to_time
+            ):
+                raise ValidationError("查询参数 from 不得晚于 to")
+
+            signer_did = _single("signer_did")
+            if signer_did is None or not signer_did:
+                raise ValidationError(
+                    "查询参数 signer_did 必填且必须为非空字符串"
+                )
+
+            # filters 按固定键序记录“显式提供”的生效值，缺省项为 None。
+            filters = {
+                "after": after if after_provided else None,
+                "limit": limit if limit_provided else None,
+                "did": did,
+                "key_version": key_version,
+                "from": from_time,
+                "to": to_time,
+            }
+            return {
+                "after": after,
+                "limit": limit,
+                "snapshot": snapshot,
+                "did": did,
+                "key_version": key_version,
+                "from_time": from_time,
+                "to_time": to_time,
+                "signer_did": signer_did,
+                "filters": filters,
+            }
+
+        def _get_trust_did_deactivations_manifest(
+            self, tenant: str, query: str
+        ) -> None:
+            # GET /v1/trust/dids/deactivations/manifest：对一次确定性导出
+            # （与 export 同参数，snapshot 必填）生成签名摘要清单。
+            # 参数/snapshot 越界 400（仅 error）；签名 DID 未知（含他租
+            # 户）404、已停用 409。200 键序 snapshot、filters、count、
+            # alg、digest、signer_did、key_version、signature；filters 键
+            # 序 after、limit、did、key_version、from、to，缺省项为 null；
+            # count 为本页非负整数行数；alg 恒为 SHA-256；digest 为本页
+            # NDJSON 字节的 64 位小写 hex SHA-256；signature 由签名 DID
+            # 当前私钥对前七键规范化 JSON 做 ES256 裸 R||S 无填充
+            # base64url 签名。纯只读：不改游标、状态或审计。
+            args = self._parse_deactivation_manifest_query(query)
+
+            # 先做快照越界校验（400 优先于签名 DID 的 404/409）。
+            events, effective_snapshot, _ = (
+                store.export_did_deactivation_events(
+                    tenant,
+                    args["after"],
+                    args["limit"],
+                    snapshot=args["snapshot"],
+                    did=args["did"],
+                    key_version=args["key_version"],
+                    from_time=args["from_time"],
+                    to_time=args["to_time"],
+                )
+            )
+
+            # 签名 DID 须为本租户活动本地 DID：未知 404、停用 409。
+            signer_did = args["signer_did"]
+            key_version, private_pem = (
+                store.get_deactivation_manifest_signer(tenant, signer_did)
+            )
+
+            ndjson_bytes = _deactivation_ndjson_bytes(events)
+            digest = hashlib.sha256(ndjson_bytes).hexdigest()
+            signed = {
+                "snapshot": effective_snapshot,
+                "filters": args["filters"],
+                "count": len(events),
+                "alg": "SHA-256",
+                "digest": digest,
+                "signer_did": signer_did,
+                "key_version": key_version,
+            }
+            signature = crypto.sign(signed, private_pem)
+            manifest = dict(signed)
+            manifest["signature"] = signature
+            self._send_json(200, manifest)
+
+        def _manifest_is_well_formed(self, manifest: Any) -> bool:
+            # 清单结构校验（阶段一“清单非法”）：恰含八键且类型/取值合法。
+            if not isinstance(manifest, dict):
+                return False
+            expected = {
+                "snapshot",
+                "filters",
+                "count",
+                "alg",
+                "digest",
+                "signer_did",
+                "key_version",
+                "signature",
+            }
+            if set(manifest) != expected:
+                return False
+
+            def _is_nonneg_int(value: Any) -> bool:
+                return (
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value >= 0
+                )
+
+            def _is_positive_int(value: Any) -> bool:
+                return (
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value >= 1
+                )
+
+            if not _is_nonneg_int(manifest["snapshot"]):
+                return False
+            if not _is_nonneg_int(manifest["count"]):
+                return False
+            if manifest["alg"] != "SHA-256":
+                return False
+            if not (
+                isinstance(manifest["digest"], str)
+                and _SHA256_HEX_RE.fullmatch(manifest["digest"])
+            ):
+                return False
+            if (
+                not isinstance(manifest["signer_did"], str)
+                or not manifest["signer_did"]
+            ):
+                return False
+            if not _is_positive_int(manifest["key_version"]):
+                return False
+            if (
+                not isinstance(manifest["signature"], str)
+                or not manifest["signature"]
+            ):
+                return False
+
+            filters = manifest["filters"]
+            if not isinstance(filters, dict):
+                return False
+            if set(filters) != {
+                "after",
+                "limit",
+                "did",
+                "key_version",
+                "from",
+                "to",
+            }:
+                return False
+            if filters["after"] is not None and not _is_nonneg_int(
+                filters["after"]
+            ):
+                return False
+            limit = filters["limit"]
+            if limit is not None and not (
+                _is_positive_int(limit) and 1 <= limit <= 10000
+            ):
+                return False
+            if filters["did"] is not None and not (
+                isinstance(filters["did"], str) and filters["did"]
+            ):
+                return False
+            if filters["key_version"] is not None and not _is_positive_int(
+                filters["key_version"]
+            ):
+                return False
+            from_time = filters["from"]
+            to_time = filters["to"]
+            if from_time is not None:
+                try:
+                    _parse_utc_z_query(from_time, "from")
+                except ValidationError:
+                    return False
+            if to_time is not None:
+                try:
+                    _parse_utc_z_query(to_time, "to")
+                except ValidationError:
+                    return False
+            if (
+                from_time is not None
+                and to_time is not None
+                and from_time > to_time
+            ):
+                return False
+            return True
+
+        def _post_trust_did_deactivations_manifest_verify(
+            self, tenant: str
+        ) -> None:
+            # POST /v1/trust/dids/deactivations/manifest/verify：校验一次
+            # 导出清单与其 NDJSON 内容。外层请求错误（非法 JSON/非对象/
+            # 缺漏或多余字段/manifest 非对象/ndjson 非字符串）一律 400 且
+            # 仅 {"error": ...}。外层合法后任何失败均 HTTP 200，按顺序
+            # 返回 {"valid":false,"reason":...}：清单非法 -> 锚点不可用
+            # （本租户同 did/版本 active 锚点）-> 签名格式错误 -> 签名
+            # 校验失败 -> 导出内容不匹配（UTF-8 SHA-256 摘要及行数）。
+            # 成功仅 {"valid":true}。纯只读、租户隔离、不记审计。
+            data = self._read_json()
+            if set(data) != {"manifest", "ndjson"}:
+                missing = [f for f in ("manifest", "ndjson") if f not in data]
+                if missing:
+                    raise ValidationError(
+                        f"请求缺少字段: {', '.join(missing)}"
+                    )
+                extra = sorted(set(data) - {"manifest", "ndjson"})
+                raise ValidationError(f"请求含多余字段: {', '.join(extra)}")
+            manifest = data["manifest"]
+            ndjson = data["ndjson"]
+            if not isinstance(manifest, dict):
+                raise ValidationError(
+                    "请求不合法: 字段 manifest 必须为 JSON 对象"
+                )
+            if not isinstance(ndjson, str):
+                raise ValidationError(
+                    "请求不合法: 字段 ndjson 必须为字符串"
+                )
+
+            def _invalid(reason: str) -> None:
+                self._send_json(200, {"valid": False, "reason": reason})
+
+            # 阶段一：清单结构
+            if not self._manifest_is_well_formed(manifest):
+                _invalid("清单非法")
+                return
+
+            signer_did = manifest["signer_did"]
+            key_version = manifest["key_version"]
+
+            # 阶段二：本租户同 did/版本 active 信任锚点
+            public_pem = store.get_active_trust_anchor_public_key(
+                tenant, signer_did, key_version
+            )
+            if public_pem is None:
+                _invalid("锚点不可用")
+                return
+            try:
+                crypto.validate_public_key_pem(public_pem)
+            except (ValueError, TypeError):
+                _invalid("锚点不可用")
+                return
+
+            signed = {
+                "snapshot": manifest["snapshot"],
+                "filters": manifest["filters"],
+                "count": manifest["count"],
+                "alg": manifest["alg"],
+                "digest": manifest["digest"],
+                "signer_did": signer_did,
+                "key_version": key_version,
+            }
+            signature = manifest["signature"]
+
+            # 阶段三：签名格式
+            try:
+                crypto.validate_signature_format_strict(signature)
+            except crypto.MalformedSignature:
+                _invalid("签名格式错误")
+                return
+
+            # 阶段四：密码学验签
+            try:
+                crypto.verify(signed, signature, public_pem)
+            except crypto.MalformedSignature:
+                _invalid("签名格式错误")
+                return
+            except crypto.InvalidSignature:
+                _invalid("签名校验失败")
+                return
+            except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露细节
+                _invalid("签名校验失败")
+                return
+
+            # 阶段五：导出内容——UTF-8 字节的 SHA-256 摘要与行数
+            try:
+                raw = ndjson.encode("utf-8")
+            except UnicodeEncodeError:
+                _invalid("导出内容不匹配")
+                return
+            actual_digest = hashlib.sha256(raw).hexdigest()
+            line_count = raw.count(b"\n")
+            if (
+                actual_digest != manifest["digest"]
+                or line_count != manifest["count"]
+            ):
+                _invalid("导出内容不匹配")
+                return
+
+            self._send_json(200, {"valid": True})
 
         def _put_trust_anchor_status(
             self, tenant: str, did: str, key_version: str

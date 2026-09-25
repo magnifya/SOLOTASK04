@@ -6907,6 +6907,64 @@ class VCStore:
             next_after = picked[-1].cursor if picked else after
             return picked, effective_snapshot, next_after
 
+    def get_deactivation_manifest_signer(
+        self,
+        tenant_id: str,
+        signer_did: str,
+    ) -> Tuple[int, str]:
+        """返回本租户活动本地 DID 的（当前密钥版本, 当前私钥 PEM）。
+
+        供停用通告清单（manifest）签名使用：
+        - DID 不存在（含他租户资源）抛 NotFoundError（HTTP 404）；
+        - DID 已停用抛 ConflictError（HTTP 409）；
+        - 取该 DID 当前密钥版本的托管私钥。
+        纯只读：不修改任何状态、不记审计、不触发落盘。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            rec = (
+                bucket["dids"].get(signer_did)
+                if bucket is not None
+                else None
+            )
+            if rec is None:
+                raise NotFoundError(f"DID 不存在: {signer_did}")
+            if rec.get("status") == "deactivated":
+                raise ConflictError(f"DID 已停用: {signer_did}")
+            key_version = int(rec.get("key_version", 1))
+            private_pem = self._private_key_for_version_locked(
+                bucket, signer_did, key_version
+            )
+            if not private_pem:
+                # 正常不会发生：迁移保证当前版本私钥存在。
+                raise NotFoundError(
+                    f"DID {signer_did} 当前版本私钥不可用: {key_version}"
+                )
+            return key_version, private_pem
+
+    def get_active_trust_anchor_public_key(
+        self,
+        tenant_id: str,
+        did: str,
+        key_version: int,
+    ) -> Optional[str]:
+        """只读返回本租户 (did, key_version) active 信任锚点的公钥 PEM。
+
+        锚点不存在（含他租户）或已吊销返回 None；不校验 PEM 可解析性
+        （由调用方经 crypto.validate_public_key_pem 判定为不可用）。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            anchors = (
+                bucket["trust_anchors"].get(did)
+                if bucket is not None
+                else None
+            )
+            row = anchors.get(str(key_version)) if anchors is not None else None
+            if row is None or row.get("status") == "revoked":
+                return None
+            return row.get("public_key", "")
+
     def verify_trust_did_document(
         self,
         tenant_id: str,
