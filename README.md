@@ -56,7 +56,8 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/trust/verify` | 信任验签，请求体含非空字符串 `issuer_did`、正整数 `issuer_key_version`、非空字符串 `signature`；**缺失、吊销或验签失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
 | POST | `/v1/trust/credentials/verify` | 跨系统凭证验真：验证未在本租户签发或存储的外部凭证，无需登记 DID/凭证；请求体须恰含 `body`、`signature`；**任何失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
 | POST | `/v1/trust/dids/verify-document` | 跨系统 DID 文档验真：未在本租户注册的 DID 仅凭提交文档完成结构、证明与信任判断；请求体恰含 `document` 对象（恰含 `did`、`current_key_version`、`verification_methods`、`document_proof`）；**请求、字段、锚点、签名格式或验签失败均 HTTP 200** 返回 `valid:false` 与非空中文分类原因，成功仅 `{"valid":true}`；**原验真成功后查本租户外部 DID 停用通告**，命中同 did 返回 200 且键序 `valid,reason`，值为 `false`、“外部DID已停用：<reason>”，未命中维持原结果；纯只读、不登记资源、不写历史或审计 |
-| POST | `/v1/trust/dids/deactivate-sync` | 登记外部 DID 停用通告：请求恰含 `body`、`signature`，`body` 恰含 `did`（非空串）、`key_version`（非布尔正整数）、`reason`（1–256 码点且首尾无空白）、`deactivated_at`（UTC 秒精度 Z）；结构或值非法 400 且仅含非空中文 `error`；用本租户同 did/版本 active P-256 锚点按既有规范化 JSON 与 ES256 裸 R||S 无填充 base64url 验签 body；锚点不可用、签名格式错、验签失败均 HTTP 200、键序 `valid,reason`，值为 `false` 及“锚点不可用”/“签名格式错误”/“签名校验失败”，且不写入；首次接受 201、完全重放 200、同 did 不同通告 409 仅 `{error}`；成功响应键序 `valid,did,key_version,reason,deactivated_at`，`valid:true`；按租户+did 原子持久化、失败回滚、重启稳定 |
+| POST | `/v1/trust/dids/deactivate-sync` | 登记外部 DID 停用通告：请求恰含 `body`、`signature`，`body` 恰含 `did`（非空串）、`key_version`（非布尔正整数）、`reason`（1–256 码点且首尾无空白）、`deactivated_at`（UTC 秒精度 Z）；结构或值非法 400 且仅含非空中文 `error`；用本租户同 did/版本 active P-256 锚点按既有规范化 JSON 与 ES256 裸 R||S 无填充 base64url 验签 body；锚点不可用、签名格式错、验签失败均 HTTP 200、键序 `valid,reason`，值为 `false` 及“锚点不可用”/“签名格式错误”/“签名校验失败”，且不写入；首次接受 201、完全重放 200、同 did 不同通告 409 仅 `{error}`；成功响应键序 `valid,did,key_version,reason,deactivated_at`，`valid:true`；首次接受即与通告同一次原子写追加一条审计事件，重放/冲突/各类失败均不追加（批量逐项提交）；按租户+did 原子持久化、失败回滚、重启稳定 |
+| GET | `/v1/trust/dids/deactivations?limit=&after=&did=&key_version=&from=&to=` | 只读查询外部 DID 停用通告审计事件；参数仅允许这六个且不得重复；先按 `did`（非空）、`key_version`（ASCII 正整数）精确过滤及 `deactivated_at` 的 `from`/`to`（UTC 秒精度 Z、`from≤to`，闭区间）过滤，再按 `cursor>after` 升序取至多 `limit`（缺省 50、ASCII 整数 1–200，`after` 缺省 0、ASCII 非负整数）；空值/未知/重复/格式或范围非法均 400 且仅含非空中文 `error`；200 恰含 `events`、`next_after`，事件键序 `cursor`（整数）、`did`（字符串）、`key_version`（整数）、`reason`（字符串）、`deactivated_at`（字符串），空页 `next_after=after` 否则为页末 cursor；`cursor` 为租户内跨 DID 递增正整数，旧通告加载时按 `deactivated_at`、`did` 升序补录，迁移原子且重启不变；仅返本租户事件，无结果仍 200，只读不记审计 |
 | POST | `/v1/trust/presentations/verify` | 跨系统演示验真：验证其他系统生成且未在本租户保存的演示，无需登记 DID/凭证/演示；请求体须恰为 `{"presentation":对象,"challenge":非空串}`；**任何失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
 | POST | `/v1/trust/presentations/verify-batch` | 批量跨系统演示验真：请求体恰为 `{"presentations":[项...]}`，数组非空且不超过 100 项；每项可复用单项未绑定形态（恰含 `presentation` 对象与非空 `challenge`，演示不得含任何 `holder_*` 字段）或持有者绑定形态（另恰含非空 `source_tenant_id`，演示恰为九字段加 `holder_did`、`holder_key_version`、`holder_proof`，双锚点双签名，`source_tenant_id` 作为 holder proof 覆盖的 `tenant_id`）；**任何失败均 HTTP 200**，返回 `{"results":[...]}`（长度与顺序与输入一致，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`，不短路）；请求级非法（缺失、非法 JSON、非对象、字段缺失或多余、presentations 非数组、空数组或超限）返回 `{"results":[],"reason":"请求..."}`；纯只读、不消费、不审计 |
 | POST | `/v1/trust/proofs/verify` | 跨系统谓词证明验真：验证未在本租户保存的外部谓词证明，原本地 `/v1/proofs/{id}/verify` 不变；请求体须恰含 `proof`、`challenge`、`source_tenant_id`（后两项为非空字符串），proof 恰为 prove 九字段；**任何失败均 HTTP 200** 返回 `valid:false` 与分类中文 reason，成功仅 `{"valid":true}`；只读、不消费、不审计 |
@@ -863,6 +864,36 @@ curl -X POST localhost:8080/v1/proofs/zp_<id>/verify \
     "body": {"did":"did:web:example.com","key_version":1,
              "reason":"机构业务终止","deactivated_at":"2026-09-25T00:00:00Z"},
     "signature":"<base64url R||S>"}'
+  ```
+- `GET /v1/trust/dids/deactivations` 只读查询**外部 DID 停用通告
+  审计事件**：仅返回当前租户的事件，`X-Tenant-ID` 缺省 `default`、
+  显式空值 **400**；无事件仍返回 **200** 空数组，纯只读、不记审计、
+  不触发落盘（旧文件的内存补录项同样可见）。
+  - 查询参数**仅允许** `limit`、`after`、`did`、`key_version`、
+    `from`、`to` 六个，各自**最多提供一次**；未知参数、重复参数、
+    空值、空白/符号/小数、布尔词、Unicode 数字或范围非法均 **400**，
+    响应恰为非空中文 `{"error": "..."}`。
+  - `limit` 缺省 **50**，提供时须为 ASCII 十进制整数 **1–200**；
+    `after` 缺省 **0**，提供时须为 ASCII **非负整数**；`did` 提供时
+    须**非空字符串**；`key_version` 提供时须为 ASCII **正整数**；
+    `from`/`to` 提供时须为 **UTC 秒精度 Z** 时间
+    （`YYYY-MM-DDTHH:MM:SSZ`，毫秒/偏移/非法时刻均 400），且
+    **`from` 不晚于 `to`**。
+  - 过滤与分页顺序固定：先按 `did`、`key_version` **精确匹配**，再
+    按 `deactivated_at` 的 **`[from, to]` 闭区间**过滤，最后取
+    **`cursor > after`** 的事件按 `cursor` **升序**取至多 `limit` 项。
+  - 响应恰含 `events`、`next_after`（键序固定）；每个事件键序恰为
+    `cursor`、`did`、`key_version`、`reason`、`deactivated_at`，
+    类型依次为整数、字符串、整数、字符串、字符串。空页
+    `next_after` 等于请求的 `after`，否则为页末事件的 `cursor`。
+  - 事件**仅在通告首次接受时**与通告同一次原子写追加；完全重放、
+    冲突、锚点/签名失败与批量中的失败项均不追加，批量按输入逐项
+    提交。`cursor` 为**租户内跨 DID 递增**的持久化正整数；加载旧
+    状态文件时，已接受但无审计事件的通告按 **`deactivated_at`、
+    `did` 升序**补录，补录与迁移原子且跨重启 cursor 稳定。
+
+  ```bash
+  curl 'localhost:8080/v1/trust/dids/deactivations?limit=20&after=0'
   ```
 - `POST /v1/trust/presentations/verify` 验证**其他系统生成且未在本租户
   保存的演示**：无需登记本地 DID/凭证/演示，只读、不写凭证/演示/状态/
