@@ -34,6 +34,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   GET  /v1/trust/anchors/{did}/{key_version}/uses/history  查询锚点版本用途历史（只读）
   PUT  /v1/trust/anchors/{did}/{key_version}/status  吊销锚点版本
   GET  /v1/trust/anchors/snapshot      本租户锚点签名快照（?signer_did=，只读）
+  GET  /v1/trust/anchor-changes        可签名锚点变更流（?after=&signer_did=，只读）
   POST /v1/trust/anchors/snapshot/verify  校验锚点快照签名（只读）
   POST /v1/trust/verify                   用 active 锚点公钥验签
   POST /v1/trust/credentials/verify       跨系统凭证验真（无需登记 DID/凭证）
@@ -583,6 +584,8 @@ def build_handler(store: VCStore) -> type:
                     self._get_trust_anchor_discovery(tenant, parsed.query)
                 elif path == "/v1/trust/anchors/snapshot":
                     self._get_trust_anchor_snapshot(tenant, parsed.query)
+                elif path == "/v1/trust/anchor-changes":
+                    self._get_trust_anchor_changes(tenant, parsed.query)
                 elif path == "/v1/trust/dids/deactivations":
                     self._get_trust_did_deactivations(tenant, parsed.query)
                 elif path == "/v1/trust/dids/deactivations/manifest":
@@ -1946,6 +1949,73 @@ def build_handler(store: VCStore) -> type:
             snapshot = dict(signed)
             snapshot["signature"] = signature
             self._send_json(200, snapshot)
+
+        def _get_trust_anchor_changes(self, tenant: str, query: str) -> None:
+            # GET /v1/trust/anchor-changes?after=&signer_did=：可签名锚点
+            # 变更流。查询参数仅允许 after、signer_did 且各只能出现一次：
+            # signer_did 必填非空；after 缺省 0，须为非负 ASCII 十进制
+            # 整数。非法一律 400 且仅 {"error"}（非空中文）；签名 DID 须
+            # 为本租户活动本地 DID，未知（含他租户）404、已停用 409。
+            # 200 键序 events、next_after、signer_did、signer_key_version、
+            # signature：events 为 cursor>after 的前 200 条变更事件
+            # （cursor 升序），事件键序 cursor、action、did、key_version、
+            # public_key、status、uses，值为变更后状态；空页
+            # next_after=after，否则取页末 cursor。signature 由签名 DID
+            # 当前版本私钥对前四键递归键升序紧凑 UTF-8 JSON 做 ES256 裸
+            # R||S 无填充 base64url 签名。纯只读：不写状态、不记审计。
+            params = parse_qs(query, keep_blank_values=True)
+            unknown = sorted(set(params) - {"after", "signer_did"})
+            if unknown:
+                raise ValidationError(
+                    f"不支持的查询参数: {', '.join(unknown)}"
+                )
+
+            after_values = params.get("after")
+            if after_values is not None:
+                if len(after_values) != 1:
+                    raise ValidationError("查询参数 after 只能提供一次")
+                after = _parse_nonneg_int(after_values[0], "after")
+            else:
+                after = 0
+
+            signer_values = params.get("signer_did")
+            if signer_values is None:
+                raise ValidationError("查询参数 signer_did 必填")
+            if len(signer_values) != 1:
+                raise ValidationError("查询参数 signer_did 只能提供一次")
+            signer_did = signer_values[0]
+            if not signer_did:
+                raise ValidationError(
+                    "查询参数 signer_did 必须为非空字符串"
+                )
+
+            key_version, private_pem = (
+                store.get_trust_anchor_changes_signer(tenant, signer_did)
+            )
+            events, next_after = store.list_trust_anchor_changes(
+                tenant, after, 200
+            )
+            signed = {
+                "events": [
+                    {
+                        "cursor": event.cursor,
+                        "action": event.action,
+                        "did": event.did,
+                        "key_version": event.key_version,
+                        "public_key": event.public_key,
+                        "status": event.status,
+                        "uses": event.uses,
+                    }
+                    for event in events
+                ],
+                "next_after": next_after,
+                "signer_did": signer_did,
+                "signer_key_version": key_version,
+            }
+            signature = crypto.sign(signed, private_pem)
+            payload = dict(signed)
+            payload["signature"] = signature
+            self._send_json(200, payload)
 
         def _anchor_snapshot_is_well_formed(self, snapshot: Any) -> bool:
             # 快照结构校验（“快照非法”）：恰含四键且各键类型/取值合法。

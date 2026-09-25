@@ -60,6 +60,7 @@ from .models import (
     TrustAnchorRecord,
     TrustAnchorHistoryEvent,
     TrustAnchorUsesHistoryEvent,
+    TrustAnchorChangeEvent,
     TrustAnchorDiscoveryRecord,
 )
 
@@ -189,6 +190,15 @@ TRUST_ANCHOR_USES_ACTION_REGISTERED = "registered"
 TRUST_ANCHOR_USES_ACTION_ROTATED = "rotated"
 TRUST_ANCHOR_USES_ACTION_UPDATED = "updated"
 TRUST_ANCHOR_USES_ACTION_SNAPSHOT = "snapshot"
+
+# 可签名锚点变更流事件动作名：新版本注册/轮换、首次吊销与用途实际
+# 变更分别追加 registered/rotated/revoked/uses.updated（值为变更后
+# 状态），旧锚点加载时按（租户、did、版本）稳定补 snapshot。
+TRUST_ANCHOR_CHANGE_ACTION_REGISTERED = "registered"
+TRUST_ANCHOR_CHANGE_ACTION_ROTATED = "rotated"
+TRUST_ANCHOR_CHANGE_ACTION_REVOKED = "revoked"
+TRUST_ANCHOR_CHANGE_ACTION_USES_UPDATED = "uses.updated"
+TRUST_ANCHOR_CHANGE_ACTION_SNAPSHOT = "snapshot"
 
 
 def _utc_now() -> str:
@@ -616,6 +626,7 @@ class VCStore:
             bucket.setdefault("did_history", {})
             bucket.setdefault("did_deactivation_notices", {})
             bucket.setdefault("did_deactivation_events", [])
+            bucket.setdefault("trust_anchor_changes", [])
             for rec in bucket["dids"].values():
                 _migrate_did_row(rec)
         # 外部凭证状态历史游标（租户内持久化正整数，按追加递增）。
@@ -751,6 +762,21 @@ class VCStore:
             for event in bucket.get("did_deactivation_events", []):
                 max_cursor = max(max_cursor, int(event.get("cursor", 0)))
             self._did_deactivation_event_cursors[tenant_id] = max_cursor
+        # 可签名锚点变更流游标：按租户各自维护的持久化正整数
+        # （tenant_id -> cursor），同一租户内跨 DID 的锚点变更事件
+        # （registered/rotated/revoked/uses.updated/snapshot）共享该游标
+        # 空间，与其他历史游标空间相互独立。旧状态文件无该字段时，从各
+        # 租户已有变更事件的最大 cursor 推导。
+        raw_change_cursors = data.get("trust_anchor_change_cursors", {})
+        self._trust_anchor_change_cursors: Dict[str, int] = {
+            str(tenant_id): int(cursor)
+            for tenant_id, cursor in raw_change_cursors.items()
+        } if isinstance(raw_change_cursors, dict) else {}
+        for tenant_id, bucket in self._tenants.items():
+            max_cursor = self._trust_anchor_change_cursors.get(tenant_id, 0)
+            for event in bucket.get("trust_anchor_changes", []):
+                max_cursor = max(max_cursor, int(event.get("cursor", 0)))
+            self._trust_anchor_change_cursors[tenant_id] = max_cursor
         # 旧状态文件中已吊销但无历史的密钥版本补一条兼容项（内存态）；
         # 随下一次原子写一并落盘，重启后 cursor 稳定。
         self._backfill_key_revocations_locked()
@@ -777,6 +803,10 @@ class VCStore:
         # 旧状态文件中已存在外部 DID 停用通告但无审计事件列表的，按
         # (deactivated_at, did) 升序稳定补录（内存态）；重启后 cursor 稳定。
         self._backfill_did_deactivation_events_locked()
+        # 旧状态文件中已有锚点版本但无变更流事件的，按（租户、did、版本）
+        # 稳定补 snapshot（内存态，值为当前状态）；随下一次原子写一并
+        # 落盘，重启后 cursor 稳定。
+        self._backfill_trust_anchor_changes_locked()
 
     def _save_locked(self) -> None:
         directory = os.path.dirname(os.path.abspath(self.path))
@@ -800,6 +830,7 @@ class VCStore:
             "did_deactivation_event_cursors": (
                 self._did_deactivation_event_cursors
             ),
+            "trust_anchor_change_cursors": self._trust_anchor_change_cursors,
         }
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
@@ -820,6 +851,7 @@ class VCStore:
                 self._local_credential_status_history_cursors,
                 self._did_history_cursors,
                 self._did_deactivation_event_cursors,
+                self._trust_anchor_change_cursors,
             )
         )
 
@@ -836,6 +868,7 @@ class VCStore:
             local_credential_status_history_cursors,
             did_history_cursors,
             did_deactivation_event_cursors,
+            trust_anchor_change_cursors,
         ) = copy.deepcopy(snapshot)
         self._tenants = tenants
         self._audit = audit
@@ -852,6 +885,7 @@ class VCStore:
         )
         self._did_history_cursors = did_history_cursors
         self._did_deactivation_event_cursors = did_deactivation_event_cursors
+        self._trust_anchor_change_cursors = trust_anchor_change_cursors
 
     # ------------------------------------------------------------------ #
     # 租户桶与审计
@@ -879,6 +913,7 @@ class VCStore:
                 "did_history": {},
                 "did_deactivation_notices": {},
                 "did_deactivation_events": [],
+                "trust_anchor_changes": [],
             }
             self._tenants[tenant_id] = bucket
         return bucket
@@ -3661,6 +3696,16 @@ class VCStore:
                         ),
                     }
                 )
+                # 新版本注册追加 registered 锚点变更流事件（值为变更后
+                # 状态）；幂等重试不追加。锚点、事件、游标与审计同一次
+                # 原子写落盘。
+                self._append_trust_anchor_change_locked(
+                    bucket,
+                    tenant_id,
+                    TRUST_ANCHOR_CHANGE_ACTION_REGISTERED,
+                    did,
+                    row,
+                )
                 self._save_locked()
                 return self._trust_anchor_record(did, row), True
             except Exception:
@@ -3791,6 +3836,16 @@ class VCStore:
                         ),
                     }
                 )
+                # 用途实际变更追加 uses.updated 锚点变更流事件（值为变更
+                # 后状态）；幂等、冲突、失败与吊销均不追加。用途、事件、
+                # 游标与审计同一次原子写落盘。
+                self._append_trust_anchor_change_locked(
+                    bucket,
+                    tenant_id,
+                    TRUST_ANCHOR_CHANGE_ACTION_USES_UPDATED,
+                    did,
+                    row,
+                )
                 self._save_locked()
             except Exception:
                 self._restore_locked(snapshot)
@@ -3852,6 +3907,16 @@ class VCStore:
                                 )
                             ),
                         }
+                    )
+                    # 首次吊销追加 revoked 锚点变更流事件（值为变更后
+                    # 状态）；幂等重试不追加。锚点、事件、游标与审计
+                    # 同一次原子写落盘。
+                    self._append_trust_anchor_change_locked(
+                        bucket,
+                        tenant_id,
+                        TRUST_ANCHOR_CHANGE_ACTION_REVOKED,
+                        did,
+                        row,
                     )
                 self._save_locked()
             except Exception:
@@ -5218,6 +5283,16 @@ class VCStore:
                         ),
                     }
                 )
+                # 轮换目标新版本追加 rotated 锚点变更流事件（值为变更后
+                # 状态，uses 继承前置版本）；幂等重试不追加。锚点、事件、
+                # 游标与审计同一次原子写落盘。
+                self._append_trust_anchor_change_locked(
+                    bucket,
+                    tenant_id,
+                    TRUST_ANCHOR_CHANGE_ACTION_ROTATED,
+                    did,
+                    row,
+                )
                 self._save_locked()
                 return self._trust_anchor_record(did, row), True
             except Exception:
@@ -5736,6 +5811,113 @@ class VCStore:
                 )
                 for cursor, did, row in picked_rows
             ]
+            next_after = picked[-1].cursor if picked else after
+            return picked, next_after
+
+    def _next_trust_anchor_change_cursor_locked(self, tenant_id: str) -> int:
+        """分配租户内下一个持久化锚点变更流游标（正整数，按追加递增）。"""
+        cursor = self._trust_anchor_change_cursors.get(tenant_id, 0) + 1
+        self._trust_anchor_change_cursors[tenant_id] = cursor
+        return cursor
+
+    def _append_trust_anchor_change_locked(
+        self,
+        bucket: Dict[str, Any],
+        tenant_id: str,
+        action: str,
+        did: str,
+        row: Dict[str, Any],
+    ) -> None:
+        """（须持锁）向本租户锚点变更流追加一条事件（值为变更后状态）。
+
+        事件键序固定为 cursor、action、did、key_version、public_key、
+        status、uses；uses 为该版本变更后生效用途（按规范序）。事件、
+        游标与产生它的状态变更/审计在同一次原子写中落盘。
+        """
+        bucket.setdefault("trust_anchor_changes", []).append(
+            {
+                "cursor": self._next_trust_anchor_change_cursor_locked(
+                    tenant_id
+                ),
+                "action": action,
+                "did": did,
+                "key_version": int(row["key_version"]),
+                "public_key": row["public_key"],
+                "status": row.get("status", "active"),
+                "uses": _anchor_row_uses(row),
+            }
+        )
+
+    def _backfill_trust_anchor_changes_locked(self) -> None:
+        """加载迁移：为缺变更流事件的旧锚点版本按 did/版本序补 snapshot。
+
+        对每个租户的每个 DID 的每个锚点版本（按 did 字典序、key_version
+        升序），该版本无任何变更流事件时补一条 snapshot 事件，状态与用途
+        取该版本当前值（省略 uses 的旧记录为全用途规范序）。补录 cursor
+        为该租户内新分配的持久化正整数。仅在内存中补录：随下一次原子写
+        一并落盘；若无写操作，重启时按相同顺序重建，cursor 稳定。
+        """
+        for tenant_id in sorted(self._tenants):
+            bucket = self._tenants[tenant_id]
+            changes = bucket.setdefault("trust_anchor_changes", [])
+            known = {
+                (event.get("did"), int(event.get("key_version", 0)))
+                for event in changes
+            }
+            anchors_map = bucket.get("trust_anchors", {})
+            for did in sorted(anchors_map):
+                rows = anchors_map[did]
+                for version in sorted(int(ver) for ver in rows):
+                    if (did, version) in known:
+                        continue
+                    self._append_trust_anchor_change_locked(
+                        bucket,
+                        tenant_id,
+                        TRUST_ANCHOR_CHANGE_ACTION_SNAPSHOT,
+                        did,
+                        rows[str(version)],
+                    )
+                    known.add((did, version))
+
+    def list_trust_anchor_changes(
+        self,
+        tenant_id: str,
+        after: int = 0,
+        limit: int = 200,
+    ) -> Tuple[List[TrustAnchorChangeEvent], int]:
+        """只读查询本租户锚点变更流，按页返回。
+
+        事件按 cursor 升序；after 排除 cursor 不大于其值的事件，至多
+        返回 limit 项；next_after 为本页末项 cursor，空页保持 after。
+        纯只读：不修改任何状态、不记审计、不触发落盘。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            rows = (
+                bucket.get("trust_anchor_changes", [])
+                if bucket is not None
+                else []
+            )
+            picked: List[TrustAnchorChangeEvent] = []
+            for event_row in sorted(
+                rows, key=lambda event: int(event.get("cursor", 0))
+            ):
+                if len(picked) >= limit:
+                    break
+                cursor = int(event_row["cursor"])
+                if cursor <= after:
+                    continue
+                picked.append(
+                    TrustAnchorChangeEvent(
+                        cursor=cursor,
+                        action=event_row["action"],
+                        did=event_row["did"],
+                        key_version=int(event_row["key_version"]),
+                        public_key=event_row["public_key"],
+                        status=event_row.get("status", "active"),
+                        uses=list(event_row["uses"]),
+                    )
+                )
             next_after = picked[-1].cursor if picked else after
             return picked, next_after
 
@@ -7485,6 +7667,24 @@ class VCStore:
         """返回本租户活动本地 DID 的（当前密钥版本, 当前私钥 PEM）。
 
         供信任锚点快照（snapshot）签名使用：
+        - DID 不存在（含他租户资源）抛 NotFoundError（HTTP 404）；
+        - DID 已停用抛 ConflictError（HTTP 409）；
+        - 取该 DID 当前密钥版本的托管私钥。
+        纯只读：不修改任何状态、不记审计、不触发落盘。
+        """
+        with self._lock:
+            return self._active_did_signer_locked(
+                self._bucket_locked(tenant_id), signer_did
+            )
+
+    def get_trust_anchor_changes_signer(
+        self,
+        tenant_id: str,
+        signer_did: str,
+    ) -> Tuple[int, str]:
+        """返回本租户活动本地 DID 的（当前密钥版本, 当前私钥 PEM）。
+
+        供可签名锚点变更流（anchor-changes）签名使用：
         - DID 不存在（含他租户资源）抛 NotFoundError（HTTP 404）；
         - DID 已停用抛 ConflictError（HTTP 409）；
         - 取该 DID 当前密钥版本的托管私钥。

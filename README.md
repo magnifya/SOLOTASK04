@@ -54,6 +54,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | PUT | `/v1/trust/anchors/{did}/{key_version}/uses` | 收紧锚点版本用途白名单（无需轮换即可撤销用途）；请求体须恰含 `from_uses`、`uses`（均为非空无重复字符串数组，取值限且按规范序），否则 400；路径版本非 ASCII 正整数 400，未知或跨租户 404，已吊销 409；目标等于当前值幂等 200 且无副作用，否则 `from_uses` 须等于当前值且目标须为其真子集，前置不匹配或扩权均 409，并发不同收紧最多一个成功；200 按键序恰返 `did`、`key_version`、`uses`；实际变更仅记一次 `trust.anchor.uses.updated` 审计（`resource_type:trust_anchor`、`resource_id:<did>#<key_version>`），用途与审计原子落盘、失败回滚、重启保持 |
 | GET | `/v1/trust/anchors/{did}/{key_version}/uses/history?limit=&after=` | 只读查询锚点版本用途历史；路径版本须为 ASCII 正整数（非法 400），查询参数仅允许 `limit`（缺省 50、限 1–200）与 `after`（缺省 0、非负），二者须唯一、非空 ASCII 十进制，其他或重复参数 400；非法请求 400、未知或跨租户锚点 404，均仅返单键非空中文 `error`；200 按序恰返 `did`、`key_version`、`events`、`next_after`，事件按 `cursor` 升序且键序恰为 `cursor`、`action`、`from_uses`、`uses`、`updated_at`；新版本注册/轮换追加 `registered`/`rotated`（`from_uses:null`），实际收紧追加 `updated`（前后用途数组均保存），幂等、冲突、失败、吊销不追加；`updated_at` 为 UTC 秒精度 Z 字符串，`cursor` 为租户内跨 DID 持久递增正整数；返 `cursor>after`，空页 `next_after=after`，否则取页末 `cursor`；旧锚点加载时补 `snapshot`（`from_uses`/`updated_at` 为 `null`、`uses` 为当前值，跨重启稳定）；新建、轮换、收紧时锚点、历史、游标与审计原子落盘、失败全回滚；只读不记审计 |
 | GET | `/v1/trust/anchors?limit=&after=&status=` | 只读跨 DID 发现本租户锚点版本；响应恰含 `anchors`、`next_after`，每项恰含 `did`、`public_key`、`key_version`、`status`、`updated_at`、`cursor`；先按 `status`（可省略，或 `active`/`revoked`）过滤，再按 `cursor>after` 升序取至多 `limit`（默认 50、限 1–200，`after` 默认 0 且非负）；无锚点也返回 200 空数组，空结果 `next_after` 等于 `after`；参数仅允许这三个，重复/空值/空白/符号/Unicode 数字/越界/未知参数均 400；只读不记审计 |
+| GET | `/v1/trust/anchor-changes?after=&signer_did=` | 只读可签名锚点变更流；仅收 `after`（缺省 0、非负 ASCII 整数）与 `signer_did`（非空必填）各一次，非法 400 仅 `{"error"}`；签名 DID 须本租户活动 DID，未知/他租户 404、停用 409；注册/轮换/首次吊销/用途实改依次产生 `registered`/`rotated`/`revoked`/`uses.updated` 事件（幂等/失败无事件），事件依序含 `cursor`、`action`、`did`、`key_version`、`public_key`、`status`、`uses`（变更后状态），`cursor` 租户内持久递增，返 `cursor>after` 前 200 项；200 依序含 `events`、`next_after`（空页等于 `after`）、`signer_did`、`signer_key_version`、`signature`（签名 DID 当前私钥对前四键规范化 JSON 的 ES256 裸 R‖S 无填充 base64url）；旧锚点按 did/版本序补 `snapshot`，重启不变；只读不记审计 |
 | GET | `/v1/trust/anchors/{did}/history?limit=&after=` | 只读查询信任锚点生命周期历史；200 恰含 `did`、`events`、`next_after`，事件恰含 `{key_version,action,status,updated_at,cursor}`；仅新版本注册、轮换目标版本（active、`updated_at:null`）与首次吊销（revoked、首次吊销 UTC 秒 Z 时间）追加，幂等重试与失败不追加；`cursor` 为租户内跨 DID 共享的持久化正整数；`limit` 默认 50、限 1–200，`after` 默认 0、须非负，重复/非空 ASCII 数字外取值均 400；未知或跨租户 DID 404，已有 DID 无历史返空页；只读不记审计 |
 | PUT | `/v1/trust/anchors/{did}/{key_version}/status` | 吊销锚点版本，请求体必须恰为 `{"status":"revoked"}`；首次与重复均 200，首次置 UTC 秒精度 `updated_at`，重复保持不变；未知版本 404 |
 | POST | `/v1/trust/verify` | 信任验签，请求体含非空字符串 `issuer_did`、正整数 `issuer_key_version`、非空字符串 `signature`；**缺失、吊销或验签失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
@@ -1366,6 +1367,51 @@ curl -X POST localhost:8080/v1/trust/presentations/verify-batch \
                          {"presentation":{ ...绑定十二字段演示... },
                           "challenge":"<演示的 challenge>",
                           "source_tenant_id":"<来源租户>"}]}'
+```
+
+#### 可签名锚点变更流（只读）
+
+`GET /v1/trust/anchor-changes` 以签名分页事件流的形式输出本租户信任
+锚点的全部变更，供依赖方增量同步并校验完整性；与注册、轮换、吊销、
+用途收紧及发现/历史接口完全兼容，租户头规则不变。
+
+- 查询参数**仅允许** `after`、`signer_did`，且各自**只能出现一次**：
+  - `signer_did` **必填且非空**：签名 DID 须为**本租户活动本地
+    DID**，未知（含他租户）**404**、已停用 **409**；
+  - `after` 缺省 **0**，须为**非负 ASCII 十进制**整数；
+  - 缺 `signer_did`、空值、重复参数、未知参数、`after` 为空/符号/
+    小数/空白/Unicode 数字等一律 **400**，且响应仅含非空中文
+    `{"error": "..."}`；显式空 `X-Tenant-ID` 仍为 **400**。
+- **事件追加时机**：新版本注册、轮换目标版本、首次吊销与用途实际
+  变更依次追加 `registered`/`rotated`/`uses.updated`/`revoked` 事件；
+  幂等重试（同 PEM 同用途注册、同前置同 PEM 轮换、目标等于当前的
+  用途更新、重复吊销）与任何失败路径（400/404/409）均**不追加**。
+- 200 响应按键序恰含 `events`、`next_after`、`signer_did`、
+  `signer_key_version`、`signature`：
+  - `events` 按 `cursor` 升序，每项按键序恰含 `cursor`（正整数）、
+    `action`、`did`、`key_version`（正整数）、`public_key`、
+    `status`（`active`/`revoked`）、`uses`（按规范序的字符串数组），
+    值均为**变更后状态**；
+  - `cursor` 为**租户内跨 DID 持久递增正整数**，与其他历史游标空间
+    相互独立；返回 `cursor > after` 的前 **200** 项；
+  - `next_after` 为本页末项 `cursor`，**空页等于 `after`**；
+  - `signer_key_version` 为签名 DID 的**当前**密钥版本；`signature`
+    由该 DID 当前版本私钥对**前四键**（`events`、`next_after`、
+    `signer_did`、`signer_key_version`）递归键升序紧凑 UTF-8 JSON
+    做 **ES256**（P-256 + SHA-256）签名，输出 64 字节裸 `R||S` 的
+    无填充 base64url。
+- **旧状态兼容**：旧状态文件中已有锚点版本但无变更流事件时，加载
+  时按（租户、**did 字典序**、版本升序）为每个版本补一条
+  `snapshot` 事件（状态与用途取当前值），`cursor` 为租户内新分配的
+  持久化正整数；补录随下一次原子写一并落盘，即使加载后无写操作，
+  重启时也按相同顺序重建为**相同 cursor**。
+- 注册/轮换/吊销/用途变更时，**锚点状态、变更流事件、游标与审计在
+  同一把锁内经同一次原子写落盘，落盘失败一并回滚**。该接口为纯
+  只读查询，**不记审计**、不触发落盘。
+
+```bash
+curl "localhost:8080/v1/trust/anchor-changes?signer_did=did:example:<id>"
+curl "localhost:8080/v1/trust/anchor-changes?after=200&signer_did=did:example:<id>"
 ```
 
 ### 外部凭证状态同步
