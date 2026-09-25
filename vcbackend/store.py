@@ -172,6 +172,7 @@ AUDIT_PRESENTATION_CONSUMED = "presentation.consumed"
 AUDIT_TRUST_ANCHOR_REGISTERED = "trust.anchor.registered"
 AUDIT_TRUST_ANCHOR_REVOKED = "trust.anchor.revoked"
 AUDIT_TRUST_ANCHOR_ROTATED = "trust.anchor.rotated"
+AUDIT_TRUST_ANCHOR_USES_UPDATED = "trust.anchor.uses.updated"
 AUDIT_PROOF_CREATED = "proof.created"
 AUDIT_PROOF_CONSUMED = "proof.consumed"
 AUDIT_KEY_REVOKED = "key.revoked"
@@ -3635,6 +3636,74 @@ class VCStore:
                     f"信任锚点不存在: {did}#{key_version}"
                 )
             return _anchor_row_uses(row)
+
+    def restrict_trust_anchor_uses(
+        self,
+        tenant_id: str,
+        did: str,
+        key_version: int,
+        from_uses: List[str],
+        uses: List[str],
+    ) -> Tuple[List[str], bool]:
+        """收紧（不可扩权）锚点版本用途白名单。
+
+        - from_uses/uses 由上层校验为非空、无重复、取值限
+          TRUST_ANCHOR_USES 且按规范序的字符串数组；
+        - 锚点版本未知（含他租户资源）抛 NotFoundError；已吊销抛
+          ConflictError；
+        - 目标 uses 等于当前值：幂等成功，不改变用途、不记审计；
+        - from_uses 不等于当前值（前置不匹配，含并发已收紧），或目标
+          uses 不是当前值的真子集（扩权/含新用途）：ConflictError，
+          不改变用途、不记审计；
+        - 仅当 from_uses 等于当前值且目标为其真子集时收紧：置 row uses
+          为目标值并记一次 trust.anchor.uses.updated；用途与审计在同
+          一把锁内经同一次原子写落盘，失败回滚。
+        返回 (收紧后的当前用途, 是否实际变更)。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            anchors = (
+                bucket["trust_anchors"].get(did)
+                if bucket is not None else None
+            )
+            row = anchors.get(str(key_version)) if anchors is not None else None
+            if row is None:
+                raise NotFoundError(
+                    f"信任锚点不存在: {did}#{key_version}"
+                )
+            if row.get("status", "active") == "revoked":
+                raise ConflictError(
+                    f"信任锚点已吊销，不能收紧用途: {did}#{key_version}"
+                )
+            current = _anchor_row_uses(row)
+            if uses == current:
+                # 目标等于当前值：幂等成功，无任何副作用。
+                return list(current), False
+            if from_uses != current:
+                raise ConflictError(
+                    "前置用途与当前用途不匹配（可能已被并发收紧）: "
+                    f"{did}#{key_version}"
+                )
+            target = set(uses)
+            if not target < set(current):
+                raise ConflictError(
+                    "用途只能收紧为当前用途的真子集，不能扩权: "
+                    f"{did}#{key_version}"
+                )
+            snapshot = self._snapshot_locked()
+            try:
+                row["uses"] = list(uses)
+                self._append_audit_locked(
+                    tenant_id,
+                    AUDIT_TRUST_ANCHOR_USES_UPDATED,
+                    "trust_anchor",
+                    f"{did}#{key_version}",
+                )
+                self._save_locked()
+            except Exception:
+                self._restore_locked(snapshot)
+                raise
+            return list(uses), True
 
     def revoke_trust_anchor(
         self, tenant_id: str, did: str, key_version: int

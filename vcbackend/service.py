@@ -30,6 +30,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   GET  /v1/trust/anchors/{did}            查询 DID 的全部锚点版本
   GET  /v1/trust/anchors/{did}/history    查询信任锚点生命周期历史（只读）
   GET  /v1/trust/anchors/{did}/{key_version}/uses  查询锚点版本用途白名单（只读）
+  PUT  /v1/trust/anchors/{did}/{key_version}/uses  收紧锚点版本用途白名单（真子集、幂等、原子审计）
   PUT  /v1/trust/anchors/{did}/{key_version}/status  吊销锚点版本
   POST /v1/trust/verify                   用 active 锚点公钥验签
   POST /v1/trust/credentials/verify       跨系统凭证验真（无需登记 DID/凭证）
@@ -94,6 +95,7 @@ from .store import (
     USES_UNSET,
     ValidationError,
     VCStore,
+    _validate_trust_anchor_uses,
 )
 
 
@@ -461,6 +463,17 @@ def build_handler(store: VCStore) -> type:
                         path[len("/v1/credentials/") : -len("/status")]
                     )
                     self._put_credential_status(tenant, credential_id)
+                elif path.startswith("/v1/trust/anchors/") and path.endswith(
+                    "/uses"
+                ):
+                    rest = path[len("/v1/trust/anchors/") : -len("/uses")]
+                    did, sep, version_raw = rest.rpartition("/")
+                    if not sep or not did:
+                        self._send_error(404, f"无此路径: {path}")
+                    else:
+                        self._put_trust_anchor_uses(
+                            tenant, unquote(did), unquote(version_raw)
+                        )
                 elif path.startswith("/v1/trust/anchors/") and path.endswith(
                     "/status"
                 ):
@@ -1667,6 +1680,53 @@ def build_handler(store: VCStore) -> type:
             ):
                 raise ValidationError("路径参数 key_version 必须为正整数")
             uses = store.get_trust_anchor_uses(tenant, did, int(key_version))
+            self._send_json(
+                200,
+                {
+                    "did": did,
+                    "key_version": int(key_version),
+                    "uses": uses,
+                },
+            )
+
+        def _put_trust_anchor_uses(
+            self, tenant: str, did: str, key_version: str
+        ) -> None:
+            # PUT /v1/trust/anchors/{did}/{key_version}/uses：收紧锚点
+            # 版本用途白名单（只可真子集收紧，密钥版本无需轮换即可撤销
+            # 用途）。请求体须恰含 from_uses、uses；二者均须为非空、
+            # 无重复的字符串数组，取值限且按规范序 generic、vc、vp、
+            # proof、did、status、deactivation，否则 400。路径版本须为
+            # ASCII 正整数，非法 400；未知或他租户锚点 404；已吊销 409。
+            # 目标等于当前值幂等 200（无副作用）；否则 from_uses 须等于
+            # 当前值且目标须为其真子集，前置不匹配或扩权均 409。仅实际
+            # 收紧追加一次 trust.anchor.uses.updated，用途与审计原子
+            # 持久化，落盘失败 500 并回滚。200 按键序恰返 did、
+            # key_version、uses。
+            data = self._read_json()
+            if "from_uses" not in data:
+                raise ValidationError("缺少字段: from_uses")
+            if "uses" not in data:
+                raise ValidationError("缺少字段: uses")
+            extra = sorted(set(data) - {"from_uses", "uses"})
+            if extra:
+                raise ValidationError(f"多余字段: {', '.join(extra)}")
+            try:
+                from_uses = _validate_trust_anchor_uses(data["from_uses"])
+            except ValidationError as exc:
+                raise ValidationError(
+                    str(exc).replace("字段 uses", "字段 from_uses")
+                ) from exc
+            target_uses = _validate_trust_anchor_uses(data["uses"])
+            if (
+                not key_version
+                or any(ch < "0" or ch > "9" for ch in key_version)
+                or int(key_version) < 1
+            ):
+                raise ValidationError("路径参数 key_version 必须为正整数")
+            uses, _changed = store.restrict_trust_anchor_uses(
+                tenant, did, int(key_version), from_uses, target_uses
+            )
             self._send_json(
                 200,
                 {
