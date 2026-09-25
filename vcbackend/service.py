@@ -44,6 +44,8 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/credentials/receipt/consume-batch  批量消费验真签名回执（逐项不短路，防重放）
   GET  /v1/trust/credentials/receipt/consumptions  查询验真回执消费历史（只读）
   GET  /v1/trust/credentials/receipt/consumptions/export  确定性 NDJSON 导出回执消费历史（快照续传，只读）
+  GET  /v1/trust/credentials/receipt/consumptions/manifest 回执消费历史导出清单（签名摘要，只读）
+  POST /v1/trust/credentials/receipt/consumptions/manifest/verify 校验回执消费历史清单与 NDJSON 内容（只读）
   POST /v1/trust/credentials/import       导入外部凭证（active 锚点验签后持久化）
   POST /v1/trust/credentials/import-batch 批量导入外部凭证（逐项不短路）
   GET  /v1/trust/credentials/imported/{credential_id}  读取已导入的外部凭证（?issuer_did=）
@@ -427,6 +429,14 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_credentials_receipt_consume_batch(
                         tenant
                     )
+                elif (
+                    path
+                    == "/v1/trust/credentials/receipt/consumptions/manifest"
+                    "/verify"
+                ):
+                    self._post_trust_credential_receipt_consumptions_manifest_verify(
+                        tenant
+                    )
                 elif path == "/v1/trust/credentials/import":
                     self._post_trust_credentials_import(tenant)
                 elif path == "/v1/trust/credentials/import-batch":
@@ -642,6 +652,13 @@ def build_handler(store: VCStore) -> type:
                     == "/v1/trust/credentials/receipt/consumptions/export"
                 ):
                     self._get_trust_credential_receipt_consumptions_export(
+                        tenant, parsed.query
+                    )
+                elif (
+                    path
+                    == "/v1/trust/credentials/receipt/consumptions/manifest"
+                ):
+                    self._get_trust_credential_receipt_consumptions_manifest(
                         tenant, parsed.query
                     )
                 elif path == "/v1/trust/dids/deactivations/manifest":
@@ -3833,6 +3850,297 @@ def build_handler(store: VCStore) -> type:
             self.end_headers()
             if body:
                 self.wfile.write(body)
+
+        def _parse_receipt_consumption_manifest_query(
+            self, query: str
+        ) -> Dict[str, Any]:
+            # 回执消费历史清单查询参数：取既有 export 的 limit、after、
+            # snapshot（snapshot 必填）加唯一 signer_did。任何空值、重复、
+            # 未知参数、格式或范围非法均抛 ValidationError（HTTP 400，仅含
+            # 非空中文 error）。filters 仅 after、limit 两键，值为生效整数。
+            params = parse_qs(query, keep_blank_values=True)
+            allowed = {"limit", "after", "snapshot", "signer_did"}
+            unknown = sorted(set(params) - allowed)
+            if unknown:
+                raise ValidationError(
+                    f"不支持的查询参数: {', '.join(unknown)}"
+                )
+
+            def _single(name: str) -> Optional[str]:
+                values = params.get(name)
+                if values is None:
+                    return None
+                if len(values) != 1:
+                    raise ValidationError(
+                        f"查询参数 {name} 只能提供一次"
+                    )
+                return values[0]
+
+            limit_raw = _single("limit")
+            if limit_raw is not None:
+                limit = _parse_nonneg_int(limit_raw, "limit")
+                if not 1 <= limit <= 10000:
+                    raise ValidationError(
+                        "查询参数 limit 须在 1 到 10000 之间"
+                    )
+            else:
+                limit = 1000
+
+            after_raw = _single("after")
+            after = (
+                _parse_nonneg_int(after_raw, "after")
+                if after_raw is not None
+                else 0
+            )
+
+            snapshot_raw = _single("snapshot")
+            if snapshot_raw is None:
+                raise ValidationError("查询参数 snapshot 必填")
+            snapshot = _parse_nonneg_int(snapshot_raw, "snapshot")
+
+            signer_did = _single("signer_did")
+            if signer_did is None or not signer_did:
+                raise ValidationError(
+                    "查询参数 signer_did 必填且必须为非空字符串"
+                )
+
+            # filters 仅 after、limit，取生效整数（含缺省值）。
+            filters = {"after": after, "limit": limit}
+            return {
+                "after": after,
+                "limit": limit,
+                "snapshot": snapshot,
+                "signer_did": signer_did,
+                "filters": filters,
+            }
+
+        def _get_trust_credential_receipt_consumptions_manifest(
+            self, tenant: str, query: str
+        ) -> None:
+            # GET /v1/trust/credentials/receipt/consumptions/manifest：
+            # 对一次回执消费历史的确定性导出（与 export 同 limit/after/
+            # snapshot，snapshot 必填）生成签名摘要清单，公开协议沿用停用
+            # 通告清单。参数/snapshot 越界 400（仅 error）；签名 DID 未知
+            # （含他租户）404、已停用 409（400 判定优先）。200 键序
+            # snapshot、filters、count、alg、digest、signer_did、
+            # key_version、signature；filters 键序 after、limit，值为生效
+            # 整数；count 为本页非负整数行数；alg 恒为 SHA-256；digest 为
+            # 本页 NDJSON 字节（与 export 同形状）的 64 位小写 hex
+            # SHA-256；signature 由签名 DID 当前私钥对前七键规范化 JSON 做
+            # ES256 裸 R||S 无填充 base64url 签名。纯只读。
+            args = self._parse_receipt_consumption_manifest_query(query)
+
+            # 先做快照越界校验（400 优先于签名 DID 的 404/409）。
+            events, effective_snapshot, _ = (
+                store.export_receipt_consumption_events(
+                    tenant,
+                    args["after"],
+                    args["limit"],
+                    snapshot=args["snapshot"],
+                )
+            )
+
+            # 签名 DID 须为本租户活动本地 DID：未知 404、停用 409。
+            signer_did = args["signer_did"]
+            key_version, private_pem = (
+                store.get_receipt_consumption_manifest_signer(
+                    tenant, signer_did
+                )
+            )
+
+            ndjson_bytes = _receipt_consumption_ndjson_bytes(events)
+            digest = hashlib.sha256(ndjson_bytes).hexdigest()
+            signed = {
+                "snapshot": effective_snapshot,
+                "filters": args["filters"],
+                "count": len(events),
+                "alg": "SHA-256",
+                "digest": digest,
+                "signer_did": signer_did,
+                "key_version": key_version,
+            }
+            signature = crypto.sign(signed, private_pem)
+            manifest = dict(signed)
+            manifest["signature"] = signature
+            self._send_json(200, manifest)
+
+        def _receipt_consumption_manifest_is_well_formed(
+            self, manifest: Any
+        ) -> bool:
+            # 回执消费历史清单结构校验（阶段一“清单非法”）：顶层恰含八键
+            # 且类型/取值合法；filters 恰含 after、limit 两键且值为生效
+            # 整数（after 非负、limit 为 1..10000 的正整数）。
+            if not isinstance(manifest, dict):
+                return False
+            expected = {
+                "snapshot",
+                "filters",
+                "count",
+                "alg",
+                "digest",
+                "signer_did",
+                "key_version",
+                "signature",
+            }
+            if set(manifest) != expected:
+                return False
+
+            def _is_nonneg_int(value: Any) -> bool:
+                return (
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value >= 0
+                )
+
+            def _is_positive_int(value: Any) -> bool:
+                return (
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value >= 1
+                )
+
+            if not _is_nonneg_int(manifest["snapshot"]):
+                return False
+            if not _is_nonneg_int(manifest["count"]):
+                return False
+            if manifest["alg"] != "SHA-256":
+                return False
+            if not (
+                isinstance(manifest["digest"], str)
+                and _SHA256_HEX_RE.fullmatch(manifest["digest"])
+            ):
+                return False
+            if (
+                not isinstance(manifest["signer_did"], str)
+                or not manifest["signer_did"]
+            ):
+                return False
+            if not _is_positive_int(manifest["key_version"]):
+                return False
+            if (
+                not isinstance(manifest["signature"], str)
+                or not manifest["signature"]
+            ):
+                return False
+
+            filters = manifest["filters"]
+            if not isinstance(filters, dict):
+                return False
+            if set(filters) != {"after", "limit"}:
+                return False
+            if not _is_nonneg_int(filters["after"]):
+                return False
+            limit = filters["limit"]
+            if not (_is_positive_int(limit) and 1 <= limit <= 10000):
+                return False
+            return True
+
+        def _post_trust_credential_receipt_consumptions_manifest_verify(
+            self, tenant: str
+        ) -> None:
+            # POST /v1/trust/credentials/receipt/consumptions/manifest/
+            # verify：校验一次回执消费历史导出清单与其 NDJSON 内容，公开
+            # 协议沿用停用通告清单验真。外层错误（非法 JSON/非对象/缺漏或
+            # 多余字段/manifest 非对象/ndjson 非字符串）一律 400 且仅
+            # {"error": ...}。外层合法后任何失败均 HTTP 200，按序返回
+            # {"valid":false,"reason":...}：清单非法 -> 锚点不可用
+            # （本租户同 did/版本且含 vc 用途的 active 锚点）-> 签名格式
+            # 错误 -> 签名校验失败 -> 导出内容不匹配（UTF-8 SHA-256 摘要
+            # 及 LF 行数）。成功仅 {"valid":true}。纯只读、租户隔离、不记
+            # 审计，结论跨重启稳定。
+            data = self._read_json()
+            if set(data) != {"manifest", "ndjson"}:
+                missing = [f for f in ("manifest", "ndjson") if f not in data]
+                if missing:
+                    raise ValidationError(
+                        f"请求缺少字段: {', '.join(missing)}"
+                    )
+                extra = sorted(set(data) - {"manifest", "ndjson"})
+                raise ValidationError(f"请求含多余字段: {', '.join(extra)}")
+            manifest = data["manifest"]
+            ndjson = data["ndjson"]
+            if not isinstance(manifest, dict):
+                raise ValidationError(
+                    "请求不合法: 字段 manifest 必须为 JSON 对象"
+                )
+            if not isinstance(ndjson, str):
+                raise ValidationError(
+                    "请求不合法: 字段 ndjson 必须为字符串"
+                )
+
+            reason = self._verify_receipt_consumption_manifest_item(
+                tenant, manifest, ndjson
+            )
+            if reason is not None:
+                self._send_json(200, {"valid": False, "reason": reason})
+                return
+            self._send_json(200, {"valid": True})
+
+        def _verify_receipt_consumption_manifest_item(
+            self, tenant: str, manifest: Any, ndjson: str
+        ) -> Optional[str]:
+            # 单项回执消费历史清单验真：按序返回失败原因（清单非法 ->
+            # 锚点不可用 -> 签名格式错误 -> 签名校验失败 -> 导出内容不
+            # 匹配），成功返回 None。锚点须为本租户同 did/版本 active 且
+            # 含 vc 用途。纯只读。
+            # 阶段一：清单结构
+            if not self._receipt_consumption_manifest_is_well_formed(manifest):
+                return "清单非法"
+
+            signer_did = manifest["signer_did"]
+            key_version = manifest["key_version"]
+
+            # 阶段二：本租户同 did/版本且含 vc 用途的 active 信任锚点
+            public_pem = store.get_active_trust_anchor_public_key(
+                tenant, signer_did, key_version, required_use="vc"
+            )
+            if public_pem is None:
+                return "锚点不可用"
+            try:
+                crypto.validate_public_key_pem(public_pem)
+            except (ValueError, TypeError):
+                return "锚点不可用"
+
+            signed = {
+                "snapshot": manifest["snapshot"],
+                "filters": manifest["filters"],
+                "count": manifest["count"],
+                "alg": manifest["alg"],
+                "digest": manifest["digest"],
+                "signer_did": signer_did,
+                "key_version": key_version,
+            }
+            signature = manifest["signature"]
+
+            # 阶段三：签名格式
+            try:
+                crypto.validate_signature_format_strict(signature)
+            except crypto.MalformedSignature:
+                return "签名格式错误"
+
+            # 阶段四：密码学验签
+            try:
+                crypto.verify(signed, signature, public_pem)
+            except crypto.MalformedSignature:
+                return "签名格式错误"
+            except crypto.InvalidSignature:
+                return "签名校验失败"
+            except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露细节
+                return "签名校验失败"
+
+            # 阶段五：导出内容——UTF-8 字节的 SHA-256 摘要与 LF 行数
+            try:
+                raw = ndjson.encode("utf-8")
+            except UnicodeEncodeError:
+                return "导出内容不匹配"
+            actual_digest = hashlib.sha256(raw).hexdigest()
+            line_count = raw.count(b"\n")
+            if (
+                actual_digest != manifest["digest"]
+                or line_count != manifest["count"]
+            ):
+                return "导出内容不匹配"
+            return None
 
         @staticmethod
         def _verify_credential_receipt_item(
