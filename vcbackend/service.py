@@ -46,6 +46,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   GET  /v1/trust/dids/deactivations/export 确定性 NDJSON 导出停用通告（快照续传，只读）
   GET  /v1/trust/dids/deactivations/manifest 停用通告导出清单（签名摘要，只读）
   POST /v1/trust/dids/deactivations/manifest/verify 校验停用通告清单与 NDJSON 内容（只读）
+  POST /v1/trust/dids/deactivations/manifest/verify-batch 批量校验停用通告清单与 NDJSON（只读）
   POST /v1/trust/presentations/verify     跨系统演示验真（无需登记 DID/凭证/演示）
   POST /v1/trust/presentations/verify-batch 批量跨系统演示验真（仅未绑定形态，不消费）
   POST /v1/trust/presentations/verify-with-status 外部演示验真并合并同步状态（只读）
@@ -360,6 +361,13 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_dids_deactivate_sync_batch(tenant)
                 elif path == "/v1/trust/dids/deactivations/manifest/verify":
                     self._post_trust_did_deactivations_manifest_verify(tenant)
+                elif (
+                    path
+                    == "/v1/trust/dids/deactivations/manifest/verify-batch"
+                ):
+                    self._post_trust_did_deactivations_manifest_verify_batch(
+                        tenant
+                    )
                 elif path == "/v1/trust/verify":
                     self._post_trust_verify(tenant)
                 elif path == "/v1/trust/credentials/verify":
@@ -2257,6 +2265,67 @@ def build_handler(store: VCStore) -> type:
                 return False
             return True
 
+        def _verify_deactivation_manifest(
+            self, tenant: str, manifest: Any, ndjson: Any
+        ) -> Tuple[bool, str]:
+            # 单项清单验真（供单项与批量端点共用）：按顺序短路校验
+            # 清单结构 -> 本租户同 did/版本 active 锚点 -> 签名格式 ->
+            # 密码学签名 -> 导出内容（UTF-8 SHA-256 摘要及行数）。
+            # 返回 (是否有效, 失败原因)；成功原因为空串。
+            if not self._manifest_is_well_formed(manifest):
+                return False, "清单非法"
+
+            signer_did = manifest["signer_did"]
+            key_version = manifest["key_version"]
+
+            public_pem = store.get_active_trust_anchor_public_key(
+                tenant, signer_did, key_version
+            )
+            if public_pem is None:
+                return False, "锚点不可用"
+            try:
+                crypto.validate_public_key_pem(public_pem)
+            except (ValueError, TypeError):
+                return False, "锚点不可用"
+
+            signed = {
+                "snapshot": manifest["snapshot"],
+                "filters": manifest["filters"],
+                "count": manifest["count"],
+                "alg": manifest["alg"],
+                "digest": manifest["digest"],
+                "signer_did": signer_did,
+                "key_version": key_version,
+            }
+            signature = manifest["signature"]
+
+            try:
+                crypto.validate_signature_format_strict(signature)
+            except crypto.MalformedSignature:
+                return False, "签名格式错误"
+
+            try:
+                crypto.verify(signed, signature, public_pem)
+            except crypto.MalformedSignature:
+                return False, "签名格式错误"
+            except crypto.InvalidSignature:
+                return False, "签名校验失败"
+            except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露细节
+                return False, "签名校验失败"
+
+            try:
+                raw = ndjson.encode("utf-8")
+            except UnicodeEncodeError:
+                return False, "导出内容不匹配"
+            actual_digest = hashlib.sha256(raw).hexdigest()
+            line_count = raw.count(b"\n")
+            if (
+                actual_digest != manifest["digest"]
+                or line_count != manifest["count"]
+            ):
+                return False, "导出内容不匹配"
+            return True, ""
+
         def _post_trust_did_deactivations_manifest_verify(
             self, tenant: str
         ) -> None:
@@ -2288,77 +2357,110 @@ def build_handler(store: VCStore) -> type:
                     "请求不合法: 字段 ndjson 必须为字符串"
                 )
 
-            def _invalid(reason: str) -> None:
+            valid, reason = self._verify_deactivation_manifest(
+                tenant, manifest, ndjson
+            )
+            if valid:
+                self._send_json(200, {"valid": True})
+            else:
                 self._send_json(200, {"valid": False, "reason": reason})
 
-            # 阶段一：清单结构
-            if not self._manifest_is_well_formed(manifest):
-                _invalid("清单非法")
-                return
-
-            signer_did = manifest["signer_did"]
-            key_version = manifest["key_version"]
-
-            # 阶段二：本租户同 did/版本 active 信任锚点
-            public_pem = store.get_active_trust_anchor_public_key(
-                tenant, signer_did, key_version
-            )
-            if public_pem is None:
-                _invalid("锚点不可用")
-                return
+        def _post_trust_did_deactivations_manifest_verify_batch(
+            self, tenant: str
+        ) -> None:
+            # POST /v1/trust/dids/deactivations/manifest/verify-batch：
+            # 批量校验清单与 NDJSON。请求体须恰为 {"items":[项...]}，
+            # 数组 1–100 项；空体、非法 JSON、非对象、字段缺失/多余、
+            # items 非数组/空/超限均 HTTP 200 返回
+            # {"results":[],"reason":"请求..."}。合法批次逐项沿用单项
+            # 验真顺序（清单结构 -> 锚点 -> 签名格式 -> 签名 -> 导出
+            # 内容），失败不短路，返回与输入等长同序的 {"results":[...]}：
+            # 成功项仅 {"valid":true}，失败项 {"valid":false,"reason":...}，
+            # 项非对象、字段或类型非法按“清单非法”处理。纯只读、租户
+            # 隔离、不写状态/历史/审计。
             try:
-                crypto.validate_public_key_pem(public_pem)
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
             except (ValueError, TypeError):
-                _invalid("锚点不可用")
+                self._send_json(
+                    200,
+                    {"results": [],
+                     "reason": "请求不合法: 请求体缺失或长度声明非法"},
+                )
                 return
-
-            signed = {
-                "snapshot": manifest["snapshot"],
-                "filters": manifest["filters"],
-                "count": manifest["count"],
-                "alg": manifest["alg"],
-                "digest": manifest["digest"],
-                "signer_did": signer_did,
-                "key_version": key_version,
-            }
-            signature = manifest["signature"]
-
-            # 阶段三：签名格式
+            except Exception:  # noqa: BLE001
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 请求体读取失败"}
+                )
+                return
+            if not raw:
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 请求体缺失"}
+                )
+                return
             try:
-                crypto.validate_signature_format_strict(signature)
-            except crypto.MalformedSignature:
-                _invalid("签名格式错误")
+                data = json.loads(raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                self._send_json(
+                    200,
+                    {"results": [], "reason": "请求不合法: 请求体不是合法 UTF-8 文本"},
+                )
+                return
+            except json.JSONDecodeError:
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 请求体不是合法 JSON"}
+                )
                 return
 
-            # 阶段四：密码学验签
-            try:
-                crypto.verify(signed, signature, public_pem)
-            except crypto.MalformedSignature:
-                _invalid("签名格式错误")
+            def _reject(reason: str) -> None:
+                self._send_json(200, {"results": [], "reason": reason})
+
+            if not isinstance(data, dict):
+                _reject("请求不合法: 请求体必须为 JSON 对象")
                 return
-            except crypto.InvalidSignature:
-                _invalid("签名校验失败")
+            if set(data) != {"items"}:
+                missing = [f for f in ("items",) if f not in data]
+                if missing:
+                    _reject(f"请求缺少字段: {', '.join(missing)}")
+                    return
+                extra = sorted(set(data) - {"items"})
+                _reject(f"请求含多余字段: {', '.join(extra)}")
                 return
-            except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露细节
-                _invalid("签名校验失败")
+            items = data["items"]
+            if not isinstance(items, list):
+                _reject("请求不合法: 字段 items 必须为数组")
+                return
+            if not items:
+                _reject("请求不合法: items 数组不能为空")
+                return
+            if len(items) > 100:
+                _reject(
+                    "请求不合法: items 数组不能超过 100 项"
+                    f"（当前 {len(items)} 项）"
+                )
                 return
 
-            # 阶段五：导出内容——UTF-8 字节的 SHA-256 摘要与行数
-            try:
-                raw = ndjson.encode("utf-8")
-            except UnicodeEncodeError:
-                _invalid("导出内容不匹配")
-                return
-            actual_digest = hashlib.sha256(raw).hexdigest()
-            line_count = raw.count(b"\n")
-            if (
-                actual_digest != manifest["digest"]
-                or line_count != manifest["count"]
-            ):
-                _invalid("导出内容不匹配")
-                return
-
-            self._send_json(200, {"valid": True})
+            results = []
+            for item in items:  # 顺序校验，失败不短路
+                if (
+                    not isinstance(item, dict)
+                    or set(item) != {"manifest", "ndjson"}
+                    or not isinstance(item["manifest"], dict)
+                    or not isinstance(item["ndjson"], str)
+                ):
+                    results.append({"valid": False, "reason": "清单非法"})
+                    continue
+                try:
+                    valid, reason = self._verify_deactivation_manifest(
+                        tenant, item["manifest"], item["ndjson"]
+                    )
+                except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露细节
+                    valid, reason = False, "签名校验失败"
+                if valid:
+                    results.append({"valid": True})
+                else:
+                    results.append({"valid": False, "reason": reason})
+            self._send_json(200, {"results": results})
 
         def _put_trust_anchor_status(
             self, tenant: str, did: str, key_version: str

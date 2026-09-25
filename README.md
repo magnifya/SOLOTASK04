@@ -60,6 +60,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | GET | `/v1/trust/dids/deactivations?limit=&after=&did=&key_version=&from=&to=` | 只读查询本租户外部 DID 停用通告审计事件：仅允许六参数且不得重复，空值/未知/格式或范围非法均 400 且恰返非空中文 `{"error":...}`；`limit` 缺省 50、为 1–200 的 ASCII 整数，`after` 缺省 0、为非负 ASCII 整数，`did` 非空，`key_version` 为 ASCII 正整数，`from`/`to` 为 UTC 秒精度 Z 时间且 `from≤to`；先按 `did`、`key_version` 精确过滤及 `deactivated_at` 闭区间过滤，再取 `cursor>after` 按 cursor 升序分页；200 键序 `events,next_after`，事件键序 `cursor,did,key_version,reason,deactivated_at`（整数/字符串/整数/字符串/字符串），空页 `next_after=after`，否则取页末 cursor；`cursor` 为租户内跨 DID 递增正整数，旧通告加载时按 `deactivated_at,did` 升序补录、重启不变；无结果仍 200，缺省 `default`、显式空租户头 400、仅返本租户事件 |
 | GET | `/v1/trust/dids/deactivations/manifest?snapshot=&signer_did=&limit=&after=&did=&key_version=&from=&to=` | 只读生成停用通告导出的签名摘要清单：取 export 的七参数（`snapshot` **必填**、显式提供且不得超过当时最大游标，越界/空值/重复/未知/格式或范围非法均 400 且仅 `{error}`）与唯一非空 `signer_did`；签名 DID 须为本租户**活动本地 DID**，未知（含他租户）404、已停用 409（400 越界判定优先）；200 键序 `snapshot,filters,count,alg,digest,signer_did,key_version,signature`，`filters` 键序 `after,limit,did,key_version,from,to`、按序记录显式生效值、缺省项为 `null`；`count` 为本页非负整数行数，`alg` 恒为 `SHA-256`，`digest` 为本页 NDJSON 字节（与 export 同形状）的 64 位小写 hex SHA-256；`signature` 由签名 DID **当前私钥**按既有 ES256 裸 R||S 无填充 base64url 规则签署前七键的规范化 JSON；纯只读、租户隔离，签名 ECDSA 字节每次可变但跨重启可验真 |
 | POST | `/v1/trust/dids/deactivations/manifest/verify` | 校验停用通告清单与其 NDJSON 导出内容：请求体须恰为 `{"manifest":对象,"ndjson":字符串}`；外层错误（非法 JSON/非对象、缺漏或多余字段、`manifest` 非对象、`ndjson` 非字符串）一律 **400** 且仅 `{"error":...}`。外层合法后任何失败均 **HTTP 200**，依次校验清单结构、本租户同 `signer_did`/`key_version` 的 **active 信任锚点**、签名格式、密码学签名、UTF-8 字节 SHA-256 摘要及行数；失败返 `{"valid":false,"reason":...}`，`reason` 依次恰为“清单非法”“锚点不可用”“签名格式错误”“签名校验失败”“导出内容不匹配”，成功仅 `{"valid":true}`；纯只读、租户隔离、不记审计，结论跨重启稳定 |
+| POST | `/v1/trust/dids/deactivations/manifest/verify-batch` | 批量校验停用通告清单与 NDJSON（只读）：请求体恰为 `{"items":[项...]}`，限 1–100 项；空体、非法 JSON、非对象、字段缺失/多余、`items` 非数组/空/超限均 HTTP 200 按键序返回 `{"results":[],"reason":"请求…"}`；合法批次 200 仅含等长同序 `results`，逐项不短路；每项恰含 `manifest` 对象、`ndjson` 字符串，项非对象、字段或类型非法按“清单非法”处理；逐项沿用单项验真顺序与五种固定原因，成功项仅 `{"valid":true}`，失败项键序 `valid,reason`；不写状态、历史或审计，重启结论稳定 |
 | POST | `/v1/trust/presentations/verify` | 跨系统演示验真：验证其他系统生成且未在本租户保存的演示，无需登记 DID/凭证/演示；请求体须恰为 `{"presentation":对象,"challenge":非空串}`；**任何失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
 | POST | `/v1/trust/presentations/verify-batch` | 批量跨系统演示验真：请求体恰为 `{"presentations":[项...]}`，数组非空且不超过 100 项；每项可复用单项未绑定形态（恰含 `presentation` 对象与非空 `challenge`，演示不得含任何 `holder_*` 字段）或持有者绑定形态（另恰含非空 `source_tenant_id`，演示恰为九字段加 `holder_did`、`holder_key_version`、`holder_proof`，双锚点双签名，`source_tenant_id` 作为 holder proof 覆盖的 `tenant_id`）；**任何失败均 HTTP 200**，返回 `{"results":[...]}`（长度与顺序与输入一致，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`，不短路）；请求级非法（缺失、非法 JSON、非对象、字段缺失或多余、presentations 非数组、空数组或超限）返回 `{"results":[],"reason":"请求..."}`；纯只读、不消费、不审计 |
 | POST | `/v1/trust/proofs/verify` | 跨系统谓词证明验真：验证未在本租户保存的外部谓词证明，原本地 `/v1/proofs/{id}/verify` 不变；请求体须恰含 `proof`、`challenge`、`source_tenant_id`（后两项为非空字符串），proof 恰为 prove 九字段；**任何失败均 HTTP 200** 返回 `valid:false` 与分类中文 reason，成功仅 `{"valid":true}`；只读、不消费、不审计 |
@@ -1014,6 +1015,37 @@ curl -X POST localhost:8080/v1/proofs/zp_<id>/verify \
   curl -X POST -H 'X-Tenant-ID: acme' \
     localhost:8080/v1/trust/dids/deactivations/manifest/verify \
     -d '{"manifest":{ ...上一步清单对象... },"ndjson":"<导出的 NDJSON 文本>"}'
+  ```
+- `POST /v1/trust/dids/deactivations/manifest/verify-batch` **批量校验
+  停用通告清单与其 NDJSON 导出内容**，逐项复用单项
+  `manifest/verify` 的验真顺序与原因分类；**只读、租户隔离、不写
+  状态/历史/审计**，结论跨重启稳定。
+  - **外层请求**：体须**恰为** `{"items":[项...]}`，`items` 为
+    **1–100 项**的数组。空体、非法 JSON、非对象、缺 `items` 或含
+    多余字段、`items` 非数组、空数组或超过 100 项，一律 **HTTP 200**
+    按键序返回 `{"results":[],"reason":"请求…"}`（`reason` 以
+    “请求”开头的非空中文）。
+  - 请求级合法后**逐项不短路**校验，**HTTP 200** 响应仅含与输入
+    **等长同序**的 `results`：
+    - 每项须**恰含** `manifest`（对象）与 `ndjson`（字符串）；项
+      非对象、字段缺失/多余或类型非法，该项按
+      `{"valid":false,"reason":"清单非法"}` 处理；
+    - 结构合法的项沿用单项验真顺序：清单结构 → 本租户同
+      `signer_did`/`key_version` 的 **active 信任锚点**（跨租户
+      不可探测）→ ES256 裸 `R||S` 无填充 base64url 签名格式 →
+      密码学签名 → `ndjson` UTF-8 字节 SHA-256 摘要及 LF 行数；
+      失败项键序 `valid,reason`，`reason` 恰为“清单非法”“锚点
+      不可用”“签名格式错误”“签名校验失败”“导出内容不匹配”
+      之一；成功项仅 `{"valid":true}`；
+    - 不要求保存签发方事件账本，不登记任何资源。
+  - `X-Tenant-ID` 缺省 `default`、显式空值 **400**；跨租户锚点
+    不可用。单项验真、GET 清单、导出及其他 HTTP 入口行为不变。
+
+  ```bash
+  curl -X POST -H 'X-Tenant-ID: acme' \
+    localhost:8080/v1/trust/dids/deactivations/manifest/verify-batch \
+    -d '{"items":[{"manifest":{...},"ndjson":"..."},
+                   {"manifest":{...},"ndjson":"..."}]}'
   ```
 - `POST /v1/trust/presentations/verify` 验证**其他系统生成且未在本租户
   保存的演示**：无需登记本地 DID/凭证/演示，只读、不写凭证/演示/状态/
