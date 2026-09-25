@@ -908,6 +908,37 @@ curl -X POST localhost:8080/v1/proofs/zp_<id>/verify \
     'localhost:8080/v1/trust/dids/deactivations?limit=50&after=0'
   curl 'localhost:8080/v1/trust/dids/deactivations?did=did:web:example.com&key_version=1&from=2026-01-01T00:00:00Z&to=2026-12-31T00:00:00Z'
   ```
+- `GET /v1/trust/dids/deactivations/export` **确定性 NDJSON 导出外部 DID
+  停用通告审计事件**，与查询端点共用过滤规则，额外支持**快照续传**：
+  同一 `snapshot` 的续页天然排除快照之后新登记的事件，跨重启字节一致。
+  - **查询参数仅允许** `limit`、`after`、`snapshot`、`did`、`key_version`、
+    `from`、`to`，且均**只能出现一次**：
+    - `limit` 缺省 **1000**，须为 **1–10000** 的**非空 ASCII 十进制**整数；
+    - `after` 缺省 **0**，须为**非空非负 ASCII 十进制**整数；
+    - `snapshot` 缺省为**请求开始时原子读取的本租户最大 cursor**（无事件
+      为 0）；显式提供时须为**非负 ASCII 十进制**整数且**不超过当时最大
+      值**；
+    - `did`、`key_version`、`from`、`to` 校验与查询端点完全一致。
+    - 重复参数、空值、未知参数、布尔词、小数、符号或范围非法一律 **400**
+      且响应**恰为**非空中文 `{"error": "..."}`。
+  - **过滤后再分页**：先按 `did`、`key_version` 精确过滤及
+    `deactivated_at` 闭区间过滤，再取 **`after < cursor ≤ snapshot`**
+    按 `cursor` 升序的前 `limit` 条。
+  - 成功 **200**，`Content-Type: application/x-ndjson; charset=utf-8`；
+    响应头 **`X-Snapshot-Cursor`** 为生效快照、**`X-Next-After`** 为末行
+    `cursor`（空结果为 `after`）。每行一个事件，键序固定为 `cursor`、
+    `did`、`key_version`、`reason`、`deactivated_at`（类型与查询端点
+    一致）；**UTF-8 紧凑 JSON、非 ASCII 不转义、字符串按 RFC 8259 最短
+    转义、LF 结行（末行亦有 LF）、无 BOM**；空结果为**零字节**。
+  - 续页方式：以响应头 `X-Next-After` 作为下一页 `after`，并带上同一
+    `snapshot`，即可在事件持续追加时获得确定的分页结果。
+  - 该接口为纯只读查询，**不改游标、状态或审计**；`X-Tenant-ID` 缺省
+    `default`、显式空值 **400**；其余 HTTP 入口与 CLI 行为均保持不变。
+
+  ```bash
+  curl -D - 'localhost:8080/v1/trust/dids/deactivations/export?limit=1000'
+  curl 'localhost:8080/v1/trust/dids/deactivations/export?snapshot=42&after=1000&limit=1000'
+  ```
 - `POST /v1/trust/presentations/verify` 验证**其他系统生成且未在本租户
   保存的演示**：无需登记本地 DID/凭证/演示，只读、不写凭证/演示/状态/
   历史/审计，跨租户各自使用本租户锚点，重启后结论一致。
