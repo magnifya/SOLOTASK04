@@ -43,6 +43,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/credentials/receipt/consume  消费验真签名回执（防重放，首次落盘并审计）
   POST /v1/trust/credentials/receipt/consume-batch  批量消费验真签名回执（逐项不短路，防重放）
   GET  /v1/trust/credentials/receipt/consumptions  查询验真回执消费历史（只读）
+  GET  /v1/trust/credentials/receipt/consumptions/export  确定性 NDJSON 导出回执消费历史（快照续传，只读）
   POST /v1/trust/credentials/import       导入外部凭证（active 锚点验签后持久化）
   POST /v1/trust/credentials/import-batch 批量导入外部凭证（逐项不短路）
   GET  /v1/trust/credentials/imported/{credential_id}  读取已导入的外部凭证（?issuer_did=）
@@ -133,6 +134,34 @@ def _deactivation_ndjson_bytes(events: Any) -> bytes:
     return "".join(
         json.dumps(
             _deactivation_event_obj(event),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        + "\n"
+        for event in events
+    ).encode("utf-8")
+
+
+def _receipt_consumption_event_obj(event: Any) -> Dict[str, Any]:
+    return {
+        "cursor": event.cursor,
+        "receipt_id": event.receipt_id,
+        "verifier_did": event.verifier_did,
+        "nonce": event.nonce,
+        "consumed_at": event.consumed_at,
+    }
+
+
+def _receipt_consumption_ndjson_bytes(events: Any) -> bytes:
+    """按消费历史导出端点的确定性规则将事件编码为 NDJSON 字节。
+
+    每行键序固定为 cursor、receipt_id、verifier_did、nonce、consumed_at，
+    UTF-8 紧凑 JSON、非 ASCII 不转义、LF 结行（末行亦有 LF）；空列表
+    为零字节。
+    """
+    return "".join(
+        json.dumps(
+            _receipt_consumption_event_obj(event),
             ensure_ascii=False,
             separators=(",", ":"),
         )
@@ -606,6 +635,13 @@ def build_handler(store: VCStore) -> type:
                     self._get_trust_did_deactivations(tenant, parsed.query)
                 elif path == "/v1/trust/credentials/receipt/consumptions":
                     self._get_trust_credential_receipt_consumptions(
+                        tenant, parsed.query
+                    )
+                elif (
+                    path
+                    == "/v1/trust/credentials/receipt/consumptions/export"
+                ):
+                    self._get_trust_credential_receipt_consumptions_export(
                         tenant, parsed.query
                     )
                 elif path == "/v1/trust/dids/deactivations/manifest":
@@ -3717,6 +3753,86 @@ def build_handler(store: VCStore) -> type:
                     "next_after": next_after,
                 },
             )
+
+        def _get_trust_credential_receipt_consumptions_export(
+            self, tenant: str, query: str
+        ) -> None:
+            # GET /v1/trust/credentials/receipt/consumptions/export：确定性
+            # NDJSON 导出本租户验真回执消费历史，支持快照续传。
+            # 查询参数仅允许 limit、after、snapshot，且均只能出现一次：
+            # - limit 缺省 1000，须为 1..10000 的非空 ASCII 十进制整数；
+            # - after 缺省 0，须为非负 ASCII 十进制整数；
+            # - snapshot 缺省为请求开始时原子读取的租户最大 cursor
+            #   （无事件为 0），显式提供时须为非负 ASCII 十进制整数且
+            #   不超过当时最大值；
+            # - after 不得大于生效 snapshot。
+            # 空值、重复参数、未知参数、格式或范围非法一律 400 且恰返
+            # {"error": "非空中文原因"}。取 after < cursor <= snapshot
+            # 按 cursor 升序的前 limit 条。成功 200，类型
+            # application/x-ndjson; charset=utf-8；响应头
+            # X-Snapshot-Cursor 为生效快照、X-Next-After 为末行
+            # cursor（空结果为 after）。每行键序 cursor、receipt_id、
+            # verifier_did、nonce、consumed_at，UTF-8 紧凑 JSON、
+            # 非 ASCII 不转义、RFC8259 最短转义、LF 结行（末行亦有
+            # LF）、无 BOM，空结果零字节。同一 snapshot 续页天然排除
+            # 快照后新事件。纯只读：不改游标、状态或审计。
+            params = parse_qs(query, keep_blank_values=True)
+            allowed = {"limit", "after", "snapshot"}
+            unknown = sorted(set(params) - allowed)
+            if unknown:
+                raise ValidationError(
+                    f"不支持的查询参数: {', '.join(unknown)}"
+                )
+
+            def _single(name: str) -> Optional[str]:
+                values = params.get(name)
+                if values is None:
+                    return None
+                if len(values) != 1:
+                    raise ValidationError(
+                        f"查询参数 {name} 只能提供一次"
+                    )
+                return values[0]
+
+            limit_raw = _single("limit")
+            if limit_raw is not None:
+                limit = _parse_nonneg_int(limit_raw, "limit")
+                if not 1 <= limit <= 10000:
+                    raise ValidationError(
+                        "查询参数 limit 须在 1 到 10000 之间"
+                    )
+            else:
+                limit = 1000
+
+            after_raw = _single("after")
+            if after_raw is not None:
+                after = _parse_nonneg_int(after_raw, "after")
+            else:
+                after = 0
+
+            snapshot_raw = _single("snapshot")
+            snapshot: Optional[int] = (
+                _parse_nonneg_int(snapshot_raw, "snapshot")
+                if snapshot_raw is not None
+                else None
+            )
+
+            events, snapshot_cursor, next_after = (
+                store.export_receipt_consumption_events(
+                    tenant, after, limit, snapshot=snapshot
+                )
+            )
+            body = _receipt_consumption_ndjson_bytes(events)
+            self.send_response(200)
+            self.send_header(
+                "Content-Type", "application/x-ndjson; charset=utf-8"
+            )
+            self.send_header("X-Snapshot-Cursor", str(snapshot_cursor))
+            self.send_header("X-Next-After", str(next_after))
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
 
         @staticmethod
         def _verify_credential_receipt_item(
