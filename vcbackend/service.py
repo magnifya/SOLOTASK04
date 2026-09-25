@@ -39,6 +39,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/verify                   用 active 锚点公钥验签
   POST /v1/trust/credentials/verify       跨系统凭证验真（无需登记 DID/凭证）
   POST /v1/trust/credentials/verify-receipt  跨系统凭证验真签名回执（只读）
+  POST /v1/trust/credentials/receipt/verify  校验验真签名回执（只读）
   POST /v1/trust/credentials/import       导入外部凭证（active 锚点验签后持久化）
   POST /v1/trust/credentials/import-batch 批量导入外部凭证（逐项不短路）
   GET  /v1/trust/credentials/imported/{credential_id}  读取已导入的外部凭证（?issuer_did=）
@@ -385,6 +386,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_credentials_verify(tenant)
                 elif path == "/v1/trust/credentials/verify-receipt":
                     self._post_trust_credentials_verify_receipt(tenant)
+                elif path == "/v1/trust/credentials/receipt/verify":
+                    self._post_trust_credentials_receipt_verify(tenant)
                 elif path == "/v1/trust/credentials/import":
                     self._post_trust_credentials_import(tenant)
                 elif path == "/v1/trust/credentials/import-batch":
@@ -3342,6 +3345,175 @@ def build_handler(store: VCStore) -> type:
                     "receipt_signature": receipt_signature,
                 },
             )
+
+        def _post_trust_credentials_receipt_verify(self, tenant: str) -> None:
+            # POST /v1/trust/credentials/receipt/verify：只读校验跨系统
+            # 凭证验真签名回执。
+            # 1) 请求体须恰含 receipt、receipt_signature、body、
+            #    signature、nonce：receipt、body 为 JSON 对象，
+            #    receipt_signature、signature、nonce 为非空字符串且
+            #    nonce 为 1..256 码点；非法 JSON/非对象、键集或类型
+            #    不符一律 400 且仅 {error}；
+            # 2) 外层合法后任何失败均 HTTP 200，按键序恰返
+            #    {valid:false, reason}，按序检查：回执非法（恰为
+            #    verify-receipt 七字段且类型沿用公开协议）-> nonce错误
+            #    （两处 nonce 相等）-> 绑定错误（receipt 的
+            #    credential_id/issuer_did/issuer_key_version 与 body
+            #    相等，缺版本按 1）-> 摘要错误（按原规则用
+            #    {body,signature} 复算 credential_digest）-> 锚点不可用
+            #    （本租户 verifier_did/版本 active 且含 vc 用途锚点）
+            #    -> 签名格式错误 -> 签名校验失败（receipt_signature
+            #    覆盖完整 receipt，ES256 裸 R||S 无填充 base64url）；
+            # 3) 成功仅 {"valid":true}。不重验凭证签名、不审计；纯只读。
+            data = self._read_json()
+            expected_fields = (
+                "receipt",
+                "receipt_signature",
+                "body",
+                "signature",
+                "nonce",
+            )
+            if set(data) != set(expected_fields):
+                missing = [f for f in expected_fields if f not in data]
+                if missing:
+                    raise ValidationError(
+                        f"缺少字段: {', '.join(missing)}"
+                    )
+                extra = sorted(set(data) - set(expected_fields))
+                raise ValidationError(
+                    f"多余字段: {', '.join(extra)}"
+                )
+            if not isinstance(data["receipt"], dict):
+                raise ValidationError("字段 receipt 必须为 JSON 对象")
+            if not isinstance(data["body"], dict):
+                raise ValidationError("字段 body 必须为 JSON 对象")
+            for field in ("receipt_signature", "signature"):
+                if not isinstance(data[field], str) or not data[field]:
+                    raise ValidationError(
+                        f"字段 {field} 必须为非空字符串"
+                    )
+            nonce = data["nonce"]
+            if not isinstance(nonce, str) or not nonce:
+                raise ValidationError("字段 nonce 必须为非空字符串")
+            if not 1 <= len(nonce) <= 256:
+                raise ValidationError(
+                    "字段 nonce 长度须为 1 到 256 个 Unicode 码点"
+                )
+
+            reason = self._verify_credential_receipt_item(tenant, data)
+            if reason is not None:
+                self._send_json(200, {"valid": False, "reason": reason})
+                return
+            self._send_json(200, {"valid": True})
+
+        @staticmethod
+        def _verify_credential_receipt_item(
+            tenant: str, data: Dict[str, Any]
+        ) -> Optional[str]:
+            # 回执验真（只读）：按序返回失败原因（回执非法 -> nonce错误
+            # -> 绑定错误 -> 摘要错误 -> 锚点不可用 -> 签名格式错误 ->
+            # 签名校验失败），成功返回 None。不重验凭证签名、不记审计。
+            receipt = data["receipt"]
+            body = data["body"]
+            signature = data["signature"]
+            nonce = data["nonce"]
+            receipt_signature = data["receipt_signature"]
+
+            # 阶段一：回执结构——恰为 verify-receipt 返回的七字段对象，
+            # 字段与类型沿用公开协议
+            receipt_fields = (
+                "credential_id",
+                "issuer_did",
+                "issuer_key_version",
+                "credential_digest",
+                "verifier_did",
+                "verifier_key_version",
+                "nonce",
+            )
+            if set(receipt) != set(receipt_fields):
+                return "回执非法"
+            for field in ("credential_id", "issuer_did", "verifier_did"):
+                if not isinstance(receipt[field], str) or not receipt[field]:
+                    return "回执非法"
+            issuer_key_version = receipt["issuer_key_version"]
+            if (
+                not isinstance(issuer_key_version, int)
+                or isinstance(issuer_key_version, bool)
+                or issuer_key_version < 1
+            ):
+                return "回执非法"
+            digest = receipt["credential_digest"]
+            if not isinstance(digest, str) or not _SHA256_HEX_RE.fullmatch(
+                digest
+            ):
+                return "回执非法"
+            verifier_key_version = receipt["verifier_key_version"]
+            if (
+                not isinstance(verifier_key_version, int)
+                or isinstance(verifier_key_version, bool)
+                or verifier_key_version < 1
+            ):
+                return "回执非法"
+            receipt_nonce = receipt["nonce"]
+            if (
+                not isinstance(receipt_nonce, str)
+                or not 1 <= len(receipt_nonce) <= 256
+            ):
+                return "回执非法"
+
+            # 阶段二：两处 nonce 相等
+            if receipt_nonce != nonce:
+                return "nonce错误"
+
+            # 阶段三：绑定——receipt 的 credential_id、issuer_did、
+            # issuer_key_version 与 body 相等（body 缺版本按 1）
+            body_key_version = body.get("issuer_key_version", 1)
+            if (
+                receipt["credential_id"] != body.get("credential_id")
+                or receipt["issuer_did"] != body.get("issuer_did")
+                or issuer_key_version != body_key_version
+            ):
+                return "绑定错误"
+
+            # 阶段四：摘要——按原规则用 {body,signature} 复算
+            # credential_digest（递归键升序紧凑 UTF-8 JSON 的 SHA-256
+            # 小写 64 位 hex）
+            want_digest = hashlib.sha256(
+                crypto.canonicalize({"body": body, "signature": signature})
+            ).hexdigest()
+            if digest != want_digest:
+                return "摘要错误"
+
+            # 阶段五：本租户 verifier_did/版本 active 且含 vc 用途锚点
+            public_pem = store.get_active_trust_anchor_public_key(
+                tenant,
+                receipt["verifier_did"],
+                verifier_key_version,
+                required_use="vc",
+            )
+            if public_pem is None:
+                return "锚点不可用"
+            try:
+                crypto.validate_public_key_pem(public_pem)
+            except (ValueError, TypeError):
+                return "锚点不可用"
+
+            # 阶段六：签名格式（ES256 裸 R||S 无填充 base64url）
+            try:
+                crypto.validate_signature_format_strict(receipt_signature)
+            except crypto.MalformedSignature:
+                return "签名格式错误"
+
+            # 阶段七：密码学验签——receipt_signature 覆盖完整 receipt
+            try:
+                crypto.verify(receipt, receipt_signature, public_pem)
+            except crypto.MalformedSignature:
+                return "签名格式错误"
+            except crypto.InvalidSignature:
+                return "签名校验失败"
+            except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露细节
+                return "签名校验失败"
+            return None
 
         def _post_trust_credentials_import(self, tenant: str) -> None:
             # 外部凭证导入：请求体恰为 {body, signature}，body 规则同
