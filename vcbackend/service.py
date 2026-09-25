@@ -39,6 +39,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/verify                   用 active 锚点公钥验签
   POST /v1/trust/credentials/verify       跨系统凭证验真（无需登记 DID/凭证）
   POST /v1/trust/credentials/verify-receipt  跨系统凭证验真签名回执（只读）
+  POST /v1/trust/credentials/receipt/verify  校验验真签名回执（只读）
   POST /v1/trust/credentials/import       导入外部凭证（active 锚点验签后持久化）
   POST /v1/trust/credentials/import-batch 批量导入外部凭证（逐项不短路）
   GET  /v1/trust/credentials/imported/{credential_id}  读取已导入的外部凭证（?issuer_did=）
@@ -385,6 +386,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_credentials_verify(tenant)
                 elif path == "/v1/trust/credentials/verify-receipt":
                     self._post_trust_credentials_verify_receipt(tenant)
+                elif path == "/v1/trust/credentials/receipt/verify":
+                    self._post_trust_credentials_receipt_verify(tenant)
                 elif path == "/v1/trust/credentials/import":
                     self._post_trust_credentials_import(tenant)
                 elif path == "/v1/trust/credentials/import-batch":
@@ -3342,6 +3345,170 @@ def build_handler(store: VCStore) -> type:
                     "receipt_signature": receipt_signature,
                 },
             )
+
+        def _post_trust_credentials_receipt_verify(self, tenant: str) -> None:
+            # POST /v1/trust/credentials/receipt/verify：校验跨系统凭证
+            # 验真签名回执（纯只读）。
+            # 1) 请求体须恰含 receipt、receipt_signature、body、
+            #    signature、nonce：receipt、body 为 JSON 对象，
+            #    receipt_signature、signature、nonce 为非空字符串，
+            #    nonce 限 1..256 个 Unicode 码点；违反均 400 仅
+            #    {error}；
+            # 2) 结构合法后依次检查，失败均 200 按键序恰返
+            #    {valid:false, reason}：
+            #    回执结构（恰为 verify-receipt 返回的七字段对象，字段
+            #    与类型沿用公开协议）-> “回执非法”；
+            #    receipt.nonce 与请求 nonce 相等 -> “nonce错误”；
+            #    receipt 的 credential_id、issuer_did、
+            #    issuer_key_version 与 body 相等（缺版本按 1）->
+            #    “绑定错误”；按原规则以 {body,signature} 复算
+            #    credential_digest -> “摘要错误”；本租户
+            #    (verifier_did, verifier_key_version) 锚点 active 且
+            #    含 vc 用途 -> “锚点不可用”；receipt_signature 格式
+            #    与验签（ES256 裸 R||S 无填充 base64url，覆盖完整
+            #    receipt）-> “签名格式错误”/“签名校验失败”；
+            # 3) 成功仅 {"valid": true}。不重验凭证签名，不审计。
+            data = self._read_json()
+            expected_fields = (
+                "receipt",
+                "receipt_signature",
+                "body",
+                "signature",
+                "nonce",
+            )
+            if set(data) != set(expected_fields):
+                missing = [f for f in expected_fields if f not in data]
+                if missing:
+                    raise ValidationError(
+                        f"缺少字段: {', '.join(missing)}"
+                    )
+                extra = sorted(set(data) - set(expected_fields))
+                raise ValidationError(
+                    f"多余字段: {', '.join(extra)}"
+                )
+            receipt = data["receipt"]
+            if not isinstance(receipt, dict):
+                raise ValidationError("字段 receipt 必须为 JSON 对象")
+            body = data["body"]
+            if not isinstance(body, dict):
+                raise ValidationError("字段 body 必须为 JSON 对象")
+            receipt_signature = data["receipt_signature"]
+            if (
+                not isinstance(receipt_signature, str)
+                or not receipt_signature
+            ):
+                raise ValidationError(
+                    "字段 receipt_signature 必须为非空字符串"
+                )
+            signature = data["signature"]
+            if not isinstance(signature, str) or not signature:
+                raise ValidationError("字段 signature 必须为非空字符串")
+            nonce = data["nonce"]
+            if not isinstance(nonce, str) or not nonce:
+                raise ValidationError("字段 nonce 必须为非空字符串")
+            if not 1 <= len(nonce) <= 256:
+                raise ValidationError(
+                    "字段 nonce 长度须为 1 到 256 个 Unicode 码点"
+                )
+
+            # 1. 回执结构：恰为七字段，字段与类型沿用公开协议。
+            structure_ok = set(receipt) == {
+                "credential_id",
+                "issuer_did",
+                "issuer_key_version",
+                "credential_digest",
+                "verifier_did",
+                "verifier_key_version",
+                "nonce",
+            }
+            if structure_ok:
+                for field in ("credential_id", "issuer_did", "verifier_did"):
+                    value = receipt[field]
+                    if not isinstance(value, str) or not value:
+                        structure_ok = False
+                        break
+            if structure_ok:
+                for field in ("issuer_key_version", "verifier_key_version"):
+                    value = receipt[field]
+                    if (
+                        not isinstance(value, int)
+                        or isinstance(value, bool)
+                        or value < 1
+                    ):
+                        structure_ok = False
+                        break
+            if structure_ok:
+                digest_value = receipt["credential_digest"]
+                if not isinstance(
+                    digest_value, str
+                ) or not _SHA256_HEX_RE.match(digest_value):
+                    structure_ok = False
+            if structure_ok:
+                receipt_nonce = receipt["nonce"]
+                if not isinstance(
+                    receipt_nonce, str
+                ) or not 1 <= len(receipt_nonce) <= 256:
+                    structure_ok = False
+            if not structure_ok:
+                self._send_invalid("回执非法")
+                return
+
+            # 2. 两处 nonce 相等。
+            if receipt["nonce"] != nonce:
+                self._send_invalid("nonce错误")
+                return
+
+            # 3. 绑定：credential_id、issuer_did、issuer_key_version
+            #    （body 缺版本按 1）与 receipt 相等。
+            if (
+                receipt["credential_id"] != body.get("credential_id")
+                or receipt["issuer_did"] != body.get("issuer_did")
+                or receipt["issuer_key_version"]
+                != body.get("issuer_key_version", 1)
+            ):
+                self._send_invalid("绑定错误")
+                return
+
+            # 4. 摘要：按原规则以 {body,signature} 的规范化 JSON 复算
+            #    SHA-256 小写 hex。
+            credential_digest = hashlib.sha256(
+                crypto.canonicalize({"body": body, "signature": signature})
+            ).hexdigest()
+            if receipt["credential_digest"] != credential_digest:
+                self._send_invalid("摘要错误")
+                return
+
+            # 5. 锚点：本租户 (verifier_did, verifier_key_version)
+            #    active 且含 vc 用途，公钥可解析。
+            public_pem = store.get_active_trust_anchor_public_key(
+                tenant,
+                receipt["verifier_did"],
+                receipt["verifier_key_version"],
+                required_use="vc",
+            )
+            if public_pem is None:
+                self._send_invalid("锚点不可用")
+                return
+            try:
+                crypto.validate_public_key_pem(public_pem)
+            except (ValueError, TypeError):
+                self._send_invalid("锚点不可用")
+                return
+
+            # 6. 签名格式与验签：receipt_signature 覆盖完整 receipt。
+            try:
+                crypto.verify(receipt, receipt_signature, public_pem)
+            except crypto.MalformedSignature:
+                self._send_invalid("签名格式错误")
+                return
+            except crypto.InvalidSignature:
+                self._send_invalid("签名校验失败")
+                return
+            except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
+                self._send_invalid("签名校验失败")
+                return
+
+            self._send_json(200, {"valid": True})
 
         def _post_trust_credentials_import(self, tenant: str) -> None:
             # 外部凭证导入：请求体恰为 {body, signature}，body 规则同
