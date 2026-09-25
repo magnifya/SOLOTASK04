@@ -46,6 +46,7 @@ from .models import (
     CredentialStatusSyncRecord,
     CredentialStatusHistoryEvent,
     DidDeactivationNoticeRecord,
+    DidDeactivationEvent,
     ImportedCredentialRecord,
     LocalCredentialStatusHistoryEvent,
     DIDRecord,
@@ -537,6 +538,7 @@ class VCStore:
             bucket.setdefault("local_credential_status_history", {})
             bucket.setdefault("did_history", {})
             bucket.setdefault("did_deactivation_notices", {})
+            bucket.setdefault("did_deactivation_events", [])
             for rec in bucket["dids"].values():
                 _migrate_did_row(rec)
         # 外部凭证状态历史游标（租户内持久化正整数，按追加递增）。
@@ -635,6 +637,20 @@ class VCStore:
                 for event in entries:
                     max_cursor = max(max_cursor, int(event.get("cursor", 0)))
             self._did_history_cursors[tenant_id] = max_cursor
+        # 外部 DID 停用通告审计历史游标：按租户各自维护的持久化正整数
+        # （tenant_id -> cursor），同一租户内跨 DID 的停用通告事件共享
+        # 该游标空间，仅首次接受通告时追加；与其他历史游标空间相互独立。
+        # 旧状态文件无该字段时，从各租户已有事件的最大 cursor 推导。
+        raw_notice_cursors = data.get("did_deactivation_event_cursors", {})
+        self._did_deactivation_event_cursors: Dict[str, int] = {
+            str(tenant_id): int(cursor)
+            for tenant_id, cursor in raw_notice_cursors.items()
+        } if isinstance(raw_notice_cursors, dict) else {}
+        for tenant_id, bucket in self._tenants.items():
+            max_cursor = self._did_deactivation_event_cursors.get(tenant_id, 0)
+            for event in bucket.get("did_deactivation_events", []):
+                max_cursor = max(max_cursor, int(event.get("cursor", 0)))
+            self._did_deactivation_event_cursors[tenant_id] = max_cursor
         # 旧状态文件中已吊销但无历史的密钥版本补一条兼容项（内存态）；
         # 随下一次原子写一并落盘，重启后 cursor 稳定。
         self._backfill_key_revocations_locked()
@@ -654,6 +670,9 @@ class VCStore:
         # （created_at, did, 动作）稳定补兼容项（内存态，audit 字段为
         # None）；重启后 cursor 稳定。
         self._backfill_did_history_locked()
+        # 旧状态文件中已存在外部 DID 停用通告但无审计事件列表的，按
+        # (deactivated_at, did) 升序稳定补录（内存态）；重启后 cursor 稳定。
+        self._backfill_did_deactivation_events_locked()
 
     def _save_locked(self) -> None:
         directory = os.path.dirname(os.path.abspath(self.path))
@@ -671,6 +690,9 @@ class VCStore:
                 self._local_credential_status_history_cursors
             ),
             "did_history_cursors": self._did_history_cursors,
+            "did_deactivation_event_cursors": (
+                self._did_deactivation_event_cursors
+            ),
         }
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
@@ -689,6 +711,7 @@ class VCStore:
                 self._trust_anchor_history_cursors,
                 self._local_credential_status_history_cursors,
                 self._did_history_cursors,
+                self._did_deactivation_event_cursors,
             )
         )
 
@@ -703,6 +726,7 @@ class VCStore:
             trust_anchor_history_cursors,
             local_credential_status_history_cursors,
             did_history_cursors,
+            did_deactivation_event_cursors,
         ) = copy.deepcopy(snapshot)
         self._tenants = tenants
         self._audit = audit
@@ -715,6 +739,7 @@ class VCStore:
             local_credential_status_history_cursors
         )
         self._did_history_cursors = did_history_cursors
+        self._did_deactivation_event_cursors = did_deactivation_event_cursors
 
     # ------------------------------------------------------------------ #
     # 租户桶与审计
@@ -740,6 +765,7 @@ class VCStore:
                 "local_credential_status_history": {},
                 "did_history": {},
                 "did_deactivation_notices": {},
+                "did_deactivation_events": [],
             }
             self._tenants[tenant_id] = bucket
         return bucket
@@ -6584,6 +6610,21 @@ class VCStore:
             snapshot = self._snapshot_locked()
             try:
                 notices[did] = new_row
+                # 首次接受即与通告原子追加审计事件；重放/冲突/失败不追加。
+                events = bucket.setdefault("did_deactivation_events", [])
+                cursor = (
+                    self._did_deactivation_event_cursors.get(tenant_id, 0) + 1
+                )
+                self._did_deactivation_event_cursors[tenant_id] = cursor
+                events.append(
+                    {
+                        "cursor": cursor,
+                        "did": did,
+                        "key_version": key_version,
+                        "reason": reason,
+                        "deactivated_at": deactivated_at,
+                    }
+                )
                 self._save_locked()
             except Exception:
                 self._restore_locked(snapshot)
@@ -6693,6 +6734,105 @@ class VCStore:
         if row is None:
             return None
         return self._deactivation_notice_record(did, row)
+
+    def _next_did_deactivation_cursor_locked(self, tenant_id: str) -> int:
+        """分配租户内下一个持久化停用通告审计游标（正整数，按追加递增）。"""
+        cursor = self._did_deactivation_event_cursors.get(tenant_id, 0) + 1
+        self._did_deactivation_event_cursors[tenant_id] = cursor
+        return cursor
+
+    def _backfill_did_deactivation_events_locked(self) -> None:
+        """加载迁移：为缺审计事件的旧停用通告稳定补录（内存态）。
+
+        对每个租户遍历已持久化的 did_deactivation_notices，将尚无对应
+        审计事件的通告按 (deactivated_at, did) 升序稳定补录，cursor 为
+        该租户内新分配的持久化正整数。仅在内存中补录：随下一次原子写
+        一并落盘；即使加载后无写操作，重启时也按相同（租户、
+        deactivated_at、did）顺序重建为相同 cursor。
+        """
+        for tenant_id in sorted(self._tenants):
+            bucket = self._tenants[tenant_id]
+            events = bucket.setdefault("did_deactivation_events", [])
+            known_dids = {event.get("did") for event in events}
+            notices = bucket.get("did_deactivation_notices", {})
+            missing = [
+                (row.get("deactivated_at") or "", did, row)
+                for did, row in notices.items()
+                if did not in known_dids
+            ]
+            missing.sort(key=lambda item: (item[0], item[1]))
+            for _, did, row in missing:
+                events.append(
+                    {
+                        "cursor": (
+                            self._next_did_deactivation_cursor_locked(
+                                tenant_id
+                            )
+                        ),
+                        "did": did,
+                        "key_version": int(row["key_version"]),
+                        "reason": row["reason"],
+                        "deactivated_at": row["deactivated_at"],
+                    }
+                )
+            events.sort(key=lambda event: int(event.get("cursor", 0)))
+
+    def list_did_deactivation_events(
+        self,
+        tenant_id: str,
+        after: int = 0,
+        limit: int = 50,
+        did: Optional[str] = None,
+        key_version: Optional[int] = None,
+        from_time: Optional[str] = None,
+        to_time: Optional[str] = None,
+    ) -> Tuple[List[DidDeactivationEvent], int]:
+        """只读分页查询本租户外部 DID 停用通告审计事件。
+
+        - 先按 did、key_version 精确过滤及 deactivated_at 闭区间过滤
+          （from_time/to_time 为 UTC 秒精度 Z 串，from_time <= to_time）；
+        - 再按 cursor > after 升序取至多 limit 项；
+        - next_after 为本页末项 cursor，空页保持 after。
+        纯只读：不修改任何状态、不记审计、不触发落盘。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            entries: List[Dict[str, Any]] = []
+            if bucket is not None:
+                entries = list(
+                    bucket.get("did_deactivation_events", [])
+                )
+            entries.sort(key=lambda event: int(event.get("cursor", 0)))
+            picked: List[DidDeactivationEvent] = []
+            for row in entries:
+                if did is not None and row.get("did") != did:
+                    continue
+                if (
+                    key_version is not None
+                    and int(row.get("key_version", 0)) != key_version
+                ):
+                    continue
+                deactivated_at = row.get("deactivated_at") or ""
+                if from_time is not None and deactivated_at < from_time:
+                    continue
+                if to_time is not None and deactivated_at > to_time:
+                    continue
+                cursor = int(row["cursor"])
+                if cursor <= after:
+                    continue
+                if len(picked) >= limit:
+                    break
+                picked.append(
+                    DidDeactivationEvent(
+                        cursor=cursor,
+                        did=row["did"],
+                        key_version=int(row["key_version"]),
+                        reason=row["reason"],
+                        deactivated_at=row["deactivated_at"],
+                    )
+                )
+            next_after = picked[-1].cursor if picked else after
+            return picked, next_after
 
     def verify_trust_did_document(
         self,

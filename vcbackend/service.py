@@ -42,6 +42,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/dids/verify-document-batch 批量跨系统 DID 文档验真（不短路，只读）
   POST /v1/trust/dids/deactivate-sync     登记外部 DID 停用通告（active 锚点验签）
   POST /v1/trust/dids/deactivate-sync-batch 批量登记外部 DID 停用通告（逐项不短路）
+  GET  /v1/trust/dids/deactivations       查询外部 DID 停用通告审计事件（只读）
   POST /v1/trust/presentations/verify     跨系统演示验真（无需登记 DID/凭证/演示）
   POST /v1/trust/presentations/verify-batch 批量跨系统演示验真（仅未绑定形态，不消费）
   POST /v1/trust/presentations/verify-with-status 外部演示验真并合并同步状态（只读）
@@ -68,7 +69,9 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
 
 import errno
 import json
+import re
 import sys
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
@@ -120,6 +123,37 @@ def _parse_positive_int(raw: str, field: str) -> int:
     if value < 1:
         raise ValidationError(f"查询参数 {field} 必须为正整数")
     return value
+
+
+# 查询参数中 UTC 秒精度 Z 时间的严格形状（定宽补零、无小数、无偏移）。
+_UTC_Z_QUERY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+
+def _parse_utc_z_query(raw: str, field: str) -> str:
+    """校验并返回查询参数中的 UTC 秒精度 Z 时间串。
+
+    仅接受形如 YYYY-MM-DDTHH:MM:SSZ 的合法时刻（拒绝空白、毫秒、时区
+    偏移、缺 Z、未补零、非法月/日/时分秒与 Unicode 数字），返回原文
+    （定宽 Z 串按字典序比较与时间先后一致）。
+    """
+    if (
+        not isinstance(raw, str)
+        or not _UTC_Z_QUERY_RE.match(raw)
+    ):
+        raise ValidationError(
+            f"查询参数 {field} 必须为 UTC 秒精度 Z 时间"
+            "（YYYY-MM-DDTHH:MM:SSZ）"
+        )
+    try:
+        datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except (ValueError, TypeError):
+        raise ValidationError(
+            f"查询参数 {field} 必须为 UTC 秒精度 Z 时间"
+            "（YYYY-MM-DDTHH:MM:SSZ）"
+        )
+    return raw
 
 
 def build_handler(store: VCStore) -> type:
@@ -481,6 +515,8 @@ def build_handler(store: VCStore) -> type:
                     )
                 elif path == "/v1/trust/anchors":
                     self._get_trust_anchor_discovery(tenant, parsed.query)
+                elif path == "/v1/trust/dids/deactivations":
+                    self._get_trust_did_deactivations(tenant, parsed.query)
                 elif path.startswith(
                     "/v1/trust/credentials/imported/"
                 ):
@@ -1663,6 +1699,113 @@ def build_handler(store: VCStore) -> type:
                             "cursor": record.cursor,
                         }
                         for record in anchors
+                    ],
+                    "next_after": next_after,
+                },
+            )
+
+        def _get_trust_did_deactivations(self, tenant: str, query: str) -> None:
+            # GET /v1/trust/dids/deactivations：只读查询本租户外部 DID
+            # 停用通告审计事件。查询参数仅允许 limit、after、did、
+            # key_version、from、to，且均只能出现一次：
+            # - limit 缺省 50，须为 1..200 的非空 ASCII 十进制整数；
+            # - after 缺省 0，须为非负 ASCII 十进制整数；
+            # - did 提供时须为非空字符串；
+            # - key_version 须为 ASCII 十进制正整数；
+            # - from/to 须为 UTC 秒精度 Z 时间（YYYY-MM-DDTHH:MM:SSZ），
+            #   且 from <= to（闭区间过滤 deactivated_at）。
+            # 空值、重复参数、未知参数、格式或范围非法一律 400 且仅含
+            # 非空中文 error。先按 did/key_version 精确过滤与
+            # deactivated_at 闭区间过滤，再按 cursor > after 升序分页。
+            # 200 键序 events、next_after；事件键序 cursor、did、
+            # key_version、reason、deactivated_at；空页 next_after 等于
+            # after。无任何事件也返回 200 空数组。纯只读：不写状态、
+            # 不记审计。
+            params = parse_qs(query, keep_blank_values=True)
+            allowed = {"limit", "after", "did", "key_version", "from", "to"}
+            unknown = sorted(set(params) - allowed)
+            if unknown:
+                raise ValidationError(
+                    f"不支持的查询参数: {', '.join(unknown)}"
+                )
+
+            def _single(name: str) -> Optional[str]:
+                values = params.get(name)
+                if values is None:
+                    return None
+                if len(values) != 1:
+                    raise ValidationError(
+                        f"查询参数 {name} 只能提供一次"
+                    )
+                return values[0]
+
+            limit_raw = _single("limit")
+            if limit_raw is not None:
+                limit = _parse_nonneg_int(limit_raw, "limit")
+                if not 1 <= limit <= 200:
+                    raise ValidationError(
+                        "查询参数 limit 须在 1 到 200 之间"
+                    )
+            else:
+                limit = 50
+
+            after_raw = _single("after")
+            if after_raw is not None:
+                after = _parse_nonneg_int(after_raw, "after")
+            else:
+                after = 0
+
+            did = _single("did")
+            if did is not None and not did:
+                raise ValidationError("查询参数 did 必须为非空字符串")
+
+            key_version_raw = _single("key_version")
+            key_version: Optional[int] = None
+            if key_version_raw is not None:
+                key_version = _parse_positive_int(
+                    key_version_raw, "key_version"
+                )
+
+            from_raw = _single("from")
+            from_time = (
+                _parse_utc_z_query(from_raw, "from")
+                if from_raw is not None
+                else None
+            )
+            to_raw = _single("to")
+            to_time = (
+                _parse_utc_z_query(to_raw, "to")
+                if to_raw is not None
+                else None
+            )
+            if (
+                from_time is not None
+                and to_time is not None
+                and from_time > to_time
+            ):
+                raise ValidationError("查询参数 from 不得晚于 to")
+
+            events, next_after = store.list_did_deactivation_events(
+                tenant,
+                after,
+                limit,
+                did=did,
+                key_version=key_version,
+                from_time=from_time,
+                to_time=to_time,
+            )
+            self._send_json(
+                200,
+                {
+                    "events": [
+                        {
+                            "cursor": event.cursor,
+                            "did": event.did,
+                            "key_version": event.key_version,
+                            "reason": event.reason,
+                            "deactivated_at": event.deactivated_at,
+                        }
+                        for event in events
                     ],
                     "next_after": next_after,
                 },

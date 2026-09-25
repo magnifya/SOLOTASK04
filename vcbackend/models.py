@@ -284,6 +284,24 @@ class DidDeactivationNoticeRecord:
 
 
 @dataclass
+class DidDeactivationEvent:
+    """外部 DID 停用通告审计历史中的一条事件（只读查询用）。
+
+    按租户归属；仅首次接受通告时追加一条（与通告记录在同一次原子写中
+    落盘），完全重放、冲突或锚点/签名失败均不追加。cursor 为租户内跨
+    DID 持久递增正整数，按追加顺序单调递增，独立于其他历史游标空间。
+    旧状态文件中已存在但无审计历史的通告，加载时按
+    (deactivated_at, did) 升序稳定补录，重启后 cursor 不变。
+    """
+
+    cursor: int
+    did: str
+    key_version: int
+    reason: str
+    deactivated_at: str
+
+
+@dataclass
 class ImportedCredentialRecord:
     """一条已导入的外部凭证（按租户与 issuer_did#credential_id 双键隔离）。
 
