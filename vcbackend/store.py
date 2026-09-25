@@ -3604,24 +3604,26 @@ class VCStore:
         else:
             uses_list = _validate_trust_anchor_uses(uses)
         with self._lock:
-            bucket = self._ensure_bucket_locked(tenant_id)
-            anchors = bucket["trust_anchors"].setdefault(did, {})
-            existing = anchors.get(str(key_version))
-            if existing is not None:
-                if existing.get("public_key") != public_key:
-                    raise ConflictError(
-                        f"信任锚点已存在且公钥不同: {did}#{key_version}"
-                    )
-                if _anchor_row_uses(existing) != (
-                    uses_list
-                    if uses_list is not None
-                    else list(TRUST_ANCHOR_USES)
-                ):
-                    raise ConflictError(
-                        f"信任锚点已存在且用途不同: {did}#{key_version}"
-                    )
-                snapshot = self._snapshot_locked()
-                try:
+            # 快照必须先于 _ensure_bucket_locked/setdefault：落盘失败
+            # 回滚后不得残留空租户桶、空 DID 条目或版本行。
+            snapshot = self._snapshot_locked()
+            try:
+                bucket = self._ensure_bucket_locked(tenant_id)
+                anchors = bucket["trust_anchors"].setdefault(did, {})
+                existing = anchors.get(str(key_version))
+                if existing is not None:
+                    if existing.get("public_key") != public_key:
+                        raise ConflictError(
+                            f"信任锚点已存在且公钥不同: {did}#{key_version}"
+                        )
+                    if _anchor_row_uses(existing) != (
+                        uses_list
+                        if uses_list is not None
+                        else list(TRUST_ANCHOR_USES)
+                    ):
+                        raise ConflictError(
+                            f"信任锚点已存在且用途不同: {did}#{key_version}"
+                        )
                     # 幂等重试同样每次记录审计
                     self._append_audit_locked(
                         tenant_id,
@@ -3630,13 +3632,8 @@ class VCStore:
                         f"{did}#{key_version}",
                     )
                     self._save_locked()
-                except Exception:
-                    self._restore_locked(snapshot)
-                    raise
-                return self._trust_anchor_record(did, existing), False
+                    return self._trust_anchor_record(did, existing), False
 
-            snapshot = self._snapshot_locked()
-            try:
                 row = {
                     "key_version": key_version,
                     "public_key": public_key,
