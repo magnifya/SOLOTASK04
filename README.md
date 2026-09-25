@@ -55,7 +55,8 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | PUT | `/v1/trust/anchors/{did}/{key_version}/status` | 吊销锚点版本，请求体必须恰为 `{"status":"revoked"}`；首次与重复均 200，首次置 UTC 秒精度 `updated_at`，重复保持不变；未知版本 404 |
 | POST | `/v1/trust/verify` | 信任验签，请求体含非空字符串 `issuer_did`、正整数 `issuer_key_version`、非空字符串 `signature`；**缺失、吊销或验签失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
 | POST | `/v1/trust/credentials/verify` | 跨系统凭证验真：验证未在本租户签发或存储的外部凭证，无需登记 DID/凭证；请求体须恰含 `body`、`signature`；**任何失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
-| POST | `/v1/trust/dids/verify-document` | 跨系统 DID 文档验真：未在本租户注册的 DID 仅凭提交文档完成结构、证明与信任判断；请求体恰含 `document` 对象（恰含 `did`、`current_key_version`、`verification_methods`、`document_proof`）；**请求、字段、锚点、签名格式或验签失败均 HTTP 200** 返回 `valid:false` 与非空中文分类原因，成功仅 `{"valid":true}`；纯只读、不登记资源、不写历史或审计 |
+| POST | `/v1/trust/dids/verify-document` | 跨系统 DID 文档验真：未在本租户注册的 DID 仅凭提交文档完成结构、证明与信任判断；请求体恰含 `document` 对象（恰含 `did`、`current_key_version`、`verification_methods`、`document_proof`）；**请求、字段、锚点、签名格式或验签失败均 HTTP 200** 返回 `valid:false` 与非空中文分类原因，成功仅 `{"valid":true}`；**原验真成功后查本租户外部 DID 停用通告**，命中同 did 返回 200 且键序 `valid,reason`，值为 `false`、“外部DID已停用：<reason>”，未命中维持原结果；纯只读、不登记资源、不写历史或审计 |
+| POST | `/v1/trust/dids/deactivate-sync` | 登记外部 DID 停用通告：请求恰含 `body`、`signature`，`body` 恰含 `did`（非空串）、`key_version`（非布尔正整数）、`reason`（1–256 码点且首尾无空白）、`deactivated_at`（UTC 秒精度 Z）；结构或值非法 400 且仅含非空中文 `error`；用本租户同 did/版本 active P-256 锚点按既有规范化 JSON 与 ES256 裸 R||S 无填充 base64url 验签 body；锚点不可用、签名格式错、验签失败均 HTTP 200、键序 `valid,reason`，值为 `false` 及“锚点不可用”/“签名格式错误”/“签名校验失败”，且不写入；首次接受 201、完全重放 200、同 did 不同通告 409 仅 `{error}`；成功响应键序 `valid,did,key_version,reason,deactivated_at`，`valid:true`；按租户+did 原子持久化、失败回滚、重启稳定 |
 | POST | `/v1/trust/presentations/verify` | 跨系统演示验真：验证其他系统生成且未在本租户保存的演示，无需登记 DID/凭证/演示；请求体须恰为 `{"presentation":对象,"challenge":非空串}`；**任何失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
 | POST | `/v1/trust/presentations/verify-batch` | 批量跨系统演示验真：请求体恰为 `{"presentations":[项...]}`，数组非空且不超过 100 项；每项可复用单项未绑定形态（恰含 `presentation` 对象与非空 `challenge`，演示不得含任何 `holder_*` 字段）或持有者绑定形态（另恰含非空 `source_tenant_id`，演示恰为九字段加 `holder_did`、`holder_key_version`、`holder_proof`，双锚点双签名，`source_tenant_id` 作为 holder proof 覆盖的 `tenant_id`）；**任何失败均 HTTP 200**，返回 `{"results":[...]}`（长度与顺序与输入一致，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`，不短路）；请求级非法（缺失、非法 JSON、非对象、字段缺失或多余、presentations 非数组、空数组或超限）返回 `{"results":[],"reason":"请求..."}`；纯只读、不消费、不审计 |
 | POST | `/v1/trust/proofs/verify` | 跨系统谓词证明验真：验证未在本租户保存的外部谓词证明，原本地 `/v1/proofs/{id}/verify` 不变；请求体须恰含 `proof`、`challenge`、`source_tenant_id`（后两项为非空字符串），proof 恰为 prove 九字段；**任何失败均 HTTP 200** 返回 `valid:false` 与分类中文 reason，成功仅 `{"valid":true}`；只读、不消费、不审计 |
@@ -808,10 +809,60 @@ curl -X POST localhost:8080/v1/proofs/zp_<id>/verify \
     → 签名格式 → 密码学验签。任何失败均 **HTTP 200** 返回
     `{"valid":false,"reason":"<非空中文原因>"}`，成功仅返回
     `{"valid":true}`（无其他字段）；显式空 `X-Tenant-ID` 仍为 **400**。
+  - **外部 DID 停用通告**：上述原验真**成功之后**，再按当前租户同
+    `did` 查询 `POST /v1/trust/dids/deactivate-sync` 登记的停用通告；
+    命中时返回 **HTTP 200**、键序 `valid,reason`，值为
+    `false`、`"外部DID已停用：<通告 reason>"`；未命中维持原结果
+    （成功仍为 `{"valid":true}`）。查询为只读：不登记资源、不写历史
+    或审计；跨租户通告互不可见，结论随状态文件重启稳定。
 
   ```bash
   curl -X POST localhost:8080/v1/trust/dids/verify-document \
     -d '{"document":{ ...GET /v1/dids/{did}/document 返回的整个文档对象... }}'
+  ```
+- `POST /v1/trust/dids/deactivate-sync` 登记**外部 DID 停用通告**：
+  外部系统对其 DID 停用后，将带 ES256 签名的通告提交给本租户，供
+  `POST /v1/trust/dids/verify-document` 在原验真成功后拦截。通告按
+  租户与 `did` 隔离持久化，不读取本地 DID 注册表，其他 HTTP 与 CLI
+  行为完全不变。
+  - 请求体必须**恰含** `body`（JSON 对象）与 `signature`（非空字符
+    串）；缺失/多余字段、请求体缺失/非法 JSON/非对象一律 **400** 且
+    响应仅含非空中文 `{"error": "..."}`。
+  - `body` 必须**恰含**四个字段：
+    - `did`：**非空字符串**；
+    - `key_version`：**非布尔正整数**（布尔、0、负数、字符串均 400）；
+    - `reason`：长度 **1–256 个 Unicode 码点**的字符串，且**首尾不
+      得含空白**（空串、纯空白、首尾空格/制表符/换行、超长均 400；
+      保存原文，不做裁剪）；
+    - `deactivated_at`：**UTC 秒精度 Z 格式**
+      `YYYY-MM-DDTHH:MM:SSZ`（毫秒、偏移、缺 Z、非法时刻均 400）。
+  - 签名规则与其他信任接口一致：**ES256/SHA-256**，64 字节裸
+    `R||S` 的**无填充 base64url**，覆盖提交的完整 `body` 按 key
+    升序的规范化 JSON（紧凑序列化、UTF-8、嵌套递归排序）。验签公钥
+    取**当前租户** `(did, key_version)` 的信任锚点，仅 `active` 的
+    P-256 公钥可用。
+  - 锚点缺失、已吊销或公钥不可用 → **HTTP 200**
+    `{"valid":false,"reason":"锚点不可用"}`；签名编码非法 →
+    `reason:"签名格式错误"`；密码学验签失败 →
+    `reason:"签名校验失败"`。失败响应键序固定为 `valid,reason`，
+    **不写入、不改变任何状态**。
+  - 验签通过后按 **(租户, did)** 持久化：
+    - **首次接受**：**201**，响应键序恰为
+      `valid,did,key_version,reason,deactivated_at`，`valid:true`；
+    - **完全重放**（同 did 且 key_version/reason/deactivated_at 完全
+      一致）：**200** 返回首次记录，不重复写入；
+    - **同 did 已有不同通告**（任一字段不同）：**409** 且响应仅含
+      非空中文 `{"error": "..."}`，不写入。
+  - 记录与落盘在同一把锁内经**同一次原子写**完成，落盘失败一并
+    回滚；通告随状态文件**跨重启保留**。遵守 `X-Tenant-ID` 缺省
+    `default`、显式空值 **400** 与跨租户隔离（他租户登记的通告与
+    锚点均不可见、不可探测）。
+
+  ```bash
+  curl -X POST localhost:8080/v1/trust/dids/deactivate-sync -d '{
+    "body": {"did":"did:web:example.com","key_version":1,
+             "reason":"机构业务终止","deactivated_at":"2026-09-25T00:00:00Z"},
+    "signature":"<base64url R||S>"}'
   ```
 - `POST /v1/trust/presentations/verify` 验证**其他系统生成且未在本租户
   保存的演示**：无需登记本地 DID/凭证/演示，只读、不写凭证/演示/状态/
@@ -1450,6 +1501,7 @@ python3 tests/predicate_proof_test.py
 python3 tests/holder_binding_test.py
 python3 tests/trust_credential_verify_test.py
 python3 tests/trust_did_document_verify_test.py
+python3 tests/trust_did_deactivation_sync_test.py
 python3 tests/trust_presentation_verify_test.py
 python3 tests/trust_proof_verify_test.py
 python3 tests/trust_proof_verify_batch_test.py
@@ -1511,7 +1563,10 @@ vcbackend/
                追加与分页）、跨系统外部凭证验真（含合并同步状态
                的只读判定）、跨系统 DID 文档验真（仅凭提交文档的
                结构/证明/信任判断、active 锚点同 DID 同版本且公钥
-               原文匹配、只读不登记）、跨系统外部演示验真（未绑定九字段、
+               原文匹配、验真成功后查外部 DID 停用通告、只读不登记）、
+               外部 DID 停用通告登记（恰含四字段的 body 校验、active
+               锚点 ES256 验签、按租户+did 原子持久化、完全重放幂等、
+               异通告冲突、失败不写入）、跨系统外部演示验真（未绑定九字段、
                挑战一致性与期限判定）、跨系统外部谓词证明验真
                （九字段与 predicates/results 结构校验、不重算 results、
                tenant_id=source_tenant_id 规范化验签、期限判定，只读不消费）、
@@ -1624,6 +1679,12 @@ tests/trust_did_document_verify_test.py 跨系统 DID 文档验真（成功与�
                                    签名格式/验签/证明覆盖范围分类 reason、
                                    显式空租户头 400、只读不审计不登记、
                                    重启结论稳定、既有接口不变）
+tests/trust_did_deactivation_sync_test.py 外部 DID 停用通告（请求/body
+                                   四字段 400 仅 error、锚点不可用/签名格式
+                                   错误/签名校验失败 200 不写入、首次 201
+                                   键序、完全重放 200、异通告 409、
+                                   verify-document 命中“外部DID已停用”、
+                                   跨租户隔离、显式空租户头 400、重启稳定）
 tests/trust_presentation_verify_test.py 跨系统演示验真（请求/演示字段/holder_*
                                    拒绝/挑战/锚点/签名格式/验签/过期分类 reason、
                                    恰九字段与类型、只读不记审计、跨租户/重启）

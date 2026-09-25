@@ -45,6 +45,7 @@ from .models import (
     CredentialStatusRecord,
     CredentialStatusSyncRecord,
     CredentialStatusHistoryEvent,
+    DidDeactivationNoticeRecord,
     ImportedCredentialRecord,
     LocalCredentialStatusHistoryEvent,
     DIDRecord,
@@ -111,6 +112,17 @@ MAX_SUSPEND_REASON = 256
 IMPORTED_ANCHOR_UNAVAILABLE_REASON = "锚点不可用"
 IMPORTED_SIGNATURE_MALFORMED_REASON = "签名格式错误"
 IMPORTED_SIGNATURE_INVALID_REASON = "签名校验失败"
+
+# 外部 DID 停用通告验真失败时的统一中文原因（与导入重验一致）
+DEACTIVATION_ANCHOR_UNAVAILABLE_REASON = IMPORTED_ANCHOR_UNAVAILABLE_REASON
+DEACTIVATION_SIGNATURE_MALFORMED_REASON = IMPORTED_SIGNATURE_MALFORMED_REASON
+DEACTIVATION_SIGNATURE_INVALID_REASON = IMPORTED_SIGNATURE_INVALID_REASON
+
+# DID 文档验真命中外部 DID 停用通告时的统一中文原因前缀
+EXTERNAL_DID_DEACTIVATED_REASON_PREFIX = "外部DID已停用："
+
+# 外部 DID 停用通告 reason 允许的最大 Unicode 码点长度
+MAX_DEACTIVATION_NOTICE_REASON = 256
 
 # 哨兵：调用方未提供 reason 字段（区别于显式传 None 等非法值）
 REASON_UNSET = object()
@@ -524,6 +536,7 @@ class VCStore:
             bucket.setdefault("trust_anchor_history", {})
             bucket.setdefault("local_credential_status_history", {})
             bucket.setdefault("did_history", {})
+            bucket.setdefault("did_deactivation_notices", {})
             for rec in bucket["dids"].values():
                 _migrate_did_row(rec)
         # 外部凭证状态历史游标（租户内持久化正整数，按追加递增）。
@@ -726,6 +739,7 @@ class VCStore:
                 "trust_anchor_history": {},
                 "local_credential_status_history": {},
                 "did_history": {},
+                "did_deactivation_notices": {},
             }
             self._tenants[tenant_id] = bucket
         return bucket
@@ -6375,6 +6389,225 @@ class VCStore:
             next_after = picked[-1].cursor if picked else after
             return picked, next_after
 
+    # ------------------------------------------------------------------ #
+    # 外部 DID 停用通告
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _deactivation_notice_record(
+        did: str, row: Dict[str, Any]
+    ) -> DidDeactivationNoticeRecord:
+        return DidDeactivationNoticeRecord(
+            did=did,
+            key_version=int(row["key_version"]),
+            reason=row["reason"],
+            deactivated_at=row["deactivated_at"],
+        )
+
+    def sync_did_deactivation_notice(
+        self,
+        tenant_id: str,
+        data: Any,
+    ) -> Dict[str, Any]:
+        """登记一条外部 DID 停用通告，返回结果字典。
+
+        请求体须恰含 body（JSON 对象）与 signature（非空字符串）；
+        body 须恰含 did、key_version、reason、deactivated_at：
+          - did 为非空字符串；
+          - key_version 为非布尔正整数；
+          - reason 为 1–256 个 Unicode 码点且首尾无空白的字符串；
+          - deactivated_at 为 UTC 秒精度 Z 格式（YYYY-MM-DDTHH:MM:SSZ）。
+        任何请求/字段非法均抛 ValidationError（HTTP 400）。
+
+        签名覆盖 body 的规范化 JSON，用本租户 (did, key_version) 的
+        active 信任锚点 P-256 公钥验签。锚点缺失/吊销/公钥不可用、
+        签名格式错误、密码学验签失败均不抛异常、不写入，返回
+        {"valid": False, "reason": ...}，原因恰为
+        “锚点不可用”/“签名格式错误”/“签名校验失败”。
+
+        验签通过后按 (tenant, did) 持久化：首次接受 201；同一 did 的
+        完全重放（通告内容一致）200 返回首次记录；同一 did 已有不同
+        通告抛 ConflictError（HTTP 409），不写入。记录在同一把锁内经
+        同一次原子写落盘，失败回滚，重启后稳定。
+        """
+        # ---- 请求结构（错误 -> 400）----
+        if not isinstance(data, dict):
+            raise ValidationError("请求体必须为 JSON 对象")
+        if set(data) != {"body", "signature"}:
+            missing = [f for f in ("body", "signature") if f not in data]
+            if missing:
+                raise ValidationError(f"缺少字段: {', '.join(missing)}")
+            extra = sorted(set(data) - {"body", "signature"})
+            raise ValidationError(f"多余字段: {', '.join(extra)}")
+        body = data["body"]
+        signature = data["signature"]
+        if not isinstance(body, dict):
+            raise ValidationError("字段 body 必须为 JSON 对象")
+        if not isinstance(signature, str) or not signature:
+            raise ValidationError("字段 signature 必须为非空字符串")
+
+        # ---- body 字段（错误 -> 400）----
+        required = ("did", "key_version", "reason", "deactivated_at")
+        for field in required:
+            if field not in body:
+                raise ValidationError(f"body 缺少字段: {field}")
+        extra = sorted(set(body) - set(required))
+        if extra:
+            raise ValidationError(f"body 含多余字段: {', '.join(extra)}")
+        did = body["did"]
+        key_version = body["key_version"]
+        reason = body["reason"]
+        deactivated_at = body["deactivated_at"]
+        if not isinstance(did, str) or not did:
+            raise ValidationError("body 字段 did 必须为非空字符串")
+        if not isinstance(key_version, int) or isinstance(
+            key_version, bool
+        ) or key_version < 1:
+            raise ValidationError(
+                "body 字段 key_version 必须为非布尔正整数"
+            )
+        if not isinstance(reason, str) or not (
+            1 <= len(reason) <= MAX_DEACTIVATION_NOTICE_REASON
+        ):
+            raise ValidationError(
+                "body 字段 reason 必须为 1 到 "
+                f"{MAX_DEACTIVATION_NOTICE_REASON} 个码点的字符串"
+            )
+        if reason != reason.strip():
+            raise ValidationError("body 字段 reason 首尾不得含空白")
+        if not isinstance(deactivated_at, str) or not (
+            _UTC_Z_SHAPE_RE.match(deactivated_at)
+        ):
+            raise ValidationError(
+                "body 字段 deactivated_at 必须为 UTC 秒精度 Z 格式"
+                "（YYYY-MM-DDTHH:MM:SSZ）"
+            )
+        try:
+            _parse_utc_z(deactivated_at)
+        except ValueError:
+            raise ValidationError(
+                "body 字段 deactivated_at 必须为 UTC 秒精度 Z 格式"
+                "（YYYY-MM-DDTHH:MM:SSZ）"
+            )
+
+        # ---- 锚点（缺失/吊销/公钥不可用 -> 200 valid:false，不写入）----
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            anchors = (
+                bucket["trust_anchors"].get(did)
+                if bucket is not None
+                else None
+            )
+            anchor_row = (
+                anchors.get(str(key_version))
+                if anchors is not None
+                else None
+            )
+            public_pem = (
+                anchor_row.get("public_key", "")
+                if anchor_row is not None
+                else ""
+            )
+            anchor_status = (
+                anchor_row.get("status", "active")
+                if anchor_row is not None
+                else None
+            )
+        if anchor_row is None or anchor_status == "revoked":
+            return {
+                "valid": False,
+                "reason": DEACTIVATION_ANCHOR_UNAVAILABLE_REASON,
+            }
+        try:
+            crypto.validate_public_key_pem(public_pem)
+        except (ValueError, TypeError):
+            return {
+                "valid": False,
+                "reason": DEACTIVATION_ANCHOR_UNAVAILABLE_REASON,
+            }
+
+        # ---- 签名（覆盖 body 的规范化 JSON，ES256 裸 R||S 无填充
+        #       base64url）----
+        try:
+            crypto.verify(body, signature, public_pem)
+        except crypto.MalformedSignature:
+            return {
+                "valid": False,
+                "reason": DEACTIVATION_SIGNATURE_MALFORMED_REASON,
+            }
+        except crypto.InvalidSignature:
+            return {
+                "valid": False,
+                "reason": DEACTIVATION_SIGNATURE_INVALID_REASON,
+            }
+        except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
+            return {
+                "valid": False,
+                "reason": DEACTIVATION_SIGNATURE_INVALID_REASON,
+            }
+
+        # ---- 持久化（按租户+did、重放幂等、异通告冲突、原子落盘）----
+        with self._lock:
+            bucket = self._ensure_bucket_locked(tenant_id)
+            notices = bucket.setdefault("did_deactivation_notices", {})
+            existing = notices.get(did)
+            if existing is not None:
+                identical = (
+                    int(existing.get("key_version")) == key_version
+                    and existing.get("reason") == reason
+                    and existing.get("deactivated_at") == deactivated_at
+                )
+                if identical:
+                    # 完全重放：200、不替换、返回首次记录
+                    return {
+                        "valid": True,
+                        "status_code": 200,
+                        "record": self._deactivation_notice_record(
+                            did, existing
+                        ),
+                    }
+                # 同一 did 已有不同通告：冲突，不写入
+                raise ConflictError(
+                    f"外部 DID 已存在不同的停用通告: {did}"
+                )
+
+            new_row = {
+                "did": did,
+                "key_version": key_version,
+                "reason": reason,
+                "deactivated_at": deactivated_at,
+                "signature": signature,
+            }
+            snapshot = self._snapshot_locked()
+            try:
+                notices[did] = new_row
+                self._save_locked()
+            except Exception:
+                self._restore_locked(snapshot)
+                raise
+            return {
+                "valid": True,
+                "status_code": 201,
+                "record": self._deactivation_notice_record(did, new_row),
+            }
+
+    def get_did_deactivation_notice(
+        self,
+        tenant_id: str,
+        did: str,
+    ) -> Optional[DidDeactivationNoticeRecord]:
+        """只读查询本租户某 DID 的外部停用通告；未登记（含他租户）返回
+        None。不写状态、不记审计。"""
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            row = (
+                bucket.get("did_deactivation_notices", {}).get(did)
+                if bucket is not None
+                else None
+            )
+        if row is None:
+            return None
+        return self._deactivation_notice_record(did, row)
+
     def verify_trust_did_document(
         self,
         tenant_id: str,
@@ -6397,10 +6630,12 @@ class VCStore:
         - 锚点按当前租户 (did, current_key_version) 查找，仅 active 且
           公钥与文档最高版本 public_key 原文完全匹配的锚点可用；
         - document_proof 为 ES256 裸 R||S 无填充 base64url，覆盖除
-          document_proof 外整个文档的递归排序紧凑 JSON。
+          document_proof 外整个文档的递归排序紧凑 JSON；
+        - 原验真成功后查本租户 (did) 的外部 DID 停用通告：命中返回
+          (False, "外部DID已停用：<reason>")，否则维持原验真结果。
 
         纯只读：不登记资源、不写状态/历史/审计，绝不向上抛异常；跨
-        租户各自使用本租户锚点，结论随状态文件重启后稳定。
+        租户各自使用本租户锚点与停用通告，结论随状态文件重启后稳定。
         """
         # 1. 请求结构：恰含 document，且为 JSON 对象
         if not isinstance(data, dict):
@@ -6555,6 +6790,15 @@ class VCStore:
             return False, "签名校验失败，DID 文档或证明可能被改动"
         except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
             return False, "签名校验失败: 验签过程发生内部错误"
+
+        # 7. 原验真成功后查本租户外部 DID 停用通告：命中同 did 返回
+        #    valid:false 与“外部DID已停用：<reason>”，否则维持原结果。
+        notice = self.get_did_deactivation_notice(tenant_id, did)
+        if notice is not None:
+            return (
+                False,
+                f"{EXTERNAL_DID_DEACTIVATED_REASON_PREFIX}{notice.reason}",
+            )
         return True, ""
 
     def verify_trust_did_documents_batch(
