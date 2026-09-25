@@ -24,11 +24,12 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/presentations/{presentation_id}/verify  以存储记录为锚校验演示
   POST /v1/credentials/{credential_id}/prove    生成谓词证明
   POST /v1/proofs/{proof_id}/verify             以存储记录为锚校验谓词证明
-  POST /v1/trust/anchors                  注册信任锚点（同 DID/版本同 PEM 幂等）
+  POST /v1/trust/anchors                  注册信任锚点（同 DID/版本同 PEM 同用途幂等；可选 uses 用途白名单）
   GET  /v1/trust/anchors                  跨 DID 只读发现锚点版本（?limit=&after=&status=）
-  POST /v1/trust/anchors/{did}/rotate     带前置版本校验的密钥轮换
+  POST /v1/trust/anchors/{did}/rotate     带前置版本校验的密钥轮换（继承前置用途）
   GET  /v1/trust/anchors/{did}            查询 DID 的全部锚点版本
   GET  /v1/trust/anchors/{did}/history    查询信任锚点生命周期历史（只读）
+  GET  /v1/trust/anchors/{did}/{key_version}/uses  查询锚点版本用途白名单（只读）
   PUT  /v1/trust/anchors/{did}/{key_version}/status  吊销锚点版本
   POST /v1/trust/verify                   用 active 锚点公钥验签
   POST /v1/trust/credentials/verify       跨系统凭证验真（无需登记 DID/凭证）
@@ -90,6 +91,7 @@ from .store import (
     NotFoundError,
     PresentationRecord,
     REASON_UNSET,
+    USES_UNSET,
     ValidationError,
     VCStore,
 )
@@ -593,6 +595,17 @@ def build_handler(store: VCStore) -> type:
                     self._get_trust_anchor_history(
                         tenant, did, parsed.query
                     )
+                elif path.startswith("/v1/trust/anchors/") and path.endswith(
+                    "/uses"
+                ):
+                    rest = path[len("/v1/trust/anchors/") : -len("/uses")]
+                    did, sep, version_raw = rest.rpartition("/")
+                    if not sep or not did:
+                        self._send_error(404, f"无此路径: {path}")
+                    else:
+                        self._get_trust_anchor_uses(
+                            tenant, unquote(did), unquote(version_raw)
+                        )
                 elif path.startswith("/v1/trust/anchors/"):
                     did = unquote(path[len("/v1/trust/anchors/") :])
                     self._get_trust_anchors(tenant, did)
@@ -1606,13 +1619,16 @@ def build_handler(store: VCStore) -> type:
 
         def _post_trust_anchors(self, tenant: str) -> None:
             # 字段依次为：did 非空字符串、public_key 为 P-256 PEM、
-            # key_version 为非布尔正整数；多余字段一律 400。
+            # key_version 为非布尔正整数；uses 可省略（等效全用途），
+            # 提供时须为非空无重复字符串数组且值限白名单（规范序
+            # generic、vc、vp、proof、did、status、deactivation）；
+            # 多余字段一律 400。
             data = self._read_json()
             self._require_fields(data, ("did", "public_key"))
             if "key_version" not in data:
                 raise ValidationError("缺少字段: key_version")
             extra = sorted(
-                set(data) - {"did", "public_key", "key_version"}
+                set(data) - {"did", "public_key", "key_version", "uses"}
             )
             if extra:
                 raise ValidationError(f"多余字段: {', '.join(extra)}")
@@ -1621,9 +1637,10 @@ def build_handler(store: VCStore) -> type:
                 data["did"],
                 data["public_key"],
                 data["key_version"],
+                uses=data.get("uses", USES_UNSET),
             )
-            # 新建 201；同 DID/版本同 PEM 幂等重试 200；PEM 不同由
-            # store 抛 ConflictError -> 409。
+            # 新建 201；同 DID/版本同 PEM 同用途幂等重试 200；PEM 或
+            # 用途不同由 store 抛 ConflictError -> 409。响应不增键。
             self._send_json(
                 201 if created else 200,
                 self._trust_anchor_payload(record),
@@ -1634,6 +1651,28 @@ def build_handler(store: VCStore) -> type:
             records = store.list_trust_anchors(tenant, did)
             self._send_json(
                 200, [self._trust_anchor_payload(r) for r in records]
+            )
+
+        def _get_trust_anchor_uses(
+            self, tenant: str, did: str, version_raw: str
+        ) -> None:
+            # GET /v1/trust/anchors/{did}/{key_version}/uses：只读查询
+            # 锚点版本的有效用途白名单。key_version 须为 ASCII 十进制
+            # 正整数，否则 400；锚点未知或属他租户 404。200 按键序恰返
+            # did、key_version、uses；uses 按规范序（generic、vc、vp、
+            # proof、did、status、deactivation），省略注册或旧记录为
+            # 全用途。纯只读：不写状态、不记审计。
+            if not did:
+                raise ValidationError("路径缺少 did")
+            key_version = _parse_positive_int(version_raw, "key_version")
+            uses = store.get_trust_anchor_uses(tenant, did, key_version)
+            self._send_json(
+                200,
+                {
+                    "did": did,
+                    "key_version": key_version,
+                    "uses": uses,
+                },
             )
 
         def _get_trust_anchor_history(
@@ -2317,9 +2356,10 @@ def build_handler(store: VCStore) -> type:
             signer_did = manifest["signer_did"]
             key_version = manifest["key_version"]
 
-            # 阶段二：本租户同 did/版本 active 信任锚点
+            # 阶段二：本租户同 did/版本 active 信任锚点（须含 deactivation
+            # 用途，缺少用途同样按“锚点不可用”处理）
             public_pem = store.get_active_trust_anchor_public_key(
-                tenant, signer_did, key_version
+                tenant, signer_did, key_version, use="deactivation"
             )
             if public_pem is None:
                 return "锚点不可用"

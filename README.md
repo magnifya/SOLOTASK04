@@ -47,9 +47,10 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/presentations/{presentation_id}/verify` | 校验演示，新演示请求体恰为 `{"presentation":对象,"challenge":串}`（旧演示恰为 `{"presentation":对象}`）；**任何失败一律 HTTP 200**，成功 `{"valid":true}`，失败附非空中文 `reason` |
 | POST | `/v1/credentials/{credential_id}/prove` | 生成谓词证明，请求体恰为 `{"predicates":[项...]}` 加可选 `challenge`、`expires_in`；成功 201 返回证明对象；字段问题 400、未知凭证 404 |
 | POST | `/v1/proofs/{proof_id}/verify` | 校验谓词证明，请求体恰为 `{"proof":对象,"challenge":串}`；**任何失败一律 HTTP 200**，成功 `{"valid":true}`，失败附非空中文 `reason` |
-| POST | `/v1/trust/anchors` | 注册信任锚点，请求体 `{"did","public_key","key_version"}`（非空字符串、P-256 PEM、非布尔正整数）；返回 201 与 `did`、`public_key`、`key_version`、`status:"active"`、`updated_at:null` |
-| POST | `/v1/trust/anchors/{did}/rotate` | 带前置版本校验的密钥轮换，请求体须恰含 `from_key_version`（非布尔正整数）、`public_key`（P-256 PEM）；目标版本为 `from_key_version+1`；新建 201、同前置同 PEM 幂等重试 200，响应字段同 GET 元素 |
+| POST | `/v1/trust/anchors` | 注册信任锚点，请求体 `{"did","public_key","key_version"}`（非空字符串、P-256 PEM、非布尔正整数），可选 `uses`（非空无重复的非空字符串数组，值限 `generic`、`vc`、`vp`、`proof`、`did`、`status`、`deactivation`，存储按该规范序；省略等效全用途）；返回 201 与 `did`、`public_key`、`key_version`、`status:"active"`、`updated_at:null`；同 DID/版本同 PEM 且同用途幂等重试 200，PEM 或用途不同 409 |
+| POST | `/v1/trust/anchors/{did}/rotate` | 带前置版本校验的密钥轮换，请求体须恰含 `from_key_version`（非布尔正整数）、`public_key`（P-256 PEM）；目标版本为 `from_key_version+1`，并继承前置版本的用途白名单；新建 201、同前置同 PEM 幂等重试 200，响应字段同 GET 元素 |
 | GET | `/v1/trust/anchors/{did}` | 返回该 DID 的全部锚点版本数组（按 `key_version` 升序）；未知 DID 404 |
+| GET | `/v1/trust/anchors/{did}/{key_version}/uses` | 只读查询锚点版本的有效用途白名单；`key_version` 须为 ASCII 十进制正整数（否则 400），未知或跨租户锚点 404；200 按键序恰返 `did`、`key_version`、`uses`，`uses` 按规范序，省略注册或旧记录为全用途；只读不记审计 |
 | GET | `/v1/trust/anchors?limit=&after=&status=` | 只读跨 DID 发现本租户锚点版本；响应恰含 `anchors`、`next_after`，每项恰含 `did`、`public_key`、`key_version`、`status`、`updated_at`、`cursor`；先按 `status`（可省略，或 `active`/`revoked`）过滤，再按 `cursor>after` 升序取至多 `limit`（默认 50、限 1–200，`after` 默认 0 且非负）；无锚点也返回 200 空数组，空结果 `next_after` 等于 `after`；参数仅允许这三个，重复/空值/空白/符号/Unicode 数字/越界/未知参数均 400；只读不记审计 |
 | GET | `/v1/trust/anchors/{did}/history?limit=&after=` | 只读查询信任锚点生命周期历史；200 恰含 `did`、`events`、`next_after`，事件恰含 `{key_version,action,status,updated_at,cursor}`；仅新版本注册、轮换目标版本（active、`updated_at:null`）与首次吊销（revoked、首次吊销 UTC 秒 Z 时间）追加，幂等重试与失败不追加；`cursor` 为租户内跨 DID 共享的持久化正整数；`limit` 默认 50、限 1–200，`after` 默认 0、须非负，重复/非空 ASCII 数字外取值均 400；未知或跨租户 DID 404，已有 DID 无历史返空页；只读不记审计 |
 | PUT | `/v1/trust/anchors/{did}/{key_version}/status` | 吊销锚点版本，请求体必须恰为 `{"status":"revoked"}`；首次与重复均 200，首次置 UTC 秒精度 `updated_at`，重复保持不变；未知版本 404 |
@@ -731,13 +732,30 @@ curl -X POST localhost:8080/v1/proofs/zp_<id>/verify \
 
 - 信任锚点按租户隔离：锚点仅在所属租户内可见，跨租户访问按不存在
   处理（GET/吊销为 404，验签端点仍遵循公开错误协议返回 200/`valid:false`）。
-- `POST /v1/trust/anchors` 请求体须恰含 `did`、`public_key`、`key_version`，
-  依次为**非空字符串**、**可解析的 P-256 公钥 PEM**、**非布尔正整数**；
-  缺字段、类型非法、多余字段一律 400。成功返回 201，字段恰为
-  `{did, public_key, key_version, status:"active", updated_at:null}`。
-- 同一 `(did, key_version)` 再次提交：PEM **相同**视为幂等重试，返回
-  **200** 与既有记录（含已吊销状态与 `updated_at`），每次重试都记
-  `trust.anchor.registered`；PEM **不同**返回 **409**，不记审计。
+- `POST /v1/trust/anchors` 请求体须恰含 `did`、`public_key`、`key_version`
+  及可选 `uses`，依次为**非空字符串**、**可解析的 P-256 公钥 PEM**、
+  **非布尔正整数**；`uses` 提供时须为**非空无重复的非空字符串数组**，
+  值限 `generic`、`vc`、`vp`、`proof`、`did`、`status`、`deactivation`
+  （存储与比较按该规范序），省略等效全用途；缺字段、类型非法、
+  `uses` 非法、多余字段一律 400 且仅含非空中文 `error`。成功返回 201，
+  字段恰为 `{did, public_key, key_version, status:"active", updated_at:null}`。
+- 同一 `(did, key_version)` 再次提交：PEM **相同**且有效用途**相同**
+  视为幂等重试，返回 **200** 与既有记录（含已吊销状态与 `updated_at`），
+  每次重试都记 `trust.anchor.registered`；PEM **不同**或用途**不同**
+  返回 **409**，不记审计。
+- `GET /v1/trust/anchors/{did}/{key_version}/uses` 只读返回该锚点版本的
+  有效用途白名单：路径版本须为 ASCII 十进制正整数（否则 400），锚点未知
+  （含他租户）404；200 按键序恰含 `did`、`key_version`、`uses`，`uses`
+  按规范序，省略注册或旧记录为全用途；不记审计。
+- 轮换（`POST /v1/trust/anchors/{did}/rotate`）的新版本**继承前置版本的
+  用途白名单**（前置省略则同为全用途）。
+- `/v1/trust` 下各验签/同步入口按用途白名单约束 active 锚点：
+  `verify`→`generic`，`credentials/*`→`vc`，`presentations/*`→`vp`，
+  `proofs/*`→`proof`，`dids/verify-document*`→`did`，
+  `credential-status/*`→`status`，`dids/deactivate-sync*` 与
+  `dids/deactivations/manifest/verify*`→`deactivation`；active 锚点缺少
+  该入口用途时沿用该入口“锚点不可用”的状态码与 `reason`
+  （较早错误优先，失败不写入、不消费、不记审计）。
 - `GET /v1/trust/anchors/{did}` 返回该 DID 的**全部锚点版本数组**
   （按 `key_version` 升序，元素字段同注册响应）；DID 未知（含他租户）404。
 - `PUT /v1/trust/anchors/{did}/{key_version}/status` 请求体必须恰为

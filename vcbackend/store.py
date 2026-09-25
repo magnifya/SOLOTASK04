@@ -119,6 +119,24 @@ DEACTIVATION_ANCHOR_UNAVAILABLE_REASON = IMPORTED_ANCHOR_UNAVAILABLE_REASON
 DEACTIVATION_SIGNATURE_MALFORMED_REASON = IMPORTED_SIGNATURE_MALFORMED_REASON
 DEACTIVATION_SIGNATURE_INVALID_REASON = IMPORTED_SIGNATURE_INVALID_REASON
 
+# active 锚点缺少入口所需用途时的统一中文原因（与“锚点不可用”一致）
+ANCHOR_USE_UNAVAILABLE_REASON = IMPORTED_ANCHOR_UNAVAILABLE_REASON
+
+# 信任锚点用途白名单：值域与规范序（存储、响应与比较均按此序）。
+# 省略注册或旧记录（无 uses 键）等效于全用途。
+TRUST_ANCHOR_USES_CANONICAL: Tuple[str, ...] = (
+    "generic",
+    "vc",
+    "vp",
+    "proof",
+    "did",
+    "status",
+    "deactivation",
+)
+
+# 哨兵：注册锚点时未提供 uses 字段（区别于显式传 null 等非法值）
+USES_UNSET = object()
+
 # DID 文档验真命中外部 DID 停用通告时的统一中文原因前缀
 EXTERNAL_DID_DEACTIVATED_REASON_PREFIX = "外部DID已停用："
 
@@ -3415,6 +3433,47 @@ class VCStore:
         )
 
     @staticmethod
+    def _anchor_effective_uses(row: Dict[str, Any]) -> Tuple[str, ...]:
+        """锚点版本的有效用途（规范序）。
+
+        无 uses 键的记录（省略注册或旧状态文件）等效于全用途；存储的
+        uses 在写入前已按规范序规范化。
+        """
+        uses = row.get("uses")
+        if uses is None:
+            return TRUST_ANCHOR_USES_CANONICAL
+        return tuple(uses)
+
+    @classmethod
+    def _anchor_use_allowed(cls, row: Dict[str, Any], use: str) -> bool:
+        """active 锚点是否允许指定用途（省略/旧记录为全用途）。"""
+        return use in cls._anchor_effective_uses(row)
+
+    @staticmethod
+    def _validate_anchor_uses(uses: Any) -> Optional[List[str]]:
+        """校验注册请求的 uses 字段，返回规范序列表；省略时返回 None。
+
+        提供时须为非空、无重复的非空字符串数组，且值限
+        TRUST_ANCHOR_USES_CANONICAL 白名单；非法抛 ValidationError(400)。
+        返回列表按白名单规范序排列（输入顺序不影响存储与比较）。
+        """
+        if uses is USES_UNSET:
+            return None
+        if not isinstance(uses, list) or not uses:
+            raise ValidationError("字段 uses 必须为非空字符串数组")
+        for item in uses:
+            if not isinstance(item, str) or not item:
+                raise ValidationError("字段 uses 必须为非空字符串数组")
+        if len(set(uses)) != len(uses):
+            raise ValidationError("字段 uses 不得含重复用途")
+        unknown = sorted(set(uses) - set(TRUST_ANCHOR_USES_CANONICAL))
+        if unknown:
+            raise ValidationError(
+                f"字段 uses 含不支持的用途: {', '.join(unknown)}"
+            )
+        return [use for use in TRUST_ANCHOR_USES_CANONICAL if use in uses]
+
+    @staticmethod
     def _validate_trust_fields(
         did: Any, public_key: Any, key_version: Any
     ) -> Tuple[str, str, int]:
@@ -3439,18 +3498,29 @@ class VCStore:
         did: Any,
         public_key: Any,
         key_version: Any,
+        uses: Any = USES_UNSET,
     ) -> Tuple[TrustAnchorRecord, bool]:
         """注册（或幂等重试）信任锚点，返回 (记录, 是否新建)。
 
         - did 须为非空字符串，public_key 须为可解析的 P-256 PEM，
           key_version 须为非布尔正整数，否则 ValidationError(400)；
-        - 同 (did, key_version) 且 PEM 相同：幂等返回既有记录（200），
-          每次重试均记 trust.anchor.registered；
-        - 同 (did, key_version) 但 PEM 不同：ConflictError(409)，不记审计；
+        - uses 可省略（等效全用途）；提供时须为非空无重复的非空字符串
+          数组，值限 TRUST_ANCHOR_USES_CANONICAL 白名单，否则
+          ValidationError(400)；存储按白名单规范序；
+        - 同 (did, key_version) 且 PEM 相同、有效用途相同：幂等返回
+          既有记录（200），每次重试均记 trust.anchor.registered；
+        - 同 (did, key_version) 但 PEM 不同或有效用途不同：
+          ConflictError(409)，不记审计；
         - 新锚点状态为 active、updated_at 为 None（201）。
         """
         did, public_key, key_version = self._validate_trust_fields(
             did, public_key, key_version
+        )
+        canonical_uses = self._validate_anchor_uses(uses)
+        effective_uses = (
+            tuple(canonical_uses)
+            if canonical_uses is not None
+            else TRUST_ANCHOR_USES_CANONICAL
         )
         with self._lock:
             bucket = self._ensure_bucket_locked(tenant_id)
@@ -3460,6 +3530,10 @@ class VCStore:
                 if existing.get("public_key") != public_key:
                     raise ConflictError(
                         f"信任锚点已存在且公钥不同: {did}#{key_version}"
+                    )
+                if self._anchor_effective_uses(existing) != effective_uses:
+                    raise ConflictError(
+                        f"信任锚点已存在且用途不同: {did}#{key_version}"
                     )
                 snapshot = self._snapshot_locked()
                 try:
@@ -3484,6 +3558,10 @@ class VCStore:
                     "status": "active",
                     "updated_at": None,
                 }
+                if canonical_uses is not None:
+                    # 显式用途白名单按规范序持久化；省略则不写 uses 键
+                    # （与旧记录一致，等效全用途）。
+                    row["uses"] = canonical_uses
                 anchors[str(key_version)] = row
                 self._append_audit_locked(
                     tenant_id,
@@ -3534,6 +3612,27 @@ class VCStore:
                 anchors.values(), key=lambda row: int(row["key_version"])
             )
             return [self._trust_anchor_record(did, row) for row in rows]
+
+    def get_trust_anchor_uses(
+        self, tenant_id: str, did: str, key_version: int
+    ) -> List[str]:
+        """只读返回本租户 (did, key_version) 锚点版本的有效用途（规范序）。
+
+        省略注册或旧记录等效全用途；锚点未知（含他租户资源）抛
+        NotFoundError。纯只读：不写状态、不记审计。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            anchors = (
+                bucket["trust_anchors"].get(did)
+                if bucket is not None else None
+            )
+            row = anchors.get(str(key_version)) if anchors is not None else None
+            if row is None:
+                raise NotFoundError(
+                    f"信任锚点不存在: {did}#{key_version}"
+                )
+            return list(self._anchor_effective_uses(row))
 
     def revoke_trust_anchor(
         self, tenant_id: str, did: str, key_version: int
@@ -3646,6 +3745,9 @@ class VCStore:
 
         if status == "revoked":
             return False, f"信任锚点已吊销: {issuer_did}#{key_version}"
+        if not self._anchor_use_allowed(row, "generic"):
+            # active 锚点缺少本入口用途：按“锚点不可用”处理
+            return False, ANCHOR_USE_UNAVAILABLE_REASON
 
         message = {k: v for k, v in data.items() if k != "signature"}
         try:
@@ -3744,6 +3846,9 @@ class VCStore:
             )
         if status == "revoked":
             return False, f"锚点已吊销: {issuer_did}#{key_version}"
+        if not self._anchor_use_allowed(row, "vc"):
+            # active 锚点缺少本入口用途：按“锚点不可用”处理
+            return False, ANCHOR_USE_UNAVAILABLE_REASON
         try:
             crypto.validate_public_key_pem(public_pem)
         except (ValueError, TypeError):
@@ -4116,6 +4221,9 @@ class VCStore:
             return False, f"锚点不存在: {issuer_did}#{key_version}"
         if status == "revoked":
             return False, f"锚点已吊销: {issuer_did}#{key_version}"
+        if not self._anchor_use_allowed(row, "vp"):
+            # active 锚点缺少本入口用途：按“锚点不可用”处理
+            return False, ANCHOR_USE_UNAVAILABLE_REASON
         try:
             crypto.validate_public_key_pem(public_pem)
         except (ValueError, TypeError):
@@ -4170,6 +4278,9 @@ class VCStore:
                 return False, f"持有者锚点不存在: {holder_ref}"
             if holder_status == "revoked":
                 return False, f"持有者锚点已吊销: {holder_ref}"
+            if not self._anchor_use_allowed(holder_row, "vp"):
+                # active 持有者锚点缺少本入口用途：按“锚点不可用”处理
+                return False, ANCHOR_USE_UNAVAILABLE_REASON
             try:
                 crypto.validate_public_key_pem(holder_public_pem)
             except (ValueError, TypeError):
@@ -4571,6 +4682,9 @@ class VCStore:
             return False, f"锚点不存在: {issuer_did}#{key_version}"
         if status == "revoked":
             return False, f"锚点已吊销: {issuer_did}#{key_version}"
+        if not self._anchor_use_allowed(row, "proof"):
+            # active 锚点缺少本入口用途：按“锚点不可用”处理
+            return False, ANCHOR_USE_UNAVAILABLE_REASON
         try:
             crypto.validate_public_key_pem(public_pem)
         except (ValueError, TypeError):
@@ -4796,6 +4910,7 @@ class VCStore:
           前置不存在 NotFoundError(404)；前置已吊销或非最高版本
           ValidationError(400)，不改动任何版本、不记审计；
         - 新版本为 active、updated_at 为 None，旧版本状态原样保留；
+          新版本继承前置版本的用途白名单（前置省略则同为全用途）；
           轮换与审计在同一把锁内经同一次原子写落盘，失败回滚。
         """
         if not isinstance(did, str) or not did:
@@ -4880,6 +4995,10 @@ class VCStore:
                     "updated_at": None,
                     "from_key_version": from_key_version,
                 }
+                if "uses" in from_row:
+                    # 轮换版本继承前置版本的用途白名单（前置无 uses 键
+                    # 时同为省略，等效全用途）。
+                    row["uses"] = list(from_row["uses"])
                 anchors[str(target_version)] = row
                 self._append_audit_locked(
                     tenant_id,
@@ -5547,6 +5666,9 @@ class VCStore:
                 "valid": False,
                 "reason": f"锚点已吊销: {issuer_did}#{key_version}",
             }
+        if not self._anchor_use_allowed(anchor_row, "vc"):
+            # active 锚点缺少本入口用途：按“锚点不可用”处理
+            return {"valid": False, "reason": ANCHOR_USE_UNAVAILABLE_REASON}
         try:
             crypto.validate_public_key_pem(public_pem)
         except (ValueError, TypeError):
@@ -5819,6 +5941,9 @@ class VCStore:
 
         # 锚点：缺失或 revoked（含公钥不可用）统一为“锚点不可用”
         if anchor_row is None or anchor_status == "revoked":
+            return False, IMPORTED_ANCHOR_UNAVAILABLE_REASON
+        if not self._anchor_use_allowed(anchor_row, "vc"):
+            # active 锚点缺少本入口用途：同按“锚点不可用”处理
             return False, IMPORTED_ANCHOR_UNAVAILABLE_REASON
         try:
             crypto.validate_public_key_pem(public_pem)
@@ -6188,6 +6313,9 @@ class VCStore:
                 "valid": False,
                 "reason": f"锚点已吊销: {issuer_did}#{key_version}",
             }
+        if not self._anchor_use_allowed(anchor_row, "status"):
+            # active 锚点缺少本入口用途：按“锚点不可用”处理
+            return {"valid": False, "reason": ANCHOR_USE_UNAVAILABLE_REASON}
         try:
             crypto.validate_public_key_pem(public_pem)
         except (ValueError, TypeError):
@@ -6608,6 +6736,12 @@ class VCStore:
                 "valid": False,
                 "reason": DEACTIVATION_ANCHOR_UNAVAILABLE_REASON,
             }
+        if not self._anchor_use_allowed(anchor_row, "deactivation"):
+            # active 锚点缺少本入口用途：同按“锚点不可用”处理
+            return {
+                "valid": False,
+                "reason": DEACTIVATION_ANCHOR_UNAVAILABLE_REASON,
+            }
         try:
             crypto.validate_public_key_pem(public_pem)
         except (ValueError, TypeError):
@@ -7020,11 +7154,14 @@ class VCStore:
         tenant_id: str,
         did: str,
         key_version: int,
+        use: Optional[str] = None,
     ) -> Optional[str]:
         """只读返回本租户 (did, key_version) active 信任锚点的公钥 PEM。
 
         锚点不存在（含他租户）或已吊销返回 None；不校验 PEM 可解析性
         （由调用方经 crypto.validate_public_key_pem 判定为不可用）。
+        use 提供时，active 锚点的有效用途不含该用途同样返回 None
+        （调用方按“锚点不可用”处理）。
         """
         with self._lock:
             bucket = self._bucket_locked(tenant_id)
@@ -7035,6 +7172,8 @@ class VCStore:
             )
             row = anchors.get(str(key_version)) if anchors is not None else None
             if row is None or row.get("status") == "revoked":
+                return None
+            if use is not None and not self._anchor_use_allowed(row, use):
                 return None
             return row.get("public_key", "")
 
@@ -7205,6 +7344,9 @@ class VCStore:
             return False, f"锚点不存在: {did}#{current_version}"
         if anchor_status == "revoked":
             return False, f"锚点已吊销: {did}#{current_version}"
+        if not self._anchor_use_allowed(row, "did"):
+            # active 锚点缺少本入口用途：按“锚点不可用”处理
+            return False, ANCHOR_USE_UNAVAILABLE_REASON
         if anchor_public_pem != highest_public_pem:
             return False, (
                 f"锚点公钥与文档当前版本公钥不匹配: {did}#{current_version}"
