@@ -7755,6 +7755,64 @@ class VCStore:
                 raise StorageError("存储失败") from exc
             return True, consumed_at
 
+    def consume_credential_receipts_batch(
+        self,
+        tenant_id: str,
+        keys: List[Tuple[str, str, str]],
+    ) -> List[Tuple[bool, Optional[str]]]:
+        """批量消费跨系统凭证验真签名回执（防重放），与输入等长同序。
+
+        调用方须先对每项完成回执验真（七阶段全部通过）。keys 每项为
+        (verifier_did, nonce, receipt_id)。本方法在锁内按输入顺序原子
+        判定并标记：
+        - 同键（含历史记录与批内前项）已消费：该项返回 (False, None)，
+          不写状态、不记审计；
+        - 首次消费：记录 consumed_at（UTC 秒精度 Z）并追加一条
+          trust.credential.receipt.consumed 审计（resource_type 为
+          credential_receipt、resource_id 为 receipt_id），该项返回
+          (True, consumed_at)；
+        - 本批全部新消费与审计在同一次原子写落盘；落盘失败回滚内存中
+          的全部消费标记与审计事件，抛 StorageError（可重试）；
+        - 与单条 consume 并发时每键仅一次成功，跨重启保留。
+        """
+        with self._lock:
+            snapshot = self._snapshot_locked()
+            outcomes: List[Tuple[bool, Optional[str]]] = []
+            dirty = False
+            try:
+                for verifier_did, nonce, receipt_id in keys:
+                    bucket = self._bucket_locked(tenant_id)
+                    by_verifier = (
+                        bucket["consumed_receipts"].get(verifier_did)
+                        if bucket is not None
+                        else None
+                    )
+                    if by_verifier is not None and nonce in by_verifier:
+                        outcomes.append((False, None))
+                        continue
+                    bucket = self._ensure_bucket_locked(tenant_id)
+                    consumed_at = _utc_now()
+                    bucket["consumed_receipts"].setdefault(
+                        verifier_did, {}
+                    )[nonce] = {
+                        "receipt_id": receipt_id,
+                        "consumed_at": consumed_at,
+                    }
+                    self._append_audit_locked(
+                        tenant_id,
+                        AUDIT_TRUST_CREDENTIAL_RECEIPT_CONSUMED,
+                        "credential_receipt",
+                        receipt_id,
+                    )
+                    outcomes.append((True, consumed_at))
+                    dirty = True
+                if dirty:
+                    self._save_locked()
+            except Exception as exc:
+                self._restore_locked(snapshot)
+                raise StorageError("存储失败") from exc
+            return outcomes
+
     def get_trust_anchor_snapshot_signer(
         self,
         tenant_id: str,
