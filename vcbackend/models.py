@@ -253,6 +253,28 @@ class TrustAnchorUsesHistoryEvent:
 
 
 @dataclass
+class TrustAnchorChangeEvent:
+    """可签名信任锚点变更流中的一条事件（只读变更流查询用）。
+
+    按租户归属、跨 DID 共享游标：锚点新版本注册、轮换、首次吊销与实际
+    用途收紧分别追加 registered/rotated/revoked/uses.updated；幂等重试、
+    冲突与失败路径不追加。事件各字段值均为变更后状态：did/key_version/
+    public_key 标识锚点版本，status 为 active/revoked，uses 为变更后
+    生效用途（按规范序）。cursor 为租户内跨 DID 持久递增正整数，独立于
+    其他历史游标空间。旧状态文件中已有锚点版本但无变更事件的，加载时按
+    （租户、did、key_version）稳定补一条 snapshot 事件（取当前状态）。
+    """
+
+    cursor: int
+    action: str
+    did: str
+    key_version: int
+    public_key: str
+    status: str
+    uses: List[str]
+
+
+@dataclass
 class TrustAnchorDiscoveryRecord:
     """跨 DID 发现接口中的一条锚点版本（只读发现查询用）。
 
