@@ -30,6 +30,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   GET  /v1/trust/anchors/{did}            查询 DID 的全部锚点版本
   GET  /v1/trust/anchors/{did}/history    查询信任锚点生命周期历史（只读）
   GET  /v1/trust/anchors/{did}/{key_version}/uses  查询锚点版本用途白名单（只读）
+  PUT  /v1/trust/anchors/{did}/{key_version}/uses  收紧锚点版本用途白名单（真子集，幂等）
   PUT  /v1/trust/anchors/{did}/{key_version}/status  吊销锚点版本
   POST /v1/trust/verify                   用 active 锚点公钥验签
   POST /v1/trust/credentials/verify       跨系统凭证验真（无需登记 DID/凭证）
@@ -470,6 +471,17 @@ def build_handler(store: VCStore) -> type:
                         self._send_error(404, f"无此路径: {path}")
                     else:
                         self._put_trust_anchor_status(
+                            tenant, unquote(did), unquote(version_raw)
+                        )
+                elif path.startswith("/v1/trust/anchors/") and path.endswith(
+                    "/uses"
+                ):
+                    rest = path[len("/v1/trust/anchors/") : -len("/uses")]
+                    did, sep, version_raw = rest.rpartition("/")
+                    if not sep or not did:
+                        self._send_error(404, f"无此路径: {path}")
+                    else:
+                        self._put_trust_anchor_uses(
                             tenant, unquote(did), unquote(version_raw)
                         )
                 else:
@@ -2529,6 +2541,47 @@ def build_handler(store: VCStore) -> type:
             record = store.revoke_trust_anchor(tenant, did, int(key_version))
             # 首次吊销与幂等重试均 200，updated_at 保持首次值
             self._send_json(200, self._trust_anchor_payload(record))
+
+        def _put_trust_anchor_uses(
+            self, tenant: str, did: str, key_version: str
+        ) -> None:
+            # PUT /v1/trust/anchors/{did}/{key_version}/uses：收紧锚点
+            # 版本的用途白名单（无需轮换即可撤销用途）。请求体必须恰含
+            # from_uses、uses，两者均须为非空无重复字符串数组、取值限
+            # 且按规范序；路径 key_version 须为 ASCII 十进制正整数。
+            # 未知或跨租户锚点 404，已吊销 409；目标等于当前值幂等
+            # 200 且无副作用，否则 from_uses 须等于当前值且目标为其
+            # 真子集，前置不匹配或扩权均 409。200 按键序恰返 did、
+            # key_version、uses；实际变更仅记一次
+            # trust.anchor.uses.updated 审计。
+            data = self._read_json()
+            for field in ("from_uses", "uses"):
+                if field not in data:
+                    raise ValidationError(f"缺少字段: {field}")
+            extra = sorted(set(data) - {"from_uses", "uses"})
+            if extra:
+                raise ValidationError(f"多余字段: {', '.join(extra)}")
+            if (
+                not key_version
+                or any(ch < "0" or ch > "9" for ch in key_version)
+                or int(key_version) < 1
+            ):
+                raise ValidationError("路径参数 key_version 必须为正整数")
+            uses = store.update_trust_anchor_uses(
+                tenant,
+                did,
+                int(key_version),
+                data["from_uses"],
+                data["uses"],
+            )
+            self._send_json(
+                200,
+                {
+                    "did": did,
+                    "key_version": int(key_version),
+                    "uses": uses,
+                },
+            )
 
         def _post_trust_anchor_rotate(
             self, tenant: str, did: str
