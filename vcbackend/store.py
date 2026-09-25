@@ -3603,10 +3603,15 @@ class VCStore:
             uses_list: Optional[List[str]] = None
         else:
             uses_list = _validate_trust_anchor_uses(uses)
+        # 先用只读方式解析既有版本（不建桶、不建 DID 映射），与轮换/
+        # 吊销/用途更新保持一致：冲突等只读判定不付出快照拷贝代价。
         with self._lock:
-            bucket = self._ensure_bucket_locked(tenant_id)
-            anchors = bucket["trust_anchors"].setdefault(did, {})
-            existing = anchors.get(str(key_version))
+            pre_bucket = self._bucket_locked(tenant_id)
+            existing = (
+                pre_bucket["trust_anchors"].get(did, {}).get(str(key_version))
+                if pre_bucket is not None
+                else None
+            )
             if existing is not None:
                 if existing.get("public_key") != public_key:
                     raise ConflictError(
@@ -3635,8 +3640,13 @@ class VCStore:
                     raise
                 return self._trust_anchor_record(did, existing), False
 
+            # 新版本：快照须在任何状态变更（含为新租户建桶、为新 DID
+            # 建映射）之前取得，落盘失败回滚可彻底移除新租户空桶与新
+            # DID 空映射，不残留半写结构。
             snapshot = self._snapshot_locked()
             try:
+                bucket = self._ensure_bucket_locked(tenant_id)
+                anchors = bucket["trust_anchors"].setdefault(did, {})
                 row = {
                     "key_version": key_version,
                     "public_key": public_key,
