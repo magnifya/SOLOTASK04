@@ -38,6 +38,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/credentials/imported/{credential_id}/verify  重启后重新验证已落盘凭证（?issuer_did=，只读）
   POST /v1/trust/credentials/imported/{credential_id}/verify-with-status  重验已导入凭证并合并同步状态（?issuer_did=，只读）
   POST /v1/trust/credentials/imported/verify-batch-with-status 批量重验已导入凭证并合并同步状态（只读）
+  POST /v1/trust/dids/deactivate-sync   同步外部 DID 停用通告（active 锚点验签）
   POST /v1/trust/dids/verify-document     跨系统 DID 文档验真（仅凭提交文档，只读）
   POST /v1/trust/dids/verify-document-batch 批量跨系统 DID 文档验真（不短路，只读）
   POST /v1/trust/presentations/verify     跨系统演示验真（无需登记 DID/凭证/演示）
@@ -76,6 +77,7 @@ from .store import (
     ConflictError,
     DEFAULT_TENANT,
     EXPIRES_AT_UNSET,
+    EXTERNAL_DID_DEACTIVATED_REASON_PREFIX,
     NotFoundError,
     PresentationRecord,
     REASON_UNSET,
@@ -278,6 +280,8 @@ def build_handler(store: VCStore) -> type:
                         path[len("/v1/trust/anchors/") : -len("/rotate")]
                     )
                     self._post_trust_anchor_rotate(tenant, did)
+                elif path == "/v1/trust/dids/deactivate-sync":
+                    self._post_trust_dids_deactivate_sync(tenant)
                 elif path == "/v1/trust/dids/verify-document":
                     self._post_trust_dids_verify_document(tenant)
                 elif path == "/v1/trust/dids/verify-document-batch":
@@ -1721,6 +1725,31 @@ def build_handler(store: VCStore) -> type:
                 self._trust_anchor_payload(record),
             )
 
+        def _post_trust_dids_deactivate_sync(self, tenant: str) -> None:
+            # 外部 DID 停用通告同步。请求/字段非法由 _read_json 与 store
+            # 抛 ValidationError -> 400（响应仅含非空中文 error）；同 did
+            # 已有不同通告由 store 抛 ConflictError -> 409（仅含 error）。
+            # 锚点不可用、签名格式错误、验签失败均按公开错误协议返回
+            # 200 + {"valid": false, "reason": ...} 且不写入。首次接受
+            # 201，完全重放 200；成功响应键序 valid、did、key_version、
+            # reason、deactivated_at。
+            data = self._read_json()
+            result = store.sync_did_deactivation(tenant, data)
+            if not result.get("valid"):
+                self._send_invalid(result.get("reason") or "验签失败")
+                return
+            record = result["record"]
+            self._send_json(
+                result["status_code"],
+                {
+                    "valid": True,
+                    "did": record.did,
+                    "key_version": record.key_version,
+                    "reason": record.reason,
+                    "deactivated_at": record.deactivated_at,
+                },
+            )
+
         def _post_trust_dids_verify_document(self, tenant: str) -> None:
             # 跨系统 DID 文档验真：公开错误协议，任何失败都返回
             # 200 + {"valid": false, "reason": "<非空中文原因>"}，成功仅
@@ -1750,6 +1779,18 @@ def build_handler(store: VCStore) -> type:
 
             try:
                 valid, reason = store.verify_trust_did_document(tenant, data)
+                if valid:
+                    # 原验真成功后查本租户外部 DID 停用通告：命中同 did
+                    # 则改判 valid:false，原因为“外部DID已停用：<reason>”。
+                    record = store.get_did_deactivation(
+                        tenant, data["document"]["did"]
+                    )
+                    if record is not None:
+                        valid = False
+                        reason = (
+                            EXTERNAL_DID_DEACTIVATED_REASON_PREFIX
+                            + record.reason
+                        )
             except Exception:  # noqa: BLE001 验真失败绝不暴露内部细节
                 self._send_invalid("验真过程发生内部错误")
                 return

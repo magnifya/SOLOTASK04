@@ -267,6 +267,23 @@ class CredentialStatusSyncRecord:
 
 
 @dataclass
+class ExternalDIDDeactivationRecord:
+    """一条外部 DID 停用通告（按租户与 did 隔离）。
+
+    仅在通过本租户同 did/版本 active 信任锚点验签后写入；key_version
+    为通告签名所用的锚点版本；reason 为 1-256 码点、首尾无空白的停用
+    原因；deactivated_at 为签发方声明的停用时间（UTC ISO8601 秒精度
+    Z 结尾）。首次接受后内容不可变：完全重放幂等返回，同 did 不同
+    通告一律冲突拒绝。
+    """
+
+    did: str
+    key_version: int
+    reason: str
+    deactivated_at: str
+
+
+@dataclass
 class ImportedCredentialRecord:
     """一条已导入的外部凭证（按租户与 issuer_did#credential_id 双键隔离）。
 
