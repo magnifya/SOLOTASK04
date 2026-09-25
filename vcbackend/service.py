@@ -41,6 +41,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/dids/verify-document     跨系统 DID 文档验真（仅凭提交文档，只读）
   POST /v1/trust/dids/verify-document-batch 批量跨系统 DID 文档验真（不短路，只读）
   POST /v1/trust/dids/deactivate-sync     登记外部 DID 停用通告（active 锚点验签）
+  POST /v1/trust/dids/deactivate-sync-batch 批量登记外部 DID 停用通告（逐项不短路）
   POST /v1/trust/presentations/verify     跨系统演示验真（无需登记 DID/凭证/演示）
   POST /v1/trust/presentations/verify-batch 批量跨系统演示验真（仅未绑定形态，不消费）
   POST /v1/trust/presentations/verify-with-status 外部演示验真并合并同步状态（只读）
@@ -285,6 +286,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_dids_verify_document_batch(tenant)
                 elif path == "/v1/trust/dids/deactivate-sync":
                     self._post_trust_dids_deactivate_sync(tenant)
+                elif path == "/v1/trust/dids/deactivate-sync-batch":
+                    self._post_trust_dids_deactivate_sync_batch(tenant)
                 elif path == "/v1/trust/verify":
                     self._post_trust_verify(tenant)
                 elif path == "/v1/trust/credentials/verify":
@@ -1845,6 +1848,68 @@ def build_handler(store: VCStore) -> type:
                     "deactivated_at": record.deactivated_at,
                 },
             )
+
+        def _post_trust_dids_deactivate_sync_batch(self, tenant: str) -> None:
+            # 批量外部 DID 停用通告登记：任何失败都返回 HTTP 200。请求体须
+            # 恰为 {"items": [项...]}，数组非空且不超过 100 项；请求体非法
+            # （外层缺失、非法 JSON、非对象、字段缺失或多余、items 非数组、
+            # 空数组或超过上限）时返回 {"results": [], "reason": "请求..."}。
+            # 请求级合法时返回 {"results": [...]}，长度与顺序与输入一致，
+            # 逐项复用单项登记规则，失败不短路：项结构/字段错误 400、同 did
+            # 异通告 409、锚点/签名失败 200、落盘失败 500 均收敛为单项结果
+            # （含 http_status 与非空中文 reason），不影响其余项；成功项
+            # 首次 201、完全重放 200。显式空 X-Tenant-ID 在此之前由路由
+            # 统一判 400。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                self._send_json(
+                    200,
+                    {"results": [],
+                     "reason": "请求不合法: 请求体缺失或长度声明非法"},
+                )
+                return
+            except Exception:  # noqa: BLE001
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 请求体读取失败"}
+                )
+                return
+            if not raw:
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 请求体缺失"}
+                )
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                self._send_json(
+                    200,
+                    {"results": [],
+                     "reason": "请求不合法: 请求体不是合法 UTF-8 文本"},
+                )
+                return
+            except json.JSONDecodeError:
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 请求体不是合法 JSON"}
+                )
+                return
+
+            try:
+                ok, reason, results = (
+                    store.sync_did_deactivation_notice_batch(tenant, data)
+                )
+            except Exception:  # noqa: BLE001 批量登记失败绝不暴露内部细节
+                self._send_json(
+                    200, {"results": [], "reason": "请求不合法: 登记过程发生内部错误"}
+                )
+                return
+            if not ok:
+                self._send_json(
+                    200, {"results": [], "reason": reason or "请求不合法"}
+                )
+                return
+            self._send_json(200, {"results": results})
 
         def _post_trust_verify(self, tenant: str) -> None:
             # 与凭证/演示 verify 相同的公开错误协议：任何失败都返回
