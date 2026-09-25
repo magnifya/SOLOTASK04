@@ -40,6 +40,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/credentials/verify       跨系统凭证验真（无需登记 DID/凭证）
   POST /v1/trust/credentials/verify-receipt  跨系统凭证验真签名回执（只读）
   POST /v1/trust/credentials/receipt/verify  校验验真签名回执（只读）
+  POST /v1/trust/credentials/receipt/consume  消费验真签名回执（防重放，首次落盘并审计）
   POST /v1/trust/credentials/import       导入外部凭证（active 锚点验签后持久化）
   POST /v1/trust/credentials/import-batch 批量导入外部凭证（逐项不短路）
   GET  /v1/trust/credentials/imported/{credential_id}  读取已导入的外部凭证（?issuer_did=）
@@ -98,6 +99,7 @@ from .store import (
     NotFoundError,
     PresentationRecord,
     REASON_UNSET,
+    StorageError,
     TRUST_ANCHOR_USES,
     USES_UNSET,
     ValidationError,
@@ -388,6 +390,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_credentials_verify_receipt(tenant)
                 elif path == "/v1/trust/credentials/receipt/verify":
                     self._post_trust_credentials_receipt_verify(tenant)
+                elif path == "/v1/trust/credentials/receipt/consume":
+                    self._post_trust_credentials_receipt_consume(tenant)
                 elif path == "/v1/trust/credentials/import":
                     self._post_trust_credentials_import(tenant)
                 elif path == "/v1/trust/credentials/import-batch":
@@ -3346,25 +3350,15 @@ def build_handler(store: VCStore) -> type:
                 },
             )
 
-        def _post_trust_credentials_receipt_verify(self, tenant: str) -> None:
-            # POST /v1/trust/credentials/receipt/verify：只读校验跨系统
-            # 凭证验真签名回执。
-            # 1) 请求体须恰含 receipt、receipt_signature、body、
-            #    signature、nonce：receipt、body 为 JSON 对象，
-            #    receipt_signature、signature、nonce 为非空字符串且
-            #    nonce 为 1..256 码点；非法 JSON/非对象、键集或类型
-            #    不符一律 400 且仅 {error}；
-            # 2) 外层合法后任何失败均 HTTP 200，按键序恰返
-            #    {valid:false, reason}，按序检查：回执非法（恰为
-            #    verify-receipt 七字段且类型沿用公开协议）-> nonce错误
-            #    （两处 nonce 相等）-> 绑定错误（receipt 的
-            #    credential_id/issuer_did/issuer_key_version 与 body
-            #    相等，缺版本按 1）-> 摘要错误（按原规则用
-            #    {body,signature} 复算 credential_digest）-> 锚点不可用
-            #    （本租户 verifier_did/版本 active 且含 vc 用途锚点）
-            #    -> 签名格式错误 -> 签名校验失败（receipt_signature
-            #    覆盖完整 receipt，ES256 裸 R||S 无填充 base64url）；
-            # 3) 成功仅 {"valid":true}。不重验凭证签名、不审计；纯只读。
+        def _read_receipt_verify_request(self) -> Dict[str, Any]:
+            """receipt/verify 与 receipt/consume 共用的外层请求校验。
+
+            请求体须恰含 receipt、receipt_signature、body、signature、
+            nonce：receipt、body 为 JSON 对象，receipt_signature、
+            signature、nonce 为非空字符串且 nonce 为 1..256 码点；
+            非法 JSON/非对象、键集或类型不符一律抛 ValidationError
+            （400 且仅 {error}）。
+            """
             data = self._read_json()
             expected_fields = (
                 "receipt",
@@ -3399,12 +3393,85 @@ def build_handler(store: VCStore) -> type:
                 raise ValidationError(
                     "字段 nonce 长度须为 1 到 256 个 Unicode 码点"
                 )
+            return data
 
+        def _post_trust_credentials_receipt_verify(self, tenant: str) -> None:
+            # POST /v1/trust/credentials/receipt/verify：只读校验跨系统
+            # 凭证验真签名回执。
+            # 1) 请求体须恰含 receipt、receipt_signature、body、
+            #    signature、nonce：receipt、body 为 JSON 对象，
+            #    receipt_signature、signature、nonce 为非空字符串且
+            #    nonce 为 1..256 码点；非法 JSON/非对象、键集或类型
+            #    不符一律 400 且仅 {error}；
+            # 2) 外层合法后任何失败均 HTTP 200，按键序恰返
+            #    {valid:false, reason}，按序检查：回执非法（恰为
+            #    verify-receipt 七字段且类型沿用公开协议）-> nonce错误
+            #    （两处 nonce 相等）-> 绑定错误（receipt 的
+            #    credential_id/issuer_did/issuer_key_version 与 body
+            #    相等，缺版本按 1）-> 摘要错误（按原规则用
+            #    {body,signature} 复算 credential_digest）-> 锚点不可用
+            #    （本租户 verifier_did/版本 active 且含 vc 用途锚点）
+            #    -> 签名格式错误 -> 签名校验失败（receipt_signature
+            #    覆盖完整 receipt，ES256 裸 R||S 无填充 base64url）；
+            # 3) 成功仅 {"valid":true}。不重验凭证签名、不审计；纯只读。
+            data = self._read_receipt_verify_request()
             reason = self._verify_credential_receipt_item(tenant, data)
             if reason is not None:
                 self._send_json(200, {"valid": False, "reason": reason})
                 return
             self._send_json(200, {"valid": True})
+
+        def _post_trust_credentials_receipt_consume(self, tenant: str) -> None:
+            # POST /v1/trust/credentials/receipt/consume：验真并消费
+            # 跨系统凭证验真签名回执（防重放）。
+            # 1) 请求与字段约束同 receipt/verify：恰含 receipt、
+            #    receipt_signature、body、signature、nonce；外层非法
+            #    一律 400 且仅 {error}；
+            # 2) 外层合法后先按七阶段顺序验真，失败沿用原 HTTP 200、
+            #    固定 reason 及优先级，不写状态、不记审计；
+            # 3) 验真成功后按租户以 (verifier_did, nonce) 为唯一键
+            #    消费：首次 200 按序恰返 valid、receipt_id、
+            #    consumed_at（valid:true，receipt_id 为 receipt 规范
+            #    化 JSON 字节的 SHA-256 小写 64 位 hex，consumed_at
+            #    为 UTC 秒精度 Z）；同键重放（receipt 可不同）200
+            #    恰返 {"valid":false,"reason":"回执已消费"}；并发
+            #    仅一次成功；
+            # 4) 首次消费与审计（trust.credential.receipt.consumed /
+            #    credential_receipt / receipt_id）同一次原子落盘；
+            #    重放与验真失败不记；落盘失败回滚二者，500 仅返
+            #    {"error":"存储失败"}，可重试；重启仍判重。
+            data = self._read_receipt_verify_request()
+            reason = self._verify_credential_receipt_item(tenant, data)
+            if reason is not None:
+                self._send_json(200, {"valid": False, "reason": reason})
+                return
+            receipt = data["receipt"]
+            receipt_id = hashlib.sha256(
+                crypto.canonicalize(receipt)
+            ).hexdigest()
+            try:
+                consumed, consumed_at = store.consume_credential_receipt(
+                    tenant,
+                    receipt["verifier_did"],
+                    receipt["nonce"],
+                    receipt_id,
+                )
+            except StorageError:
+                self._send_error(500, "存储失败")
+                return
+            if not consumed:
+                self._send_json(
+                    200, {"valid": False, "reason": "回执已消费"}
+                )
+                return
+            self._send_json(
+                200,
+                {
+                    "valid": True,
+                    "receipt_id": receipt_id,
+                    "consumed_at": consumed_at,
+                },
+            )
 
         @staticmethod
         def _verify_credential_receipt_item(

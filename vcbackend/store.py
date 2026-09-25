@@ -90,6 +90,10 @@ class ConflictError(RuntimeError):
     """资源状态冲突（映射为 HTTP 409），如已吊销凭证再次登记 active。"""
 
 
+class StorageError(RuntimeError):
+    """落盘失败（内存变更已回滚，可重试；映射为 HTTP 500 仅 {error}）。"""
+
+
 # 吊销时未提供合法 reason 的默认原因
 DEFAULT_REVOKE_REASON = "持证人主动吊销"
 
@@ -181,6 +185,7 @@ AUDIT_KEY_REVOKED = "key.revoked"
 AUDIT_DID_DEACTIVATED = "did.deactivated"
 AUDIT_TRUST_CREDENTIAL_STATUS_SYNCED = "trust.credential.status.synced"
 AUDIT_TRUST_CREDENTIAL_IMPORTED = "trust.credential.imported"
+AUDIT_TRUST_CREDENTIAL_RECEIPT_CONSUMED = "trust.credential.receipt.consumed"
 
 # 信任锚点用途历史事件动作名（区别于审计动作名）：
 # 新版本注册/轮换分别追加 registered/rotated（from_uses 为 None），实际
@@ -626,6 +631,7 @@ class VCStore:
             bucket.setdefault("did_deactivation_notices", {})
             bucket.setdefault("did_deactivation_events", [])
             bucket.setdefault("trust_anchor_change_events", [])
+            bucket.setdefault("consumed_receipts", {})
             for rec in bucket["dids"].values():
                 _migrate_did_row(rec)
         # 外部凭证状态历史游标（租户内持久化正整数，按追加递增）。
@@ -929,6 +935,7 @@ class VCStore:
                 "did_deactivation_notices": {},
                 "did_deactivation_events": [],
                 "trust_anchor_change_events": [],
+                "consumed_receipts": {},
             }
             self._tenants[tenant_id] = bucket
         return bucket
@@ -7696,6 +7703,57 @@ class VCStore:
             return self._active_did_signer_locked(
                 self._bucket_locked(tenant_id), verifier_did
             )
+
+    def consume_credential_receipt(
+        self,
+        tenant_id: str,
+        verifier_did: str,
+        nonce: str,
+        receipt_id: str,
+    ) -> Tuple[bool, Optional[str]]:
+        """按 (verifier_did, nonce) 消费跨系统凭证验真签名回执（防重放）。
+
+        调用方须先完成回执验真（七阶段全部通过）。本方法在锁内原子
+        判定并标记：
+        - 同键已消费：返回 (False, None)，不写状态、不记审计；
+        - 首次消费：记录 consumed_at（UTC 秒精度 Z）并追加一条
+          trust.credential.receipt.consumed 审计（resource_type 为
+          credential_receipt、resource_id 为 receipt_id），二者同一
+          次原子写落盘，返回 (True, consumed_at)；并发仅一次成功，
+          跨重启保留；
+        - 落盘失败：回滚内存中的消费标记与审计事件，抛 StorageError
+          （可重试）。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            by_verifier = (
+                bucket["consumed_receipts"].get(verifier_did)
+                if bucket is not None
+                else None
+            )
+            if by_verifier is not None and nonce in by_verifier:
+                return False, None
+            bucket = self._ensure_bucket_locked(tenant_id)
+            snapshot = self._snapshot_locked()
+            try:
+                consumed_at = _utc_now()
+                bucket["consumed_receipts"].setdefault(
+                    verifier_did, {}
+                )[nonce] = {
+                    "receipt_id": receipt_id,
+                    "consumed_at": consumed_at,
+                }
+                self._append_audit_locked(
+                    tenant_id,
+                    AUDIT_TRUST_CREDENTIAL_RECEIPT_CONSUMED,
+                    "credential_receipt",
+                    receipt_id,
+                )
+                self._save_locked()
+            except Exception as exc:
+                self._restore_locked(snapshot)
+                raise StorageError("存储失败") from exc
+            return True, consumed_at
 
     def get_trust_anchor_snapshot_signer(
         self,
