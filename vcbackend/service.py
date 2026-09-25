@@ -38,6 +38,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/anchors/snapshot/verify  校验锚点快照签名（只读）
   POST /v1/trust/verify                   用 active 锚点公钥验签
   POST /v1/trust/credentials/verify       跨系统凭证验真（无需登记 DID/凭证）
+  POST /v1/trust/credentials/verify-receipt 跨系统凭证验真签名回执（只读）
   POST /v1/trust/credentials/import       导入外部凭证（active 锚点验签后持久化）
   POST /v1/trust/credentials/import-batch 批量导入外部凭证（逐项不短路）
   GET  /v1/trust/credentials/imported/{credential_id}  读取已导入的外部凭证（?issuer_did=）
@@ -382,6 +383,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_verify(tenant)
                 elif path == "/v1/trust/credentials/verify":
                     self._post_trust_credentials_verify(tenant)
+                elif path == "/v1/trust/credentials/verify-receipt":
+                    self._post_trust_credentials_verify_receipt(tenant)
                 elif path == "/v1/trust/credentials/import":
                     self._post_trust_credentials_import(tenant)
                 elif path == "/v1/trust/credentials/import-batch":
@@ -3241,6 +3244,147 @@ def build_handler(store: VCStore) -> type:
             if not valid:
                 payload["reason"] = reason or "验签失败"
             self._send_json(200, payload)
+
+        def _post_trust_credentials_verify_receipt(self, tenant: str) -> None:
+            # 跨系统凭证验真签名回执：
+            # - 请求体须恰含 body、signature、verifier_did、nonce 四键；
+            #   非法 JSON、非对象、键集不符、verifier_did 非非空字符串、
+            #   nonce 非 1–256 码点非空字符串一律 400 且仅 {error}。
+            # - 请求级合法后，body/signature 完全沿用既有外部凭证验真
+            #   规则（store.verify_trust_credential）；任一失败均先返回
+            #   200 恰为 {valid:false,reason}（沿用原原因），且不查询
+            #   验证者 DID。
+            # - 仅验真成功才查本租户验证者 DID：未知或跨租户 404、
+            #   停用 409，均仅 {error}。
+            # - 成功 200 键序恰为 valid、receipt、receipt_signature：
+            #   receipt 键序 credential_id、issuer_did、issuer_key_version、
+            #   credential_digest、verifier_did、verifier_key_version、nonce；
+            #   credential_digest 为 {body,signature} 递归键升序紧凑 UTF-8
+            #   JSON 的 SHA-256 小写 64 位 hex；receipt_signature 为验证者
+            #   当前私钥对 receipt 规范化 JSON 的 ES256 裸 R||S 无填充
+            #   base64url 签名。
+            # 纯只读：不落盘、不记审计。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                self._send_error(400, "请求体缺失或长度声明非法")
+                return
+            except Exception:  # noqa: BLE001
+                self._send_error(400, "请求体读取失败")
+                return
+            if not raw:
+                self._send_error(400, "请求体缺失")
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                self._send_error(400, "请求体不是合法 UTF-8 文本")
+                return
+            except json.JSONDecodeError:
+                self._send_error(400, "请求体不是合法 JSON")
+                return
+            if not isinstance(data, dict):
+                self._send_error(400, "请求体必须为 JSON 对象")
+                return
+            expected_keys = {
+                "body",
+                "signature",
+                "verifier_did",
+                "nonce",
+            }
+            if set(data) != expected_keys:
+                missing = [
+                    f for f in (
+                        "body",
+                        "signature",
+                        "verifier_did",
+                        "nonce",
+                    ) if f not in data
+                ]
+                if missing:
+                    self._send_error(
+                        400, f"请求缺少字段: {', '.join(missing)}"
+                    )
+                    return
+                extra = sorted(set(data) - expected_keys)
+                self._send_error(
+                    400, f"请求含多余字段: {', '.join(extra)}"
+                )
+                return
+            verifier_did = data["verifier_did"]
+            if not isinstance(verifier_did, str) or not verifier_did:
+                self._send_error(
+                    400, "字段 verifier_did 必须为非空字符串"
+                )
+                return
+            nonce = data["nonce"]
+            if (
+                not isinstance(nonce, str)
+                or not nonce
+                or not 1 <= len(nonce) <= 256
+            ):
+                self._send_error(
+                    400, "字段 nonce 必须为 1–256 码点的非空字符串"
+                )
+                return
+
+            # 既有外部凭证验真全规则（仅传 body/signature，verifier_did/
+            # nonce 不参与验签、不影响其任何判定与原因）。
+            try:
+                valid, reason = store.verify_trust_credential(
+                    tenant,
+                    {"body": data["body"], "signature": data["signature"]},
+                )
+            except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
+                self._send_invalid("验签过程发生内部错误")
+                return
+            if not valid:
+                self._send_json(
+                    200,
+                    {"valid": False, "reason": reason or "验签失败"},
+                )
+                return
+
+            # 仅验真成功才查本租户验证者 DID：未知/跨租户 404、停用 409。
+            try:
+                verifier_key_version, verifier_private_pem = (
+                    store.get_credential_verify_receipt_signer(
+                        tenant, verifier_did
+                    )
+                )
+            except NotFoundError as exc:
+                self._send_error(404, str(exc))
+                return
+            except ConflictError as exc:
+                self._send_error(409, str(exc))
+                return
+
+            body = data["body"]
+            issuer_key_version = body.get("issuer_key_version", 1)
+            credential_digest = hashlib.sha256(
+                crypto.canonicalize(
+                    {"body": body, "signature": data["signature"]}
+                )
+            ).hexdigest()
+            receipt = {
+                "credential_id": body["credential_id"],
+                "issuer_did": body["issuer_did"],
+                "issuer_key_version": issuer_key_version,
+                "credential_digest": credential_digest,
+                "verifier_did": verifier_did,
+                "verifier_key_version": verifier_key_version,
+                "nonce": nonce,
+            }
+            receipt_signature = crypto.sign(receipt, verifier_private_pem)
+            self._send_json(
+                200,
+                {
+                    "valid": True,
+                    "receipt": receipt,
+                    "receipt_signature": receipt_signature,
+                },
+            )
 
         def _post_trust_credentials_import(self, tenant: str) -> None:
             # 外部凭证导入：请求体恰为 {body, signature}，body 规则同

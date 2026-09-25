@@ -7697,6 +7697,24 @@ class VCStore:
                 self._bucket_locked(tenant_id), signer_did
             )
 
+    def get_credential_verify_receipt_signer(
+        self,
+        tenant_id: str,
+        verifier_did: str,
+    ) -> Tuple[int, str]:
+        """返回本租户活动本地验证者 DID 的（当前密钥版本, 当前私钥 PEM）。
+
+        供跨系统凭证验真签名回执（verify-receipt）签名使用：
+        - DID 不存在（含他租户资源）抛 NotFoundError（HTTP 404）；
+        - DID 已停用抛 ConflictError（HTTP 409）；
+        - 取该 DID 当前密钥版本的托管私钥。
+        纯只读：不修改任何状态、不记审计、不触发落盘。
+        """
+        with self._lock:
+            return self._active_did_signer_locked(
+                self._bucket_locked(tenant_id), verifier_did
+            )
+
     def list_trust_anchor_snapshot(
         self, tenant_id: str
     ) -> List[Dict[str, Any]]:
