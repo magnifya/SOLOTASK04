@@ -43,6 +43,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/dids/deactivate-sync     登记外部 DID 停用通告（active 锚点验签）
   POST /v1/trust/dids/deactivate-sync-batch 批量登记外部 DID 停用通告（逐项不短路）
   GET  /v1/trust/dids/deactivations       查询外部 DID 停用通告审计事件（只读）
+  GET  /v1/trust/dids/deactivations/export 快照确定性导出停用通告审计事件（NDJSON，只读）
   POST /v1/trust/presentations/verify     跨系统演示验真（无需登记 DID/凭证/演示）
   POST /v1/trust/presentations/verify-batch 批量跨系统演示验真（仅未绑定形态，不消费）
   POST /v1/trust/presentations/verify-with-status 外部演示验真并合并同步状态（只读）
@@ -175,6 +176,21 @@ def build_handler(store: VCStore) -> type:
 
         def _send_error(self, status: int, message: str) -> None:
             self._send_json(status, {"error": message})
+
+        def _send_ndjson(
+            self, status: int, body: bytes, headers: Dict[str, str]
+        ) -> None:
+            """发送 NDJSON 原始字节响应（无 BOM，空结果为零字节）。"""
+            self.send_response(status)
+            self.send_header(
+                "Content-Type", "application/x-ndjson; charset=utf-8"
+            )
+            for key, value in headers.items():
+                self.send_header(key, value)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
 
         def _send_invalid(self, reason: str) -> None:
             """verify 端点统一失败响应：HTTP 200 + valid:false + 中文原因。"""
@@ -517,6 +533,10 @@ def build_handler(store: VCStore) -> type:
                     self._get_trust_anchor_discovery(tenant, parsed.query)
                 elif path == "/v1/trust/dids/deactivations":
                     self._get_trust_did_deactivations(tenant, parsed.query)
+                elif path == "/v1/trust/dids/deactivations/export":
+                    self._get_trust_did_deactivations_export(
+                        tenant, parsed.query
+                    )
                 elif path.startswith(
                     "/v1/trust/credentials/imported/"
                 ):
@@ -1808,6 +1828,139 @@ def build_handler(store: VCStore) -> type:
                         for event in events
                     ],
                     "next_after": next_after,
+                },
+            )
+
+        def _get_trust_did_deactivations_export(
+            self, tenant: str, query: str
+        ) -> None:
+            # GET /v1/trust/dids/deactivations/export：以快照确定性导出
+            # 本租户外部 DID 停用通告审计事件（NDJSON）。查询参数仅允许
+            # limit、after、snapshot、did、key_version、from、to，且均
+            # 只能出现一次：
+            # - limit 缺省 1000，须为 1..10000 的非空 ASCII 十进制整数；
+            # - after 缺省 0，须为非负 ASCII 十进制整数；
+            # - snapshot 缺省为请求开始时原子读取的本租户最大游标
+            #   （无事件为 0），显式提供时须为不超过当时最大值的非负
+            #   ASCII 十进制整数；
+            # - did 提供时须为非空字符串；
+            # - key_version 须为 ASCII 十进制正整数；
+            # - from/to 须为 UTC 秒精度 Z 时间，且 from <= to。
+            # 空值、重复参数、未知参数、格式或范围非法一律 400 且仅含
+            # 非空中文 error。先按 did/key_version 精确过滤与
+            # deactivated_at 闭区间过滤，再取 after < cursor <= snapshot
+            # 的前 limit 条；同一 snapshot 续页不受后续新事件影响。
+            # 200 响应类型 application/x-ndjson; charset=utf-8，响应头
+            # X-Snapshot-Cursor 为快照、X-Next-After 为末行 cursor
+            # （空结果为 after）；每行一个紧凑 JSON 事件，键序 cursor、
+            # did、key_version、reason、deactivated_at，UTF-8 不转义
+            # 非 ASCII，LF 结行（末行亦有 LF），无 BOM，空结果零字节。
+            # 纯只读：不写状态、不改游标、不记审计。
+            params = parse_qs(query, keep_blank_values=True)
+            allowed = {
+                "limit", "after", "snapshot",
+                "did", "key_version", "from", "to",
+            }
+            unknown = sorted(set(params) - allowed)
+            if unknown:
+                raise ValidationError(
+                    f"不支持的查询参数: {', '.join(unknown)}"
+                )
+
+            def _single(name: str) -> Optional[str]:
+                values = params.get(name)
+                if values is None:
+                    return None
+                if len(values) != 1:
+                    raise ValidationError(
+                        f"查询参数 {name} 只能提供一次"
+                    )
+                return values[0]
+
+            limit_raw = _single("limit")
+            if limit_raw is not None:
+                limit = _parse_nonneg_int(limit_raw, "limit")
+                if not 1 <= limit <= 10000:
+                    raise ValidationError(
+                        "查询参数 limit 须在 1 到 10000 之间"
+                    )
+            else:
+                limit = 1000
+
+            after_raw = _single("after")
+            if after_raw is not None:
+                after = _parse_nonneg_int(after_raw, "after")
+            else:
+                after = 0
+
+            snapshot_raw = _single("snapshot")
+            snapshot: Optional[int] = None
+            if snapshot_raw is not None:
+                snapshot = _parse_nonneg_int(snapshot_raw, "snapshot")
+
+            did = _single("did")
+            if did is not None and not did:
+                raise ValidationError("查询参数 did 必须为非空字符串")
+
+            key_version_raw = _single("key_version")
+            key_version: Optional[int] = None
+            if key_version_raw is not None:
+                key_version = _parse_positive_int(
+                    key_version_raw, "key_version"
+                )
+
+            from_raw = _single("from")
+            from_time = (
+                _parse_utc_z_query(from_raw, "from")
+                if from_raw is not None
+                else None
+            )
+            to_raw = _single("to")
+            to_time = (
+                _parse_utc_z_query(to_raw, "to")
+                if to_raw is not None
+                else None
+            )
+            if (
+                from_time is not None
+                and to_time is not None
+                and from_time > to_time
+            ):
+                raise ValidationError("查询参数 from 不得晚于 to")
+
+            events, next_after, snapshot_cursor = (
+                store.list_did_deactivation_events_export(
+                    tenant,
+                    after,
+                    limit,
+                    snapshot=snapshot,
+                    did=did,
+                    key_version=key_version,
+                    from_time=from_time,
+                    to_time=to_time,
+                )
+            )
+            lines = b"".join(
+                json.dumps(
+                    {
+                        "cursor": event.cursor,
+                        "did": event.did,
+                        "key_version": event.key_version,
+                        "reason": event.reason,
+                        "deactivated_at": event.deactivated_at,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                + b"\n"
+                for event in events
+            )
+            self._send_ndjson(
+                200,
+                lines,
+                {
+                    "X-Snapshot-Cursor": str(snapshot_cursor),
+                    "X-Next-After": str(next_after),
                 },
             )
 

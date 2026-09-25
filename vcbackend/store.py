@@ -6834,6 +6834,77 @@ class VCStore:
             next_after = picked[-1].cursor if picked else after
             return picked, next_after
 
+    def list_did_deactivation_events_export(
+        self,
+        tenant_id: str,
+        after: int = 0,
+        limit: int = 1000,
+        snapshot: Optional[int] = None,
+        did: Optional[str] = None,
+        key_version: Optional[int] = None,
+        from_time: Optional[str] = None,
+        to_time: Optional[str] = None,
+    ) -> Tuple[List[DidDeactivationEvent], int, int]:
+        """只读快照分页导出本租户外部 DID 停用通告审计事件。
+
+        - 在锁内原子读取本租户当前最大游标（无事件为 0）；snapshot
+          缺省取该最大值，显式提供时须不超过该最大值，否则抛
+          ValidationError；
+        - 先按 did、key_version 精确过滤及 deactivated_at 闭区间过滤
+          （from_time/to_time 为 UTC 秒精度 Z 串，from_time <= to_time），
+          再按 after < cursor <= snapshot 升序取至多 limit 项；
+        - 返回 (事件列表, next_after, snapshot)：next_after 为本页末项
+          cursor，空页保持 after；同一 snapshot 续页不受后续新事件影响。
+        纯只读：不修改任何状态、不记审计、不触发落盘。
+        """
+        with self._lock:
+            max_cursor = self._did_deactivation_event_cursors.get(
+                tenant_id, 0
+            )
+            if snapshot is None:
+                snapshot = max_cursor
+            elif snapshot > max_cursor:
+                raise ValidationError(
+                    "查询参数 snapshot 不得超过当前最大游标"
+                )
+            bucket = self._bucket_locked(tenant_id)
+            entries: List[Dict[str, Any]] = []
+            if bucket is not None:
+                entries = list(
+                    bucket.get("did_deactivation_events", [])
+                )
+            entries.sort(key=lambda event: int(event.get("cursor", 0)))
+            picked: List[DidDeactivationEvent] = []
+            for row in entries:
+                if did is not None and row.get("did") != did:
+                    continue
+                if (
+                    key_version is not None
+                    and int(row.get("key_version", 0)) != key_version
+                ):
+                    continue
+                deactivated_at = row.get("deactivated_at") or ""
+                if from_time is not None and deactivated_at < from_time:
+                    continue
+                if to_time is not None and deactivated_at > to_time:
+                    continue
+                cursor = int(row["cursor"])
+                if cursor <= after or cursor > snapshot:
+                    continue
+                if len(picked) >= limit:
+                    break
+                picked.append(
+                    DidDeactivationEvent(
+                        cursor=cursor,
+                        did=row["did"],
+                        key_version=int(row["key_version"]),
+                        reason=row["reason"],
+                        deactivated_at=row["deactivated_at"],
+                    )
+                )
+            next_after = picked[-1].cursor if picked else after
+            return picked, next_after, snapshot
+
     def verify_trust_did_document(
         self,
         tenant_id: str,
