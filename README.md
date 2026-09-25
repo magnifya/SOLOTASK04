@@ -37,9 +37,9 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | GET | `/v1/dids/{did}/keys/history?limit=&after=` | 只读查询 DID 密钥生命周期历史；200 恰含 `did`、`events`、`next_after`，事件恰含 `{key_version,key_handle,public_key,action,status,updated_at,audit_seq,audit_timestamp,cursor}` 且按 `cursor` 升序、禁止私钥；新建版本追加 active（v1 为 `did.created`、轮换为 `key.rotated`），首次吊销追加 revoked/`key.revoked` 并同秒，重复/失败/幂等不追加；游标租户内跨 DID 持久递增且与吊销历史隔离；分页参数沿用 `keys/revocations`；未知或跨租户 DID 404，空页 `next_after=after`，只读不记审计 |
 | POST | `/v1/credentials` | 签发凭证，请求体 `{"issuer_did","subject_did","claims"}` 加可选 `expires_at`；提供时必须是 UTC 秒精度 Z 格式 `YYYY-MM-DDTHH:MM:SSZ` 且严格晚于当前时刻（否则 400），仅在提供时写入正文并参与签名；返回 201 与 `credential_id`、`signature`、`issuer_key_version` |
 | GET | `/v1/credentials/{credential_id}` | 返回 `credential_id`、`body`、`signature`；不存在 404 |
-| PUT | `/v1/credentials/{credential_id}/status` | 登记状态，请求体必须恰为 `{"status":"active"}`；首次 201、重复 200，均含 `credential_id`、`status`、`updated_at`（重复保持首次值）；已吊销 409 |
-| GET | `/v1/credentials/{credential_id}/status` | 返回 `credential_id`、`status`、`updated_at`；历史无状态按 `active` 返回且 `updated_at` 为 `null`；不存在 404 |
-| GET | `/v1/credentials/{credential_id}/status/history?limit=&after=` | 只读查询本地凭证状态历史；响应恰含 `credential_id`、`events`、`next_after`，事件恰含 `{status,reason,updated_at,revoked_at,audit_seq,audit_timestamp,cursor}`；仅首次 active 与首次 revoke 各追加一条，重复与失败路径不追加；按 `updated_at`、`cursor` 升序；未知或跨租户凭证 404，有凭证无状态空页；参数规则同其他历史接口，只读不记审计 |
+| PUT | `/v1/credentials/{credential_id}/status` | 登记/变更状态，请求体必须恰为 `{"status":"active"}` 或 `{"status":"suspended","reason":"原因"}`（reason 裁剪后 1–256 码点，非法 400）；无状态→active 首次 201，active/无状态→suspended 与 suspended→active 为 200，同状态同原因幂等 200（保持首次 `updated_at`），suspended 同状态不同原因 409，已 revoked 任意目标 409；响应恰含 `credential_id`、`status`、`updated_at` |
+| GET | `/v1/credentials/{credential_id}/status` | 返回 `credential_id`、`status`、`updated_at`；历史无状态按 `active` 返回且 `updated_at` 为 `null`；suspended 为暂停状态、revoked 含吊销信息（本响应仅三键）；不存在或他租户 404 |
+| GET | `/v1/credentials/{credential_id}/status/history?limit=&after=` | 只读查询本地凭证状态历史；响应恰含 `credential_id`、`events`、`next_after`，事件恰含 `{status,reason,updated_at,revoked_at,audit_seq,audit_timestamp,cursor}`；首次 active、每次暂停/恢复与首次 revoke 各追加一条（暂停保存原因、恢复 reason/revoked_at 为 null），同状态幂等、重复吊销与失败路径不追加；按 `updated_at`、`cursor` 升序；未知或跨租户凭证 404，有凭证无状态空页；参数规则同其他历史接口，只读不记审计 |
 | POST | `/v1/credentials/{credential_id}/revoke` | 吊销凭证；`reason` 可省略（默认“持证人主动吊销”），否则须为字符串且首尾裁剪后非空；返回 200 与 `credential_id`、`status:"revoked"`、`reason`、`revoked_at`、`updated_at`；不存在 404 |
 | POST | `/v1/credentials/{credential_id}/verify` | 验签，请求体 `{"body","signature"}`；**任何失败一律 HTTP 200**，返回 `valid`（失败时附分类中文 `reason`） |
 | POST | `/v1/credentials/{credential_id}/present` | 生成选择性披露演示，请求体恰为 `{"disclose":[路径...]}` 加可选 `challenge`、`expires_in`、`holder_binding`；成功 201 返回演示对象（绑定时另含 `holder_did`、`holder_key_version`、`holder_proof`）；字段问题 400、未知凭证 404 |
@@ -107,6 +107,8 @@ curl -X POST localhost:8080/v1/credentials \
 curl localhost:8080/v1/credentials/vc_<id>
 curl -X PUT localhost:8080/v1/credentials/vc_<id>/status \
   -d '{"status":"active"}'
+curl -X PUT localhost:8080/v1/credentials/vc_<id>/status \
+  -d '{"status":"suspended","reason":"违规调查中"}'   # 暂停（恢复再 PUT active）
 curl localhost:8080/v1/credentials/vc_<id>/status
 curl -X POST localhost:8080/v1/credentials/vc_<id>/revoke \
   -d '{"reason":"持证人造假"}'   # reason 可省略
@@ -197,25 +199,40 @@ python3 -m vcbackend.cli verify vc_<id>     # 成功输出 true（退出码 0）
 
 ### 凭证状态与吊销
 
-- `PUT .../status` 请求体必须**恰为** `{"status":"active"}`：缺失 `status`、
-  取值非 `active`、含多余字段、请求体缺失/非法 JSON/非对象一律 400 并返回
-  非空 `error`。无状态登记返回 201，重复登记 200；两者均返回
-  `credential_id`、`status`、`updated_at`，重复登记保持首次 `updated_at`
-  与状态不变。
+- `PUT .../status` 请求体必须**恰为** `{"status":"active"}` 或
+  `{"status":"suspended","reason":"原因"}`：缺失 `status`/`reason`、
+  取值非法、active 携带 `reason` 等多余字段、请求体缺失/非法 JSON/非对象
+  一律 400 并返回非空 `error`。`reason` 须为字符串且首尾裁剪后为
+  **1–256 个 Unicode 码点**（空白串、超长均 400），保存裁剪后的值。
+  - **无状态→active** 首次登记返回 **201**；**无状态→suspended** 直接
+    暂停返回 **200**；**active/无状态→suspended**、**suspended→active**
+    （恢复）均为状态变更 **200**；
+  - **同状态幂等**：active→active 与 suspended→suspended 同原因返回
+    **200**，保持首次 `updated_at` 不变；**suspended→suspended 不同
+    原因**返回 **409** 与非空 `error`；
+  - 所有成功路径（含幂等）均返回 `credential_id`、`status`、`updated_at`
+    三个键（暂停/恢复均记 `status.updated` 审计；幂等不追加历史）；
+  - **revoked 为终态**：已吊销凭证再 PUT 任意状态（active/suspended）
+    均 **409**，状态与时间字段保持不变。
 - `GET .../status` 返回 `credential_id`、`status`、`updated_at`；历史无状态
-  凭证按 `active` 返回、`updated_at` 为 `null`；未知凭证 404。
+  凭证按 `active` 返回、`updated_at` 为 `null`；未知凭证或他租户凭证 404。
 - `POST .../revoke`：未知凭证 404。首次请求可省略 `reason`（空请求体或
   `{}` 均可），默认“持证人主动吊销”；提供时必须是字符串且首尾裁剪后非空
   （显式 `null`、数字、空白串均为 400）。保存并返回裁剪后的值，成功为 200，
   返回 `credential_id`、`status:"revoked"`、`reason`、`revoked_at`、
   `updated_at`。已吊销时再次调用，任何 `reason`（含非法值）都被忽略并返回
-  首次结果；非法 `reason` 仅首次请求返回 400。
-- 已 `revoked` 的凭证再 `PUT .../status` 返回 409 与非空 `error`，状态与
-  时间字段保持不变。
+  首次结果；非法 `reason` 仅首次请求返回 400。已暂停凭证可直接吊销进入
+  终态（暂停原因随之清除，状态历史仍保留暂停/恢复事件）。
 - 状态随状态文件持久化，**跨重启保留**。
-- verify 在签名与锚定均成功后检查状态：`revoked` 返回 200、
-  `{"valid":false,"reason":"凭证已吊销：<保存的 reason>"}`；`active` 或
-  无状态维持原结果（签名失败仍优先返回签名类原因）。
+- verify 在签名、密钥、DID、有效期检查均通过后检查凭证状态（判定位置与
+  吊销相同）：`suspended` 返回 200、
+  `{"valid":false,"reason":"凭证已暂停：<保存的 reason>"}`，**不消费**
+  演示/证明、不记审计，恢复后即可正常使用；`revoked` 返回
+  `{"valid":false,"reason":"凭证已吊销：<保存的 reason>"}`；过期优先于
+  暂停/吊销，`active` 或无状态维持原结果（签名失败仍优先返回签名类原因）。
+- present / present-batch / prove 对已暂停凭证返回 **409** 与非空
+  `error`，不创建演示/证明、不记审计；恢复后可正常生成。已吊销凭证仍
+  沿用“可生成、验签处拒绝”的既有行为。
 
 #### 凭证状态历史（只读）
 
@@ -229,19 +246,26 @@ python3 -m vcbackend.cli verify vc_<id>     # 成功输出 true（退出码 0）
   **`updated_at` 升序**，同一 `updated_at` 按 **`cursor`** 升序；每项
   恰含 `status`、`reason`、`updated_at`、`revoked_at`、`audit_seq`、
   `audit_timestamp`、`cursor`：
-  - **首次 active 登记**（`PUT .../status` 首次 201）追加一条
+  - **首次 active 登记**（无状态 `PUT .../status` 首次 201）追加一条
     `status:"active"` 事件，`reason`/`revoked_at` 均为 `null`，
     `updated_at` 为首次登记时间（UTC 秒精度 Z）；
+  - **暂停**（active/无状态→suspended，200）追加一条
+    `status:"suspended"` 事件，`reason` 为裁剪后 1–256 码点的暂停原因，
+    `revoked_at` 为 `null`；
+  - **恢复**（suspended→active，200）追加一条 `status:"active"` 事件，
+    `reason`/`revoked_at` 均为 `null`；
   - **首次 revoke** 追加一条 `status:"revoked"` 事件，`reason` 为
     裁剪后的吊销原因，`revoked_at`/`updated_at` 为首次吊销时间
     （UTC 秒精度 Z，二者相同）；
-  - 重复 active 登记（200）、重复吊销（每次仍记审计）与任何失败路径
-    （首次非法 reason 400、未知凭证 404、已吊销再登记 409）均**不追加**；
-  - 未先登记 active 直接吊销时历史仅含一条 revoked 事件。
+  - 重复 active 登记（200）、同状态同原因幂等暂停（200，每次仍记审计）、
+    重复吊销（每次仍记审计）与任何失败路径（首次非法 reason 400、未知
+    凭证 404、同状态不同原因 409、已吊销再变更 409）均**不追加**；
+  - 未先登记 active 直接吊销时历史仅含一条 revoked 事件；未先登记
+    active 直接暂停时历史以 suspended 事件开始。
 - `audit_seq`/`audit_timestamp` **关联产生该状态变更的审计事件**
-  （active 为 `status.updated`、revoke 为 `credential.revoked`，
-  `resource_type` 均为 `credential`）；旧状态补录的兼容项无法追溯时
-  两者均为 `null`，仍照常返回与分页。
+  （active/suspended/恢复均为 `status.updated`、revoke 为
+  `credential.revoked`，`resource_type` 均为 `credential`）；旧状态补录
+  的兼容项无法追溯时两者均为 `null`，仍照常返回与分页。
 - `cursor` 为**租户内持久化正整数**：同一租户内不同凭证的状态事件
   共享同一游标空间，按追加顺序单调递增并跨重启稳定；不同租户各自
   从 1 计起。
@@ -257,13 +281,15 @@ python3 -m vcbackend.cli verify vc_<id>     # 成功输出 true（退出码 0）
   `cursor` 为该租户内新分配的持久化正整数，`audit_seq`/`audit_timestamp`
   为 `null`；兼容项随下一次原子写一并落盘，即使加载后无写操作，重启
   时也按相同顺序重建为**相同 cursor**。
-- 首次 active / 首次 revoke 时，**状态、历史、游标与审计事件在同一
-  把锁内经同一次原子写落盘，落盘失败一并回滚**（状态不变、历史不
-  追加、游标不前进、审计不记录）。该历史接口为纯只读查询，**不记
+- 首次 active / 首次暂停 / 恢复 / 首次 revoke 时，**状态、历史、游标与
+  审计事件在同一把锁内经同一次原子写落盘，落盘失败一并回滚**（状态不变、
+  历史不追加、游标不前进、审计不记录）。该历史接口为纯只读查询，**不记
   审计**、不触发落盘，`GET .../status`、签发、验签与吊销的幂等响应
   均保持不变。
 
 ```bash
+curl -X PUT localhost:8080/v1/credentials/vc_<id>/status -d '{"status":"active"}'
+curl -X PUT localhost:8080/v1/credentials/vc_<id>/status -d '{"status":"suspended","reason":"违规调查中"}'
 curl -X PUT localhost:8080/v1/credentials/vc_<id>/status -d '{"status":"active"}'
 curl -X POST localhost:8080/v1/credentials/vc_<id>/revoke -d '{"reason":"持证人造假"}'
 curl "localhost:8080/v1/credentials/vc_<id>/status/history?limit=50&after=0"

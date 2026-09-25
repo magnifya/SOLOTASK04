@@ -14,7 +14,7 @@
 GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（只读）
   POST /v1/credentials                    签发凭证
   GET  /v1/credentials/{credential_id}    查询凭证
-  PUT  /v1/credentials/{credential_id}/status   登记 active（首次 201/重复 200）
+  PUT  /v1/credentials/{credential_id}/status   登记 active（首次 201/重复 200）或暂停/恢复 suspended（200）
   GET  /v1/credentials/{credential_id}/status   查询状态（无状态按 active）
   GET  /v1/credentials/{credential_id}/status/history  查询凭证状态历史（只读）
   POST /v1/credentials/{credential_id}/revoke   吊销凭证
@@ -943,22 +943,51 @@ def build_handler(store: VCStore) -> type:
         def _put_credential_status(
             self, tenant: str, credential_id: str
         ) -> None:
-            # 请求体必须恰为 {"status": "active"}：缺字段、取值非法、
-            # 多余字段一律 400。
+            # 请求体必须恰为 {"status": "active"} 或
+            # {"status": "suspended", "reason": "原因"}：缺字段、取值
+            # 非法、多余字段一律 400；reason 须为字符串且首尾裁剪后为
+            # 1..256 个 Unicode 码点，否则 400。
             data = self._read_json()
             if "status" not in data:
                 raise ValidationError("缺少字段: status")
-            extra = sorted(set(data) - {"status"})
-            if extra:
-                raise ValidationError(f"多余字段: {', '.join(extra)}")
-            if data["status"] != "active":
-                raise ValidationError(
-                    f"字段 status 非法: {data['status']!r}（仅支持 active）"
+            status = data["status"]
+            if status == "active":
+                extra = sorted(set(data) - {"status"})
+                if extra:
+                    raise ValidationError(
+                        f"多余字段: {', '.join(extra)}"
+                    )
+                record, created = store.set_credential_status(
+                    tenant, credential_id, "active"
                 )
-            record, created = store.set_credential_active(
-                tenant, credential_id
-            )
-            # 无状态登记 201；重复登记 200，保持首次 updated_at
+            elif status == "suspended":
+                extra = sorted(set(data) - {"status", "reason"})
+                if extra:
+                    raise ValidationError(
+                        f"多余字段: {', '.join(extra)}"
+                    )
+                if "reason" not in data:
+                    raise ValidationError("缺少字段: reason")
+                reason = data["reason"]
+                if not isinstance(reason, str):
+                    raise ValidationError("字段 reason 必须为字符串")
+                reason = reason.strip()
+                if not reason:
+                    raise ValidationError("字段 reason 裁剪后不能为空")
+                if len(reason) > 256:
+                    raise ValidationError(
+                        "字段 reason 裁剪后须为 1 到 256 个 Unicode 码点"
+                    )
+                record, created = store.set_credential_status(
+                    tenant, credential_id, "suspended", reason=reason
+                )
+            else:
+                raise ValidationError(
+                    "字段 status 非法: "
+                    f"{status!r}（仅支持 active、suspended）"
+                )
+            # 无状态首次登记 active 为 201；暂停/恢复转换与同状态幂等
+            # 均为 200（幂等保持首次 updated_at）。
             self._send_json(
                 201 if created else 200, self._status_payload(record)
             )
