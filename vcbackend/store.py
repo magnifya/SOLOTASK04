@@ -29,6 +29,7 @@
 """
 
 import copy
+import hashlib
 import json
 import os
 import re
@@ -181,6 +182,9 @@ AUDIT_KEY_REVOKED = "key.revoked"
 AUDIT_DID_DEACTIVATED = "did.deactivated"
 AUDIT_TRUST_CREDENTIAL_STATUS_SYNCED = "trust.credential.status.synced"
 AUDIT_TRUST_CREDENTIAL_IMPORTED = "trust.credential.imported"
+AUDIT_TRUST_CREDENTIAL_RECEIPT_CONSUMED = (
+    "trust.credential.receipt.consumed"
+)
 
 # 信任锚点用途历史事件动作名（区别于审计动作名）：
 # 新版本注册/轮换分别追加 registered/rotated（from_uses 为 None），实际
@@ -626,6 +630,9 @@ class VCStore:
             bucket.setdefault("did_deactivation_notices", {})
             bucket.setdefault("did_deactivation_events", [])
             bucket.setdefault("trust_anchor_change_events", [])
+            # 验真回执消费记录：按租户以 JSON 数组 [verifier_did, nonce]
+            # 紧凑序列化字符串为键
+            bucket.setdefault("consumed_receipts", {})
             for rec in bucket["dids"].values():
                 _migrate_did_row(rec)
         # 外部凭证状态历史游标（租户内持久化正整数，按追加递增）。
@@ -929,6 +936,7 @@ class VCStore:
                 "did_deactivation_notices": {},
                 "did_deactivation_events": [],
                 "trust_anchor_change_events": [],
+                "consumed_receipts": {},
             }
             self._tenants[tenant_id] = bucket
         return bucket
@@ -7696,6 +7704,69 @@ class VCStore:
             return self._active_did_signer_locked(
                 self._bucket_locked(tenant_id), verifier_did
             )
+
+    def consume_credential_receipt(
+        self,
+        tenant_id: str,
+        receipt: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """首次消费一条已通过七阶段验真的回执，防重放。
+
+        按租户以 (verifier_did, nonce) 为唯一键（键序列化为 JSON 数组
+        字符串，保证任意内容都不撞键）；receipt_id 为 receipt 规范化
+        JSON 字节（递归键升序紧凑 UTF-8）的 SHA-256 小写 64 位 hex。
+
+        - 同键首次：在同一把锁内写入消费记录（receipt_id、consumed_at
+          为 UTC 秒精度 Z 串）并追加一条
+          trust.credential.receipt.consumed 审计（resource_type 为
+          credential_receipt、resource_id 为 receipt_id），经同一次原子
+          写落盘；返回 {"consumed": True, ...}。
+        - 同键重放（receipt 内容可不同）：不替换、不审计，返回
+          {"consumed": False, "receipt_id": 首次 receipt_id,
+          "consumed_at": 首次时间}。
+        并发仅一次成功；落盘失败回滚消费记录与审计后向上抛错（由
+        HTTP 层映射为 500 “存储失败”，可重试）；重启后仍判重。
+        """
+        verifier_did = receipt["verifier_did"]
+        nonce = receipt["nonce"]
+        key = json.dumps(
+            [verifier_did, nonce], ensure_ascii=False, separators=(",", ":")
+        )
+        receipt_id = hashlib.sha256(
+            crypto.canonicalize(receipt)
+        ).hexdigest()
+        consumed_at = _utc_now()
+        with self._lock:
+            bucket = self._ensure_bucket_locked(tenant_id)
+            consumed = bucket.setdefault("consumed_receipts", {})
+            existing = consumed.get(key)
+            if existing is not None:
+                return {
+                    "consumed": False,
+                    "receipt_id": existing["receipt_id"],
+                    "consumed_at": existing["consumed_at"],
+                }
+            snapshot = self._snapshot_locked()
+            try:
+                consumed[key] = {
+                    "receipt_id": receipt_id,
+                    "consumed_at": consumed_at,
+                }
+                self._append_audit_locked(
+                    tenant_id,
+                    AUDIT_TRUST_CREDENTIAL_RECEIPT_CONSUMED,
+                    "credential_receipt",
+                    receipt_id,
+                )
+                self._save_locked()
+            except Exception:
+                self._restore_locked(snapshot)
+                raise
+            return {
+                "consumed": True,
+                "receipt_id": receipt_id,
+                "consumed_at": consumed_at,
+            }
 
     def get_trust_anchor_snapshot_signer(
         self,
