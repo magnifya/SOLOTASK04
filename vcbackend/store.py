@@ -4312,6 +4312,41 @@ class VCStore:
             return False, deactivation_reason
         return True, ""
 
+    def _synced_anchor_events_latest_locked(
+        self,
+        tenant_id: str,
+        signer_did: str,
+        at: int,
+    ) -> Dict[Tuple[str, int], Dict[str, Any]]:
+        """``_synced_anchor_events_latest`` 的持锁核心：调用方须已持有
+        ``self._lock``，供需要在同一次锁持有期间联合读取多份快照的
+        调用方复用。
+        """
+        checkpoints = self._anchor_changes_sync_checkpoints.get(tenant_id)
+        cp = checkpoints.get(signer_did) if checkpoints is not None else None
+        if cp is None:
+            raise NotFoundError("该签名方尚未同步锚点变更")
+        checkpoint = int(cp["next_after"])
+        if at > checkpoint:
+            raise ConflictError("查询时间点超过同步检查点")
+        bucket = self._bucket_locked(tenant_id)
+        pages: List[Dict[str, Any]] = []
+        if bucket is not None:
+            pages = bucket.get("synced_anchor_change_pages", {}).get(
+                signer_did, []
+            )
+        latest: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        for page in pages:
+            for event in page["events"]:
+                cursor = int(event["cursor"])
+                if cursor > at:
+                    continue
+                key = (event["did"], int(event["key_version"]))
+                existing = latest.get(key)
+                if existing is None or cursor > int(existing["cursor"]):
+                    latest[key] = event
+        return latest
+
     def _synced_anchor_events_latest(
         self,
         tenant_id: str,
@@ -4325,37 +4360,9 @@ class VCStore:
         事件的映射，供单条与批量同步锚点验真共用同一快照。
         """
         with self._lock:
-            checkpoints = self._anchor_changes_sync_checkpoints.get(
-                tenant_id
+            return self._synced_anchor_events_latest_locked(
+                tenant_id, signer_did, at
             )
-            cp = (
-                checkpoints.get(signer_did)
-                if checkpoints is not None else None
-            )
-            if cp is None:
-                raise NotFoundError("该签名方尚未同步锚点变更")
-            checkpoint = int(cp["next_after"])
-            if at > checkpoint:
-                raise ConflictError("查询时间点超过同步检查点")
-            bucket = self._bucket_locked(tenant_id)
-            pages: List[Dict[str, Any]] = []
-            if bucket is not None:
-                pages = bucket.get("synced_anchor_change_pages", {}).get(
-                    signer_did, []
-                )
-            latest: Dict[Tuple[str, int], Dict[str, Any]] = {}
-            for page in pages:
-                for event in page["events"]:
-                    cursor = int(event["cursor"])
-                    if cursor > at:
-                        continue
-                    key = (event["did"], int(event["key_version"]))
-                    existing = latest.get(key)
-                    if existing is None or cursor > int(
-                        existing["cursor"]
-                    ):
-                        latest[key] = event
-        return latest
 
     @staticmethod
     def _verify_synced_credential_against(
@@ -10257,22 +10264,41 @@ class VCStore:
             )
         return True, ""
 
-    def _did_deactivation_reasons_snapshot(
+    def _did_deactivation_reasons_locked(
         self, tenant_id: str
     ) -> Dict[str, str]:
-        """一次原子读取本租户外部 DID 停用通告快照（只读）。
+        """读取本租户外部 DID 停用通告快照（只读），返回 did -> 通告
+        reason 的映射副本；调用方须已持有 ``self._lock``，供联合快照
+        在同一次锁持有期间复制。
+        """
+        bucket = self._bucket_locked(tenant_id)
+        rows = (
+            bucket.get("did_deactivation_notices", {})
+            if bucket is not None
+            else {}
+        )
+        return {did: row["reason"] for did, row in rows.items()}
 
-        返回 did -> 通告 reason 的映射副本，供单条与批量同步验真在
-        批初读取后于锁外判定，整批共用同一快照。
+    def _synced_did_document_verification_snapshot(
+        self, tenant_id: str, signer_did: str, at: int
+    ) -> Tuple[Dict[Tuple[str, int], Dict[str, Any]], Dict[str, str]]:
+        """同一次锁持有期间复制同步验真所需的联合快照（只读）。
+
+        在一次 ``self._lock`` 持有期间先校验检查点（来源无检查点抛
+        NotFoundError、at 超检查点抛 ConflictError），再复制该来源
+        cursor<=at 的同步锚点末事件视图与本租户外部 DID 停用通告
+        快照，随后释放锁。两份快照因此要么同取于并发原子写入之前、
+        要么同取于其后，绝不出现“锚点旧、通告新”的混合视图；调用方
+        在锁外逐项验真，验签期间不持锁。
         """
         with self._lock:
-            bucket = self._bucket_locked(tenant_id)
-            rows = (
-                bucket.get("did_deactivation_notices", {})
-                if bucket is not None
-                else {}
+            latest = self._synced_anchor_events_latest_locked(
+                tenant_id, signer_did, at
             )
-            return {did: row["reason"] for did, row in rows.items()}
+            notice_reasons = self._did_deactivation_reasons_locked(
+                tenant_id
+            )
+        return latest, notice_reasons
 
     def verify_trust_did_document_synced(
         self,
@@ -10303,11 +10329,14 @@ class VCStore:
         纯只读：不改同步页、检查点、锚点、状态或审计，结论随状态
         文件跨重启稳定。
         """
-        # 1. 同步检查点（先于文档校验）：未同步 404、at 越界 409
-        latest = self._synced_anchor_events_latest(tenant_id, signer_did, at)
-        # 2. 批初一次原子读取本租户停用通告快照
-        notice_reasons = self._did_deactivation_reasons_snapshot(tenant_id)
-        # 3. 文档结构、锚点、签名与停用判定（共用快照）
+        # 1. 同一次锁持有期间校验检查点（未同步 404、at 越界 409，
+        #    先于文档校验）并复制锚点末事件视图与停用通告联合快照
+        latest, notice_reasons = (
+            self._synced_did_document_verification_snapshot(
+                tenant_id, signer_did, at
+            )
+        )
+        # 2. 文档结构、锚点、签名与停用判定（锁外共用联合快照）
         return self._verify_synced_did_document_against(
             latest, notice_reasons, document
         )
@@ -10326,9 +10355,11 @@ class VCStore:
         上限）由服务层校验（400）。本方法假定三者类型已合法：
         - 检查点语义与 :meth:`verify_trust_did_document_synced`
         一致：来源未同步（含跨租户）抛 NotFoundError，at 超检查点
-        抛 ConflictError，均先于逐项校验；合法时在批初原子读取
-        cursor<=at 的同步锚点快照与本租户停用通告快照，整批共用，
-        并发写入不会造成批内混合结论；
+        抛 ConflictError，均先于逐项校验；合法时在同一次锁持有期间
+        复制 cursor<=at 的同步锚点末事件视图与本租户停用通告快照，
+        释放锁后逐项验真（验签不持锁），整批共用同一联合快照：并发
+        原子写入（如同时撤销锚点并登记同 DID 停用通告）只会被整批
+        同见于写前或写后，不会造成批内混合结论；
         - 逐项不短路、等长同序：每项即一份 DID 文档，非对象项失败
           原因为“DID文档非法”，其余逐项复用单条
           verify-document-synced 的文档结构、锚点、签名格式、验签
@@ -10338,8 +10369,11 @@ class VCStore:
         纯只读：不改同步页、检查点、锚点、状态或审计，结论随状态
         文件跨重启稳定。
         """
-        latest = self._synced_anchor_events_latest(tenant_id, signer_did, at)
-        notice_reasons = self._did_deactivation_reasons_snapshot(tenant_id)
+        latest, notice_reasons = (
+            self._synced_did_document_verification_snapshot(
+                tenant_id, signer_did, at
+            )
+        )
         results: List[Dict[str, Any]] = []
         for document in documents:  # 逐项处理，失败不短路
             valid, reason = self._verify_synced_did_document_against(
