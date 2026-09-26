@@ -636,6 +636,7 @@ class VCStore:
             bucket.setdefault("receipt_consumption_events", [])
             bucket.setdefault("synced_receipts", {})
             bucket.setdefault("synced_receipt_consumption_events", [])
+            bucket.setdefault("synced_anchor_change_events", {})
             for rec in bucket["dids"].values():
                 _migrate_did_row(rec)
         # 外部凭证状态历史游标（租户内持久化正整数，按追加递增）。
@@ -835,6 +836,19 @@ class VCStore:
                 bucket["synced_receipt_consumption_events"] = normalized
             if not isinstance(bucket.get("synced_receipts"), dict):
                 bucket["synced_receipts"] = {}
+        # 同步锚点变更事件：按 (租户, signer_did) 分桶，保存来源方变更
+        # 流已落盘页的原始事件行（按来源 cursor 升序追加）；同步游标空
+        # 间与本地变更流相互独立，同步不写审计。
+        for tenant_id, bucket in self._tenants.items():
+            raw_anchor_events = bucket.get("synced_anchor_change_events")
+            if not isinstance(raw_anchor_events, dict):
+                bucket["synced_anchor_change_events"] = {}
+            else:
+                normalized_anchor: Dict[str, List[Dict[str, Any]]] = {}
+                for signer_did, rows in raw_anchor_events.items():
+                    if isinstance(rows, list):
+                        normalized_anchor[str(signer_did)] = list(rows)
+                bucket["synced_anchor_change_events"] = normalized_anchor
         # 回执同步检查点：按 (租户, signer_did) 维护 {"snapshot", "after"}，
         # snapshot/after 均为来源方导出游标（非本租户事件游标）。
         raw_checkpoints = data.get("receipt_sync_checkpoints", {})
@@ -862,6 +876,42 @@ class VCStore:
                         }
                 if tenant_rows:
                     self._receipt_sync_checkpoints[str(tenant_id)] = (
+                        tenant_rows
+                    )
+        # 锚点变更流同步检查点：按 (租户, signer_did) 维护已落盘末页的
+        # {"after", "next_after", "digest"}；after/next_after 为来源方变
+        # 更流游标（非空页恒有 after < next_after），digest 为该页
+        # changes 递归键升序紧凑 UTF-8 JSON 字节的 SHA-256 十六进制摘要，
+        # 用于同 after 重放的字节一致性判定。
+        raw_anchor_checkpoints = data.get("anchor_change_sync_checkpoints", {})
+        self._anchor_change_sync_checkpoints: Dict[str, Dict[str, Any]] = {}
+        if isinstance(raw_anchor_checkpoints, dict):
+            for tenant_id, by_signer in raw_anchor_checkpoints.items():
+                if not isinstance(by_signer, dict):
+                    continue
+                tenant_rows = {}
+                for signer_did, row in by_signer.items():
+                    if not isinstance(row, dict):
+                        continue
+                    after = row.get("after")
+                    next_after = row.get("next_after")
+                    digest = row.get("digest")
+                    if (
+                        isinstance(after, int)
+                        and not isinstance(after, bool)
+                        and isinstance(next_after, int)
+                        and not isinstance(next_after, bool)
+                        and 0 <= after < next_after
+                        and isinstance(digest, str)
+                        and digest
+                    ):
+                        tenant_rows[str(signer_did)] = {
+                            "after": int(after),
+                            "next_after": int(next_after),
+                            "digest": digest,
+                        }
+                if tenant_rows:
+                    self._anchor_change_sync_checkpoints[str(tenant_id)] = (
                         tenant_rows
                     )
         # 旧状态文件中已吊销但无历史的密钥版本补一条兼容项（内存态）；
@@ -924,6 +974,9 @@ class VCStore:
             "trust_anchor_change_cursors": self._trust_anchor_change_cursors,
             "receipt_consumption_cursors": self._receipt_consumption_cursors,
             "receipt_sync_checkpoints": self._receipt_sync_checkpoints,
+            "anchor_change_sync_checkpoints": (
+                self._anchor_change_sync_checkpoints
+            ),
         }
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
@@ -947,6 +1000,7 @@ class VCStore:
                 self._trust_anchor_change_cursors,
                 self._receipt_consumption_cursors,
                 self._receipt_sync_checkpoints,
+                self._anchor_change_sync_checkpoints,
             )
         )
 
@@ -966,6 +1020,7 @@ class VCStore:
             trust_anchor_change_cursors,
             receipt_consumption_cursors,
             receipt_sync_checkpoints,
+            anchor_change_sync_checkpoints,
         ) = copy.deepcopy(snapshot)
         self._tenants = tenants
         self._audit = audit
@@ -985,6 +1040,7 @@ class VCStore:
         self._trust_anchor_change_cursors = trust_anchor_change_cursors
         self._receipt_consumption_cursors = receipt_consumption_cursors
         self._receipt_sync_checkpoints = receipt_sync_checkpoints
+        self._anchor_change_sync_checkpoints = anchor_change_sync_checkpoints
 
     # ------------------------------------------------------------------ #
     # 租户桶与审计
@@ -1017,6 +1073,7 @@ class VCStore:
                 "receipt_consumption_events": [],
                 "synced_receipts": {},
                 "synced_receipt_consumption_events": {},
+                "synced_anchor_change_events": {},
             }
             self._tenants[tenant_id] = bucket
         return bucket
@@ -8264,6 +8321,77 @@ class VCStore:
                 self._restore_locked(mem_snapshot)
                 raise StorageError("存储失败") from exc
             return created, snapshot, next_after, len(events)
+
+    def sync_anchor_changes(
+        self,
+        tenant_id: str,
+        signer_did: str,
+        after: int,
+        next_after: int,
+        events: List[Dict[str, Any]],
+        digest: str,
+    ) -> Tuple[bool, int, int]:
+        """原子同步一页跨系统信任锚点变更流（来源方已验真的非空页）。
+
+        检查点键为 (tenant_id, signer_did)，记录已落盘末页的
+        {"after", "next_after", "digest"}（after/next_after 为来源方变
+        更流游标，digest 为该页 changes 规范化 JSON 字节的 SHA-256 十六
+        进制摘要）。非空页（来源游标严格递增，故 next_after > after）
+        推进规则：
+        - 首次（无检查点）：after 必须为 0，否则 ConflictError（跳页）；
+        - 续页：after 等于已存 next_after；
+        - after 等于已存末页 after 且 digest 相同为幂等重放：不推进、
+          不写盘，accepted 为 0；
+        - 其余（旧页、跳页、同位异内容）一律 ConflictError。
+
+        events 为来源页原始事件行（结构与合法性由调用方保证）。新页将
+        原始事件、摘要与检查点在同一次原子写落盘；同步不写审计。落盘
+        失败回滚全部内存变更并抛 StorageError。
+
+        返回 (created, next_after, accepted)：created 表示是否首次建立
+        检查点（HTTP 201），其后（含重放）为 False（HTTP 200）；
+        next_after 为本页末事件 cursor；accepted 为新落盘事件数（重放
+        为 0）。
+        """
+        with self._lock:
+            bucket = self._ensure_bucket_locked(tenant_id)
+            events_by_signer = bucket[
+                "synced_anchor_change_events"
+            ].setdefault(signer_did, [])
+            checkpoints = self._anchor_change_sync_checkpoints.setdefault(
+                tenant_id, {}
+            )
+            cp = checkpoints.get(signer_did)
+
+            if cp is None:
+                if after != 0:
+                    # 首个非空页必须从 0 起，否则为跳页
+                    raise ConflictError("同步游标冲突")
+                created = True
+            elif after == cp["next_after"]:
+                created = False
+            elif after == cp["after"] and digest == cp["digest"]:
+                # 幂等重放：不推进、不写盘
+                return False, cp["next_after"], 0
+            else:
+                # 旧页、跳页或同位异内容
+                raise ConflictError("同步游标冲突")
+
+            mem_snapshot = self._snapshot_locked()
+            try:
+                events_by_signer.extend(
+                    copy.deepcopy(event) for event in events
+                )
+                checkpoints[signer_did] = {
+                    "after": after,
+                    "next_after": next_after,
+                    "digest": digest,
+                }
+                self._save_locked()
+            except Exception as exc:
+                self._restore_locked(mem_snapshot)
+                raise StorageError("存储失败") from exc
+            return created, next_after, len(events)
 
     def get_trust_anchor_snapshot_signer(
         self,

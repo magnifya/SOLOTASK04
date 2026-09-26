@@ -27,6 +27,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/anchors                  注册信任锚点（同 DID/版本同 PEM 且 uses 相同幂等；可选 uses 用途白名单）
   GET  /v1/trust/anchor-changes           可签名信任锚点变更流（?after=&signer_did=，只读）
   POST /v1/trust/anchor-changes/verify    跨系统信任锚点变更流只读验真（不依赖本地事件）
+  POST /v1/trust/anchor-changes/sync      跨系统信任锚点变更流同步接收（验真后检查点防重放落盘，不审计）
   GET  /v1/trust/anchors                  跨 DID 只读发现锚点版本（?limit=&after=&status=）
   POST /v1/trust/anchors/{did}/rotate     带前置版本校验的密钥轮换（继承前置 uses）
   GET  /v1/trust/anchors/{did}            查询 DID 的全部锚点版本
@@ -430,6 +431,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_anchor_snapshot_verify(tenant)
                 elif path == "/v1/trust/anchor-changes/verify":
                     self._post_trust_anchor_changes_verify(tenant)
+                elif path == "/v1/trust/anchor-changes/sync":
+                    self._post_trust_anchor_changes_sync(tenant)
                 elif path.startswith("/v1/trust/anchors/") and path.endswith(
                     "/rotate"
                 ):
@@ -2271,6 +2274,95 @@ def build_handler(store: VCStore) -> type:
                 self._send_json(200, {"valid": False, "reason": reason})
                 return
             self._send_json(200, {"valid": True})
+
+        def _post_trust_anchor_changes_sync(self, tenant: str) -> None:
+            # POST /v1/trust/anchor-changes/sync：跨系统信任锚点变更流同
+            # 步接收与防重放检查点。请求体恰含 changes（JSON 对象）、
+            # after（非布尔非负整数），缺失/非法 JSON/非对象/键集或类型
+            # 错误均 400 且仅 {"error": 非空中文}。外层合法后完整复用
+            # /verify 的变更结构、锚点用途、签名格式与验签顺序，四类失
+            # 败均 200 {"valid":false,"reason"} 且不写入。验真成功后以
+            # (租户, signer_did) 为检查点键：首个非空页须 after=0，续页
+            # 须等于已存 next_after；同 after 且 changes 递归键升序紧凑
+            # UTF-8 JSON 字节相同为幂等重放，旧页/跳页/同位异内容均 409
+            # 仅 {"error":"同步游标冲突"}。首个非空页 201、后续新页 200；
+            # 重放或空页 200 且不推进。成功响应键序恰为 valid、
+            # signer_did、next_after、accepted（valid=true；新页
+            # accepted 为 events 长度，重放或空页为 0）。每个新页将原始
+            # events、摘要与检查点原子落盘，落盘失败全部回滚并 500 仅
+            # {"error":"存储失败"}；并发同一检查点至多一项推进，重启后
+            # 结论不变；同步不记审计。
+            data = self._read_json()
+            if set(data) != {"changes", "after"}:
+                missing = [f for f in ("changes", "after") if f not in data]
+                if missing:
+                    raise ValidationError(
+                        f"请求缺少字段: {', '.join(missing)}"
+                    )
+                extra = sorted(set(data) - {"changes", "after"})
+                raise ValidationError(f"请求含多余字段: {', '.join(extra)}")
+            changes = data["changes"]
+            if not isinstance(changes, dict):
+                raise ValidationError(
+                    "请求不合法: 字段 changes 必须为 JSON 对象"
+                )
+            after = data["after"]
+            if (
+                not isinstance(after, int)
+                or isinstance(after, bool)
+                or after < 0
+            ):
+                raise ValidationError(
+                    "请求不合法: 字段 after 必须为非布尔非负整数"
+                )
+
+            reason = self._verify_anchor_changes_item(tenant, changes, after)
+            if reason is not None:
+                self._send_json(200, {"valid": False, "reason": reason})
+                return
+
+            signer_did = changes["signer_did"]
+            events = changes["events"]
+            if not events:
+                # 空页：200 且不推进、不写盘
+                self._send_json(
+                    200,
+                    {
+                        "valid": True,
+                        "signer_did": signer_did,
+                        "next_after": changes["next_after"],
+                        "accepted": 0,
+                    },
+                )
+                return
+
+            digest = hashlib.sha256(
+                crypto.canonicalize(changes)
+            ).hexdigest()
+            try:
+                created, next_after, accepted = store.sync_anchor_changes(
+                    tenant,
+                    signer_did,
+                    after,
+                    changes["next_after"],
+                    events,
+                    digest,
+                )
+            except ConflictError:
+                self._send_error(409, "同步游标冲突")
+                return
+            except StorageError:
+                self._send_error(500, "存储失败")
+                return
+            self._send_json(
+                201 if created else 200,
+                {
+                    "valid": True,
+                    "signer_did": signer_did,
+                    "next_after": next_after,
+                    "accepted": accepted,
+                },
+            )
 
         def _get_trust_anchor_snapshot(self, tenant: str, query: str) -> None:
             # GET /v1/trust/anchors/snapshot?signer_did=：对本租户全部
