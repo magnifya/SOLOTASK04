@@ -4521,6 +4521,89 @@ class VCStore:
                 results.append({"valid": False, "reason": reason})
         return results
 
+    def verify_trust_credentials_synced_batch_with_status(
+        self,
+        tenant_id: str,
+        signer_did: str,
+        at: int,
+        items: Any,
+    ) -> List[Dict[str, Any]]:
+        """批量以同步锚点快照验真外部凭证并合并批初状态快照。
+
+        请求级结构（恰含 signer_did/at/credentials、类型与 1–100 项
+        上限）由服务层校验（400）。本方法假定三者类型已合法：
+        - 检查点语义与 :meth:`verify_trust_credentials_synced_batch`
+          一致：来源未同步（含跨租户）抛 NotFoundError，at 超检查点
+          抛 ConflictError，均先于逐项校验；合法时按 cursor<=at 解析
+          一次锚点快照，并在批初同一次原子读取本租户
+          ``credential_status_sync`` 状态快照，整批共用；
+        - 逐项不短路、等长同序：项须恰含 body（JSON 对象）与
+          signature（非空字符串），否则该项
+          ``{"valid": false, "reason": "请求项非法"}``；合法项复用
+          单条 verify-synced 的凭证字段、锚点、签名格式、验签与
+          有效期规则及原因分类；
+        - 验真通过后按 ``(issuer_did, credential_id)`` 查批初状态
+          快照：未同步（含属他租户）为“外部凭证状态未同步”，
+          revoked 为“外部凭证已吊销：<保存的 reason>”（保存记录无
+          reason 时用“未知原因”），unknown 为“外部凭证状态未知”，
+          active 判成功；
+        - 成功项仅 ``{"valid": true}``，失败项键序为 valid、reason。
+
+        纯只读：不改同步页、检查点、锚点、凭证、状态或审计，结论随
+        状态文件跨重启稳定。
+        """
+        latest = self._synced_anchor_events_latest(tenant_id, signer_did, at)
+        with self._lock:  # 批初一次原子读取本租户状态快照，整批共用
+            bucket = self._bucket_locked(tenant_id)
+            status_rows: Dict[str, Dict[str, Dict[str, Any]]] = {}
+            if bucket is not None:
+                for issuer, rows in (
+                    bucket.get("credential_status_sync", {}).items()
+                ):
+                    status_rows[issuer] = {
+                        cid: dict(row) for cid, row in rows.items()
+                    }
+        results: List[Dict[str, Any]] = []
+        for item in items:  # 逐项处理，失败不短路
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"body", "signature"}
+                or not isinstance(item["body"], dict)
+                or not isinstance(item["signature"], str)
+                or not item["signature"]
+            ):
+                results.append({"valid": False, "reason": "请求项非法"})
+                continue
+            valid, reason = self._verify_synced_credential_against(
+                latest, item["body"], item["signature"]
+            )
+            if valid:
+                body = item["body"]
+                row = status_rows.get(body["issuer_did"], {}).get(
+                    body["credential_id"]
+                )
+                if row is None:
+                    valid, reason = False, "外部凭证状态未同步"
+                else:
+                    status = row.get("status")
+                    if status == "revoked":
+                        saved_reason = row.get("reason")
+                        if not saved_reason:
+                            saved_reason = "未知原因"
+                        valid, reason = (
+                            False,
+                            f"外部凭证已吊销：{saved_reason}",
+                        )
+                    elif status != "active":
+                        # status 仅可能为 active/revoked/unknown
+                        # （同步入口已约束）。
+                        valid, reason = False, "外部凭证状态未知"
+            if valid:
+                results.append({"valid": True})
+            else:
+                results.append({"valid": False, "reason": reason})
+        return results
+
     def verify_trust_credential_with_status(
         self,
         tenant_id: str,

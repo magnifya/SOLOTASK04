@@ -44,6 +44,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/credentials/verify       跨系统凭证验真（无需登记 DID/凭证）
   POST /v1/trust/credentials/verify-synced  以同步锚点验真外部凭证（只读）
   POST /v1/trust/credentials/verify-synced-batch  批量以同步锚点快照验真外部凭证（只读）
+  POST /v1/trust/credentials/verify-synced-batch-with-status  批量同步锚点验真并合并批初状态快照（只读）
   POST /v1/trust/credentials/verify-receipt  跨系统凭证验真签名回执（只读）
   POST /v1/trust/credentials/receipt/verify  校验验真签名回执（只读）
   POST /v1/trust/credentials/receipt/consume  消费验真签名回执（防重放，首次落盘并审计）
@@ -473,6 +474,13 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_credentials_verify_synced(tenant)
                 elif path == "/v1/trust/credentials/verify-synced-batch":
                     self._post_trust_credentials_verify_synced_batch(tenant)
+                elif (
+                    path
+                    == "/v1/trust/credentials/verify-synced-batch-with-status"
+                ):
+                    self._post_trust_credentials_verify_synced_batch_with_status(
+                        tenant
+                    )
                 elif path == "/v1/trust/credentials/verify-receipt":
                     self._post_trust_credentials_verify_receipt(tenant)
                 elif path == "/v1/trust/credentials/receipt/verify":
@@ -3922,6 +3930,80 @@ def build_handler(store: VCStore) -> type:
             try:
                 results = store.verify_trust_credentials_synced_batch(
                     tenant, signer_did, at, credentials
+                )
+            except NotFoundError:
+                self._send_error(404, "同步来源不存在")
+                return
+            except ConflictError:
+                self._send_error(409, "同步游标冲突")
+                return
+            except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
+                self._send_error(500, "服务器内部错误")
+                return
+            self._send_json(200, {"results": results})
+
+        def _post_trust_credentials_verify_synced_batch_with_status(
+            self, tenant: str
+        ) -> None:
+            # POST /v1/trust/credentials/verify-synced-batch-with-status：
+            # 批量以同步锚点快照验真外部凭证并合并批初本租户状态快照
+            # （只读）。请求级协议与 verify-synced-batch 完全一致：请求体
+            # 须恰含 signer_did（非空字符串）、at（非布尔非负整数）、
+            # credentials（1–100 项数组）；空体、非法 JSON、非对象、键集
+            # 或类型错误、空数组或超限均 400 且仅 {"error":"请求非法"}；
+            # 来源未同步或跨租户 404 仅 {"error":"同步来源不存在"}，at
+            # 超检查点 409 仅 {"error":"同步游标冲突"}，均先于逐项校验。
+            # 合法时 200 仅返 {"results":[...]}，逐项不短路、等长同序：
+            # 项须恰含 body（对象）与非空 signature，否则该项
+            # {"valid":false,"reason":"请求项非法"}；合法项沿用
+            # verify-synced-batch 的凭证字段、版本兼容、cursor<=at 末
+            # 锚点、签名、期限、顺序及原因；验真通过后按 (issuer_did,
+            # credential_id) 查批初原子读取的本租户状态快照：未同步、
+            # revoked、unknown 分别返“外部凭证状态未同步”“外部凭证已
+            # 吊销：<reason>”（空原因用“未知原因”）“外部凭证状态未
+            # 知”，active 成功。成功项仅 {"valid":true}，失败项键序
+            # valid、reason。纯只读：不写状态或审计；租户头缺省
+            # default、显式空 400 并隔离。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except Exception:  # noqa: BLE001 请求非法绝不暴露内部细节
+                self._send_error(400, "请求非法")
+                return
+            if not raw:
+                self._send_error(400, "请求非法")
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send_error(400, "请求非法")
+                return
+            if not isinstance(data, dict) or set(data) != {
+                "signer_did",
+                "at",
+                "credentials",
+            }:
+                self._send_error(400, "请求非法")
+                return
+            signer_did = data["signer_did"]
+            at = data["at"]
+            credentials = data["credentials"]
+            if (
+                not isinstance(signer_did, str)
+                or not signer_did
+                or not isinstance(at, int)
+                or isinstance(at, bool)
+                or at < 0
+                or not isinstance(credentials, list)
+                or not 1 <= len(credentials) <= 100
+            ):
+                self._send_error(400, "请求非法")
+                return
+            try:
+                results = (
+                    store.verify_trust_credentials_synced_batch_with_status(
+                        tenant, signer_did, at, credentials
+                    )
                 )
             except NotFoundError:
                 self._send_error(404, "同步来源不存在")
