@@ -47,6 +47,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   GET  /v1/trust/credentials/receipt/consumptions/manifest 回执消费历史导出清单（签名摘要，只读）
   POST /v1/trust/credentials/receipt/consumptions/manifest/verify 校验回执消费历史清单与 NDJSON 内容（只读）
   POST /v1/trust/receipt-sync 同步外系统回执消费历史（清单验真、检查点防重放，原子落盘不审计）
+  POST /v1/trust/receipt-sync-batch 批量同步外系统回执消费历史（逐项不短路，原子落盘不审计）
   POST /v1/trust/credentials/import       导入外部凭证（active 锚点验签后持久化）
   POST /v1/trust/credentials/import-batch 批量导入外部凭证（逐项不短路）
   GET  /v1/trust/credentials/imported/{credential_id}  读取已导入的外部凭证（?issuer_did=）
@@ -440,6 +441,8 @@ def build_handler(store: VCStore) -> type:
                     )
                 elif path == "/v1/trust/receipt-sync":
                     self._post_trust_receipt_sync(tenant)
+                elif path == "/v1/trust/receipt-sync-batch":
+                    self._post_trust_receipt_sync_batch(tenant)
                 elif path == "/v1/trust/credentials/import":
                     self._post_trust_credentials_import(tenant)
                 elif path == "/v1/trust/credentials/import-batch":
@@ -4300,6 +4303,137 @@ def build_handler(store: VCStore) -> type:
                     "count": count,
                 },
             )
+
+        def _post_trust_receipt_sync_batch(self, tenant: str) -> None:
+            # POST /v1/trust/receipt-sync-batch：批量同步外系统验真回执
+            # 消费历史，任何失败都返回 HTTP 200。请求体须恰为
+            # {"items": [项...]}，数组限 1–50 项；请求级非法（空体、非法
+            # JSON、非对象、键集错、items 非数组/空/超限）一律恰返
+            # {"results": [], "reason": "请求非法"}，不写任何状态。
+            # 请求级合法时按输入顺序逐项复用单条 receipt-sync 的完整规则
+            # （清单验真、NDJSON 结构、重复键、游标与检查点、原子落盘），
+            # 失败不短路：项结构/类型错误收敛为
+            # {valid:false,http_status:400,reason:"请求项非法"}；验真/
+            # 内容失败沿用单条 200 固定 reason；游标冲突 409“同步游标
+            # 冲突”；落盘失败 500“存储失败”且仅回滚本项。失败项键序
+            # valid,http_status,reason；成功项键序 valid,http_status,
+            # signer_did,snapshot,next_after,count（首次检查点 201，否则
+            # 200）。同签名方后项可见前项已提交状态；逐项原子提交，与单条
+            # 并发不跳页、不重复推进、不半写，跨重启保持；同步不写审计。
+            # 显式空 X-Tenant-ID 在此之前由路由统一判 400。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except Exception:  # noqa: BLE001 请求非法绝不暴露内部细节
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            data: Any = None
+            if raw:
+                try:
+                    data = json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    data = None
+            items = data.get("items") if isinstance(data, dict) else None
+            if (
+                not isinstance(data, dict)
+                or set(data) != {"items"}
+                or not isinstance(items, list)
+                or not 1 <= len(items) <= 50
+            ):
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+
+            results = [
+                self._receipt_sync_batch_item(tenant, item) for item in items
+            ]
+            self._send_json(200, {"results": results})
+
+        def _receipt_sync_batch_item(
+            self, tenant: str, item: Any
+        ) -> Dict[str, Any]:
+            # 批量同步的单项处理：完全沿用单条 receipt-sync 的各阶段规则，
+            # 将单条的 HTTP 状态与响应体收敛为单项结果对象。
+            if not isinstance(item, dict) or set(item) != {
+                "manifest",
+                "ndjson",
+            }:
+                return {
+                    "valid": False,
+                    "http_status": 400,
+                    "reason": "请求项非法",
+                }
+            manifest = item["manifest"]
+            ndjson = item["ndjson"]
+            if not isinstance(manifest, dict) or not isinstance(ndjson, str):
+                return {
+                    "valid": False,
+                    "http_status": 400,
+                    "reason": "请求项非法",
+                }
+
+            # 阶段一：清单验真（与单条相同的五段顺序与固定 reason）。
+            reason = self._verify_receipt_consumption_manifest_item(
+                tenant, manifest, ndjson
+            )
+            if reason is not None:
+                return {"valid": False, "http_status": 200, "reason": reason}
+
+            signer_did = manifest["signer_did"]
+            snapshot = manifest["snapshot"]
+            after = manifest["filters"]["after"]
+
+            # 阶段二：NDJSON 结构、游标窗口与页内重复键。
+            events = self._parse_receipt_sync_ndjson(ndjson, after, snapshot)
+            if events is None:
+                return {
+                    "valid": False,
+                    "http_status": 200,
+                    "reason": "导出内容非法",
+                }
+
+            # 阶段三：检查点推进、历史重复键与逐项原子落盘。
+            try:
+                created, effective_snapshot, next_after, count = (
+                    store.sync_receipt_consumptions(
+                        tenant, signer_did, snapshot, after, events
+                    )
+                )
+            except ConflictError:
+                return {
+                    "valid": False,
+                    "http_status": 409,
+                    "reason": "同步游标冲突",
+                }
+            except ValidationError:
+                return {
+                    "valid": False,
+                    "http_status": 200,
+                    "reason": "导出内容非法",
+                }
+            except StorageError:
+                return {
+                    "valid": False,
+                    "http_status": 500,
+                    "reason": "存储失败",
+                }
+            except Exception:  # noqa: BLE001 单项失败不影响其余项
+                return {
+                    "valid": False,
+                    "http_status": 500,
+                    "reason": "存储失败",
+                }
+            return {
+                "valid": True,
+                "http_status": 201 if created else 200,
+                "signer_did": signer_did,
+                "snapshot": effective_snapshot,
+                "next_after": next_after,
+                "count": count,
+            }
 
         @staticmethod
         def _verify_credential_receipt_item(
