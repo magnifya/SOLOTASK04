@@ -9860,6 +9860,38 @@ class VCStore:
                 return None
             return row.get("public_key", "")
 
+    def trust_anchor_key_snapshot(
+        self,
+        tenant_id: str,
+        required_use: Optional[str] = None,
+    ) -> Dict[Tuple[str, int], str]:
+        """批初一次原子读取本租户 active 信任锚点公钥快照（只读）。
+
+        返回 (did, key_version) -> 公钥 PEM 的映射，仅含 active 且（提供
+        required_use 时）用途白名单允许该用途的锚点，判定规则与
+        :meth:`get_active_trust_anchor_public_key` 一致。供批量验真在
+        批初读取一次、整批共用：并发吊销或用途收紧不会令同批观察到
+        混合状态。纯只读：不写状态、不记审计、不触发落盘。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            anchors = (
+                bucket["trust_anchors"] if bucket is not None else {}
+            )
+            snapshot: Dict[Tuple[str, int], str] = {}
+            for did, rows in anchors.items():
+                for row in rows.values():
+                    if row.get("status") == "revoked":
+                        continue
+                    if required_use is not None and not _anchor_use_allowed(
+                        row, required_use
+                    ):
+                        continue
+                    snapshot[(did, int(row["key_version"]))] = row.get(
+                        "public_key", ""
+                    )
+            return snapshot
+
     def verify_trust_did_document(
         self,
         tenant_id: str,

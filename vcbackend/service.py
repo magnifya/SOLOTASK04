@@ -28,6 +28,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   GET  /v1/trust/anchor-changes           可签名信任锚点变更流（?after=&signer_did=，只读）
   GET  /v1/trust/ac-proof                  锚点变更 Merkle 包含证明（?cursor=&snapshot=&signer_did=，只读）
   POST /v1/trust/ac-proof                  校验锚点变更证明（结构/锚点/签名/包含路径，不依赖本地事件）
+  POST /v1/trust/ac-proof/verify-batch     批量校验锚点变更证明（批初锚点快照，逐项不短路，只读）
   POST /v1/trust/anchor-changes/verify    跨系统信任锚点变更流只读验真（不依赖本地事件）
   POST /v1/trust/anchor-changes/sync      跨系统信任锚点变更流同步接收（验真、检查点防重放，原子落盘不审计）
   GET  /v1/trust/anchor-changes/sync-history  查询锚点变更同步页历史（?signer_did=&limit=&after=，只读）
@@ -535,6 +536,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_anchor_changes_verify(tenant)
                 elif path == "/v1/trust/ac-proof":
                     self._post_trust_ac_proof(tenant)
+                elif path == "/v1/trust/ac-proof/verify-batch":
+                    self._post_trust_ac_proof_verify_batch(tenant)
                 elif path == "/v1/trust/anchor-changes/sync":
                     self._post_trust_anchor_changes_sync(tenant)
                 elif path.startswith("/v1/trust/anchors/") and path.endswith(
@@ -2456,17 +2459,35 @@ def build_handler(store: VCStore) -> type:
             if not self._anchor_proof_is_well_formed(proof):
                 return "证明非法"
 
-            signer_did = proof["signer_did"]
-            signer_key_version = proof["signer_key_version"]
-
             # 阶段二：本租户同 signer_did/版本且含 generic 用途的
             # active 信任锚点
             public_pem = store.get_active_trust_anchor_public_key(
                 tenant,
-                signer_did,
-                signer_key_version,
+                proof["signer_did"],
+                proof["signer_key_version"],
                 required_use="generic",
             )
+            return self._verify_anchor_proof_with_key(proof, public_pem)
+
+        def _verify_anchor_proof_against_snapshot(
+            self,
+            proof: Any,
+            anchor_snapshot: Dict[Tuple[str, int], str],
+        ) -> Optional[str]:
+            # 批量验真的逐项判定：阶段顺序与原因分类同单项，但锚点取自
+            # 批初一次原子读取的本租户快照，整批不观察混合状态。
+            if not self._anchor_proof_is_well_formed(proof):
+                return "证明非法"
+            public_pem = anchor_snapshot.get(
+                (proof["signer_did"], proof["signer_key_version"])
+            )
+            return self._verify_anchor_proof_with_key(proof, public_pem)
+
+        def _verify_anchor_proof_with_key(
+            self, proof: Dict[str, Any], public_pem: Optional[str]
+        ) -> Optional[str]:
+            # 结构已合法、锚点公钥已解析后的共用阶段：锚点可用性 ->
+            # 签名格式 -> 验签 -> 包含路径重算。
             if public_pem is None:
                 return "锚点不可用"
             try:
@@ -2535,6 +2556,59 @@ def build_handler(store: VCStore) -> type:
                 self._send_json(200, {"valid": False, "reason": reason})
                 return
             self._send_json(200, {"valid": True})
+
+        def _post_trust_ac_proof_verify_batch(self, tenant: str) -> None:
+            # POST /v1/trust/ac-proof/verify-batch：批量校验锚点变更证
+            # 明，不依赖本地事件。请求体须恰为 {"items": [证明...]}，数
+            # 组限 1–100 项；空体、非法 JSON、非对象、键集错误、items
+            # 非数组/空/超限均 HTTP 200 且按键序恰返
+            # {"results": [], "reason": "请求非法"}。合法批次在批初一
+            # 次原子读取本租户信任锚点快照，整批共用（并发吊销或用途
+            # 收紧不会令同批观察到混合状态），逐项不短路、results 等
+            # 长同序；每项须为 POST /v1/trust/ac-proof 中的 proof 对
+            # 象，逐项复用单项的结构、锚点、签名格式、验签与路径重算
+            # 顺序及原因分类。成功项仅 {"valid": true}，失败项键序
+            # valid、reason。纯只读：不写状态、游标或审计。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except Exception:  # noqa: BLE001
+                self._send_json(200, {"results": [], "reason": "请求非法"})
+                return
+            if not raw:
+                self._send_json(200, {"results": [], "reason": "请求非法"})
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send_json(200, {"results": [], "reason": "请求非法"})
+                return
+            if not isinstance(data, dict) or set(data) != {"items"}:
+                self._send_json(200, {"results": [], "reason": "请求非法"})
+                return
+            items = data["items"]
+            if (
+                not isinstance(items, list)
+                or not items
+                or len(items) > 100
+            ):
+                self._send_json(200, {"results": [], "reason": "请求非法"})
+                return
+
+            # 批初一次原子读取本租户信任锚点快照，整批共用
+            anchor_snapshot = store.trust_anchor_key_snapshot(
+                tenant, required_use="generic"
+            )
+            results: List[Dict[str, Any]] = []
+            for item in items:  # 逐项校验，失败不短路
+                reason = self._verify_anchor_proof_against_snapshot(
+                    item, anchor_snapshot
+                )
+                if reason is None:
+                    results.append({"valid": True})
+                else:
+                    results.append({"valid": False, "reason": reason})
+            self._send_json(200, {"results": results})
 
         def _anchor_changes_is_well_formed(
             self, changes: Any, after: Any
