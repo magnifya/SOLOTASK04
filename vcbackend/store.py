@@ -4604,6 +4604,70 @@ class VCStore:
                 results.append({"valid": False, "reason": reason})
         return results
 
+    def verify_trust_credential_synced_with_status(
+        self,
+        tenant_id: str,
+        signer_did: str,
+        at: int,
+        body: Any,
+        signature: Any,
+    ) -> Tuple[bool, str]:
+        """以同步锚点验真外部凭证并合并请求初状态快照（只读）。
+
+        请求结构（恰含 signer_did/at/body/signature 及类型）由服务层
+        校验（400）。本方法假定四键类型已合法，协议与
+        :meth:`verify_trust_credential_synced` 完全一致：
+        - 来源未同步（含跨租户）抛 NotFoundError，at 超检查点抛
+          ConflictError；
+        - 合法时按 cursor<=at 解析一次锚点快照，并在请求初同一次原子
+          读取本租户 ``credential_status_sync`` 状态快照；
+        - 凭证字段、锚点、签名覆盖、格式、验签与有效期规则及原因分类
+          与 :meth:`verify_trust_credential_synced` 完全一致，原验真失败
+          不查询状态；
+        - 验真通过后按 ``(issuer_did, credential_id)`` 查请求初状态
+          快照：未同步（含属他租户）为“外部凭证状态未同步”，revoked
+          为“外部凭证已吊销：<保存的 reason>”（保存记录无 reason 时用
+          “未知原因”），unknown 为“外部凭证状态未知”，active 判成功。
+
+        纯只读：不改同步页、检查点、锚点、凭证、状态或审计，结论随
+        状态文件跨重启稳定。
+        """
+        latest = self._synced_anchor_events_latest(tenant_id, signer_did, at)
+        with self._lock:  # 请求初一次原子读取本租户状态快照
+            bucket = self._bucket_locked(tenant_id)
+            status_rows: Dict[str, Dict[str, Dict[str, Any]]] = {}
+            if bucket is not None:
+                for issuer, rows in (
+                    bucket.get("credential_status_sync", {}).items()
+                ):
+                    status_rows[issuer] = {
+                        cid: dict(row) for cid, row in rows.items()
+                    }
+        valid, reason = self._verify_synced_credential_against(
+            latest, body, signature
+        )
+        if valid:
+            row = status_rows.get(body["issuer_did"], {}).get(
+                body["credential_id"]
+            )
+            if row is None:
+                valid, reason = False, "外部凭证状态未同步"
+            else:
+                status = row.get("status")
+                if status == "revoked":
+                    saved_reason = row.get("reason")
+                    if not saved_reason:
+                        saved_reason = "未知原因"
+                    valid, reason = (
+                        False,
+                        f"外部凭证已吊销：{saved_reason}",
+                    )
+                elif status != "active":
+                    # status 仅可能为 active/revoked/unknown
+                    # （同步入口已约束）。
+                    valid, reason = False, "外部凭证状态未知"
+        return valid, reason
+
     def verify_trust_credential_with_status(
         self,
         tenant_id: str,
@@ -5514,6 +5578,72 @@ class VCStore:
                 results.append({"valid": False, "reason": reason})
         return results
 
+    def verify_trust_presentation_synced_with_status(
+        self,
+        tenant_id: str,
+        signer_did: str,
+        at: int,
+        presentation: Any,
+        challenge: Any,
+    ) -> Tuple[bool, str]:
+        """以同步锚点验真未绑定外部演示并合并请求初状态快照（只读）。
+
+        请求结构（恰含 signer_did/at/presentation/challenge 及类型）由
+        服务层校验（400）。本方法假定四键类型已合法，协议与
+        :meth:`verify_trust_presentation_synced` 完全一致：
+        - 来源未同步（含跨租户）抛 NotFoundError，at 超检查点抛
+          ConflictError；
+        - 合法时按 cursor<=at 解析一次锚点快照，并在请求初同一次原子
+          读取本租户 ``credential_status_sync`` 状态快照；
+        - 演示九字段、holder_* 禁令、挑战、锚点、proof 覆盖、签名格式、
+          验签与期限规则及原因分类与
+          :meth:`verify_trust_presentation_synced` 完全一致，原验真失败
+          不查询状态；
+        - 验真通过后按演示的 ``(issuer_did, credential_id)`` 查请求初
+          状态快照：未同步（含属他租户）为“外部凭证状态未同步”，
+          revoked 为“外部凭证已吊销：<保存的 reason>”（保存记录无
+          reason 时用“未知原因”），unknown 为“外部凭证状态未知”，
+          active 判成功。
+
+        纯只读：不改同步页、检查点、锚点、演示、状态或审计，结论随
+        状态文件跨重启稳定。
+        """
+        latest = self._synced_anchor_events_latest(tenant_id, signer_did, at)
+        with self._lock:  # 请求初一次原子读取本租户状态快照
+            bucket = self._bucket_locked(tenant_id)
+            status_rows: Dict[str, Dict[str, Dict[str, Any]]] = {}
+            if bucket is not None:
+                for issuer, rows in (
+                    bucket.get("credential_status_sync", {}).items()
+                ):
+                    status_rows[issuer] = {
+                        cid: dict(row) for cid, row in rows.items()
+                    }
+        valid, reason = self._verify_synced_presentation_against(
+            latest, presentation, challenge
+        )
+        if valid:
+            row = status_rows.get(
+                presentation["issuer_did"], {}
+            ).get(presentation["credential_id"])
+            if row is None:
+                valid, reason = False, "外部凭证状态未同步"
+            else:
+                status = row.get("status")
+                if status == "revoked":
+                    saved_reason = row.get("reason")
+                    if not saved_reason:
+                        saved_reason = "未知原因"
+                    valid, reason = (
+                        False,
+                        f"外部凭证已吊销：{saved_reason}",
+                    )
+                elif status != "active":
+                    # status 仅可能为 active/revoked/unknown
+                    # （同步入口已约束）。
+                    valid, reason = False, "外部凭证状态未知"
+        return valid, reason
+
     def verify_trust_proof(
         self,
         tenant_id: str,
@@ -6083,6 +6213,74 @@ class VCStore:
             else:
                 results.append({"valid": False, "reason": reason})
         return results
+
+    def verify_trust_proof_synced_with_status(
+        self,
+        tenant_id: str,
+        signer_did: str,
+        at: int,
+        proof: Any,
+        challenge: Any,
+        source_tenant_id: Any,
+    ) -> Tuple[bool, str]:
+        """以同步锚点验真外部谓词证明并合并请求初状态快照（只读）。
+
+        请求结构（恰含 signer_did/at/proof/challenge/source_tenant_id
+        及类型）由服务层校验（400）。本方法假定五键类型已合法，协议与
+        :meth:`verify_trust_proof_synced` 完全一致：
+        - 来源未同步（含跨租户）抛 NotFoundError，at 超检查点抛
+          ConflictError；
+        - 合法时按 cursor<=at 解析一次锚点快照，并在请求初同一次原子
+          读取本租户 ``credential_status_sync`` 状态快照；
+        - 证明九字段、谓词/results、RFC6901 路径、挑战、锚点、签名
+          覆盖（去掉 proof 后八字段并加入 tenant_id=source_tenant_id）、
+          签名格式、验签与期限规则及原因分类与
+          :meth:`verify_trust_proof_synced` 完全一致，原验真失败不查询
+          状态；
+        - 验真通过后按证明的 ``(issuer_did, credential_id)`` 查请求初
+          状态快照：未同步（含属他租户）为“外部凭证状态未同步”，
+          revoked 为“外部凭证已吊销：<保存的 reason>”（保存记录无
+          reason 时用“未知原因”），unknown 为“外部凭证状态未知”，
+          active 判成功。
+
+        纯只读：不改同步页、检查点、锚点、证明、状态或审计，结论随
+        状态文件跨重启稳定。
+        """
+        latest = self._synced_anchor_events_latest(tenant_id, signer_did, at)
+        with self._lock:  # 请求初一次原子读取本租户状态快照
+            bucket = self._bucket_locked(tenant_id)
+            status_rows: Dict[str, Dict[str, Dict[str, Any]]] = {}
+            if bucket is not None:
+                for issuer, rows in (
+                    bucket.get("credential_status_sync", {}).items()
+                ):
+                    status_rows[issuer] = {
+                        cid: dict(row) for cid, row in rows.items()
+                    }
+        valid, reason = self._verify_synced_proof_against(
+            latest, proof, challenge, source_tenant_id
+        )
+        if valid:
+            row = status_rows.get(
+                proof["issuer_did"], {}
+            ).get(proof["credential_id"])
+            if row is None:
+                valid, reason = False, "外部凭证状态未同步"
+            else:
+                status = row.get("status")
+                if status == "revoked":
+                    saved_reason = row.get("reason")
+                    if not saved_reason:
+                        saved_reason = "未知原因"
+                    valid, reason = (
+                        False,
+                        f"外部凭证已吊销：{saved_reason}",
+                    )
+                elif status != "active":
+                    # status 仅可能为 active/revoked/unknown
+                    # （同步入口已约束）。
+                    valid, reason = False, "外部凭证状态未知"
+        return valid, reason
 
     def verify_trust_proof_with_status(
         self,

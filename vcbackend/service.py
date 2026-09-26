@@ -43,6 +43,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/verify                   用 active 锚点公钥验签
   POST /v1/trust/credentials/verify       跨系统凭证验真（无需登记 DID/凭证）
   POST /v1/trust/credentials/verify-synced  以同步锚点验真外部凭证（只读）
+  POST /v1/trust/credentials/verify-synced-with-status  同步锚点验真并合并请求初状态快照（只读）
   POST /v1/trust/credentials/verify-synced-batch  批量以同步锚点快照验真外部凭证（只读）
   POST /v1/trust/credentials/verify-synced-batch-with-status  批量同步锚点验真并合并批初状态快照（只读）
   POST /v1/trust/credentials/verify-receipt  跨系统凭证验真签名回执（只读）
@@ -72,6 +73,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/dids/deactivations/manifest/verify-batch 批量校验清单与 NDJSON（只读）
   POST /v1/trust/presentations/verify     跨系统演示验真（无需登记 DID/凭证/演示）
   POST /v1/trust/presentations/verify-synced  以同步锚点验真未绑定外部演示（只读）
+  POST /v1/trust/presentations/verify-synced-with-status  同步锚点验真演示并合并请求初状态快照（只读）
   POST /v1/trust/presentations/verify-synced-batch  批量以同步锚点快照验真未绑定演示（只读）
   POST /v1/trust/presentations/verify-synced-batch-with-status  批量同步锚点验真演示并合并批初状态快照（只读）
   POST /v1/trust/presentations/verify-batch 批量跨系统演示验真（仅未绑定形态，不消费）
@@ -79,6 +81,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/presentations/verify-batch-with-status 批量演示验真并合并同步状态（只读）
   POST /v1/trust/proofs/verify            跨系统谓词证明验真（无需登记 DID/凭证/证明，不消费）
   POST /v1/trust/proofs/verify-synced     以同步锚点验真外部谓词证明（只读）
+  POST /v1/trust/proofs/verify-synced-with-status  同步锚点验真谓词证明并合并请求初状态快照（只读）
   POST /v1/trust/proofs/verify-synced-batch  批量以同步锚点快照验真外部谓词证明（只读）
   POST /v1/trust/proofs/verify-synced-batch-with-status  批量同步锚点验真谓词证明并合并批初状态快照（只读）
   POST /v1/trust/proofs/verify-batch      批量跨系统谓词证明验真（兼容单项规则，不消费）
@@ -474,6 +477,13 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_credentials_verify(tenant)
                 elif path == "/v1/trust/credentials/verify-synced":
                     self._post_trust_credentials_verify_synced(tenant)
+                elif (
+                    path
+                    == "/v1/trust/credentials/verify-synced-with-status"
+                ):
+                    self._post_trust_credentials_verify_synced_with_status(
+                        tenant
+                    )
                 elif path == "/v1/trust/credentials/verify-synced-batch":
                     self._post_trust_credentials_verify_synced_batch(tenant)
                 elif (
@@ -541,6 +551,13 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_presentations_verify(tenant)
                 elif path == "/v1/trust/presentations/verify-synced":
                     self._post_trust_presentations_verify_synced(tenant)
+                elif (
+                    path
+                    == "/v1/trust/presentations/verify-synced-with-status"
+                ):
+                    self._post_trust_presentations_verify_synced_with_status(
+                        tenant
+                    )
                 elif path == "/v1/trust/presentations/verify-synced-batch":
                     self._post_trust_presentations_verify_synced_batch(tenant)
                 elif (
@@ -562,6 +579,10 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_proofs_verify(tenant)
                 elif path == "/v1/trust/proofs/verify-synced":
                     self._post_trust_proofs_verify_synced(tenant)
+                elif (
+                    path == "/v1/trust/proofs/verify-synced-with-status"
+                ):
+                    self._post_trust_proofs_verify_synced_with_status(tenant)
                 elif path == "/v1/trust/proofs/verify-synced-batch":
                     self._post_trust_proofs_verify_synced_batch(tenant)
                 elif (
@@ -3887,6 +3908,78 @@ def build_handler(store: VCStore) -> type:
                 return
             self._send_json(200, {"valid": True})
 
+        def _post_trust_credentials_verify_synced_with_status(
+            self, tenant: str
+        ) -> None:
+            # POST /v1/trust/credentials/verify-synced-with-status：以同步
+            # 锚点验真外部凭证并合并请求初本租户状态快照（只读）。请求
+            # 协议与 verify-synced 完全一致：请求体须恰含 signer_did
+            # （非空字符串）、at（非布尔非负整数）、body（JSON 对象）、
+            # signature（非空字符串）；非法 JSON、非对象、键集或类型
+            # 错误均 400 且仅 {"error": 非空中文}。signer_did 未同步或
+            # 跨租户 404、at 超过同步检查点 409，同形仅 {"error"}。
+            # 外层合法后任何失败均 HTTP 200 按键序恰返
+            # {"valid":false,"reason":...}：凭证字段、版本兼容、
+            # cursor<=at 末锚点、签名覆盖、签名格式、验签、有效期及校验
+            # 顺序与原因完全沿用 verify-synced，原验真失败不查状态；验真
+            # 成功后按 (issuer_did, credential_id) 查请求初原子读取的本
+            # 租户状态快照：未同步、revoked、unknown 依次失败为“外部
+            # 凭证状态未同步”“外部凭证已吊销：<reason>”（空或缺失
+            # reason 用“未知原因”）“外部凭证状态未知”，active 成功。
+            # 成功仅 {"valid":true}。纯只读：不改任何数据、不审计；
+            # 租户头缺省 default、显式空 400 并隔离，重启一致。
+            data = self._read_json()
+            required = ("signer_did", "at", "body", "signature")
+            if set(data) != set(required):
+                missing = [f for f in required if f not in data]
+                if missing:
+                    raise ValidationError(
+                        f"请求缺少字段: {', '.join(missing)}"
+                    )
+                extra = sorted(set(data) - set(required))
+                raise ValidationError(
+                    f"请求含多余字段: {', '.join(extra)}"
+                )
+            signer_did = data["signer_did"]
+            if not isinstance(signer_did, str) or not signer_did:
+                raise ValidationError(
+                    "请求不合法: 字段 signer_did 必须为非空字符串"
+                )
+            at = data["at"]
+            if (
+                not isinstance(at, int)
+                or isinstance(at, bool)
+                or at < 0
+            ):
+                raise ValidationError(
+                    "请求不合法: 字段 at 必须为非布尔非负整数"
+                )
+            body = data["body"]
+            if not isinstance(body, dict):
+                raise ValidationError(
+                    "请求不合法: 字段 body 必须为 JSON 对象"
+                )
+            signature = data["signature"]
+            if not isinstance(signature, str) or not signature:
+                raise ValidationError(
+                    "请求不合法: 字段 signature 必须为非空字符串"
+                )
+            try:
+                valid, reason = (
+                    store.verify_trust_credential_synced_with_status(
+                        tenant, signer_did, at, body, signature
+                    )
+                )
+            except (NotFoundError, ConflictError):
+                raise
+            except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
+                self._send_invalid("验签过程发生内部错误")
+                return
+            if not valid:
+                self._send_invalid(reason or "验签失败")
+                return
+            self._send_json(200, {"valid": True})
+
         def _post_trust_credentials_verify_synced_batch(
             self, tenant: str
         ) -> None:
@@ -5604,6 +5697,79 @@ def build_handler(store: VCStore) -> type:
                 return
             self._send_json(200, {"valid": True})
 
+        def _post_trust_presentations_verify_synced_with_status(
+            self, tenant: str
+        ) -> None:
+            # POST /v1/trust/presentations/verify-synced-with-status：以
+            # 同步锚点验真未绑定外部演示并合并请求初本租户状态快照
+            # （只读）。请求协议与 verify-synced 完全一致：请求体须恰含
+            # signer_did（非空字符串）、at（非布尔非负整数）、
+            # presentation（JSON 对象）、challenge（非空字符串）；非法
+            # JSON、非对象、键集或类型错误均 400 且仅 {"error": 非空
+            # 中文}。signer_did 未同步或跨租户 404、at 超过同步检查点
+            # 409，同形仅 {"error"}。外层合法后任何失败均 HTTP 200 按
+            # 键序恰返 {"valid":false,"reason":...}：演示九字段、
+            # holder_* 禁令、挑战、cursor<=at 末锚点、proof 覆盖、签名
+            # 格式、验签、期限及校验顺序与原因完全沿用 verify-synced，
+            # 原验真失败不查状态；验真成功后按演示的
+            # (issuer_did, credential_id) 查请求初原子读取的本租户状态
+            # 快照：未同步、revoked、unknown 依次失败为“外部凭证状态未
+            # 同步”“外部凭证已吊销：<reason>”（空或缺失 reason 用
+            # “未知原因”）“外部凭证状态未知”，active 成功。成功仅
+            # {"valid":true}。纯只读：不改任何数据、不审计；租户头缺省
+            # default、显式空 400 并隔离，重启一致。
+            data = self._read_json()
+            required = ("signer_did", "at", "presentation", "challenge")
+            if set(data) != set(required):
+                missing = [f for f in required if f not in data]
+                if missing:
+                    raise ValidationError(
+                        f"请求缺少字段: {', '.join(missing)}"
+                    )
+                extra = sorted(set(data) - set(required))
+                raise ValidationError(
+                    f"请求含多余字段: {', '.join(extra)}"
+                )
+            signer_did = data["signer_did"]
+            if not isinstance(signer_did, str) or not signer_did:
+                raise ValidationError(
+                    "请求不合法: 字段 signer_did 必须为非空字符串"
+                )
+            at = data["at"]
+            if (
+                not isinstance(at, int)
+                or isinstance(at, bool)
+                or at < 0
+            ):
+                raise ValidationError(
+                    "请求不合法: 字段 at 必须为非布尔非负整数"
+                )
+            presentation = data["presentation"]
+            if not isinstance(presentation, dict):
+                raise ValidationError(
+                    "请求不合法: 字段 presentation 必须为 JSON 对象"
+                )
+            challenge = data["challenge"]
+            if not isinstance(challenge, str) or not challenge:
+                raise ValidationError(
+                    "请求不合法: 字段 challenge 必须为非空字符串"
+                )
+            try:
+                valid, reason = (
+                    store.verify_trust_presentation_synced_with_status(
+                        tenant, signer_did, at, presentation, challenge
+                    )
+                )
+            except (NotFoundError, ConflictError):
+                raise
+            except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
+                self._send_invalid("验签过程发生内部错误")
+                return
+            if not valid:
+                self._send_invalid(reason or "验签失败")
+                return
+            self._send_json(200, {"valid": True})
+
         def _post_trust_presentations_verify_synced_batch(
             self, tenant: str
         ) -> None:
@@ -6019,6 +6185,85 @@ def build_handler(store: VCStore) -> type:
                 )
             try:
                 valid, reason = store.verify_trust_proof_synced(
+                    tenant, signer_did, at, proof, challenge,
+                    source_tenant_id,
+                )
+            except (NotFoundError, ConflictError):
+                raise
+            except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
+                self._send_invalid("验签过程发生内部错误")
+                return
+            if not valid:
+                self._send_invalid(reason or "验签失败")
+                return
+            self._send_json(200, {"valid": True})
+
+        def _post_trust_proofs_verify_synced_with_status(
+            self, tenant: str
+        ) -> None:
+            # POST /v1/trust/proofs/verify-synced-with-status：以同步锚点
+            # 验真外部谓词证明并合并请求初本租户状态快照（只读）。请求
+            # 协议与 verify-synced 完全一致：请求体须恰含 signer_did
+            # （非空字符串）、at（非布尔非负整数）、proof（JSON 对象）、
+            # challenge（非空字符串）、source_tenant_id（非空字符串）；
+            # 非法 JSON、非对象、键集或类型错误均 400 且仅
+            # {"error": 非空中文}。signer_did 未同步或跨租户 404、at
+            # 超过同步检查点 409，同形仅 {"error"}。外层合法后任何失败
+            # 均 HTTP 200 按键序恰返 {"valid":false,"reason":...}：证明
+            # 九字段、谓词/results、RFC6901 路径、挑战、cursor<=at 末
+            # 锚点、签名覆盖、签名格式、验签、期限及校验顺序与原因完全
+            # 沿用 verify-synced，原验真失败不查状态；验真成功后按证明
+            # 的 (issuer_did, credential_id) 查请求初原子读取的本租户
+            # 状态快照：未同步、revoked、unknown 依次失败为“外部凭证
+            # 状态未同步”“外部凭证已吊销：<reason>”（空或缺失 reason
+            # 用“未知原因”）“外部凭证状态未知”，active 成功。成功仅
+            # {"valid":true}。纯只读：不改任何数据、不审计；租户头缺省
+            # default、显式空 400 并隔离，重启一致。
+            data = self._read_json()
+            required = (
+                "signer_did", "at", "proof", "challenge", "source_tenant_id"
+            )
+            if set(data) != set(required):
+                missing = [f for f in required if f not in data]
+                if missing:
+                    raise ValidationError(
+                        f"请求缺少字段: {', '.join(missing)}"
+                    )
+                extra = sorted(set(data) - set(required))
+                raise ValidationError(
+                    f"请求含多余字段: {', '.join(extra)}"
+                )
+            signer_did = data["signer_did"]
+            if not isinstance(signer_did, str) or not signer_did:
+                raise ValidationError(
+                    "请求不合法: 字段 signer_did 必须为非空字符串"
+                )
+            at = data["at"]
+            if (
+                not isinstance(at, int)
+                or isinstance(at, bool)
+                or at < 0
+            ):
+                raise ValidationError(
+                    "请求不合法: 字段 at 必须为非布尔非负整数"
+                )
+            proof = data["proof"]
+            if not isinstance(proof, dict):
+                raise ValidationError(
+                    "请求不合法: 字段 proof 必须为 JSON 对象"
+                )
+            challenge = data["challenge"]
+            if not isinstance(challenge, str) or not challenge:
+                raise ValidationError(
+                    "请求不合法: 字段 challenge 必须为非空字符串"
+                )
+            source_tenant_id = data["source_tenant_id"]
+            if not isinstance(source_tenant_id, str) or not source_tenant_id:
+                raise ValidationError(
+                    "请求不合法: 字段 source_tenant_id 必须为非空字符串"
+                )
+            try:
+                valid, reason = store.verify_trust_proof_synced_with_status(
                     tenant, signer_did, at, proof, challenge,
                     source_tenant_id,
                 )
