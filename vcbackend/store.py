@@ -121,6 +121,9 @@ IMPORTED_ANCHOR_UNAVAILABLE_REASON = "锚点不可用"
 IMPORTED_SIGNATURE_MALFORMED_REASON = "签名格式错误"
 IMPORTED_SIGNATURE_INVALID_REASON = "签名校验失败"
 
+# 以同步锚点验真外部凭证时锚点不可用的统一中文原因
+SYNCED_ANCHOR_UNAVAILABLE_REASON = "同步锚点不可用"
+
 # 外部 DID 停用通告验真失败时的统一中文原因（与导入重验一致）
 DEACTIVATION_ANCHOR_UNAVAILABLE_REASON = IMPORTED_ANCHOR_UNAVAILABLE_REASON
 DEACTIVATION_SIGNATURE_MALFORMED_REASON = IMPORTED_SIGNATURE_MALFORMED_REASON
@@ -4301,6 +4304,148 @@ class VCStore:
         )
         if deactivation_reason is not None:
             return False, deactivation_reason
+        return True, ""
+
+    def verify_trust_credential_synced(
+        self,
+        tenant_id: str,
+        signer_did: str,
+        at: int,
+        body: Any,
+        signature: Any,
+    ) -> Tuple[bool, str]:
+        """以同步锚点验真外部凭证，返回 (是否有效, 失败原因)。
+
+        请求结构（恰含 signer_did/at/body/signature 及类型）由服务层
+        校验（400）。本方法假定四键类型已合法：
+        - 该签名方在本租户无同步检查点（含跨租户）抛 NotFoundError；
+          at 超过检查点抛 ConflictError；
+        - 凭证字段规则沿用 :meth:`verify_trust_credential`：body 须含
+          credential_id/issuer_did/subject_did/claims/issued_at，
+          issuer_key_version 省略按版本 1 且不注入签名正文，提供时须
+          为非布尔正整数；
+        - 锚点取该来源 cursor<=at 的已同步事件，以 (issuer_did, 版本)
+          最后事件为准；缺失、非 active 或 uses 无 vc 均返回
+          (False, "同步锚点不可用")；
+        - 签名须为 ES256、64 字节裸 R||S 无填充 base64url，覆盖完整
+          body 的规范化 JSON；格式错/验签错/到期依次返回
+          “签名格式错误”/“签名校验失败”/“凭证已过期”；
+        - expires_at 规则与 :meth:`verify_trust_credential` 一致。
+
+        纯只读：不改同步页、检查点、锚点、凭证、状态或审计，结论随
+        状态文件跨重启稳定。
+        """
+        with self._lock:
+            checkpoints = self._anchor_changes_sync_checkpoints.get(
+                tenant_id
+            )
+            cp = (
+                checkpoints.get(signer_did)
+                if checkpoints is not None else None
+            )
+            if cp is None:
+                raise NotFoundError("该签名方尚未同步锚点变更")
+            checkpoint = int(cp["next_after"])
+            if at > checkpoint:
+                raise ConflictError("查询时间点超过同步检查点")
+            bucket = self._bucket_locked(tenant_id)
+            pages: List[Dict[str, Any]] = []
+            if bucket is not None:
+                pages = bucket.get("synced_anchor_change_pages", {}).get(
+                    signer_did, []
+                )
+            latest: Dict[Tuple[str, int], Dict[str, Any]] = {}
+            for page in pages:
+                for event in page["events"]:
+                    cursor = int(event["cursor"])
+                    if cursor > at:
+                        continue
+                    key = (event["did"], int(event["key_version"]))
+                    existing = latest.get(key)
+                    if existing is None or cursor > int(
+                        existing["cursor"]
+                    ):
+                        latest[key] = event
+
+        # 凭证字段（沿用 /v1/trust/credentials/verify 的分类原因）
+        required_str = (
+            "credential_id",
+            "issuer_did",
+            "subject_did",
+            "issued_at",
+        )
+        for field in required_str:
+            if field not in body:
+                return False, f"凭证缺少字段: {field}"
+            value = body[field]
+            if not isinstance(value, str) or not value:
+                return False, f"凭证字段 {field} 必须为非空字符串"
+        if "claims" not in body:
+            return False, "凭证缺少字段: claims"
+        if not isinstance(body["claims"], dict):
+            return False, "凭证字段 claims 必须为 JSON 对象"
+        key_version = 1
+        if "issuer_key_version" in body:
+            version_obj = body["issuer_key_version"]
+            if (
+                not isinstance(version_obj, int)
+                or isinstance(version_obj, bool)
+                or version_obj < 1
+            ):
+                return False, "凭证字段 issuer_key_version 必须为正整数"
+            key_version = version_obj
+        issuer_did = body["issuer_did"]
+
+        # 同步锚点：(issuer_did, 版本) 最后事件，须 active 且含 vc 用途
+        anchor = latest.get((issuer_did, key_version))
+        if (
+            anchor is None
+            or anchor["status"] != "active"
+            or "vc" not in anchor["uses"]
+        ):
+            return False, SYNCED_ANCHOR_UNAVAILABLE_REASON
+        public_pem = anchor["public_key"]
+        try:
+            crypto.validate_public_key_pem(public_pem)
+        except (ValueError, TypeError):
+            return False, SYNCED_ANCHOR_UNAVAILABLE_REASON
+
+        # 签名格式（严格：64 字节裸 R||S 无填充 base64url）与密码学
+        # 验签：覆盖完整 body 的规范化 JSON，省略 issuer_key_version
+        # 时不注入正文。
+        try:
+            crypto.validate_signature_format_strict(signature)
+        except crypto.MalformedSignature:
+            return False, IMPORTED_SIGNATURE_MALFORMED_REASON
+        try:
+            crypto.verify(body, signature, public_pem)
+        except crypto.MalformedSignature:
+            return False, IMPORTED_SIGNATURE_MALFORMED_REASON
+        except crypto.InvalidSignature:
+            return False, IMPORTED_SIGNATURE_INVALID_REASON
+        except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
+            return False, IMPORTED_SIGNATURE_INVALID_REASON
+
+        # 有效期：仅在 body 提供 expires_at 时检查，规则同既有验真。
+        if "expires_at" in body:
+            expires_value = body["expires_at"]
+            if (
+                not isinstance(expires_value, str)
+                or not _UTC_Z_SHAPE_RE.match(expires_value)
+            ):
+                return False, (
+                    "凭证字段 expires_at 必须为 UTC 秒精度 Z 格式"
+                    "（YYYY-MM-DDTHH:MM:SSZ）"
+                )
+            try:
+                expires_dt = _parse_utc_z(expires_value)
+            except ValueError:
+                return False, (
+                    "凭证字段 expires_at 必须为 UTC 秒精度 Z 格式"
+                    "（YYYY-MM-DDTHH:MM:SSZ）"
+                )
+            if datetime.now(timezone.utc) >= expires_dt:
+                return False, CREDENTIAL_EXPIRED_REASON
         return True, ""
 
     def verify_trust_credential_with_status(
