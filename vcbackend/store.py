@@ -634,6 +634,8 @@ class VCStore:
             bucket.setdefault("trust_anchor_change_events", [])
             bucket.setdefault("consumed_receipts", {})
             bucket.setdefault("receipt_consumption_events", [])
+            bucket.setdefault("synced_receipts", {})
+            bucket.setdefault("synced_receipt_consumption_events", [])
             for rec in bucket["dids"].values():
                 _migrate_did_row(rec)
         # 外部凭证状态历史游标（租户内持久化正整数，按追加递增）。
@@ -816,6 +818,52 @@ class VCStore:
                 max_cursor = max(max_cursor, int(event.get("cursor", 0)))
             if max_cursor:
                 self._receipt_consumption_cursors[tenant_id] = max_cursor
+        # 同步回执事件：按 (租户, signer_did) 分桶，每个签名者保存其来源
+        # 导出游标空间内的事件行（按来源 cursor 升序），供续页/重放时做
+        # 同位内容比对；另以租户全局 synced_receipts 索引 (verifier_did,
+        # nonce) 供 consume 防重放命中。同步游标空间与本地消费历史相互
+        # 独立，同步不写审计。
+        for tenant_id, bucket in self._tenants.items():
+            raw_events = bucket.get("synced_receipt_consumption_events")
+            if not isinstance(raw_events, dict):
+                bucket["synced_receipt_consumption_events"] = {}
+            else:
+                normalized: Dict[str, List[Dict[str, Any]]] = {}
+                for signer_did, rows in raw_events.items():
+                    if isinstance(rows, list):
+                        normalized[str(signer_did)] = list(rows)
+                bucket["synced_receipt_consumption_events"] = normalized
+            if not isinstance(bucket.get("synced_receipts"), dict):
+                bucket["synced_receipts"] = {}
+        # 回执同步检查点：按 (租户, signer_did) 维护 {"snapshot", "after"}，
+        # snapshot/after 均为来源方导出游标（非本租户事件游标）。
+        raw_checkpoints = data.get("receipt_sync_checkpoints", {})
+        self._receipt_sync_checkpoints: Dict[str, Dict[str, Any]] = {}
+        if isinstance(raw_checkpoints, dict):
+            for tenant_id, by_signer in raw_checkpoints.items():
+                if not isinstance(by_signer, dict):
+                    continue
+                tenant_rows: Dict[str, Any] = {}
+                for signer_did, row in by_signer.items():
+                    if not isinstance(row, dict):
+                        continue
+                    snapshot = row.get("snapshot")
+                    after = row.get("after")
+                    if (
+                        isinstance(snapshot, int)
+                        and not isinstance(snapshot, bool)
+                        and isinstance(after, int)
+                        and not isinstance(after, bool)
+                        and 0 <= after <= snapshot
+                    ):
+                        tenant_rows[str(signer_did)] = {
+                            "snapshot": int(snapshot),
+                            "after": int(after),
+                        }
+                if tenant_rows:
+                    self._receipt_sync_checkpoints[str(tenant_id)] = (
+                        tenant_rows
+                    )
         # 旧状态文件中已吊销但无历史的密钥版本补一条兼容项（内存态）；
         # 随下一次原子写一并落盘，重启后 cursor 稳定。
         self._backfill_key_revocations_locked()
@@ -875,6 +923,7 @@ class VCStore:
             ),
             "trust_anchor_change_cursors": self._trust_anchor_change_cursors,
             "receipt_consumption_cursors": self._receipt_consumption_cursors,
+            "receipt_sync_checkpoints": self._receipt_sync_checkpoints,
         }
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
@@ -897,6 +946,7 @@ class VCStore:
                 self._did_deactivation_event_cursors,
                 self._trust_anchor_change_cursors,
                 self._receipt_consumption_cursors,
+                self._receipt_sync_checkpoints,
             )
         )
 
@@ -915,6 +965,7 @@ class VCStore:
             did_deactivation_event_cursors,
             trust_anchor_change_cursors,
             receipt_consumption_cursors,
+            receipt_sync_checkpoints,
         ) = copy.deepcopy(snapshot)
         self._tenants = tenants
         self._audit = audit
@@ -933,6 +984,7 @@ class VCStore:
         self._did_deactivation_event_cursors = did_deactivation_event_cursors
         self._trust_anchor_change_cursors = trust_anchor_change_cursors
         self._receipt_consumption_cursors = receipt_consumption_cursors
+        self._receipt_sync_checkpoints = receipt_sync_checkpoints
 
     # ------------------------------------------------------------------ #
     # 租户桶与审计
@@ -963,6 +1015,8 @@ class VCStore:
                 "trust_anchor_change_events": [],
                 "consumed_receipts": {},
                 "receipt_consumption_events": [],
+                "synced_receipts": {},
+                "synced_receipt_consumption_events": {},
             }
             self._tenants[tenant_id] = bucket
         return bucket
@@ -7963,6 +8017,12 @@ class VCStore:
             )
             if by_verifier is not None and nonce in by_verifier:
                 return False, None
+            # 同步回执（receipt-sync）落盘的 (verifier_did, nonce) 同样
+            # 视为已消费：命中即重放，不写消费记录/历史、不记审计。
+            if self._receipt_key_synced_locked(
+                tenant_id, verifier_did, nonce
+            ):
+                return False, None
             bucket = self._ensure_bucket_locked(tenant_id)
             snapshot = self._snapshot_locked()
             try:
@@ -8025,6 +8085,14 @@ class VCStore:
                     if by_verifier is not None and nonce in by_verifier:
                         outcomes.append((False, None))
                         continue
+                    # 同步回执（receipt-sync）落盘的 (verifier_did, nonce)
+                    # 同样视为已消费：命中即重放，不写消费记录/历史、不记
+                    # 审计（与单条 consume 一致）。
+                    if self._receipt_key_synced_locked(
+                        tenant_id, verifier_did, nonce
+                    ):
+                        outcomes.append((False, None))
+                        continue
                     bucket = self._ensure_bucket_locked(tenant_id)
                     consumed_at = _utc_now()
                     bucket["consumed_receipts"].setdefault(
@@ -8050,6 +8118,152 @@ class VCStore:
                 self._restore_locked(snapshot)
                 raise StorageError("存储失败") from exc
             return outcomes
+
+    def _receipt_key_synced_locked(
+        self, tenant_id: str, verifier_did: str, nonce: str
+    ) -> bool:
+        """锁内判断 (verifier_did, nonce) 是否已由回执同步落盘。"""
+        bucket = self._bucket_locked(tenant_id)
+        if bucket is None:
+            return False
+        by_verifier = bucket.get("synced_receipts", {}).get(verifier_did)
+        return by_verifier is not None and nonce in by_verifier
+
+    def sync_receipt_consumptions(
+        self,
+        tenant_id: str,
+        signer_did: str,
+        snapshot: int,
+        after: int,
+        events: List[Dict[str, Any]],
+    ) -> Tuple[bool, int, int, int]:
+        """原子同步一页验真回执消费历史（来源方导出事件）。
+
+        检查点键为 (tenant_id, signer_did)，记录来源方导出游标的
+        {"snapshot", "after"}（记为 (S, A)，A 为已落盘末行来源 cursor）。
+        请求 (snapshot=s, after=a, 行游标 r1<...<rn，均在 (a, s]) 的推进
+        规则：
+        - 首次（无检查点）：a 必须为 0，否则 ConflictError（跳页）；
+        - 续页同快照：s == S 且 a <= A（a == A 为正常续页；a < A 为旧
+          窗口重发）；a > A 为跳页，ConflictError；
+        - 换新快照：s > S 时仅当 A == S（旧快照已追平）且 a == S，否则
+          ConflictError；s < S 为旧快照，ConflictError；
+        - 行游标只要求严格递增且落在 (a, s]（由调用方校验）；与已覆盖
+          区域（cursor <= A）同位的行必须与已落盘行逐字段一致，否则
+          ConflictError（同位异内容）；一致时按幂等重放处理（200）。
+
+        events 为已解析好的事件行，恰含 cursor/receipt_id/verifier_did/
+        nonce/consumed_at（类型与键序由调用方保证）。新行的
+        (verifier_did, nonce) 在本批内及与全部历史（含其他 signer 同步页
+        与本地 consume 记录）均不得重复，否则 ValidationError（导出内容
+        非法）。
+
+        新事件、synced_receipts 判重索引与检查点在同一次原子写落盘；同步
+        不写审计。落盘失败回滚全部内存变更并抛 StorageError。
+
+        返回 (created, snapshot, next_after, count)：created 表示是否首次
+        建立检查点（HTTP 201），其后（含重放）为 False（HTTP 200）；
+        next_after 为本页末行来源 cursor（空页为 a）；count 为提交页的
+        事件行数。
+        """
+        with self._lock:
+            bucket = self._ensure_bucket_locked(tenant_id)
+            events_by_signer = bucket[
+                "synced_receipt_consumption_events"
+            ].setdefault(signer_did, [])
+            checkpoints = self._receipt_sync_checkpoints.setdefault(
+                tenant_id, {}
+            )
+            cp = checkpoints.get(signer_did)
+
+            # ---- 检查点游标规则（非法一律 ConflictError）----
+            if cp is None:
+                if after != 0:
+                    raise ConflictError("同步游标冲突")
+                covered_after = 0
+            elif snapshot < cp["snapshot"]:
+                # 旧快照
+                raise ConflictError("同步游标冲突")
+            elif snapshot == cp["snapshot"]:
+                if after > cp["after"]:
+                    # 跳页：声称的进度超过已落盘进度
+                    raise ConflictError("同步游标冲突")
+                covered_after = cp["after"]
+            else:
+                # 新快照：必须旧快照已追平且 after 衔接旧 snapshot
+                if cp["after"] != cp["snapshot"] or after != cp["snapshot"]:
+                    raise ConflictError("同步游标冲突")
+                covered_after = cp["after"]
+
+            # ---- 行游标：窗口 + 同位内容比对 + 新区稠密连续 ----
+            # 来源游标为每个事件 +1 的稠密空间，检查点 (snapshot, after)
+            # 承诺 after 以内全部游标均已落盘：已覆盖区内的行必须逐字段
+            # 一致（幂等重放）；新区首行必须恰为 covered_after+1 且其后
+            # 逐行 +1，否则为跳页。
+            stored_by_cursor = {
+                int(row["cursor"]): row for row in events_by_signer
+            }
+            new_rows: List[Dict[str, Any]] = []
+            expected_new_cursor = covered_after + 1
+            for row in events:
+                cursor = int(row["cursor"])
+                if cursor <= after or cursor > snapshot:
+                    # 窗口外（调用方已先校验，此处兜底）
+                    raise ValidationError("导出内容非法")
+                if cursor <= covered_after:
+                    stored = stored_by_cursor.get(cursor)
+                    if stored is None or stored != row:
+                        # 同位异内容（或同位行缺失）
+                        raise ConflictError("同步游标冲突")
+                else:
+                    if cursor != expected_new_cursor:
+                        raise ConflictError("同步游标冲突")
+                    expected_new_cursor += 1
+                    new_rows.append(row)
+
+            # ---- 新行 (verifier_did, nonce) 唯一性：批内 + 全部历史 ----
+            local_consumed = bucket.get("consumed_receipts", {})
+            synced_index = bucket.setdefault("synced_receipts", {})
+            seen_in_batch: set = set()
+            for row in new_rows:
+                key = (row["verifier_did"], row["nonce"])
+                if key in seen_in_batch:
+                    raise ValidationError("导出内容非法")
+                seen_in_batch.add(key)
+                if (
+                    key[0] in local_consumed
+                    and key[1] in local_consumed[key[0]]
+                ):
+                    raise ValidationError("导出内容非法")
+                if (
+                    key[0] in synced_index
+                    and key[1] in synced_index[key[0]]
+                ):
+                    raise ValidationError("导出内容非法")
+
+            created = cp is None
+            mem_snapshot = self._snapshot_locked()
+            try:
+                for row in new_rows:
+                    events_by_signer.append(dict(row))
+                    synced_index.setdefault(row["verifier_did"], {})[
+                        row["nonce"]
+                    ] = {
+                        "receipt_id": row["receipt_id"],
+                        "consumed_at": row["consumed_at"],
+                        "signer_did": signer_did,
+                    }
+                events_by_signer.sort(key=lambda row: int(row["cursor"]))
+                next_after = int(events[-1]["cursor"]) if events else after
+                checkpoints[signer_did] = {
+                    "snapshot": snapshot,
+                    "after": max(covered_after, next_after),
+                }
+                self._save_locked()
+            except Exception as exc:
+                self._restore_locked(mem_snapshot)
+                raise StorageError("存储失败") from exc
+            return created, snapshot, next_after, len(events)
 
     def get_trust_anchor_snapshot_signer(
         self,

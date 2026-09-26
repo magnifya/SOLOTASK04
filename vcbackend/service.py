@@ -46,6 +46,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   GET  /v1/trust/credentials/receipt/consumptions/export  确定性 NDJSON 导出回执消费历史（快照续传，只读）
   GET  /v1/trust/credentials/receipt/consumptions/manifest 回执消费历史导出清单（签名摘要，只读）
   POST /v1/trust/credentials/receipt/consumptions/manifest/verify 校验回执消费历史清单与 NDJSON 内容（只读）
+  POST /v1/trust/receipt-sync 同步外系统回执消费历史（清单验真、检查点防重放，原子落盘不审计）
   POST /v1/trust/credentials/import       导入外部凭证（active 锚点验签后持久化）
   POST /v1/trust/credentials/import-batch 批量导入外部凭证（逐项不短路）
   GET  /v1/trust/credentials/imported/{credential_id}  读取已导入的外部凭证（?issuer_did=）
@@ -92,7 +93,7 @@ import re
 import sys
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
 from . import crypto
@@ -437,6 +438,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_credential_receipt_consumptions_manifest_verify(
                         tenant
                     )
+                elif path == "/v1/trust/receipt-sync":
+                    self._post_trust_receipt_sync(tenant)
                 elif path == "/v1/trust/credentials/import":
                     self._post_trust_credentials_import(tenant)
                 elif path == "/v1/trust/credentials/import-batch":
@@ -4141,6 +4144,162 @@ def build_handler(store: VCStore) -> type:
             ):
                 return "导出内容不匹配"
             return None
+
+        @staticmethod
+        def _parse_receipt_sync_ndjson(
+            ndjson: str, after: int, snapshot: int
+        ) -> Optional[List[Dict[str, Any]]]:
+            """解析同步页 NDJSON：成功返回事件行列表，非法返回 None。
+
+            规则沿用 export 事件：每行恰为以 LF 结行的 UTF-8 紧凑 JSON
+            （末行亦有 LF、无 CR、无 BOM、无空行），行对象恰含且按键序
+            为 cursor、receipt_id、verifier_did、nonce、consumed_at；
+            cursor 为非布尔非负整数，receipt_id/verifier_did/nonce/
+            consumed_at 为非空字符串；行内 cursor 严格递增且满足
+            after < cursor <= snapshot；页内 (verifier_did, nonce) 不得
+            重复。空串为零行的合法页。
+            """
+            if not ndjson:
+                return []
+            if not ndjson.endswith("\n") or "\r" in ndjson:
+                return None
+            events: List[Dict[str, Any]] = []
+            seen_keys: set = set()
+            prev_cursor = after
+            for line in ndjson.split("\n")[:-1]:
+                if not line:
+                    return None
+                try:
+                    row = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    return None
+                if not isinstance(row, dict):
+                    return None
+                if list(row.keys()) != [
+                    "cursor",
+                    "receipt_id",
+                    "verifier_did",
+                    "nonce",
+                    "consumed_at",
+                ]:
+                    return None
+                cursor = row["cursor"]
+                if (
+                    not isinstance(cursor, int)
+                    or isinstance(cursor, bool)
+                    or cursor <= after
+                    or cursor > snapshot
+                    or cursor <= prev_cursor
+                ):
+                    return None
+                for field in (
+                    "receipt_id",
+                    "verifier_did",
+                    "nonce",
+                    "consumed_at",
+                ):
+                    if not isinstance(row[field], str) or not row[field]:
+                        return None
+                key = (row["verifier_did"], row["nonce"])
+                if key in seen_keys:
+                    return None
+                seen_keys.add(key)
+                prev_cursor = cursor
+                events.append(row)
+            return events
+
+        def _post_trust_receipt_sync(self, tenant: str) -> None:
+            # POST /v1/trust/receipt-sync：同步外系统验真回执消费历史并
+            # 防重放。
+            # 1) 请求体恰含 manifest（对象）、ndjson（字符串）：非法
+            #    JSON/非对象、缺漏或多余字段、类型不符一律 400 且仅
+            #    {"error": "非空中文原因"}；
+            # 2) 外层合法后沿用回执消费历史清单验真（五段顺序，含锚点
+            #    active + vc 用途），任何失败 200 恰返
+            #    {valid:false,reason}；
+            # 3) 解析 NDJSON：每行须符合既有 export 事件键序与类型，
+            #    cursor 严格递增且 after < cursor <= snapshot，页内不得
+            #    重复 (verifier_did,nonce)；非法（含与历史重复键）200
+            #    返 {"valid":false,"reason":"导出内容非法"}；
+            # 4) 检查点键为 (tenant, signer_did)：首 after=0；续页同
+            #    snapshot、after=末 cursor；仅末 cursor=旧 snapshot 时
+            #    才接受递增的新 snapshot（after=旧 snapshot）；旧快照/
+            #    跳页/同位异内容 409 仅 {"error":"同步游标冲突"}；
+            # 5) 首次成功 201、重放 200，成功响应按键序恰为 valid、
+            #    signer_did、snapshot、next_after、count（后三为非负
+            #    整数）。事件与检查点原子落盘，同步不写审计；落盘失败
+            #    500 仅 {"error":"存储失败"} 并回滚，并发只增一次。
+            data = self._read_json()
+            if set(data) != {"manifest", "ndjson"}:
+                missing = [f for f in ("manifest", "ndjson") if f not in data]
+                if missing:
+                    raise ValidationError(
+                        f"请求缺少字段: {', '.join(missing)}"
+                    )
+                extra = sorted(set(data) - {"manifest", "ndjson"})
+                raise ValidationError(f"请求含多余字段: {', '.join(extra)}")
+            manifest = data["manifest"]
+            ndjson = data["ndjson"]
+            if not isinstance(manifest, dict):
+                raise ValidationError(
+                    "请求不合法: 字段 manifest 必须为 JSON 对象"
+                )
+            if not isinstance(ndjson, str):
+                raise ValidationError(
+                    "请求不合法: 字段 ndjson 必须为字符串"
+                )
+
+            # 阶段一：沿用清单验真（清单非法 -> 锚点不可用 -> 签名格式
+            # 错误 -> 签名校验失败 -> 导出内容不匹配）。
+            reason = self._verify_receipt_consumption_manifest_item(
+                tenant, manifest, ndjson
+            )
+            if reason is not None:
+                self._send_json(200, {"valid": False, "reason": reason})
+                return
+
+            signer_did = manifest["signer_did"]
+            snapshot = manifest["snapshot"]
+            after = manifest["filters"]["after"]
+
+            # 阶段二：NDJSON 结构、游标窗口与页内重复键。
+            events = self._parse_receipt_sync_ndjson(
+                ndjson, after, snapshot
+            )
+            if events is None:
+                self._send_json(
+                    200, {"valid": False, "reason": "导出内容非法"}
+                )
+                return
+
+            # 阶段三：检查点推进、历史重复键与原子落盘。
+            try:
+                created, effective_snapshot, next_after, count = (
+                    store.sync_receipt_consumptions(
+                        tenant, signer_did, snapshot, after, events
+                    )
+                )
+            except ConflictError:
+                self._send_error(409, "同步游标冲突")
+                return
+            except ValidationError:
+                self._send_json(
+                    200, {"valid": False, "reason": "导出内容非法"}
+                )
+                return
+            except StorageError:
+                self._send_error(500, "存储失败")
+                return
+            self._send_json(
+                201 if created else 200,
+                {
+                    "valid": True,
+                    "signer_did": signer_did,
+                    "snapshot": effective_snapshot,
+                    "next_after": next_after,
+                    "count": count,
+                },
+            )
 
         @staticmethod
         def _verify_credential_receipt_item(
