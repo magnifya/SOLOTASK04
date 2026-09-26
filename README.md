@@ -83,6 +83,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/trust/dids/deactivations/manifest/verify` | 校验停用通告清单与其 NDJSON 导出内容：请求体须恰为 `{"manifest":对象,"ndjson":字符串}`；外层错误（非法 JSON/非对象、缺漏或多余字段、`manifest` 非对象、`ndjson` 非字符串）一律 **400** 且仅 `{"error":...}`。外层合法后任何失败均 **HTTP 200**，依次校验清单结构、本租户同 `signer_did`/`key_version` 的 **active 信任锚点**、签名格式、密码学签名、UTF-8 字节 SHA-256 摘要及行数；失败返 `{"valid":false,"reason":...}`，`reason` 依次恰为“清单非法”“锚点不可用”“签名格式错误”“签名校验失败”“导出内容不匹配”，成功仅 `{"valid":true}`；纯只读、租户隔离、不记审计，结论跨重启稳定 |
 | POST | `/v1/trust/dids/deactivations/manifest/verify-batch` | 批量校验停用通告清单与 NDJSON（只读）：请求体恰为 `{"items":[项...]}`，数组非空且不超过 100 项，每项恰含 `manifest` 对象与 `ndjson` 字符串；**任何失败均 HTTP 200**——请求级非法（空体、非法 JSON、非对象、字段缺失或多余、`items` 非数组、空数组或超限）返回 `{"results":[],"reason":"请求..."}`，合法批次逐项沿用单项验真顺序（清单结构、本租户 active 锚点、签名格式、签名、摘要及行数）不短路返回等长同序 `{"results":[...]}`，成功项仅 `{"valid":true}`、失败项键序 `valid,reason`（五种原因之一，项结构非法按“清单非法”）；不写状态、历史或审计，结论跨重启稳定 |
 | POST | `/v1/trust/presentations/verify` | 跨系统演示验真：验证其他系统生成且未在本租户保存的演示，无需登记 DID/凭证/演示；请求体须恰为 `{"presentation":对象,"challenge":非空串}`；**任何失败均 HTTP 200**，返回 `{"valid":false,"reason":...}`，成功 `{"valid":true}` |
+| POST | `/v1/trust/presentations/consume` | 验真并一次性消费跨系统外部演示（防重放）：请求与字段约束及验真规则同 `/v1/trust/presentations/verify`——未绑定恰含 `presentation`、`challenge`；持有者绑定恰含 `presentation`、`challenge`、非空 `source_tenant_id`，演示恰为绑定十二字段，签发者/持有者双锚点、双签名、期限、校验顺序与 `reason` 全部一致；显式空租户头 **400**；任何验真失败均 **200** 按键序仅返 `{"valid":false,"reason":...}` 且不写入；验真成功后按租户以 `(issuer_did, presentation_id)` 为唯一键消费：首次 **200** 按序恰返 `valid:true`、`consumption_id`、`consumed_at`（`consumption_id` 为请求规范化 JSON 字节的 SHA-256 小写 64 位 hex，`consumed_at` 为 UTC 秒精度 Z），同键重复或并发均 **200** 仅返 `{"valid":false,"reason":"外部演示已消费"}`，每键仅一次成功；首次消费与审计（`trust.presentation.consumed` / `trust_presentation` / `consumption_id`）同一次原子落盘，重放与验真失败不记；落盘失败回滚，**500** 仅返 `{"error":"存储失败"}`，可重试；租户隔离，重启仍判重 |
 | POST | `/v1/trust/presentations/verify-synced` | 以同步锚点验真未绑定外部演示（只读）：请求体恰含 `signer_did`（非空字符串）、`at`（非布尔非负整数）、`presentation`（对象）、`challenge`（非空字符串）；空体、非法 JSON、非对象、键集或类型错误均 **400** 且仅 `{"error":非空中文}`；`signer_did` 未同步或跨租户 **404**、`at` 超过同步检查点 **409**，同形仅 `{error}`；演示九字段、`challenge`、`expires_at`、`proof` 覆盖及“请求→演示→挑战→锚点→签名格式→验签→期限”顺序沿用 `/v1/trust/presentations/verify`（演示含 `holder_*` 字段即非法）；取该来源 `cursor<=at` 的已同步事件，以 `(issuer_did,版本)` 最后事件为锚点，缺失、非 active 或 `uses` 无 `vp` 均 **200** 按键序恰返 `{"valid":false,"reason":"同步锚点不可用"}`；proof 格式错、验签失败、到期同形依次返“签名格式错误”“签名校验失败”“演示已过期”，较早错误优先；成功仅 `{"valid":true}`；纯只读：不改同步页、检查点、锚点、演示、状态或审计，重启一致；租户头缺省 `default`、显式空 400 并隔离 |
 | POST | `/v1/trust/presentations/verify-synced-batch` | 批量以同步锚点快照验真未绑定外部演示（只读）：请求体恰含 `signer_did`（非空字符串）、`at`（非布尔非负整数）、`presentations`（1–100 项数组）；空体、非法 JSON、非对象、键集或类型错误、空数组或超限均 **400** 且仅 `{"error":"请求非法"}`；来源未同步或跨租户 **404** 仅 `{"error":"同步来源不存在"}`，`at` 超过同步检查点 **409** 仅 `{"error":"同步游标冲突"}`，先于项校验；合法时 **200** 仅返 `{"results":[...]}`，逐项不短路、等长同序：项须恰含 `presentation`（对象）与非空 `challenge`，否则该项 `{"valid":false,"reason":"请求项非法"}`；合法项沿用单条 `verify-synced` 的未绑定九字段、`holder_*` 禁令、签名覆盖及“演示→挑战→锚点→格式→验签→期限”顺序，按该来源 `cursor<=at` 的 `(DID,版本)` 末项验真，锚点缺失、非 active 或 `uses` 无 `vp` 为“同步锚点不可用”，格式、验签、过期依次为“签名格式错误”“签名校验失败”“演示已过期”；成功项仅 `{"valid":true}`，失败项键序 `valid`、`reason`；纯只读：不改同步页、检查点、锚点、演示、状态或审计，重启一致；租户头缺省 `default`、显式空 400 并隔离 |
 | POST | `/v1/trust/presentations/verify-synced-batch-with-status` | 批量以同步锚点快照验真未绑定外部演示并合并批初本租户状态快照（只读）：请求级协议与 `verify-synced-batch` 完全一致，请求体恰含 `signer_did`（非空字符串）、`at`（非布尔非负整数）、`presentations`（1–100 项数组）；空体、非法 JSON、非对象、键集或类型错误、空数组或超限均 **400** 且仅 `{"error":"请求非法"}`；来源未同步或跨租户 **404** 仅 `{"error":"同步来源不存在"}`，`at` 超过同步检查点 **409** 仅 `{"error":"同步游标冲突"}`，均先于逐项校验；合法时 **200** 仅返 `{"results":[...]}`，逐项不短路、等长同序：项须恰含 `presentation`（对象）与非空 `challenge`，否则该项 `{"valid":false,"reason":"请求项非法"}`；合法项沿用 `verify-synced-batch` 的 `holder_*` 禁令、挑战、`cursor<=at` 末锚点、proof 覆盖、签名、期限、顺序及原因；验真通过后按演示的 `(issuer_did, credential_id)` 查批初原子读取的本租户状态快照：未同步、revoked、unknown 分别返“外部凭证状态未同步”“外部凭证已吊销：<reason>”（空原因用“未知原因”）“外部凭证状态未知”，active 成功；成功项仅 `{"valid":true}`，失败项键序 `valid`、`reason`；纯只读：不写状态或审计；租户头缺省 `default`、显式空 400 并隔离 |
@@ -1116,6 +1117,22 @@ curl -X POST localhost:8080/v1/proofs/zp_<id>/verify \
     （非法返回前缀“演示”的原因）；当前时间达到它时返回
     `{"valid":false,"reason":"演示已过期"}`。成功仅返回
     `{"valid":true}`。
+- `POST /v1/trust/presentations/consume` 在验真基础上**一次性消费**
+  外部演示（防重放）：请求体与验真规则（含未绑定与持有者绑定两种
+  形态、双锚点双签名、期限、顺序与 `reason`）与
+  `/v1/trust/presentations/verify` 完全一致；显式空
+  `X-Tenant-ID` 返回 400，任何验真失败均 HTTP 200 仅返
+  `{"valid":false,"reason":…}` 且不写入、不记审计。验真成功后按
+  租户以 `(issuer_did, presentation_id)` 判重：首次 **200** 按键序
+  恰返 `valid`、`consumption_id`、`consumed_at`，其中
+  `consumption_id` 为请求规范化 JSON 字节（递归键升序紧凑 UTF-8）
+  的 SHA-256 小写 64 位 hex，`consumed_at` 为 UTC 秒精度 Z；同键
+  重复（演示内容可不同）或并发均 **200** 仅返
+  `{"valid":false,"reason":"外部演示已消费"}`，每键仅一次成功。
+  首次消费与审计事件（`trust.presentation.consumed` /
+  `trust_presentation` / `consumption_id`）同一次原子写落盘，重放
+  与验真失败不记；落盘失败回滚并返回 **500** 仅
+  `{"error":"存储失败"}`（可重试）；按租户隔离，重启后仍判重。
 - `POST /v1/trust/presentations/verify-batch` 为批量版本：请求体必须
   **恰为** `{"presentations":[项...]}`，数组非空且不超过 100 项。外层
   缺失、非法 JSON、非对象、字段缺失或多余、`presentations` 非数组、

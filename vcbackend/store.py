@@ -196,6 +196,7 @@ AUDIT_DID_DEACTIVATED = "did.deactivated"
 AUDIT_TRUST_CREDENTIAL_STATUS_SYNCED = "trust.credential.status.synced"
 AUDIT_TRUST_CREDENTIAL_IMPORTED = "trust.credential.imported"
 AUDIT_TRUST_CREDENTIAL_RECEIPT_CONSUMED = "trust.credential.receipt.consumed"
+AUDIT_TRUST_PRESENTATION_CONSUMED = "trust.presentation.consumed"
 
 # 信任锚点用途历史事件动作名（区别于审计动作名）：
 # 新版本注册/轮换分别追加 registered/rotated（from_uses 为 None），实际
@@ -646,6 +647,9 @@ class VCStore:
             bucket.setdefault("synced_receipts", {})
             bucket.setdefault("synced_receipt_consumption_events", [])
             bucket.setdefault("synced_anchor_change_pages", {})
+            # 跨系统外部演示一次性消费判重索引：
+            # issuer_did -> presentation_id -> {consumption_id, consumed_at}
+            bucket.setdefault("consumed_trust_presentations", {})
             for rec in bucket["dids"].values():
                 _migrate_did_row(rec)
         # 外部凭证状态历史游标（租户内持久化正整数，按追加递增）。
@@ -1083,6 +1087,7 @@ class VCStore:
                 "synced_receipts": {},
                 "synced_receipt_consumption_events": {},
                 "synced_anchor_change_pages": {},
+                "consumed_trust_presentations": {},
             }
             self._tenants[tenant_id] = bucket
         return bucket
@@ -9508,6 +9513,57 @@ class VCStore:
                 )
             next_after = picked[-1].cursor if picked else after
             return picked, effective_snapshot, next_after
+
+    def consume_trust_presentation(
+        self,
+        tenant_id: str,
+        issuer_did: str,
+        presentation_id: str,
+        consumption_id: str,
+    ) -> Tuple[bool, Optional[str]]:
+        """按 (issuer_did, presentation_id) 一次性消费跨系统外部演示。
+
+        调用方须先完成演示验真（未绑定或持有者绑定形态全部通过）。本
+        方法在锁内原子判定并标记：
+        - 同键已消费：返回 (False, None)，不写消费标记、不记审计；
+        - 首次消费：记录 consumed_at（UTC 秒精度 Z）并追加一条
+          trust.presentation.consumed 审计（resource_type 为
+          trust_presentation、resource_id 为 consumption_id），与消费
+          标记同一次原子写落盘，返回 (True, consumed_at)；并发仅一次
+          成功，跨重启保留；
+        - 落盘失败：回滚内存中的消费标记与审计事件，抛 StorageError
+          （可重试）。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            by_issuer = (
+                bucket["consumed_trust_presentations"].get(issuer_did)
+                if bucket is not None
+                else None
+            )
+            if by_issuer is not None and presentation_id in by_issuer:
+                return False, None
+            bucket = self._ensure_bucket_locked(tenant_id)
+            snapshot = self._snapshot_locked()
+            try:
+                consumed_at = _utc_now()
+                bucket["consumed_trust_presentations"].setdefault(
+                    issuer_did, {}
+                )[presentation_id] = {
+                    "consumption_id": consumption_id,
+                    "consumed_at": consumed_at,
+                }
+                self._append_audit_locked(
+                    tenant_id,
+                    AUDIT_TRUST_PRESENTATION_CONSUMED,
+                    "trust_presentation",
+                    consumption_id,
+                )
+                self._save_locked()
+            except Exception as exc:
+                self._restore_locked(snapshot)
+                raise StorageError("存储失败") from exc
+            return True, consumed_at
 
     def consume_credential_receipt(
         self,
