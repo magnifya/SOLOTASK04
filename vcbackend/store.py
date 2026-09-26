@@ -58,6 +58,7 @@ from .models import (
     PredicateProofRecord,
     PresentationRecord,
     ReceiptConsumptionEvent,
+    TrustPresentationConsumptionEvent,
     TrustAnchorRecord,
     TrustAnchorHistoryEvent,
     TrustAnchorUsesHistoryEvent,
@@ -9622,6 +9623,90 @@ class VCStore:
                 self._restore_locked(snapshot)
                 raise StorageError("存储失败") from exc
             return outcomes
+
+    def list_trust_presentation_consumptions(
+        self,
+        tenant_id: str,
+        after: int = 0,
+        limit: int = 50,
+        issuer_did: Optional[str] = None,
+    ) -> Tuple[List[TrustPresentationConsumptionEvent], int]:
+        """只读分页查询本租户跨系统演示消费历史事件。
+
+        消费标记与 trust.presentation.consumed 审计在消费时于同一次
+        原子写落盘，本方法在同一把锁内读取二者（快照一致），仅为
+        存在匹配审计事件的消费标记产出事件，cursor 取该审计 seq
+        （正整数，天然按首次消费发生顺序单调）。重放、验真失败不落
+        标记或审计；落盘失败整体回滚——三者在此均不可见。
+
+        - 先按 issuer_did 精确过滤（未提供时不过滤）；
+        - 再按 cursor > after 升序取至多 limit 项；
+        - next_after 为本页末项 cursor，空页保持 after。
+        纯只读：不修改任何状态、不记审计、不触发落盘。
+        """
+        with self._lock:
+            # 同锁快照读取消费标记：issuer_did -> presentation_id ->
+            # {consumption_id, consumed_at}。
+            markers: List[Tuple[str, str, Dict[str, Any]]] = []
+            bucket = self._bucket_locked(tenant_id)
+            if bucket is not None:
+                for iss, by_presentation in bucket.get(
+                    "consumed_trust_presentations", {}
+                ).items():
+                    for presentation_id, row in by_presentation.items():
+                        markers.append((iss, presentation_id, row))
+            # 同锁快照读取本租户的 trust.presentation.consumed 审计，
+            # 按 resource_id(consumption_id) 索引。
+            audits_by_cid: Dict[str, Dict[str, Any]] = {}
+            for event in self._audit:
+                if (
+                    event.get("tenant_id") == tenant_id
+                    and event.get("action")
+                    == AUDIT_TRUST_PRESENTATION_CONSUMED
+                ):
+                    audits_by_cid.setdefault(event.get("resource_id"), event)
+            rows: List[Dict[str, Any]] = []
+            for iss, presentation_id, row in markers:
+                audit = audits_by_cid.get(row.get("consumption_id"))
+                if audit is None:
+                    # 标记与审计同原子写，缺失仅可能来自不一致的外部
+                    # 状态文件：按“未成功消费不可见”处理。
+                    continue
+                if issuer_did is not None and iss != issuer_did:
+                    continue
+                rows.append(
+                    {
+                        "cursor": int(audit["seq"]),
+                        "consumption_id": row["consumption_id"],
+                        "issuer_did": iss,
+                        "presentation_id": presentation_id,
+                        "consumed_at": row.get("consumed_at") or "",
+                    }
+                )
+            rows.sort(
+                key=lambda item: (
+                    item["cursor"],
+                    item["issuer_did"],
+                    item["presentation_id"],
+                )
+            )
+            picked: List[TrustPresentationConsumptionEvent] = []
+            for row in rows:
+                if row["cursor"] <= after:
+                    continue
+                if len(picked) >= limit:
+                    break
+                picked.append(
+                    TrustPresentationConsumptionEvent(
+                        cursor=row["cursor"],
+                        consumption_id=row["consumption_id"],
+                        issuer_did=row["issuer_did"],
+                        presentation_id=row["presentation_id"],
+                        consumed_at=row["consumed_at"],
+                    )
+                )
+            next_after = picked[-1].cursor if picked else after
+            return picked, next_after
 
     def consume_credential_receipt(
         self,

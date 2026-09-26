@@ -78,6 +78,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/presentations/verify     跨系统演示验真（无需登记 DID/凭证/演示）
   POST /v1/trust/presentations/consume    跨系统演示一次性消费（防重放，首次落盘并审计）
   POST /v1/trust/presentations/consume-batch  批量一次性消费外部演示（逐项不短路，防重放）
+  GET  /v1/trust/presentations/consumptions  查询跨系统演示消费历史（只读）
   POST /v1/trust/presentations/verify-synced  以同步锚点验真未绑定外部演示（只读）
   POST /v1/trust/presentations/verify-synced-with-status  同步锚点验真未绑定/持有者绑定演示并合并请求初始状态快照（只读）
   POST /v1/trust/presentations/verify-synced-batch  批量以同步锚点快照验真未绑定演示（只读）
@@ -870,6 +871,10 @@ def build_handler(store: VCStore) -> type:
                     self._get_trust_anchor_snapshot(tenant, parsed.query)
                 elif path == "/v1/trust/dids/deactivations":
                     self._get_trust_did_deactivations(tenant, parsed.query)
+                elif path == "/v1/trust/presentations/consumptions":
+                    self._get_trust_presentation_consumptions(
+                        tenant, parsed.query
+                    )
                 elif path == "/v1/trust/credentials/receipt/consumptions":
                     self._get_trust_credential_receipt_consumptions(
                         tenant, parsed.query
@@ -6228,6 +6233,92 @@ def build_handler(store: VCStore) -> type:
             if not valid:
                 payload["reason"] = reason or "验签失败"
             self._send_json(200, payload)
+
+        def _get_trust_presentation_consumptions(
+            self, tenant: str, query: str
+        ) -> None:
+            # GET /v1/trust/presentations/consumptions：只读查询本租户
+            # 跨系统外部演示的首次成功消费历史。
+            # 查询参数仅允许 limit、after、issuer_did，且均只能出现一次：
+            # - limit 缺省 50，须为 1..200 的非空 ASCII 十进制整数；
+            # - after 缺省 0，须为非负 ASCII 十进制整数；
+            # - issuer_did 可省略，提供时须为非空字符串，按字面值精确
+            #   匹配。
+            # 空值、重复参数、符号、Unicode 数字、越界或未知参数一律
+            # 400 且恰返 {"error":"请求非法"}。
+            # 先按 issuer_did 精确过滤，再取 cursor > after 的前 limit
+            # 项并按 cursor 升序。cursor 为首次成功消费对应的
+            # trust.presentation.consumed 审计 seq（正整数），消费标记
+            # 与审计在同锁快照读取，重放、验真失败或落盘失败不可见。
+            # 200 键序恰为 events、next_after；事件键序恰为 cursor、
+            # consumption_id、issuer_did、presentation_id、consumed_at
+            # （cursor 为正整数，其余四值为字符串，consumed_at 为 UTC
+            # 秒精度 Z）；空页 next_after 等于 after。无事件也 200 空
+            # 数组。纯只读：不写状态或审计。
+            params = parse_qs(query, keep_blank_values=True)
+            allowed = {"limit", "after", "issuer_did"}
+            unknown = sorted(set(params) - allowed)
+
+            def _single(name: str) -> Optional[str]:
+                values = params.get(name)
+                if values is None:
+                    return None
+                if len(values) != 1:
+                    return ""  # 重复参数与空值同形处理为 400
+                return values[0]
+
+            limit_raw = _single("limit")
+            after_raw = _single("after")
+            issuer_raw = _single("issuer_did")
+            invalid = bool(unknown)
+            limit = 50
+            after = 0
+            issuer_did: Optional[str] = None
+            if not invalid:
+                if limit_raw is not None:
+                    try:
+                        limit = _parse_nonneg_int(limit_raw, "limit")
+                    except ValidationError:
+                        invalid = True
+                    else:
+                        if not 1 <= limit <= 200:
+                            invalid = True
+                if after_raw is not None:
+                    try:
+                        after = _parse_nonneg_int(after_raw, "after")
+                    except ValidationError:
+                        invalid = True
+                if issuer_raw is not None:
+                    if not issuer_raw:
+                        invalid = True
+                    else:
+                        issuer_did = issuer_raw
+            if invalid:
+                self._send_error(400, "请求非法")
+                return
+
+            events, next_after = store.list_trust_presentation_consumptions(
+                tenant,
+                after,
+                limit,
+                issuer_did=issuer_did,
+            )
+            self._send_json(
+                200,
+                {
+                    "events": [
+                        {
+                            "cursor": event.cursor,
+                            "consumption_id": event.consumption_id,
+                            "issuer_did": event.issuer_did,
+                            "presentation_id": event.presentation_id,
+                            "consumed_at": event.consumed_at,
+                        }
+                        for event in events
+                    ],
+                    "next_after": next_after,
+                },
+            )
 
         def _post_trust_presentations_consume(self, tenant: str) -> None:
             # POST /v1/trust/presentations/consume：验真并一次性消费

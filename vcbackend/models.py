@@ -365,6 +365,26 @@ class ReceiptConsumptionEvent:
 
 
 @dataclass
+class TrustPresentationConsumptionEvent:
+    """跨系统演示消费历史中的一条事件（只读消费历史查询用）。
+
+    按租户归属、跨签发者共享游标：仅首次成功消费演示时，其消费标记与
+    trust.presentation.consumed 审计在同一次原子写落盘后才可被读到。
+    cursor 取该次消费对应审计事件的全局 seq（正整数），因此天然按消费
+    发生顺序单调；重放、验真失败或落盘失败均不可见。issuer_did/
+    presentation_id/consumption_id 为该消费唯一键与请求摘要；
+    consumed_at 为首次消费时间（UTC ISO8601 秒精度 Z）。游标空间与
+    其他历史相互独立，重启后随审计稳定。
+    """
+
+    cursor: int
+    consumption_id: str
+    issuer_did: str
+    presentation_id: str
+    consumed_at: str
+
+
+@dataclass
 class ImportedCredentialRecord:
     """一条已导入的外部凭证（按租户与 issuer_did#credential_id 双键隔离）。
 
