@@ -26,6 +26,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/proofs/{proof_id}/verify             以存储记录为锚校验谓词证明
   POST /v1/trust/anchors                  注册信任锚点（同 DID/版本同 PEM 且 uses 相同幂等；可选 uses 用途白名单）
   GET  /v1/trust/anchor-changes           可签名信任锚点变更流（?after=&signer_did=，只读）
+  POST /v1/trust/anchor-changes/verify    校验锚点变更流签名（只读）
   GET  /v1/trust/anchors                  跨 DID 只读发现锚点版本（?limit=&after=&status=）
   POST /v1/trust/anchors/{did}/rotate     带前置版本校验的密钥轮换（继承前置 uses）
   GET  /v1/trust/anchors/{did}            查询 DID 的全部锚点版本
@@ -107,10 +108,26 @@ from .store import (
     PresentationRecord,
     REASON_UNSET,
     StorageError,
+    TRUST_ANCHOR_CHANGE_REGISTERED,
+    TRUST_ANCHOR_CHANGE_REVOKED,
+    TRUST_ANCHOR_CHANGE_ROTATED,
+    TRUST_ANCHOR_CHANGE_SNAPSHOT,
+    TRUST_ANCHOR_CHANGE_USES_UPDATED,
     TRUST_ANCHOR_USES,
     USES_UNSET,
     ValidationError,
     VCStore,
+)
+
+# 可签名锚点变更流事件动作名全集（结构校验用）
+_TRUST_ANCHOR_CHANGE_ACTIONS = frozenset(
+    (
+        TRUST_ANCHOR_CHANGE_REGISTERED,
+        TRUST_ANCHOR_CHANGE_ROTATED,
+        TRUST_ANCHOR_CHANGE_REVOKED,
+        TRUST_ANCHOR_CHANGE_USES_UPDATED,
+        TRUST_ANCHOR_CHANGE_SNAPSHOT,
+    )
 )
 
 
@@ -393,6 +410,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_anchors(tenant)
                 elif path == "/v1/trust/anchors/snapshot/verify":
                     self._post_trust_anchor_snapshot_verify(tenant)
+                elif path == "/v1/trust/anchor-changes/verify":
+                    self._post_trust_anchor_changes_verify(tenant)
                 elif path.startswith("/v1/trust/anchors/") and path.endswith(
                     "/rotate"
                 ):
@@ -2259,6 +2278,206 @@ def build_handler(store: VCStore) -> type:
                 self._send_json(200, {"valid": False, "reason": reason})
                 return
             self._send_json(200, {"valid": True})
+
+        def _post_trust_anchor_changes_verify(self, tenant: str) -> None:
+            # POST /v1/trust/anchor-changes/verify：跨系统信任锚点变更流
+            # 只读验真。请求体须恰为 {"changes": 对象, "after": 非布尔非
+            # 负整数}，否则 400 且仅 {"error": 非空中文}。changes 恰含
+            # GET /v1/trust/anchor-changes 响应的 events、next_after、
+            # signer_did、signer_key_version、signature 五键，字段与事
+            # 件协议沿用该入口。外层合法后任何失败均 HTTP 200，按顺序
+            # 返回 {"valid":false,"reason":...}：变更流非法（键集/类型、
+            # events 超 200 项、cursor 非严格递增或不大于 after、
+            # next_after 与末项 cursor/after 不一致）-> 锚点不可用（本
+            # 租户同 signer_did/版本且含 generic 用途的 active 锚点）
+            # -> 签名格式错误 -> 签名校验失败。成功仅 {"valid":true}。
+            # 不依赖本地事件，纯只读：不写状态、游标或审计；租户隔离。
+            data = self._read_json()
+            if set(data) != {"changes", "after"}:
+                missing = sorted({"changes", "after"} - set(data))
+                if missing:
+                    raise ValidationError(
+                        f"请求缺少字段: {', '.join(missing)}"
+                    )
+                extra = sorted(set(data) - {"changes", "after"})
+                raise ValidationError(
+                    f"请求含多余字段: {', '.join(extra)}"
+                )
+            changes = data["changes"]
+            if not isinstance(changes, dict):
+                raise ValidationError(
+                    "请求不合法: 字段 changes 必须为 JSON 对象"
+                )
+            after = data["after"]
+            if (
+                not isinstance(after, int)
+                or isinstance(after, bool)
+                or after < 0
+            ):
+                raise ValidationError(
+                    "请求不合法: 字段 after 必须为非负整数"
+                )
+            reason = self._verify_anchor_changes_item(
+                tenant, changes, after
+            )
+            if reason is not None:
+                self._send_json(200, {"valid": False, "reason": reason})
+                return
+            self._send_json(200, {"valid": True})
+
+        def _anchor_changes_is_well_formed(
+            self, changes: Any, after: int
+        ) -> bool:
+            # 变更流结构校验（“变更流非法”）：恰含五键且各键类型/取值
+            # 合法；事件协议沿用 GET /v1/trust/anchor-changes。
+            if not isinstance(changes, dict):
+                return False
+            if set(changes) != {
+                "events",
+                "next_after",
+                "signer_did",
+                "signer_key_version",
+                "signature",
+            }:
+                return False
+            events = changes["events"]
+            if not isinstance(events, list) or len(events) > 200:
+                return False
+            for event in events:
+                if not isinstance(event, dict):
+                    return False
+                if set(event) != {
+                    "cursor",
+                    "action",
+                    "did",
+                    "key_version",
+                    "public_key",
+                    "status",
+                    "uses",
+                }:
+                    return False
+                cursor = event["cursor"]
+                if (
+                    not isinstance(cursor, int)
+                    or isinstance(cursor, bool)
+                    or cursor < 1
+                ):
+                    return False
+                if event["action"] not in _TRUST_ANCHOR_CHANGE_ACTIONS:
+                    return False
+                if not isinstance(event["did"], str) or not event["did"]:
+                    return False
+                key_version = event["key_version"]
+                if (
+                    not isinstance(key_version, int)
+                    or isinstance(key_version, bool)
+                    or key_version < 1
+                ):
+                    return False
+                if (
+                    not isinstance(event["public_key"], str)
+                    or not event["public_key"]
+                ):
+                    return False
+                if event["status"] not in ("active", "revoked"):
+                    return False
+                uses = event["uses"]
+                if not isinstance(uses, list) or not uses:
+                    return False
+                if any(
+                    not isinstance(use, str) or use not in TRUST_ANCHOR_USES
+                    for use in uses
+                ):
+                    return False
+                if len(set(uses)) != len(uses) or list(uses) != sorted(
+                    uses, key=TRUST_ANCHOR_USES.index
+                ):
+                    return False
+            cursors = [event["cursor"] for event in events]
+            if any(cursor <= after for cursor in cursors):
+                return False
+            if any(
+                cursors[index] >= cursors[index + 1]
+                for index in range(len(cursors) - 1)
+            ):
+                return False
+            next_after = changes["next_after"]
+            if (
+                not isinstance(next_after, int)
+                or isinstance(next_after, bool)
+                or next_after < 0
+            ):
+                return False
+            expected_next_after = cursors[-1] if cursors else after
+            if next_after != expected_next_after:
+                return False
+            signer_did = changes["signer_did"]
+            if not isinstance(signer_did, str) or not signer_did:
+                return False
+            signer_key_version = changes["signer_key_version"]
+            if (
+                not isinstance(signer_key_version, int)
+                or isinstance(signer_key_version, bool)
+                or signer_key_version < 1
+            ):
+                return False
+            signature = changes["signature"]
+            if not isinstance(signature, str) or not signature:
+                return False
+            return True
+
+        def _verify_anchor_changes_item(
+            self, tenant: str, changes: Any, after: int
+        ) -> Optional[str]:
+            # 变更流验真：按序返回失败原因（变更流非法 -> 锚点不可用 ->
+            # 签名格式错误 -> 签名校验失败），成功返回 None。纯只读。
+            # 阶段一：变更流键集/类型/事件协议/游标与 next_after 一致性
+            if not self._anchor_changes_is_well_formed(changes, after):
+                return "变更流非法"
+
+            events = changes["events"]
+            signer_did = changes["signer_did"]
+            signer_key_version = changes["signer_key_version"]
+
+            # 阶段二：本租户同 signer_did/版本且含 generic 用途的
+            # active 信任锚点
+            public_pem = store.get_active_trust_anchor_public_key(
+                tenant,
+                signer_did,
+                signer_key_version,
+                required_use="generic",
+            )
+            if public_pem is None:
+                return "锚点不可用"
+            try:
+                crypto.validate_public_key_pem(public_pem)
+            except (ValueError, TypeError):
+                return "锚点不可用"
+
+            signed = {
+                "events": events,
+                "next_after": changes["next_after"],
+                "signer_did": signer_did,
+                "signer_key_version": signer_key_version,
+            }
+            signature = changes["signature"]
+
+            # 阶段三：签名格式
+            try:
+                crypto.validate_signature_format_strict(signature)
+            except crypto.MalformedSignature:
+                return "签名格式错误"
+
+            # 阶段四：密码学验签
+            try:
+                crypto.verify(signed, signature, public_pem)
+            except crypto.MalformedSignature:
+                return "签名格式错误"
+            except crypto.InvalidSignature:
+                return "签名校验失败"
+            except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露细节
+                return "签名校验失败"
+            return None
 
         def _get_trust_did_deactivations(self, tenant: str, query: str) -> None:
             # GET /v1/trust/dids/deactivations：只读查询本租户外部 DID
