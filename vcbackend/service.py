@@ -76,6 +76,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/dids/deactivations/manifest/verify 校验停用通告清单与 NDJSON 内容（只读）
   POST /v1/trust/dids/deactivations/manifest/verify-batch 批量校验清单与 NDJSON（只读）
   POST /v1/trust/presentations/verify     跨系统演示验真（无需登记 DID/凭证/演示）
+  POST /v1/trust/presentations/consume    跨系统演示一次性消费（验真后按租户判重，防重放）
   POST /v1/trust/presentations/verify-synced  以同步锚点验真未绑定外部演示（只读）
   POST /v1/trust/presentations/verify-synced-with-status  同步锚点验真未绑定/持有者绑定演示并合并请求初始状态快照（只读）
   POST /v1/trust/presentations/verify-synced-batch  批量以同步锚点快照验真未绑定演示（只读）
@@ -651,6 +652,8 @@ def build_handler(store: VCStore) -> type:
                     )
                 elif path == "/v1/trust/presentations/verify":
                     self._post_trust_presentations_verify(tenant)
+                elif path == "/v1/trust/presentations/consume":
+                    self._post_trust_presentations_consume(tenant)
                 elif path == "/v1/trust/presentations/verify-synced":
                     self._post_trust_presentations_verify_synced(tenant)
                 elif (
@@ -6222,6 +6225,82 @@ def build_handler(store: VCStore) -> type:
             if not valid:
                 payload["reason"] = reason or "验签失败"
             self._send_json(200, payload)
+
+        def _post_trust_presentations_consume(self, tenant: str) -> None:
+            # POST /v1/trust/presentations/consume：跨系统演示一次性
+            # 消费（验真 + 防重放）。
+            # 1) 请求解析与验真完全沿用同目录 /verify：未绑定请求恰含
+            #    presentation、challenge；持有者绑定请求另恰含非空
+            #    source_tenant_id，演示为绑定十二字段（签发者/持有者
+            #    双锚点、双签名、期限、检查顺序与 reason 均一致）；
+            # 2) 显式空租户头由路由统一判 400；验真失败均 HTTP 200，
+            #    按序恰返 {"valid":false,"reason"}，不写状态、不记审计；
+            # 3) 验真成功后按租户以 (issuer_did, presentation_id) 判重：
+            #    首次 200 按序恰返 valid、consumption_id、consumed_at
+            #    （valid:true；consumption_id 为请求规范化 JSON 字节的
+            #    SHA-256 小写 64 位 hex；consumed_at 为 UTC 秒精度 Z）；
+            #    同键重复（演示可不同）或并发均 200 恰返
+            #    {"valid":false,"reason":"外部演示已消费"}，仅一次成功；
+            # 4) 首次消费与审计（trust.presentation.consumed /
+            #    trust_presentation / consumption_id）同一次原子落盘；
+            #    重放与验真失败不记；落盘失败回滚二者，500 仅返
+            #    {"error":"存储失败"}，可重试；租户隔离，重启仍判重。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                self._send_invalid("请求体缺失或长度声明非法")
+                return
+            except Exception:  # noqa: BLE001
+                self._send_invalid("请求体读取失败")
+                return
+            if not raw:
+                self._send_invalid("请求体缺失")
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                self._send_invalid("请求体不是合法 UTF-8 文本")
+                return
+            except json.JSONDecodeError:
+                self._send_invalid("请求体不是合法 JSON")
+                return
+
+            try:
+                valid, reason = store.verify_trust_presentation(tenant, data)
+            except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
+                self._send_invalid("验签过程发生内部错误")
+                return
+            if not valid:
+                self._send_invalid(reason or "验签失败")
+                return
+            presentation = data["presentation"]
+            consumption_id = hashlib.sha256(
+                crypto.canonicalize(data)
+            ).hexdigest()
+            try:
+                consumed, consumed_at = store.consume_trust_presentation(
+                    tenant,
+                    presentation["issuer_did"],
+                    presentation["presentation_id"],
+                    consumption_id,
+                )
+            except StorageError:
+                self._send_error(500, "存储失败")
+                return
+            if not consumed:
+                self._send_json(
+                    200, {"valid": False, "reason": "外部演示已消费"}
+                )
+                return
+            self._send_json(
+                200,
+                {
+                    "valid": True,
+                    "consumption_id": consumption_id,
+                    "consumed_at": consumed_at,
+                },
+            )
 
         def _post_trust_presentations_verify_synced(
             self, tenant: str
