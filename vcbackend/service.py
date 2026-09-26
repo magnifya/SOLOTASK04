@@ -77,6 +77,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/dids/deactivations/manifest/verify-batch 批量校验清单与 NDJSON（只读）
   POST /v1/trust/presentations/verify     跨系统演示验真（无需登记 DID/凭证/演示）
   POST /v1/trust/presentations/consume    跨系统演示一次性消费（防重放，首次落盘并审计）
+  POST /v1/trust/presentations/consume-batch  批量验真并一次性消费外部演示（逐项不短路，防重放）
   POST /v1/trust/presentations/verify-synced  以同步锚点验真未绑定外部演示（只读）
   POST /v1/trust/presentations/verify-synced-with-status  同步锚点验真未绑定/持有者绑定演示并合并请求初始状态快照（只读）
   POST /v1/trust/presentations/verify-synced-batch  批量以同步锚点快照验真未绑定演示（只读）
@@ -654,6 +655,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_presentations_verify(tenant)
                 elif path == "/v1/trust/presentations/consume":
                     self._post_trust_presentations_consume(tenant)
+                elif path == "/v1/trust/presentations/consume-batch":
+                    self._post_trust_presentations_consume_batch(tenant)
                 elif path == "/v1/trust/presentations/verify-synced":
                     self._post_trust_presentations_verify_synced(tenant)
                 elif (
@@ -6308,6 +6311,181 @@ def build_handler(store: VCStore) -> type:
                     "consumed_at": consumed_at,
                 },
             )
+
+        @staticmethod
+        def _validate_presentation_consume_item_envelope(item: Any) -> None:
+            """校验 consume-batch 逐项的外层结构（单条 consume 请求体的
+            请求结构阶段）。
+
+            未绑定项须恰含 presentation（JSON 对象）、challenge（非空
+            字符串）；持有者绑定项另须恰含非空字符串
+            source_tenant_id。键集或类型不符一律抛 ValidationError，
+            由调用方回 {"valid": false, "reason": "请求项非法"}；
+            演示内部字段及后续锚点、签名、期限等规则不在此判定，沿用
+            store.verify_trust_presentation 的顺序与 reason。
+            """
+            if not isinstance(item, dict):
+                raise ValidationError("请求项必须为 JSON 对象")
+            if "source_tenant_id" in item:
+                expected_fields = (
+                    "presentation",
+                    "challenge",
+                    "source_tenant_id",
+                )
+            else:
+                expected_fields = ("presentation", "challenge")
+            if set(item) != set(expected_fields):
+                missing = [f for f in expected_fields if f not in item]
+                if missing:
+                    raise ValidationError(
+                        f"缺少字段: {', '.join(missing)}"
+                    )
+                extra = sorted(set(item) - set(expected_fields))
+                raise ValidationError(
+                    f"多余字段: {', '.join(extra)}"
+                )
+            if not isinstance(item["presentation"], dict):
+                raise ValidationError("字段 presentation 必须为 JSON 对象")
+            challenge = item["challenge"]
+            if not isinstance(challenge, str) or not challenge:
+                raise ValidationError(
+                    "字段 challenge 必须为非空字符串"
+                )
+            if "source_tenant_id" in item:
+                source_tenant_id = item["source_tenant_id"]
+                if not isinstance(source_tenant_id, str) or not source_tenant_id:
+                    raise ValidationError(
+                        "字段 source_tenant_id 必须为非空字符串"
+                    )
+
+        def _post_trust_presentations_consume_batch(
+            self, tenant: str
+        ) -> None:
+            # POST /v1/trust/presentations/consume-batch：批量验真并一次
+            # 性消费跨系统外部演示（防重放）。
+            # 1) 请求体须恰为 {"items": [项...]}，数组限 1–100 项；空体、
+            #    非法 JSON、非对象、键集错误、items 非数组/空/超限均
+            #    HTTP 200 按键序恰返
+            #    {"results": [], "reason": "请求非法"}；
+            # 2) 合法批次逐项处理、失败不短路：项须恰为单条 consume 的
+            #    未绑定（presentation/challenge）或持有者绑定（另恰含非空
+            #    source_tenant_id）请求；项结构错（非对象、键集或外层类型
+            #    错）-> {"valid": false, "reason": "请求项非法"}；其余
+            #    完整复用单条 consume 的验真规则、校验顺序与 reason（演示
+            #    字段、挑战、双锚点、双签名、期限、停用通告），验真失败项
+            #    不写消费标记、不记审计；
+            # 3) 验真通过后按租户 (issuer_did, presentation_id) 判重：
+            #    批内首个未消费项成功，后项或历史重放均
+            #    {"valid": false, "reason": "外部演示已消费"}；成功项
+            #    键序恰为 valid、consumption_id、consumed_at，
+            #    consumption_id 为该项规范化 JSON 字节的 SHA-256 小写
+            #    64 位 hex，consumed_at 为 UTC 秒精度 Z；失败项键序恰为
+            #    valid、reason；results 与输入等长同序；顶层 200 仅含
+            #    results；
+            # 4) 本批全部新消费与审计同锁一次原子落盘；失败全回滚，500
+            #    仅返 {"error": "存储失败"}，可重试；与单条/其他批次并发
+            #    每键仅一次成功，跨重启保持判重。显式空 X-Tenant-ID 由
+            #    路由统一判 400 并按租户隔离。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except Exception:  # noqa: BLE001 请求非法统一 200 处理
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            if not raw:
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            if (
+                not isinstance(data, dict)
+                or set(data) != {"items"}
+                or not isinstance(data["items"], list)
+                or not data["items"]
+                or len(data["items"]) > 100
+            ):
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            items = data["items"]
+
+            results: List[Optional[Dict[str, Any]]] = []
+            # 验真通过、待判重消费的项：(结果下标, issuer_did,
+            # presentation_id, consumption_id)，消费判定在全部验真完成后
+            # 同锁一次完成。
+            pending: List[Tuple[int, str, str, str]] = []
+            for index, item in enumerate(items):  # 顺序处理，失败不短路
+                try:
+                    self._validate_presentation_consume_item_envelope(item)
+                except ValidationError:
+                    results.append({"valid": False, "reason": "请求项非法"})
+                    continue
+                try:
+                    valid, reason = store.verify_trust_presentation(
+                        tenant, item
+                    )
+                except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
+                    results.append(
+                        {"valid": False, "reason": "验签过程发生内部错误"}
+                    )
+                    continue
+                if not valid:
+                    results.append(
+                        {"valid": False, "reason": reason or "验签失败"}
+                    )
+                    continue
+                consumption_id = hashlib.sha256(
+                    crypto.canonicalize(item)
+                ).hexdigest()
+                pending.append(
+                    (
+                        index,
+                        item["presentation"]["issuer_did"],
+                        item["presentation"]["presentation_id"],
+                        consumption_id,
+                    )
+                )
+                results.append(None)  # 占位，消费判定后回填
+
+            if pending:
+                try:
+                    outcomes = store.consume_trust_presentations_batch(
+                        tenant,
+                        [
+                            (issuer_did, presentation_id, consumption_id)
+                            for _, issuer_did, presentation_id, consumption_id
+                            in pending
+                        ],
+                    )
+                except StorageError:
+                    self._send_error(500, "存储失败")
+                    return
+                for (
+                    (index, _, _, consumption_id),
+                    (consumed, consumed_at),
+                ) in zip(pending, outcomes):
+                    if consumed:
+                        results[index] = {
+                            "valid": True,
+                            "consumption_id": consumption_id,
+                            "consumed_at": consumed_at,
+                        }
+                    else:
+                        results[index] = {
+                            "valid": False,
+                            "reason": "外部演示已消费",
+                        }
+            self._send_json(200, {"results": results})
 
         def _post_trust_presentations_verify_synced(
             self, tenant: str
