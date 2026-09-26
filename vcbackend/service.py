@@ -42,6 +42,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/anchors/snapshot/verify  校验锚点快照签名（只读）
   POST /v1/trust/verify                   用 active 锚点公钥验签
   POST /v1/trust/credentials/verify       跨系统凭证验真（无需登记 DID/凭证）
+  POST /v1/trust/credentials/verify-synced  以同步锚点验真外部凭证（只读）
   POST /v1/trust/credentials/verify-receipt  跨系统凭证验真签名回执（只读）
   POST /v1/trust/credentials/receipt/verify  校验验真签名回执（只读）
   POST /v1/trust/credentials/receipt/consume  消费验真签名回执（防重放，首次落盘并审计）
@@ -463,6 +464,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_verify(tenant)
                 elif path == "/v1/trust/credentials/verify":
                     self._post_trust_credentials_verify(tenant)
+                elif path == "/v1/trust/credentials/verify-synced":
+                    self._post_trust_credentials_verify_synced(tenant)
                 elif path == "/v1/trust/credentials/verify-receipt":
                     self._post_trust_credentials_verify_receipt(tenant)
                 elif path == "/v1/trust/credentials/receipt/verify":
@@ -3775,6 +3778,73 @@ def build_handler(store: VCStore) -> type:
             if not valid:
                 payload["reason"] = reason or "验签失败"
             self._send_json(200, payload)
+
+        def _post_trust_credentials_verify_synced(self, tenant: str) -> None:
+            # POST /v1/trust/credentials/verify-synced：以同步锚点验真
+            # 外部凭证（只读）。
+            # 1) 请求体须恰含 signer_did、at、body、signature：依次为
+            #    非空字符串、非布尔非负整数、JSON 对象、非空字符串；
+            #    非法 JSON/非对象、键集或类型不符均 400 且仅 {error}；
+            # 2) signer_did 未同步（含跨租户）404、at 超过该来源同步
+            #    检查点 409，均仅 {error}；
+            # 3) body 凭证字段、规范化 JSON 签名与 expires_at 规则沿
+            #    用 /v1/trust/credentials/verify；issuer_key_version
+            #    省略按版本 1 且不注入签名正文；
+            # 4) 锚点取该来源 cursor<=at 的已同步事件中 (issuer_did,
+            #    版本) 的末事件：缺失、非 active 或 uses 无 vc 均 200
+            #    恰返 {"valid": false, "reason": "同步锚点不可用"}；
+            # 5) 签名格式错/验签错/到期分别同形返“签名格式错误”/
+            #    “签名校验失败”/“凭证已过期”类原因；成功仅
+            #    {"valid": true}。纯只读：不改同步页、检查点、锚点、
+            #    凭证、状态或审计，重启一致。
+            data = self._read_json()
+            expected_fields = ("signer_did", "at", "body", "signature")
+            if set(data) != set(expected_fields):
+                missing = [f for f in expected_fields if f not in data]
+                if missing:
+                    raise ValidationError(
+                        f"缺少字段: {', '.join(missing)}"
+                    )
+                extra = sorted(set(data) - set(expected_fields))
+                raise ValidationError(
+                    f"多余字段: {', '.join(extra)}"
+                )
+            signer_did = data["signer_did"]
+            if not isinstance(signer_did, str) or not signer_did:
+                raise ValidationError(
+                    "字段 signer_did 必须为非空字符串"
+                )
+            at = data["at"]
+            if (
+                not isinstance(at, int)
+                or isinstance(at, bool)
+                or at < 0
+            ):
+                raise ValidationError("字段 at 必须为非负整数")
+            if not isinstance(data["body"], dict):
+                raise ValidationError("字段 body 必须为 JSON 对象")
+            signature = data["signature"]
+            if not isinstance(signature, str) or not signature:
+                raise ValidationError(
+                    "字段 signature 必须为非空字符串"
+                )
+
+            try:
+                valid, reason = store.verify_trust_credential_synced(
+                    tenant, signer_did, at, data["body"], signature
+                )
+            except (NotFoundError, ConflictError):
+                raise
+            except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
+                self._send_invalid("验签过程发生内部错误")
+                return
+            if valid:
+                self._send_json(200, {"valid": True})
+            else:
+                self._send_json(
+                    200,
+                    {"valid": False, "reason": reason or "验签失败"},
+                )
 
         def _post_trust_credentials_verify_receipt(self, tenant: str) -> None:
             # POST /v1/trust/credentials/verify-receipt：跨系统凭证验真

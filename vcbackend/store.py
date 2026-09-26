@@ -4303,6 +4303,147 @@ class VCStore:
             return False, deactivation_reason
         return True, ""
 
+    def verify_trust_credential_synced(
+        self,
+        tenant_id: str,
+        signer_did: str,
+        at: int,
+        body: Any,
+        signature: Any,
+    ) -> Tuple[bool, str]:
+        """以同步锚点验真外部凭证（只读），返回 (是否有效, 失败原因)。
+
+        外层请求结构（恰含 signer_did/at/body/signature 及各自类型）
+        由 HTTP 层校验；本方法假定四项已按协议提供。校验顺序：同步检
+        查点 -> 凭证字段 -> 同步锚点 -> 签名格式 -> 密码学验签 ->
+        expires_at。
+        - 检查点键 (tenant_id, signer_did) 缺失（未同步或跨租户）抛
+          NotFoundError；at 超过检查点 next_after 抛 ConflictError；
+        - body 凭证字段规则与 :meth:`verify_trust_credential` 一致：
+          credential_id/issuer_did/subject_did/issued_at 非空字符串、
+          claims 对象；issuer_key_version 省略按版本 1 且不注入签名
+          正文，提供时须为非布尔正整数；
+        - 锚点取该签名方已同步事件中 cursor <= at、以 (issuer_did,
+          版本) 分组的末事件：缺失、非 active 或 uses 无 vc 均返回
+          (False, "同步锚点不可用")；
+        - 签名与 expires_at 规则同 :meth:`verify_trust_credential`
+          （ES256 64 字节裸 R||S 无填充 base64url，覆盖完整 body 的
+          规范化 JSON）。
+
+        纯只读：不修改同步页、检查点、锚点、凭证、状态或审计。
+        """
+        # 1. 同步检查点：未同步（含跨租户）404，at 超过检查点 409
+        with self._lock:
+            checkpoints = self._anchor_changes_sync_checkpoints.get(
+                tenant_id
+            )
+            cp = (
+                checkpoints.get(signer_did)
+                if checkpoints is not None else None
+            )
+            if cp is None:
+                raise NotFoundError("该签名方尚未同步锚点变更")
+            checkpoint = int(cp["next_after"])
+            if at > checkpoint:
+                raise ConflictError("查询时间点超过同步检查点")
+
+            # 2. 凭证字段（同 verify_trust_credential）
+            required_str = (
+                "credential_id",
+                "issuer_did",
+                "subject_did",
+                "issued_at",
+            )
+            for field in required_str:
+                if field not in body:
+                    return False, f"凭证缺少字段: {field}"
+                value = body[field]
+                if not isinstance(value, str) or not value:
+                    return False, f"凭证字段 {field} 必须为非空字符串"
+            if "claims" not in body:
+                return False, "凭证缺少字段: claims"
+            if not isinstance(body["claims"], dict):
+                return False, "凭证字段 claims 必须为 JSON 对象"
+            key_version = 1
+            if "issuer_key_version" in body:
+                version_obj = body["issuer_key_version"]
+                if (
+                    not isinstance(version_obj, int)
+                    or isinstance(version_obj, bool)
+                    or version_obj < 1
+                ):
+                    return False, "凭证字段 issuer_key_version 必须为正整数"
+                key_version = version_obj
+            issuer_did = body["issuer_did"]
+
+            # 3. 同步锚点：该来源 cursor <= at 的事件中 (issuer_did,
+            #    版本) 的末事件
+            bucket = self._bucket_locked(tenant_id)
+            pages: List[Dict[str, Any]] = []
+            if bucket is not None:
+                pages = bucket.get("synced_anchor_change_pages", {}).get(
+                    signer_did, []
+                )
+            anchor: Optional[Dict[str, Any]] = None
+            anchor_cursor = 0
+            for page in pages:
+                for event in page["events"]:
+                    cursor = int(event["cursor"])
+                    if cursor > at:
+                        continue
+                    if (
+                        event["did"] == issuer_did
+                        and int(event["key_version"]) == key_version
+                        and cursor > anchor_cursor
+                    ):
+                        anchor = event
+                        anchor_cursor = cursor
+            if anchor is not None:
+                public_pem = anchor["public_key"]
+                status = anchor["status"]
+                uses = list(anchor["uses"])
+
+        if anchor is None or status != "active" or "vc" not in uses:
+            return False, "同步锚点不可用"
+        try:
+            crypto.validate_public_key_pem(public_pem)
+        except (ValueError, TypeError):
+            return False, "同步锚点不可用"
+
+        # 4/5. 签名格式与密码学验签：签名覆盖完整 body 的规范化 JSON。
+        # 省略 issuer_key_version 时不得向签名正文注入该字段。
+        try:
+            crypto.verify(body, signature, public_pem)
+        except crypto.MalformedSignature:
+            return False, "签名格式错误: 不是合法的 ES256 签名编码"
+        except crypto.InvalidSignature:
+            return False, "签名校验失败，凭证正文或签名可能被改动"
+        except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
+            return False, "签名校验失败: 验签过程发生内部错误"
+
+        # 6. 有效期：同 verify_trust_credential，仅在 body 提供
+        #    expires_at 时检查，当前时间 >= expires_at 判到期。
+        if "expires_at" in body:
+            expires_value = body["expires_at"]
+            if (
+                not isinstance(expires_value, str)
+                or not _UTC_Z_SHAPE_RE.match(expires_value)
+            ):
+                return False, (
+                    "凭证字段 expires_at 必须为 UTC 秒精度 Z 格式"
+                    "（YYYY-MM-DDTHH:MM:SSZ）"
+                )
+            try:
+                expires_dt = _parse_utc_z(expires_value)
+            except ValueError:
+                return False, (
+                    "凭证字段 expires_at 必须为 UTC 秒精度 Z 格式"
+                    "（YYYY-MM-DDTHH:MM:SSZ）"
+                )
+            if datetime.now(timezone.utc) >= expires_dt:
+                return False, CREDENTIAL_EXPIRED_REASON
+        return True, ""
+
     def verify_trust_credential_with_status(
         self,
         tenant_id: str,
