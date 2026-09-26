@@ -4306,34 +4306,16 @@ class VCStore:
             return False, deactivation_reason
         return True, ""
 
-    def verify_trust_credential_synced(
+    def _synced_anchor_view(
         self,
         tenant_id: str,
         signer_did: str,
         at: int,
-        body: Any,
-        signature: Any,
-    ) -> Tuple[bool, str]:
-        """以同步锚点验真外部凭证，返回 (是否有效, 失败原因)。
+    ) -> Dict[Tuple[str, int], Dict[str, Any]]:
+        """汇聚该来源 cursor<=at 的 (did, 版本) 同步锚点末事件视图。
 
-        请求结构（恰含 signer_did/at/body/signature 及类型）由服务层
-        校验（400）。本方法假定四键类型已合法：
-        - 该签名方在本租户无同步检查点（含跨租户）抛 NotFoundError；
-          at 超过检查点抛 ConflictError；
-        - 凭证字段规则沿用 :meth:`verify_trust_credential`：body 须含
-          credential_id/issuer_did/subject_did/claims/issued_at，
-          issuer_key_version 省略按版本 1 且不注入签名正文，提供时须
-          为非布尔正整数；
-        - 锚点取该来源 cursor<=at 的已同步事件，以 (issuer_did, 版本)
-          最后事件为准；缺失、非 active 或 uses 无 vc 均返回
-          (False, "同步锚点不可用")；
-        - 签名须为 ES256、64 字节裸 R||S 无填充 base64url，覆盖完整
-          body 的规范化 JSON；格式错/验签错/到期依次返回
-          “签名格式错误”/“签名校验失败”/“凭证已过期”；
-        - expires_at 规则与 :meth:`verify_trust_credential` 一致。
-
-        纯只读：不改同步页、检查点、锚点、凭证、状态或审计，结论随
-        状态文件跨重启稳定。
+        该签名方在本租户无同步检查点（含跨租户）抛 NotFoundError；
+        at 超过检查点抛 ConflictError。纯只读。
         """
         with self._lock:
             checkpoints = self._anchor_changes_sync_checkpoints.get(
@@ -4366,7 +4348,20 @@ class VCStore:
                         existing["cursor"]
                     ):
                         latest[key] = event
+        return latest
 
+    def _verify_synced_credential(
+        self,
+        latest: Dict[Tuple[str, int], Dict[str, Any]],
+        body: Any,
+        signature: Any,
+    ) -> Tuple[bool, str]:
+        """以同步锚点末事件视图验真单条外部凭证。
+
+        校验顺序：凭证字段 -> 同步锚点 -> 签名格式 -> 密码学验签 ->
+        有效期；规则与原因分类同 :meth:`verify_trust_credential_synced`
+        的单条部分。假定 body 已为 JSON 对象、signature 已为非空字符串。
+        """
         # 凭证字段（沿用 /v1/trust/credentials/verify 的分类原因）
         required_str = (
             "credential_id",
@@ -4447,6 +4442,84 @@ class VCStore:
             if datetime.now(timezone.utc) >= expires_dt:
                 return False, CREDENTIAL_EXPIRED_REASON
         return True, ""
+
+    def verify_trust_credential_synced(
+        self,
+        tenant_id: str,
+        signer_did: str,
+        at: int,
+        body: Any,
+        signature: Any,
+    ) -> Tuple[bool, str]:
+        """以同步锚点验真外部凭证，返回 (是否有效, 失败原因)。
+
+        请求结构（恰含 signer_did/at/body/signature 及类型）由服务层
+        校验（400）。本方法假定四键类型已合法：
+        - 该签名方在本租户无同步检查点（含跨租户）抛 NotFoundError；
+          at 超过检查点抛 ConflictError；
+        - 凭证字段规则沿用 :meth:`verify_trust_credential`：body 须含
+          credential_id/issuer_did/subject_did/claims/issued_at，
+          issuer_key_version 省略按版本 1 且不注入签名正文，提供时须
+          为非布尔正整数；
+        - 锚点取该来源 cursor<=at 的已同步事件，以 (issuer_did, 版本)
+          最后事件为准；缺失、非 active 或 uses 无 vc 均返回
+          (False, "同步锚点不可用")；
+        - 签名须为 ES256、64 字节裸 R||S 无填充 base64url，覆盖完整
+          body 的规范化 JSON；格式错/验签错/到期依次返回
+          “签名格式错误”/“签名校验失败”/“凭证已过期”；
+        - expires_at 规则与 :meth:`verify_trust_credential` 一致。
+
+        纯只读：不改同步页、检查点、锚点、凭证、状态或审计，结论随
+        状态文件跨重启稳定。
+        """
+        latest = self._synced_anchor_view(tenant_id, signer_did, at)
+        return self._verify_synced_credential(latest, body, signature)
+
+    def verify_trust_credentials_synced_batch(
+        self,
+        tenant_id: str,
+        signer_did: str,
+        at: int,
+        items: List[Any],
+    ) -> List[Dict[str, Any]]:
+        """批量以同步锚点验真外部凭证，逐项不短路、等长同序返回结果。
+
+        请求结构（恰含 signer_did/at/credentials、类型与 1..100 项
+        上限）由服务层校验（400）。本方法假定三键类型已合法：
+        - 检查点规则同 :meth:`verify_trust_credential_synced`：未同步
+          （含跨租户）抛 NotFoundError，at 超检查点抛 ConflictError；
+        - 每项须恰含 body（JSON 对象）与 signature（非空字符串），
+          否则该项为 {"valid": False, "reason": "请求项非法"}；
+        - 合法项按 :meth:`verify_trust_credential_synced` 的单条规则
+          验真（凭证字段、版本兼容、签名覆盖、有效期及校验顺序），
+          锚点取该来源 cursor<=at 的 (issuer_did, 版本) 末事件；
+        - 成功项仅 {"valid": True}，失败项键序为 valid、reason。
+
+        纯只读：不改同步页、检查点、锚点、凭证、状态或审计，结论随
+        状态文件跨重启稳定。
+        """
+        latest = self._synced_anchor_view(tenant_id, signer_did, at)
+        results: List[Dict[str, Any]] = []
+        for item in items:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"body", "signature"}
+                or not isinstance(item["body"], dict)
+                or not isinstance(item["signature"], str)
+                or not item["signature"]
+            ):
+                results.append(
+                    {"valid": False, "reason": "请求项非法"}
+                )
+                continue
+            valid, reason = self._verify_synced_credential(
+                latest, item["body"], item["signature"]
+            )
+            if valid:
+                results.append({"valid": True})
+            else:
+                results.append({"valid": False, "reason": reason})
+        return results
 
     def verify_trust_credential_with_status(
         self,

@@ -43,6 +43,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/verify                   用 active 锚点公钥验签
   POST /v1/trust/credentials/verify       跨系统凭证验真（无需登记 DID/凭证）
   POST /v1/trust/credentials/verify-synced  以同步锚点验真外部凭证（只读）
+  POST /v1/trust/credentials/verify-synced-batch  批量以同步锚点快照验真外部凭证（逐项不短路，只读）
   POST /v1/trust/credentials/verify-receipt  跨系统凭证验真签名回执（只读）
   POST /v1/trust/credentials/receipt/verify  校验验真签名回执（只读）
   POST /v1/trust/credentials/receipt/consume  消费验真签名回执（防重放，首次落盘并审计）
@@ -468,6 +469,13 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_credentials_verify(tenant)
                 elif path == "/v1/trust/credentials/verify-synced":
                     self._post_trust_credentials_verify_synced(tenant)
+                elif (
+                    path
+                    == "/v1/trust/credentials/verify-synced-batch"
+                ):
+                    self._post_trust_credentials_verify_synced_batch(
+                        tenant
+                    )
                 elif path == "/v1/trust/credentials/verify-receipt":
                     self._post_trust_credentials_verify_receipt(tenant)
                 elif path == "/v1/trust/credentials/receipt/verify":
@@ -3853,6 +3861,58 @@ def build_handler(store: VCStore) -> type:
                 self._send_invalid(reason or "验签失败")
                 return
             self._send_json(200, {"valid": True})
+
+        def _post_trust_credentials_verify_synced_batch(
+            self, tenant: str
+        ) -> None:
+            # POST /v1/trust/credentials/verify-synced-batch：批量以同步
+            # 锚点快照验真外部凭证（只读）。请求体须恰含 signer_did
+            # （非空字符串）、at（非布尔非负整数）、credentials
+            # （1..100 项数组）；空体、非法 JSON、非对象、键集/类型
+            # 错误、空数组或超限均 400 且仅 {"error":"请求非法"}；
+            # 来源未同步或跨租户 404 仅 {"error":"同步来源不存在"}；
+            # at 超检查点 409 仅 {"error":"同步游标冲突"}。合法时 200
+            # 仅 {"results":[...]}，逐项不短路、等长同序：项须恰含
+            # body 对象与非空 signature，否则该项 {"valid":false,
+            # "reason":"请求项非法"}；合法项沿用单条 verify-synced 的
+            # 凭证字段、版本兼容、签名覆盖、有效期及校验顺序，按来源
+            # cursor<=at 的 (DID, 版本) 末事件验真。成功项仅
+            # {"valid":true}，失败项键序 valid、reason。纯只读：不写
+            # 同步页、检查点、锚点、凭证、状态或审计，重启一致。
+            try:
+                data = self._read_json()
+            except (ValidationError, ValueError, TypeError):
+                raise ValidationError("请求非法")
+            required = ("signer_did", "at", "credentials")
+            if set(data) != set(required):
+                raise ValidationError("请求非法")
+            signer_did = data["signer_did"]
+            if not isinstance(signer_did, str) or not signer_did:
+                raise ValidationError("请求非法")
+            at = data["at"]
+            if (
+                not isinstance(at, int)
+                or isinstance(at, bool)
+                or at < 0
+            ):
+                raise ValidationError("请求非法")
+            credentials = data["credentials"]
+            if (
+                not isinstance(credentials, list)
+                or not 1 <= len(credentials) <= 100
+            ):
+                raise ValidationError("请求非法")
+            try:
+                results = store.verify_trust_credentials_synced_batch(
+                    tenant, signer_did, at, credentials
+                )
+            except NotFoundError:
+                self._send_error(404, "同步来源不存在")
+                return
+            except ConflictError:
+                self._send_error(409, "同步游标冲突")
+                return
+            self._send_json(200, {"results": results})
 
         def _post_trust_credentials_verify_receipt(self, tenant: str) -> None:
             # POST /v1/trust/credentials/verify-receipt：跨系统凭证验真
