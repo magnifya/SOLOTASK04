@@ -28,6 +28,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   GET  /v1/trust/anchor-changes           可签名信任锚点变更流（?after=&signer_did=，只读）
   POST /v1/trust/anchor-changes/verify    跨系统信任锚点变更流只读验真（不依赖本地事件）
   POST /v1/trust/anchor-changes/sync      跨系统信任锚点变更流同步接收（验真、检查点防重放，原子落盘不审计）
+  GET  /v1/trust/anchor-changes/sync-history  查询锚点变更同步页历史（?signer_did=&limit=&after=，只读）
   GET  /v1/trust/anchors                  跨 DID 只读发现锚点版本（?limit=&after=&status=）
   POST /v1/trust/anchors/{did}/rotate     带前置版本校验的密钥轮换（继承前置 uses）
   GET  /v1/trust/anchors/{did}            查询 DID 的全部锚点版本
@@ -685,6 +686,10 @@ def build_handler(store: VCStore) -> type:
                     self._get_trust_anchor_discovery(tenant, parsed.query)
                 elif path == "/v1/trust/anchor-changes":
                     self._get_trust_anchor_changes(tenant, parsed.query)
+                elif path == "/v1/trust/anchor-changes/sync-history":
+                    self._get_trust_anchor_changes_sync_history(
+                        tenant, parsed.query
+                    )
                 elif path == "/v1/trust/anchors/snapshot":
                     self._get_trust_anchor_snapshot(tenant, parsed.query)
                 elif path == "/v1/trust/dids/deactivations":
@@ -2334,6 +2339,85 @@ def build_handler(store: VCStore) -> type:
                     "signer_did": signer_did,
                     "next_after": next_after,
                     "accepted": accepted,
+                },
+            )
+
+        def _get_trust_anchor_changes_sync_history(
+            self, tenant: str, query: str
+        ) -> None:
+            # GET /v1/trust/anchor-changes/sync-history：只读查询某签名
+            # 方已落盘的锚点变更同步页历史。
+            # 查询参数仅允许 signer_did、limit、after 且均只能出现一次：
+            # - signer_did 必填、非空；
+            # - limit 缺省 50，须为 1..200 的非空 ASCII 十进制整数；
+            # - after 缺省 0，须为非空非负 ASCII 十进制整数。
+            # 空值、重复、符号、Unicode 数字、越界或未知参数均 400 且
+            # 仅 {"error": 非空中文}；该签名方未接收非空页（含跨租户）
+            # 404 同形。200 键序恰为 signer_did、pages、next_after；
+            # pages 按来源 next_after 升序取 next_after > after 的前
+            # limit 页，每页键序恰为 after、next_after、digest、events
+            # （events 为落盘原文，值、顺序与键序不变）；空页
+            # next_after 等于 after，否则等于末页 next_after。纯只读：
+            # 不推进检查点、不记审计、不触发落盘。
+            params = parse_qs(query, keep_blank_values=True)
+            allowed = {"signer_did", "limit", "after"}
+            unknown = sorted(set(params) - allowed)
+            if unknown:
+                raise ValidationError(
+                    f"不支持的查询参数: {', '.join(unknown)}"
+                )
+
+            def _single(name: str) -> Optional[str]:
+                values = params.get(name)
+                if values is None:
+                    return None
+                if len(values) != 1:
+                    raise ValidationError(
+                        f"查询参数 {name} 只能提供一次"
+                    )
+                return values[0]
+
+            signer_did = _single("signer_did")
+            if signer_did is None:
+                raise ValidationError("查询参数 signer_did 必填")
+            if not signer_did:
+                raise ValidationError(
+                    "查询参数 signer_did 必须为非空字符串"
+                )
+
+            limit_raw = _single("limit")
+            if limit_raw is not None:
+                limit = _parse_nonneg_int(limit_raw, "limit")
+                if not 1 <= limit <= 200:
+                    raise ValidationError(
+                        "查询参数 limit 须在 1 到 200 之间"
+                    )
+            else:
+                limit = 50
+
+            after_raw = _single("after")
+            if after_raw is not None:
+                after = _parse_nonneg_int(after_raw, "after")
+            else:
+                after = 0
+
+            pages, next_after = store.list_anchor_changes_sync_history(
+                tenant, signer_did, after, limit
+            )
+            self._send_json(
+                200,
+                {
+                    "signer_did": signer_did,
+                    "pages": [
+                        {
+                            "after": int(page["after"]),
+                            "next_after": int(page["next_after"]),
+                            "digest": page["digest"],
+                            "events": page["events"],
+                        }
+                        for page in pages
+                    ],
+                    "next_after": next_after,
                 },
             )
 
