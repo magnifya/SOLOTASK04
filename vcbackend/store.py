@@ -58,6 +58,7 @@ from .models import (
     PredicateProofRecord,
     PresentationRecord,
     ReceiptConsumptionEvent,
+    TrustPresentationConsumptionEvent,
     TrustAnchorRecord,
     TrustAnchorHistoryEvent,
     TrustAnchorUsesHistoryEvent,
@@ -9622,6 +9623,77 @@ class VCStore:
                 self._restore_locked(snapshot)
                 raise StorageError("存储失败") from exc
             return outcomes
+
+    def list_trust_presentation_consumptions(
+        self,
+        tenant_id: str,
+        after: int = 0,
+        limit: int = 50,
+        issuer_did: Optional[str] = None,
+    ) -> Tuple[List[TrustPresentationConsumptionEvent], int]:
+        """只读分页查询本租户跨系统外部演示的消费历史事件。
+
+        消费标记与审计事件在同一把锁内快照读取；每条事件的 cursor 取
+        首次成功消费对应 trust.presentation.consumed 审计的 seq（全局
+        连续正整数，租户内递增但不一定连续）。
+        - 先按 issuer_did 精确过滤（未提供时不过滤）；
+        - 再按 cursor > after 升序取至多 limit 项；
+        - next_after 为本页末项 cursor，空页保持 after。
+        纯只读：不修改任何状态、不记审计、不触发落盘。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            markers: List[Tuple[str, str, Dict[str, Any]]] = []
+            if bucket is not None:
+                for iss, by_presentation in bucket.get(
+                    "consumed_trust_presentations", {}
+                ).items():
+                    for presentation_id, row in by_presentation.items():
+                        markers.append((iss, presentation_id, row))
+            # consumption_id -> 首次成功消费审计的 seq（同锁快照）
+            seq_by_consumption: Dict[str, int] = {}
+            for event in self._audit:
+                if (
+                    event.get("tenant_id") == tenant_id
+                    and event.get("action")
+                    == AUDIT_TRUST_PRESENTATION_CONSUMED
+                    and event.get("resource_type") == "trust_presentation"
+                ):
+                    seq_by_consumption[
+                        event.get("resource_id", "")
+                    ] = int(event.get("seq", 0))
+            events: List[TrustPresentationConsumptionEvent] = []
+            for iss, presentation_id, row in markers:
+                cursor = seq_by_consumption.get(
+                    row.get("consumption_id", "")
+                )
+                if not cursor:
+                    # 无对应首次消费审计（不应发生）：无法确定 cursor
+                    continue
+                events.append(
+                    TrustPresentationConsumptionEvent(
+                        cursor=cursor,
+                        consumption_id=row["consumption_id"],
+                        issuer_did=iss,
+                        presentation_id=presentation_id,
+                        consumed_at=row["consumed_at"],
+                    )
+                )
+            events.sort(key=lambda event: event.cursor)
+            picked: List[TrustPresentationConsumptionEvent] = []
+            for event in events:
+                if (
+                    issuer_did is not None
+                    and event.issuer_did != issuer_did
+                ):
+                    continue
+                if event.cursor <= after:
+                    continue
+                if len(picked) >= limit:
+                    break
+                picked.append(event)
+            next_after = picked[-1].cursor if picked else after
+            return picked, next_after
 
     def consume_credential_receipt(
         self,
