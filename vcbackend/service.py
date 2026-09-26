@@ -26,6 +26,8 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/proofs/{proof_id}/verify             以存储记录为锚校验谓词证明
   POST /v1/trust/anchors                  注册信任锚点（同 DID/版本同 PEM 且 uses 相同幂等；可选 uses 用途白名单）
   GET  /v1/trust/anchor-changes           可签名信任锚点变更流（?after=&signer_did=，只读）
+  GET  /v1/trust/ac-proof                  锚点变更 Merkle 包含证明（?cursor=&snapshot=&signer_did=，只读）
+  POST /v1/trust/ac-proof                  校验锚点变更证明（结构/锚点/签名/包含路径，不依赖本地事件）
   POST /v1/trust/anchor-changes/verify    跨系统信任锚点变更流只读验真（不依赖本地事件）
   POST /v1/trust/anchor-changes/sync      跨系统信任锚点变更流同步接收（验真、检查点防重放，原子落盘不审计）
   GET  /v1/trust/anchor-changes/sync-history  查询锚点变更同步页历史（?signer_did=&limit=&after=，只读）
@@ -262,6 +264,22 @@ _ANCHOR_CHANGE_ACTIONS = frozenset(
 )
 _ANCHOR_CHANGES_MAX_EVENTS = 200
 
+# GET /v1/trust/ac-proof 锚点变更证明响应协议。
+_ANCHOR_PROOF_RESPONSE_KEYS = (
+    "event",
+    "snapshot",
+    "root",
+    "path",
+    "signer_did",
+    "signer_key_version",
+    "signature",
+)
+# 签名覆盖前六键（不含 signature）。
+_ANCHOR_PROOF_SIGNED_KEYS = _ANCHOR_PROOF_RESPONSE_KEYS[:6]
+# Merkle 路径单项键序 side、hash。
+_ANCHOR_PROOF_PATH_ITEM_KEYS = ("side", "hash")
+_ANCHOR_PROOF_SIDES = frozenset({"left", "right"})
+
 
 def _parse_utc_z_query(raw: str, field: str) -> str:
     """校验并返回查询参数中的 UTC 秒精度 Z 时间串。
@@ -288,6 +306,76 @@ def _parse_utc_z_query(raw: str, field: str) -> str:
             "（YYYY-MM-DDTHH:MM:SSZ）"
         )
     return raw
+
+
+def _anchor_change_event_obj(event: Any) -> Dict[str, Any]:
+    """锚点变更事件按变更流协议构造固定键序对象。"""
+    return {
+        "cursor": event.cursor,
+        "action": event.action,
+        "did": event.did,
+        "key_version": event.key_version,
+        "public_key": event.public_key,
+        "status": event.status,
+        "uses": event.uses,
+    }
+
+
+def _anchor_proof_leaf_hash(event_obj: Dict[str, Any]) -> str:
+    """叶哈希 = SHA-256(0x00 || 事件规范 JSON 的 UTF-8)，返回小写 hex。"""
+    return hashlib.sha256(
+        b"\x00" + crypto.canonicalize(event_obj)
+    ).hexdigest()
+
+
+def _anchor_proof_parent_hash(left_hex: str, right_hex: str) -> str:
+    """父哈希 = SHA-256(0x01 || 左 || 右)，左右为 32 字节摘要，返回小写 hex。"""
+    return hashlib.sha256(
+        b"\x01" + bytes.fromhex(left_hex) + bytes.fromhex(right_hex)
+    ).hexdigest()
+
+
+def _anchor_proof_build(
+    leaf_hashes: List[str], index: int
+) -> Tuple[str, List[Dict[str, str]]]:
+    """以 cursor 升序叶序列对 index 处目标建 Merkle 包含证明。
+
+    奇数层复制末项；返回 (root, path)，path 自叶向根，每项
+    {"side": 兄弟所在侧, "hash": 兄弟哈希}。单叶时 root 即叶哈希、
+    path 为空。
+    """
+    path: List[Dict[str, str]] = []
+    level = list(leaf_hashes)
+    current = index
+    while len(level) > 1:
+        if len(level) % 2 == 1:
+            # 奇数末项复制后再配对。
+            level.append(level[-1])
+        if current % 2 == 0:
+            path.append({"side": "right", "hash": level[current + 1]})
+        else:
+            path.append({"side": "left", "hash": level[current - 1]})
+        next_level = [
+            _anchor_proof_parent_hash(level[pos], level[pos + 1])
+            for pos in range(0, len(level), 2)
+        ]
+        level = next_level
+        current //= 2
+    return level[0], path
+
+
+def _anchor_proof_recompute_root(
+    event_obj: Dict[str, Any], path: List[Dict[str, str]]
+) -> str:
+    """按 path 自叶向根重算 root（与建树同一叶/父哈希规则）。"""
+    current = _anchor_proof_leaf_hash(event_obj)
+    for item in path:
+        sibling = item["hash"]
+        if item["side"] == "left":
+            current = _anchor_proof_parent_hash(sibling, current)
+        else:
+            current = _anchor_proof_parent_hash(current, sibling)
+    return current
 
 
 def build_handler(store: VCStore) -> type:
@@ -445,6 +533,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_anchor_snapshot_verify(tenant)
                 elif path == "/v1/trust/anchor-changes/verify":
                     self._post_trust_anchor_changes_verify(tenant)
+                elif path == "/v1/trust/ac-proof":
+                    self._post_trust_ac_proof(tenant)
                 elif path == "/v1/trust/anchor-changes/sync":
                     self._post_trust_anchor_changes_sync(tenant)
                 elif path.startswith("/v1/trust/anchors/") and path.endswith(
@@ -748,6 +838,8 @@ def build_handler(store: VCStore) -> type:
                     self._get_trust_anchor_discovery(tenant, parsed.query)
                 elif path == "/v1/trust/anchor-changes":
                     self._get_trust_anchor_changes(tenant, parsed.query)
+                elif path == "/v1/trust/ac-proof":
+                    self._get_trust_ac_proof(tenant, parsed.query)
                 elif path == "/v1/trust/anchor-changes/sync-history":
                     self._get_trust_anchor_changes_sync_history(
                         tenant, parsed.query
@@ -2167,6 +2259,282 @@ def build_handler(store: VCStore) -> type:
             payload = dict(signed)
             payload["signature"] = signature
             self._send_json(200, payload)
+
+        def _get_trust_ac_proof(self, tenant: str, query: str) -> None:
+            # GET /v1/trust/ac-proof?cursor=&snapshot=&signer_did=：为指定
+            # 锚点变更事件生成 Merkle 包含证明。查询参数仅允许唯一
+            # cursor、snapshot、signer_did；cursor、snapshot 均为 ASCII
+            # 十进制正整数且 cursor<=snapshot<=本租户最大游标；signer_did
+            # 唯一非空。缺失/空值/重复/空白/符号/小数/布尔词/Unicode
+            # 数字/未知参数/越界一律 400 且仅 {"error": 非空中文}。签名
+            # DID 未知（含他租户）404、已停用 409；cursor 事件在 snapshot
+            # 前缀内不存在 404。
+            #
+            # 以 cursor 升序的 snapshot 前缀（cursor<=snapshot 的全部事
+            # 件）建树：叶=SHA-256(0x00||事件规范JSON UTF-8)，父=
+            # SHA-256(0x01||左||右)，奇数末项复制。200 键序 event、
+            # snapshot、root、path、signer_did、signer_key_version、
+            # signature；event 沿用变更流事件协议；root 为 64 位小写 hex；
+            # path 自叶向根，项键序 side、hash，side 限 left/right，hash
+            # 同 root 格式；signature 由签名 DID 当前私钥对前六键规范化
+            # JSON 做 ES256 裸 R||S 无填充 base64url。纯只读：不写状态、
+            # 不记审计。
+            params = parse_qs(query, keep_blank_values=True)
+            unknown = sorted(
+                set(params) - {"cursor", "snapshot", "signer_did"}
+            )
+            if unknown:
+                raise ValidationError(
+                    f"不支持的查询参数: {', '.join(unknown)}"
+                )
+
+            def _single(name: str) -> str:
+                values = params.get(name)
+                if values is None:
+                    raise ValidationError(f"查询参数 {name} 必填")
+                if len(values) != 1:
+                    raise ValidationError(
+                        f"查询参数 {name} 只能提供一次"
+                    )
+                return values[0]
+
+            cursor = _parse_positive_int(_single("cursor"), "cursor")
+            snapshot = _parse_positive_int(_single("snapshot"), "snapshot")
+            if cursor > snapshot:
+                raise ValidationError(
+                    "查询参数 cursor 不得大于 snapshot"
+                )
+            signer_did = _single("signer_did")
+            if not signer_did:
+                raise ValidationError(
+                    "查询参数 signer_did 必须为非空字符串"
+                )
+
+            # 先做 snapshot 越界校验（400 优先于签名 DID 的 404/409）。
+            store.validate_anchor_change_snapshot(tenant, snapshot)
+
+            # 签名 DID 须为本租户活动本地 DID（沿用变更流入口）：未知
+            # （含他租户）404、已停用 409；先于事件存在性 404。
+            signer_key_version, private_pem = (
+                store.get_trust_anchor_snapshot_signer(tenant, signer_did)
+            )
+
+            target, prefix = store.get_anchor_change_proof_prefix(
+                tenant, cursor, snapshot
+            )
+            if target is None:
+                raise NotFoundError("锚点变更事件不存在")
+
+            event_obj = _anchor_change_event_obj(target)
+            leaf_hashes = [
+                _anchor_proof_leaf_hash(_anchor_change_event_obj(event))
+                for event in prefix
+            ]
+            index = next(
+                pos
+                for pos, event in enumerate(prefix)
+                if event.cursor == cursor
+            )
+            root, path = _anchor_proof_build(leaf_hashes, index)
+            signed = {
+                "event": event_obj,
+                "snapshot": snapshot,
+                "root": root,
+                "path": path,
+                "signer_did": signer_did,
+                "signer_key_version": signer_key_version,
+            }
+            signature = crypto.sign(signed, private_pem)
+            proof = dict(signed)
+            proof["signature"] = signature
+            self._send_json(200, proof)
+
+        def _anchor_proof_is_well_formed(self, proof: Any) -> bool:
+            # 证明结构校验（“证明非法”）：proof 恰含 GET
+            # /v1/trust/ac-proof 响应的七键；event 沿用变更流事件协议；
+            # snapshot/sign_key_version 为非布尔正整数；root/hash 为 64
+            # 位小写 hex；path 为 list，项恰含 side、hash，side 限
+            # left/right；signer_did、signature 非空字符串。
+            if not isinstance(proof, dict):
+                return False
+            if set(proof) != set(_ANCHOR_PROOF_RESPONSE_KEYS):
+                return False
+
+            event = proof["event"]
+            if not isinstance(event, dict):
+                return False
+            if set(event) != set(_ANCHOR_CHANGE_EVENT_KEYS):
+                return False
+            event_cursor = event["cursor"]
+            if (
+                not isinstance(event_cursor, int)
+                or isinstance(event_cursor, bool)
+                or event_cursor < 1
+            ):
+                return False
+            if event["action"] not in _ANCHOR_CHANGE_ACTIONS:
+                return False
+            if not isinstance(event["did"], str) or not event["did"]:
+                return False
+            key_version = event["key_version"]
+            if (
+                not isinstance(key_version, int)
+                or isinstance(key_version, bool)
+                or key_version < 1
+            ):
+                return False
+            if (
+                not isinstance(event["public_key"], str)
+                or not event["public_key"]
+            ):
+                return False
+            if event["status"] not in ("active", "revoked"):
+                return False
+            uses = event["uses"]
+            if not isinstance(uses, list) or not uses:
+                return False
+            if any(
+                not isinstance(use, str) or use not in TRUST_ANCHOR_USES
+                for use in uses
+            ):
+                return False
+            if len(set(uses)) != len(uses) or list(uses) != sorted(
+                uses, key=TRUST_ANCHOR_USES.index
+            ):
+                return False
+
+            snapshot = proof["snapshot"]
+            if (
+                not isinstance(snapshot, int)
+                or isinstance(snapshot, bool)
+                or snapshot < event_cursor
+            ):
+                return False
+            root = proof["root"]
+            if not (
+                isinstance(root, str) and _SHA256_HEX_RE.fullmatch(root)
+            ):
+                return False
+            path = proof["path"]
+            if not isinstance(path, list):
+                return False
+            for item in path:
+                if not isinstance(item, dict):
+                    return False
+                if set(item) != set(_ANCHOR_PROOF_PATH_ITEM_KEYS):
+                    return False
+                if item["side"] not in _ANCHOR_PROOF_SIDES:
+                    return False
+                item_hash = item["hash"]
+                if not (
+                    isinstance(item_hash, str)
+                    and _SHA256_HEX_RE.fullmatch(item_hash)
+                ):
+                    return False
+            signer_did = proof["signer_did"]
+            if not isinstance(signer_did, str) or not signer_did:
+                return False
+            signer_key_version = proof["signer_key_version"]
+            if (
+                not isinstance(signer_key_version, int)
+                or isinstance(signer_key_version, bool)
+                or signer_key_version < 1
+            ):
+                return False
+            signature = proof["signature"]
+            if not isinstance(signature, str) or not signature:
+                return False
+            return True
+
+        def _verify_anchor_proof_item(
+            self, tenant: str, proof: Any
+        ) -> Optional[str]:
+            # 锚点变更证明验真：按序返回失败原因（证明非法 -> 锚点不可
+            # 用 -> 签名格式错误 -> 签名校验失败 -> 包含证明校验失败），
+            # 成功返回 None。不依赖本地事件、纯只读、不记审计。
+            # 阶段一：proof 结构与事件协议
+            if not self._anchor_proof_is_well_formed(proof):
+                return "证明非法"
+
+            signer_did = proof["signer_did"]
+            signer_key_version = proof["signer_key_version"]
+
+            # 阶段二：本租户同 signer_did/版本且含 generic 用途的
+            # active 信任锚点
+            public_pem = store.get_active_trust_anchor_public_key(
+                tenant,
+                signer_did,
+                signer_key_version,
+                required_use="generic",
+            )
+            if public_pem is None:
+                return "锚点不可用"
+            try:
+                crypto.validate_public_key_pem(public_pem)
+            except (ValueError, TypeError):
+                return "锚点不可用"
+
+            # 阶段三：签名格式（ES256 裸 R||S 无填充 base64url）
+            signature = proof["signature"]
+            try:
+                crypto.validate_signature_format_strict(signature)
+            except crypto.MalformedSignature:
+                return "签名格式错误"
+
+            # 阶段四：密码学验签，覆盖 proof 除 signature 外六键的规范
+            # 化 JSON
+            signed = {
+                key: proof[key] for key in _ANCHOR_PROOF_SIGNED_KEYS
+            }
+            try:
+                crypto.verify(signed, signature, public_pem)
+            except crypto.MalformedSignature:
+                return "签名格式错误"
+            except crypto.InvalidSignature:
+                return "签名校验失败"
+            except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露细节
+                return "签名校验失败"
+
+            # 阶段五：按 path 自叶向根重算 root，须与签名所护 root 一致
+            try:
+                recomputed = _anchor_proof_recompute_root(
+                    proof["event"], proof["path"]
+                )
+            except (ValueError, TypeError):
+                return "包含证明校验失败"
+            if recomputed != proof["root"]:
+                return "包含证明校验失败"
+            return None
+
+        def _post_trust_ac_proof(self, tenant: str) -> None:
+            # POST /v1/trust/ac-proof：校验锚点变更证明，不依赖本地事
+            # 件。请求体须恰含 proof（JSON 对象），否则 400 且仅
+            # {"error": 非空中文}；proof 须恰含 event、snapshot、root、
+            # path、signer_did、signer_key_version、signature 七键。外层
+            # 合法后任何失败均 HTTP 200，按键序返回
+            # {"valid":false,"reason":...}，原因依次为证明非法 -> 锚点
+            # 不可用（本租户同 signer_did/版本且含 generic 用途的 active
+            # 锚点）-> 签名格式错误 -> 签名校验失败 -> 包含证明校验失败
+            # （按 path 重算 root 不符）。成功仅 {"valid":true}。纯只
+            # 读、租户隔离、不记审计。
+            data = self._read_json()
+            if set(data) != {"proof"}:
+                if "proof" not in data:
+                    raise ValidationError("请求缺少字段: proof")
+                extra = sorted(set(data) - {"proof"})
+                raise ValidationError(
+                    f"请求含多余字段: {', '.join(extra)}"
+                )
+            proof = data["proof"]
+            if not isinstance(proof, dict):
+                raise ValidationError(
+                    "请求不合法: 字段 proof 必须为 JSON 对象"
+                )
+            reason = self._verify_anchor_proof_item(tenant, proof)
+            if reason is not None:
+                self._send_json(200, {"valid": False, "reason": reason})
+                return
+            self._send_json(200, {"valid": True})
 
         def _anchor_changes_is_well_formed(
             self, changes: Any, after: Any

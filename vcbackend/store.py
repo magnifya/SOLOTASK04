@@ -7211,6 +7211,65 @@ class VCStore:
             next_after = picked[-1].cursor if picked else after
             return picked, next_after
 
+    def validate_anchor_change_snapshot(
+        self, tenant_id: str, snapshot: int
+    ) -> int:
+        """只读原子校验 snapshot 不超过本租户锚点变更流最大游标。
+
+        返回当前最大游标（无事件为 0）；snapshot 超过最大值抛
+        ValidationError。不读取事件、不修改任何状态。
+        """
+        with self._lock:
+            max_cursor = self._trust_anchor_change_cursors.get(tenant_id, 0)
+            if snapshot > max_cursor:
+                raise ValidationError(
+                    "查询参数 snapshot 不得超过当前最大游标"
+                )
+            return max_cursor
+
+    def get_anchor_change_proof_prefix(
+        self,
+        tenant_id: str,
+        cursor: int,
+        snapshot: int,
+    ) -> Tuple[Optional[TrustAnchorChangeEvent], List[TrustAnchorChangeEvent]]:
+        """只读读取锚点变更证明所需的 snapshot 前缀事件。
+
+        - 返回 (目标事件, 前缀事件)：前缀事件为
+          1 <= event_cursor <= snapshot 的全部事件，按 cursor 升序；
+          目标事件为其中 cursor 恰等于 cursor 的事件，不存在时为 None
+          （调用方据此返回 404）。
+        调用方须先经 validate_anchor_change_snapshot 完成越界校验。
+        纯只读：不修改任何状态、不分配游标、不记审计、不触发落盘。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            entries: List[Dict[str, Any]] = []
+            if bucket is not None:
+                entries = list(bucket.get("trust_anchor_change_events", []))
+            entries.sort(key=lambda event: int(event.get("cursor", 0)))
+            prefix: List[TrustAnchorChangeEvent] = []
+            target: Optional[TrustAnchorChangeEvent] = None
+            for row in entries:
+                event_cursor = int(row["cursor"])
+                if event_cursor > snapshot:
+                    break
+                if event_cursor < 1:
+                    continue
+                event = TrustAnchorChangeEvent(
+                    cursor=event_cursor,
+                    action=row["action"],
+                    did=row["did"],
+                    key_version=int(row["key_version"]),
+                    public_key=row["public_key"],
+                    status=row["status"],
+                    uses=list(row["uses"]),
+                )
+                prefix.append(event)
+                if event_cursor == cursor:
+                    target = event
+            return target, prefix
+
     def sync_anchor_changes(
         self,
         tenant_id: str,
