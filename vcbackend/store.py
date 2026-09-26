@@ -124,6 +124,13 @@ IMPORTED_SIGNATURE_INVALID_REASON = "签名校验失败"
 # 以同步锚点验真外部凭证时锚点不可用的统一中文原因
 SYNCED_ANCHOR_UNAVAILABLE_REASON = "同步锚点不可用"
 
+# 以同步锚点验真持有者绑定演示时持有者锚点不可用的统一中文原因
+SYNCED_HOLDER_ANCHOR_UNAVAILABLE_REASON = "同步持有者锚点不可用"
+
+# 持有者绑定演示 holder_proof 的格式/验签失败统一中文原因
+SYNCED_HOLDER_SIGNATURE_MALFORMED_REASON = "持有者签名格式错误"
+SYNCED_HOLDER_SIGNATURE_INVALID_REASON = "持有者签名校验失败"
+
 # 外部 DID 停用通告验真失败时的统一中文原因（与导入重验一致）
 DEACTIVATION_ANCHOR_UNAVAILABLE_REASON = IMPORTED_ANCHOR_UNAVAILABLE_REASON
 DEACTIVATION_SIGNATURE_MALFORMED_REASON = IMPORTED_SIGNATURE_MALFORMED_REASON
@@ -5345,16 +5352,33 @@ class VCStore:
         latest: Dict[Tuple[str, int], Dict[str, Any]],
         presentation: Any,
         challenge: Any,
+        source_tenant_id: Optional[str] = None,
     ) -> Tuple[bool, str]:
-        """在已解析的同步锚点快照上验真一条未绑定外部演示（只读）。
+        """在已解析的同步锚点快照上验真一条外部演示（只读）。
 
-        假定 presentation 为 JSON 对象、challenge 为非空字符串；演示
-        字段、挑战、锚点、签名格式、验签与期限规则及原因分类与
-        :meth:`verify_trust_presentation_synced` 完全一致，供单条与
-        批量同步锚点验真共用同一快照。
+        假定 presentation 为 JSON 对象、challenge 为非空字符串。
+        - ``source_tenant_id`` 为 None 时为未绑定形态：演示恰为九字段
+          （presentation_id、credential_id、issuer_did、
+          issuer_key_version、disclose、claims、challenge、expires_at、
+          proof），出现任何 holder_* 字段即失败；
+        - ``source_tenant_id`` 为非空字符串时为持有者绑定形态：演示恰
+          为九字段外加 holder_did（非空字符串）、holder_key_version
+          （正整数）、holder_proof（非空字符串）。
+
+        演示字段、挑战、锚点、签名格式、验签与期限规则及原因分类与
+        :meth:`verify_trust_presentation_synced` 一致，供单条与批量
+        同步锚点验真共用同一快照。绑定形态在签发者验签之后追加持有者
+        锚点/格式/验签：持有者锚点同样取快照中
+        ``(holder_did, holder_key_version)`` 的末事件，须 active 且
+        uses 含 vp，否则为“同步持有者锚点不可用”；holder_proof 覆盖
+        去掉 proof、holder_proof 的对象（八字段加 holder_did、
+        holder_key_version）并加入 tenant_id=source_tenant_id，格式
+        错、验签失败依次为“持有者签名格式错误”“持有者签名校验失败”。
         """
-        # 演示字段（沿用 /v1/trust/presentations/verify 未绑定形态的
-        # 分类原因）：恰为九字段，出现 holder_* 即失败。
+        is_holder_bound = source_tenant_id is not None
+        # 演示字段（沿用 /v1/trust/presentations/verify 的分类原因）：
+        # 未绑定恰为九字段（出现 holder_* 即失败）；绑定恰为九字段加
+        # holder_did/holder_key_version/holder_proof。
         required_fields = {
             "presentation_id",
             "credential_id",
@@ -5366,14 +5390,21 @@ class VCStore:
             "expires_at",
             "proof",
         }
-        holder_fields = sorted(
-            key for key in presentation if key.startswith("holder_")
-        )
-        if holder_fields:
-            return False, (
-                "演示字段不合法: 不得包含持有者绑定字段 "
-                f"{', '.join(holder_fields)}"
+        if is_holder_bound:
+            required_fields |= {
+                "holder_did",
+                "holder_key_version",
+                "holder_proof",
+            }
+        else:
+            holder_fields = sorted(
+                key for key in presentation if key.startswith("holder_")
             )
+            if holder_fields:
+                return False, (
+                    "演示字段不合法: 不得包含持有者绑定字段 "
+                    f"{', '.join(holder_fields)}"
+                )
         if set(presentation) != required_fields:
             missing = sorted(required_fields - set(presentation))
             if missing:
@@ -5402,12 +5433,30 @@ class VCStore:
             value = presentation[field]
             if not isinstance(value, str) or not value:
                 return False, f"演示字段 {field} 必须为非空字符串"
+        holder_did_value: Optional[str] = None
+        holder_version_value: Optional[int] = None
+        holder_proof_value: Optional[str] = None
+        if is_holder_bound:
+            holder_did_value = presentation["holder_did"]
+            if not isinstance(holder_did_value, str) or not holder_did_value:
+                return False, "演示字段 holder_did 必须为非空字符串"
+            holder_version_value = presentation["holder_key_version"]
+            if (
+                not isinstance(holder_version_value, int)
+                or isinstance(holder_version_value, bool)
+                or holder_version_value < 1
+            ):
+                return False, "演示字段 holder_key_version 必须为正整数"
+            holder_proof_value = presentation["holder_proof"]
+            if not isinstance(holder_proof_value, str) or not holder_proof_value:
+                return False, "演示字段 holder_proof 必须为非空字符串"
 
         # 挑战：请求 challenge 须等于演示 challenge。
         if challenge != presentation["challenge"]:
             return False, "挑战不匹配: 请求 challenge 与演示 challenge 不一致"
 
-        # 同步锚点：(issuer_did, 版本) 最后事件，须 active 且含 vp 用途。
+        # 签发者同步锚点：(issuer_did, 版本) 最后事件，须 active 且含
+        # vp 用途。
         issuer_did = presentation["issuer_did"]
         anchor = latest.get((issuer_did, key_version))
         if (
@@ -5422,10 +5471,9 @@ class VCStore:
         except (ValueError, TypeError):
             return False, SYNCED_ANCHOR_UNAVAILABLE_REASON
 
-        # 签名格式（严格：64 字节裸 R||S 无填充 base64url）与密码学
-        # 验签：覆盖范围沿用 /v1/trust/presentations/verify——去掉
-        # proof 及全部 holder_* 字段后的八个字段（未绑定演示本就不含
-        # holder_*，即去掉 proof 的全部字段）。
+        # 签发者签名格式（严格：64 字节裸 R||S 无填充 base64url）与
+        # 密码学验签：覆盖去掉 proof 及全部 holder_* 字段后的八字段
+        # （未绑定演示本就不含 holder_*，即去掉 proof 的全部字段）。
         proof = presentation["proof"]
         message = {
             k: v
@@ -5444,6 +5492,45 @@ class VCStore:
             return False, IMPORTED_SIGNATURE_INVALID_REASON
         except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
             return False, IMPORTED_SIGNATURE_INVALID_REASON
+
+        # 持有者绑定：持有者锚点同样取快照中 (holder_did,
+        # holder_key_version) 的末事件，须 active 且 uses 含 vp；
+        # holder_proof 覆盖去掉 proof、holder_proof 的绑定对象（八字段
+        # 加 holder_did、holder_key_version）并加入
+        # tenant_id=source_tenant_id 后规范化验签。
+        if is_holder_bound:
+            holder_anchor = latest.get(
+                (holder_did_value, holder_version_value)
+            )
+            if (
+                holder_anchor is None
+                or holder_anchor["status"] != "active"
+                or "vp" not in holder_anchor["uses"]
+            ):
+                return False, SYNCED_HOLDER_ANCHOR_UNAVAILABLE_REASON
+            holder_public_pem = holder_anchor["public_key"]
+            try:
+                crypto.validate_public_key_pem(holder_public_pem)
+            except (ValueError, TypeError):
+                return False, SYNCED_HOLDER_ANCHOR_UNAVAILABLE_REASON
+            holder_message = dict(message)
+            holder_message["holder_did"] = holder_did_value
+            holder_message["holder_key_version"] = holder_version_value
+            holder_message["tenant_id"] = source_tenant_id
+            try:
+                crypto.validate_signature_format_strict(holder_proof_value)
+            except crypto.MalformedSignature:
+                return False, SYNCED_HOLDER_SIGNATURE_MALFORMED_REASON
+            try:
+                crypto.verify(
+                    holder_message, holder_proof_value, holder_public_pem
+                )
+            except crypto.MalformedSignature:
+                return False, SYNCED_HOLDER_SIGNATURE_MALFORMED_REASON
+            except crypto.InvalidSignature:
+                return False, SYNCED_HOLDER_SIGNATURE_INVALID_REASON
+            except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露细节
+                return False, SYNCED_HOLDER_SIGNATURE_INVALID_REASON
 
         # 期限：expires_at 须为 UTC 秒精度 Z 格式；当前时间达到它即
         # 过期。规则同 /v1/trust/presentations/verify。
@@ -5602,19 +5689,28 @@ class VCStore:
         at: int,
         presentation: Any,
         challenge: Any,
+        source_tenant_id: Optional[str] = None,
     ) -> Tuple[bool, str]:
-        """以同步锚点验真未绑定外部演示并合并请求初始状态快照（只读）。
+        """以同一同步快照验真外部演示并合并请求初始状态快照（只读）。
 
-        请求结构（恰含 signer_did/at/presentation/challenge 及类型）由
-        服务层校验（400）。检查点语义、演示九字段、holder_* 禁令、
-        挑战、锚点、签名覆盖、格式、验签、期限规则、校验顺序及原因
-        分类与 :meth:`verify_trust_presentation_synced` 完全一致；
-        验真失败原样返回，不查状态。验真通过后按演示的
-        ``(issuer_did, credential_id)`` 查请求初始一次原子读取的本
-        租户 ``credential_status_sync`` 状态快照：未同步（含属他
-        租户）为“外部凭证状态未同步”，revoked 为“外部凭证已吊销：
-        <保存的 reason>”（保存记录无 reason 时用“未知原因”），
-        unknown 为“外部凭证状态未知”，active 判成功。
+        请求结构（恰含 signer_did/at/presentation/challenge；绑定形态
+        另恰含非空字符串 source_tenant_id，及各键类型）由服务层校验
+        （400）。``source_tenant_id`` 为 None 时为未绑定形态，检查点
+        语义、演示九字段、holder_* 禁令、挑战、锚点、签名覆盖、格式、
+        验签、期限规则、校验顺序及原因分类与
+        :meth:`verify_trust_presentation_synced` 完全一致；绑定形态下
+        演示恰为九字段加 holder_did/holder_key_version/holder_proof，
+        两类锚点均取同一来源 cursor<=at 的各 DID/版本末事件且须
+        active、uses 含 vp，校验顺序为演示、挑战、签发锚点/格式/验签、
+        持有者锚点/格式/验签、期限，持有者锚点不可用、格式错、验签
+        失败依次为“同步持有者锚点不可用”“持有者签名格式错误”
+        “持有者签名校验失败”。原验真失败原样返回，不查状态。
+
+        验真通过后按演示的 ``(issuer_did, credential_id)`` 查请求初始
+        一次原子读取的本租户 ``credential_status_sync`` 状态快照：未
+        同步（含属他租户）为“外部凭证状态未同步”，revoked 为“外部
+        凭证已吊销：<保存的 reason>”（保存记录无 reason 时用“未知
+        原因”），unknown 为“外部凭证状态未知”，active 判成功。
 
         纯只读：不改同步页、检查点、锚点、演示、状态或审计，结论随
         状态文件跨重启稳定。
@@ -5622,7 +5718,7 @@ class VCStore:
         latest = self._synced_anchor_events_latest(tenant_id, signer_did, at)
         status_rows = self._status_snapshot_locked(tenant_id)
         valid, reason = self._verify_synced_presentation_against(
-            latest, presentation, challenge
+            latest, presentation, challenge, source_tenant_id
         )
         if not valid:
             return False, reason
