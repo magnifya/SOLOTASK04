@@ -29,6 +29,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/anchor-changes/verify    跨系统信任锚点变更流只读验真（不依赖本地事件）
   POST /v1/trust/anchor-changes/sync      跨系统信任锚点变更流同步接收（验真、检查点防重放，原子落盘不审计）
   GET  /v1/trust/anchor-changes/sync-history  查询锚点变更同步页历史（?signer_did=&limit=&after=，只读）
+  GET  /v1/trust/anchor-changes/synced-state  锚点变更同步时点汇聚状态视图（?signer_did=&at=&limit=&after=，只读）
   GET  /v1/trust/anchors                  跨 DID 只读发现锚点版本（?limit=&after=&status=）
   POST /v1/trust/anchors/{did}/rotate     带前置版本校验的密钥轮换（继承前置 uses）
   GET  /v1/trust/anchors/{did}            查询 DID 的全部锚点版本
@@ -688,6 +689,10 @@ def build_handler(store: VCStore) -> type:
                     self._get_trust_anchor_changes(tenant, parsed.query)
                 elif path == "/v1/trust/anchor-changes/sync-history":
                     self._get_trust_anchor_changes_sync_history(
+                        tenant, parsed.query
+                    )
+                elif path == "/v1/trust/anchor-changes/synced-state":
+                    self._get_trust_anchor_changes_synced_state(
                         tenant, parsed.query
                     )
                 elif path == "/v1/trust/anchors/snapshot":
@@ -2417,6 +2422,92 @@ def build_handler(store: VCStore) -> type:
                         }
                         for page in pages
                     ],
+                    "next_after": next_after,
+                },
+            )
+
+        def _get_trust_anchor_changes_synced_state(
+            self, tenant: str, query: str
+        ) -> None:
+            # GET /v1/trust/anchor-changes/synced-state：只读查询某签名
+            # 方已同步锚点变更在指定时点的汇聚状态视图。
+            # 查询参数仅允许 signer_did、at、limit、after 且均只能出现
+            # 一次：signer_did 必填非空；at 缺省取该签名方同步检查点、
+            # 须为 ASCII 非负整数；limit 缺省 50、限 1..200；after 缺
+            # 省 0、须为 ASCII 非负整数。空值、重复、未知参数、非
+            # ASCII 数字、符号、越界或 after>at 均 400 且仅
+            # {"error": 非空中文}；该签名方未同步（含跨租户）404 同
+            # 形，at 超过检查点 409 同形。200 键序恰为 signer_did、
+            # at、anchors、next_after；取 cursor<=at 的已同步事件，
+            # 以 (did, key_version) 末项为准，按 last_cursor>after
+            # 升序取 limit 项，每项键序恰为 did、key_version、
+            # public_key、status、uses（规范序）、last_action、
+            # last_cursor；空页 next_after=after，否则取末项
+            # last_cursor。at 分页不受后续同步影响，重启逐字节一致。
+            # 纯只读：不推进检查点、不写状态或审计。
+            params = parse_qs(query, keep_blank_values=True)
+            allowed = {"signer_did", "at", "limit", "after"}
+            unknown = sorted(set(params) - allowed)
+            if unknown:
+                raise ValidationError(
+                    f"不支持的查询参数: {', '.join(unknown)}"
+                )
+
+            def _single(name: str) -> Optional[str]:
+                values = params.get(name)
+                if values is None:
+                    return None
+                if len(values) != 1:
+                    raise ValidationError(
+                        f"查询参数 {name} 只能提供一次"
+                    )
+                return values[0]
+
+            signer_did = _single("signer_did")
+            if signer_did is None:
+                raise ValidationError("查询参数 signer_did 必填")
+            if not signer_did:
+                raise ValidationError(
+                    "查询参数 signer_did 必须为非空字符串"
+                )
+
+            at_raw = _single("at")
+            at = (
+                _parse_nonneg_int(at_raw, "at")
+                if at_raw is not None
+                else None
+            )
+
+            limit_raw = _single("limit")
+            if limit_raw is not None:
+                limit = _parse_nonneg_int(limit_raw, "limit")
+                if not 1 <= limit <= 200:
+                    raise ValidationError(
+                        "查询参数 limit 须在 1 到 200 之间"
+                    )
+            else:
+                limit = 50
+
+            after_raw = _single("after")
+            if after_raw is not None:
+                after = _parse_nonneg_int(after_raw, "after")
+            else:
+                after = 0
+
+            if at is not None and after > at:
+                raise ValidationError("查询参数 after 不能大于 at")
+
+            at_value, anchors, next_after = (
+                store.list_anchor_changes_synced_state(
+                    tenant, signer_did, at, after, limit
+                )
+            )
+            self._send_json(
+                200,
+                {
+                    "signer_did": signer_did,
+                    "at": at_value,
+                    "anchors": anchors,
                     "next_after": next_after,
                 },
             )
