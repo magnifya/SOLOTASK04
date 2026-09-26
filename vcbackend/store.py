@@ -5067,6 +5067,183 @@ class VCStore:
                 )
         return True, "", results
 
+    def verify_trust_presentation_synced(
+        self,
+        tenant_id: str,
+        signer_did: str,
+        at: int,
+        presentation: Any,
+        challenge: Any,
+    ) -> Tuple[bool, str]:
+        """以同步锚点验真未绑定外部演示，返回 (是否有效, 失败原因)。
+
+        请求结构（恰含 signer_did/at/presentation/challenge 及类型）由
+        服务层校验（400）。本方法假定四键类型已合法：
+        - 该签名方在本租户无同步检查点（含跨租户）抛 NotFoundError；
+          at 超过检查点抛 ConflictError；
+        - 演示字段、challenge、expires_at 与 proof 覆盖范围沿用
+          :meth:`verify_trust_presentation` 的未绑定形态：演示恰为
+          九字段（presentation_id、credential_id、issuer_did、
+          issuer_key_version、disclose、claims、challenge、expires_at、
+          proof），出现任何 holder_* 字段即失败；请求 challenge 须等于
+          演示 challenge；proof 覆盖去掉 proof 后的八个字段；
+        - 锚点取该来源 cursor<=at 的已同步事件，以 (issuer_did, 版本)
+          最后事件为准；缺失、非 active 或 uses 无 vp 均返回
+          (False, "同步锚点不可用")；
+        - proof 须为 ES256、64 字节裸 R||S 无填充 base64url；格式错、
+          验签错、到期依次返回 “签名格式错误”/“签名校验失败”/
+          “演示已过期”，较早错误优先。
+
+        校验顺序：请求 -> 演示字段 -> 挑战 -> 锚点 -> 签名格式 ->
+        验签 -> 期限。纯只读：不改同步页、检查点、锚点、演示、状态或
+        审计，结论随状态文件跨重启稳定。
+        """
+        with self._lock:
+            checkpoints = self._anchor_changes_sync_checkpoints.get(
+                tenant_id
+            )
+            cp = (
+                checkpoints.get(signer_did)
+                if checkpoints is not None else None
+            )
+            if cp is None:
+                raise NotFoundError("该签名方尚未同步锚点变更")
+            checkpoint = int(cp["next_after"])
+            if at > checkpoint:
+                raise ConflictError("查询时间点超过同步检查点")
+            bucket = self._bucket_locked(tenant_id)
+            pages: List[Dict[str, Any]] = []
+            if bucket is not None:
+                pages = bucket.get("synced_anchor_change_pages", {}).get(
+                    signer_did, []
+                )
+            latest: Dict[Tuple[str, int], Dict[str, Any]] = {}
+            for page in pages:
+                for event in page["events"]:
+                    cursor = int(event["cursor"])
+                    if cursor > at:
+                        continue
+                    key = (event["did"], int(event["key_version"]))
+                    existing = latest.get(key)
+                    if existing is None or cursor > int(
+                        existing["cursor"]
+                    ):
+                        latest[key] = event
+
+        # 演示字段（沿用 /v1/trust/presentations/verify 未绑定形态的
+        # 分类原因）：恰为九字段，出现 holder_* 即失败。
+        required_fields = {
+            "presentation_id",
+            "credential_id",
+            "issuer_did",
+            "issuer_key_version",
+            "disclose",
+            "claims",
+            "challenge",
+            "expires_at",
+            "proof",
+        }
+        holder_fields = sorted(
+            key for key in presentation if key.startswith("holder_")
+        )
+        if holder_fields:
+            return False, (
+                "演示字段不合法: 不得包含持有者绑定字段 "
+                f"{', '.join(holder_fields)}"
+            )
+        if set(presentation) != required_fields:
+            missing = sorted(required_fields - set(presentation))
+            if missing:
+                return False, f"演示缺少字段: {', '.join(missing)}"
+            extra = sorted(set(presentation) - required_fields)
+            return False, f"演示含多余字段: {', '.join(extra)}"
+        for field in ("presentation_id", "credential_id", "issuer_did"):
+            value = presentation[field]
+            if not isinstance(value, str) or not value:
+                return False, f"演示字段 {field} 必须为非空字符串"
+        key_version = presentation["issuer_key_version"]
+        if (
+            not isinstance(key_version, int)
+            or isinstance(key_version, bool)
+            or key_version < 1
+        ):
+            return False, "演示字段 issuer_key_version 必须为正整数"
+        disclose = presentation["disclose"]
+        if not isinstance(disclose, list) or any(
+            not isinstance(item, str) for item in disclose
+        ):
+            return False, "演示字段 disclose 必须为字符串数组"
+        if not isinstance(presentation["claims"], dict):
+            return False, "演示字段 claims 必须为 JSON 对象"
+        for field in ("challenge", "expires_at", "proof"):
+            value = presentation[field]
+            if not isinstance(value, str) or not value:
+                return False, f"演示字段 {field} 必须为非空字符串"
+
+        # 挑战：请求 challenge 须等于演示 challenge。
+        if challenge != presentation["challenge"]:
+            return False, "挑战不匹配: 请求 challenge 与演示 challenge 不一致"
+
+        # 同步锚点：(issuer_did, 版本) 最后事件，须 active 且含 vp 用途。
+        issuer_did = presentation["issuer_did"]
+        anchor = latest.get((issuer_did, key_version))
+        if (
+            anchor is None
+            or anchor["status"] != "active"
+            or "vp" not in anchor["uses"]
+        ):
+            return False, SYNCED_ANCHOR_UNAVAILABLE_REASON
+        public_pem = anchor["public_key"]
+        try:
+            crypto.validate_public_key_pem(public_pem)
+        except (ValueError, TypeError):
+            return False, SYNCED_ANCHOR_UNAVAILABLE_REASON
+
+        # 签名格式（严格：64 字节裸 R||S 无填充 base64url）与密码学
+        # 验签：覆盖范围沿用 /v1/trust/presentations/verify——去掉
+        # proof 及全部 holder_* 字段后的八个字段（未绑定演示本就不含
+        # holder_*，即去掉 proof 的全部字段）。
+        proof = presentation["proof"]
+        message = {
+            k: v
+            for k, v in presentation.items()
+            if k != "proof" and not k.startswith("holder_")
+        }
+        try:
+            crypto.validate_signature_format_strict(proof)
+        except crypto.MalformedSignature:
+            return False, IMPORTED_SIGNATURE_MALFORMED_REASON
+        try:
+            crypto.verify(message, proof, public_pem)
+        except crypto.MalformedSignature:
+            return False, IMPORTED_SIGNATURE_MALFORMED_REASON
+        except crypto.InvalidSignature:
+            return False, IMPORTED_SIGNATURE_INVALID_REASON
+        except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
+            return False, IMPORTED_SIGNATURE_INVALID_REASON
+
+        # 期限：expires_at 须为 UTC 秒精度 Z 格式；当前时间达到它即
+        # 过期。规则同 /v1/trust/presentations/verify。
+        expires_value = presentation["expires_at"]
+        if (
+            not isinstance(expires_value, str)
+            or not _UTC_Z_SHAPE_RE.match(expires_value)
+        ):
+            return False, (
+                "演示字段 expires_at 必须为 UTC 秒精度 Z 格式"
+                "（YYYY-MM-DDTHH:MM:SSZ）"
+            )
+        try:
+            expires_dt = _parse_utc_z(expires_value)
+        except ValueError:
+            return False, (
+                "演示字段 expires_at 必须为 UTC 秒精度 Z 格式"
+                "（YYYY-MM-DDTHH:MM:SSZ）"
+            )
+        if datetime.now(timezone.utc) >= expires_dt:
+            return False, "演示已过期"
+        return True, ""
+
     def verify_trust_proof(
         self,
         tenant_id: str,

@@ -69,6 +69,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/dids/deactivations/manifest/verify 校验停用通告清单与 NDJSON 内容（只读）
   POST /v1/trust/dids/deactivations/manifest/verify-batch 批量校验清单与 NDJSON（只读）
   POST /v1/trust/presentations/verify     跨系统演示验真（无需登记 DID/凭证/演示）
+  POST /v1/trust/presentations/verify-synced  以同步锚点验真未绑定外部演示（只读）
   POST /v1/trust/presentations/verify-batch 批量跨系统演示验真（仅未绑定形态，不消费）
   POST /v1/trust/presentations/verify-with-status 外部演示验真并合并同步状态（只读）
   POST /v1/trust/presentations/verify-batch-with-status 批量演示验真并合并同步状态（只读）
@@ -522,6 +523,8 @@ def build_handler(store: VCStore) -> type:
                     )
                 elif path == "/v1/trust/presentations/verify":
                     self._post_trust_presentations_verify(tenant)
+                elif path == "/v1/trust/presentations/verify-synced":
+                    self._post_trust_presentations_verify_synced(tenant)
                 elif path == "/v1/trust/presentations/verify-batch":
                     self._post_trust_presentations_verify_batch(tenant)
                 elif path == "/v1/trust/presentations/verify-with-status":
@@ -5349,6 +5352,76 @@ def build_handler(store: VCStore) -> type:
             if not valid:
                 payload["reason"] = reason or "验签失败"
             self._send_json(200, payload)
+
+        def _post_trust_presentations_verify_synced(
+            self, tenant: str
+        ) -> None:
+            # POST /v1/trust/presentations/verify-synced：以同步锚点验真
+            # 未绑定外部演示（只读）。请求体须恰含 signer_did（非空字符
+            # 串）、at（非布尔非负整数）、presentation（JSON 对象）、
+            # challenge（非空字符串）；空体、非法 JSON、非对象、键集或
+            # 类型错误均 400 且仅 {"error": 非空中文}。signer_did 未同步
+            # 或跨租户 404、at 超过同步检查点 409，同形仅 {"error"}。
+            # 外层合法后任何失败均 HTTP 200 按键序恰返
+            # {"valid":false,"reason":...}：演示九字段、challenge、
+            # expires_at、proof 覆盖及“请求→演示→挑战→锚点→签名格式→
+            # 验签→期限”顺序沿用 /v1/trust/presentations/verify（演示
+            # 出现 holder_* 字段即非法）；锚点取该来源 cursor<=at 的已
+            # 同步事件、以 (issuer_did, 版本) 最后事件为准，缺失、非
+            # active 或 uses 无 vp 均为“同步锚点不可用”；proof 格式错、
+            # 验签失败、到期同形依次为“签名格式错误”“签名校验失败”
+            # “演示已过期”，较早错误优先；成功仅 {"valid":true}。
+            # 纯只读：不改同步页、检查点、锚点、演示、状态或审计，重启
+            # 一致；租户头缺省 default、显式空 400 并隔离。
+            data = self._read_json()
+            required = ("signer_did", "at", "presentation", "challenge")
+            if set(data) != set(required):
+                missing = [f for f in required if f not in data]
+                if missing:
+                    raise ValidationError(
+                        f"请求缺少字段: {', '.join(missing)}"
+                    )
+                extra = sorted(set(data) - set(required))
+                raise ValidationError(
+                    f"请求含多余字段: {', '.join(extra)}"
+                )
+            signer_did = data["signer_did"]
+            if not isinstance(signer_did, str) or not signer_did:
+                raise ValidationError(
+                    "请求不合法: 字段 signer_did 必须为非空字符串"
+                )
+            at = data["at"]
+            if (
+                not isinstance(at, int)
+                or isinstance(at, bool)
+                or at < 0
+            ):
+                raise ValidationError(
+                    "请求不合法: 字段 at 必须为非布尔非负整数"
+                )
+            presentation = data["presentation"]
+            if not isinstance(presentation, dict):
+                raise ValidationError(
+                    "请求不合法: 字段 presentation 必须为 JSON 对象"
+                )
+            challenge = data["challenge"]
+            if not isinstance(challenge, str) or not challenge:
+                raise ValidationError(
+                    "请求不合法: 字段 challenge 必须为非空字符串"
+                )
+            try:
+                valid, reason = store.verify_trust_presentation_synced(
+                    tenant, signer_did, at, presentation, challenge
+                )
+            except (NotFoundError, ConflictError):
+                raise
+            except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
+                self._send_invalid("验签过程发生内部错误")
+                return
+            if not valid:
+                self._send_invalid(reason or "验签失败")
+                return
+            self._send_json(200, {"valid": True})
 
         def _post_trust_presentations_verify_batch(self, tenant: str) -> None:
             # 批量跨系统演示验真：与单项相同的公开错误协议，任何失败都
