@@ -5598,38 +5598,27 @@ class VCStore:
         验签 -> 期限。纯只读：不改同步页、检查点、锚点、证明、状态或
         审计，结论随状态文件跨重启稳定。
         """
-        with self._lock:
-            checkpoints = self._anchor_changes_sync_checkpoints.get(
-                tenant_id
-            )
-            cp = (
-                checkpoints.get(signer_did)
-                if checkpoints is not None else None
-            )
-            if cp is None:
-                raise NotFoundError("该签名方尚未同步锚点变更")
-            checkpoint = int(cp["next_after"])
-            if at > checkpoint:
-                raise ConflictError("查询时间点超过同步检查点")
-            bucket = self._bucket_locked(tenant_id)
-            pages: List[Dict[str, Any]] = []
-            if bucket is not None:
-                pages = bucket.get("synced_anchor_change_pages", {}).get(
-                    signer_did, []
-                )
-            latest: Dict[Tuple[str, int], Dict[str, Any]] = {}
-            for page in pages:
-                for event in page["events"]:
-                    cursor = int(event["cursor"])
-                    if cursor > at:
-                        continue
-                    key = (event["did"], int(event["key_version"]))
-                    existing = latest.get(key)
-                    if existing is None or cursor > int(
-                        existing["cursor"]
-                    ):
-                        latest[key] = event
+        latest = self._synced_anchor_events_latest(tenant_id, signer_did, at)
+        return self._verify_synced_proof_against(
+            latest, proof, challenge, source_tenant_id
+        )
 
+    @staticmethod
+    def _verify_synced_proof_against(
+        latest: Dict[Tuple[str, int], Dict[str, Any]],
+        proof: Any,
+        challenge: Any,
+        source_tenant_id: Any,
+    ) -> Tuple[bool, str]:
+        """在已解析的同步锚点快照上验真一条外部谓词证明（只读）。
+
+        假定 proof 为 JSON 对象、challenge 与 source_tenant_id 均为非空
+        字符串；证明九字段、谓词/results、RFC6901 路径、挑战、锚点、
+        签名覆盖（去掉 proof 后的八字段并加入
+        tenant_id=source_tenant_id 的规范化 JSON）、签名格式、验签与
+        期限规则及原因分类与 :meth:`verify_trust_proof_synced` 完全
+        一致，供单条与批量同步锚点验真共用同一快照。
+        """
         # 证明字段（沿用 /v1/trust/proofs/verify 的分类原因）：恰为
         # prove 响应九字段。
         required_fields = {
@@ -5788,6 +5777,57 @@ class VCStore:
         if datetime.now(timezone.utc) >= expires_dt:
             return False, "证明已过期"
         return True, ""
+
+    def verify_trust_proofs_synced_batch(
+        self,
+        tenant_id: str,
+        signer_did: str,
+        at: int,
+        items: Any,
+    ) -> List[Dict[str, Any]]:
+        """批量以同一同步锚点快照验真外部谓词证明，返回逐项结果。
+
+        请求级结构（恰含 signer_did/at/proofs、类型与 1–100 项上限）
+        由服务层校验（400）。本方法假定三者类型已合法：
+        - 检查点语义与 :meth:`verify_trust_proof_synced` 一致：来源未
+          同步（含跨租户）抛 NotFoundError，at 超检查点抛
+          ConflictError；合法时按 cursor<=at 解析一次快照，整批共用；
+        - 逐项不短路、等长同序：项须恰含 proof（JSON 对象）、
+          challenge（非空字符串）、source_tenant_id（非空字符串），
+          否则该项 ``{"valid": false, "reason": "请求项非法"}``；合法
+          项复用单条 verify-synced 的证明九字段、谓词/results、
+          RFC6901 路径、挑战、签名覆盖、锚点、格式、验签与期限规则及
+          原因分类；
+        - 成功项仅 ``{"valid": true}``，失败项键序为 valid、reason。
+
+        纯只读：不改同步页、检查点、锚点、证明、状态或审计，结论随
+        状态文件跨重启稳定。
+        """
+        latest = self._synced_anchor_events_latest(tenant_id, signer_did, at)
+        results: List[Dict[str, Any]] = []
+        for item in items:  # 逐项处理，失败不短路
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"proof", "challenge", "source_tenant_id"}
+                or not isinstance(item["proof"], dict)
+                or not isinstance(item["challenge"], str)
+                or not item["challenge"]
+                or not isinstance(item["source_tenant_id"], str)
+                or not item["source_tenant_id"]
+            ):
+                results.append({"valid": False, "reason": "请求项非法"})
+                continue
+            valid, reason = self._verify_synced_proof_against(
+                latest,
+                item["proof"],
+                item["challenge"],
+                item["source_tenant_id"],
+            )
+            if valid:
+                results.append({"valid": True})
+            else:
+                results.append({"valid": False, "reason": reason})
+        return results
 
     def verify_trust_proof_with_status(
         self,

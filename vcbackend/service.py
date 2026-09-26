@@ -77,6 +77,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/presentations/verify-batch-with-status 批量演示验真并合并同步状态（只读）
   POST /v1/trust/proofs/verify            跨系统谓词证明验真（无需登记 DID/凭证/证明，不消费）
   POST /v1/trust/proofs/verify-synced     以同步锚点验真外部谓词证明（只读）
+  POST /v1/trust/proofs/verify-synced-batch  批量以同步锚点快照验真外部谓词证明（只读）
   POST /v1/trust/proofs/verify-batch      批量跨系统谓词证明验真（兼容单项规则，不消费）
   POST /v1/trust/credentials/verify-batch 批量跨系统凭证验真（兼容单项规则）
   POST /v1/trust/credentials/verify-with-status 外部凭证验真并合并同步状态（只读）
@@ -544,6 +545,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_proofs_verify(tenant)
                 elif path == "/v1/trust/proofs/verify-synced":
                     self._post_trust_proofs_verify_synced(tenant)
+                elif path == "/v1/trust/proofs/verify-synced-batch":
+                    self._post_trust_proofs_verify_synced_batch(tenant)
                 elif path == "/v1/trust/proofs/verify-batch":
                     self._post_trust_proofs_verify_batch(tenant)
                 elif path == "/v1/trust/proofs/verify-with-status":
@@ -5857,6 +5860,76 @@ def build_handler(store: VCStore) -> type:
                 self._send_invalid(reason or "验签失败")
                 return
             self._send_json(200, {"valid": True})
+
+        def _post_trust_proofs_verify_synced_batch(
+            self, tenant: str
+        ) -> None:
+            # POST /v1/trust/proofs/verify-synced-batch：批量以同步锚点
+            # 快照验真外部谓词证明（只读）。请求体须恰含 signer_did
+            # （非空字符串）、at（非布尔非负整数）、proofs（1–100 项
+            # 数组）；空体、非法 JSON、非对象、键集或类型错误、空数组或
+            # 超限均 400 且仅 {"error":"请求非法"}；来源未同步或跨租户
+            # 404 仅 {"error":"同步来源不存在"}，at 超检查点 409 仅
+            # {"error":"同步游标冲突"}，先于项校验。合法时 200 仅返
+            # {"results":[...]}，逐项不短路、等长同序：项须恰含 proof
+            # （对象）、非空 challenge、非空 source_tenant_id，否则该项
+            # {"valid":false,"reason":"请求项非法"}；合法项沿用单条
+            # verify-synced 的证明九字段、谓词/results、RFC6901 路径、
+            # 挑战、签名覆盖、cursor<=at 末事件锚点、期限及顺序，锚点
+            # 缺失/非 active/uses 无 proof 为“同步锚点不可用”，格式、
+            # 验签、过期依次为“签名格式错误”“签名校验失败”“证明已
+            # 过期”；成功项仅 {"valid":true}，失败项键序 valid、reason。
+            # 纯只读：不改同步页、检查点、锚点、证明、状态或审计，重启
+            # 一致；租户头缺省 default、显式空 400 并隔离。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except Exception:  # noqa: BLE001 请求非法绝不暴露内部细节
+                self._send_error(400, "请求非法")
+                return
+            if not raw:
+                self._send_error(400, "请求非法")
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send_error(400, "请求非法")
+                return
+            if not isinstance(data, dict) or set(data) != {
+                "signer_did",
+                "at",
+                "proofs",
+            }:
+                self._send_error(400, "请求非法")
+                return
+            signer_did = data["signer_did"]
+            at = data["at"]
+            proofs = data["proofs"]
+            if (
+                not isinstance(signer_did, str)
+                or not signer_did
+                or not isinstance(at, int)
+                or isinstance(at, bool)
+                or at < 0
+                or not isinstance(proofs, list)
+                or not 1 <= len(proofs) <= 100
+            ):
+                self._send_error(400, "请求非法")
+                return
+            try:
+                results = store.verify_trust_proofs_synced_batch(
+                    tenant, signer_did, at, proofs
+                )
+            except NotFoundError:
+                self._send_error(404, "同步来源不存在")
+                return
+            except ConflictError:
+                self._send_error(409, "同步游标冲突")
+                return
+            except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
+                self._send_error(500, "服务器内部错误")
+                return
+            self._send_json(200, {"results": results})
 
         def _post_trust_proofs_verify_batch(self, tenant: str) -> None:
             # 批量跨系统谓词证明验真：与单项相同的公开错误协议，任何失败
