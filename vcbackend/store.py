@@ -6157,6 +6157,88 @@ class VCStore:
             )
             return picked, next_after
 
+    def get_anchor_changes_synced_state(
+        self,
+        tenant_id: str,
+        signer_did: str,
+        at: Optional[int] = None,
+        after: int = 0,
+        limit: int = 50,
+    ) -> Tuple[int, List[Dict[str, Any]], int]:
+        """只读构建某签名方已同步锚点变更在 at 游标处的合并视图。
+
+        - 该签名方在本租户无同步检查点（未接收非空页，含跨租户）时抛
+          NotFoundError；
+        - at 为 None 时取检查点 next_after（当前已同步游标）；显式 at
+          超过检查点抛 ConflictError；after 大于生效 at 抛
+          ValidationError；
+        - 取已落盘事件中 cursor <= at 者，按 (did, key_version) 以末项
+          （cursor 最大）为准合并，再按 last_cursor > after 升序取至多
+          limit 项，每项恰含 did/key_version/public_key/status/uses/
+          last_action/last_cursor；
+        - 返回 (at, anchors, next_after)：at 为生效值，空页 next_after
+          等于 after，否则为末项 last_cursor。
+
+        纯只读：不推进检查点、不修改任何状态、不记审计、不触发落盘；
+        同一 at 的视图不受后续同步影响，重启逐字节一致。
+        """
+        with self._lock:
+            existing = self._anchor_changes_sync_checkpoints.get(tenant_id)
+            cp = existing.get(signer_did) if existing is not None else None
+            if cp is None:
+                raise NotFoundError("该签名方无同步状态")
+            checkpoint = int(cp["next_after"])
+            effective_at = checkpoint if at is None else int(at)
+            if after > effective_at:
+                raise ValidationError("查询参数 after 不能大于 at")
+            if effective_at > checkpoint:
+                raise ConflictError("at 超过同步检查点")
+            bucket = self._bucket_locked(tenant_id)
+            pages: List[Dict[str, Any]] = []
+            if bucket is not None:
+                pages = (
+                    bucket.get("synced_anchor_change_pages", {}).get(
+                        signer_did
+                    )
+                    or []
+                )
+            latest: Dict[Tuple[str, int], Dict[str, Any]] = {}
+            for page in pages:
+                for event in page.get("events", []):
+                    cursor = int(event["cursor"])
+                    if cursor > effective_at:
+                        continue
+                    key = (event["did"], int(event["key_version"]))
+                    current = latest.get(key)
+                    if (
+                        current is None
+                        or cursor > int(current["cursor"])
+                    ):
+                        latest[key] = event
+            rows = sorted(
+                latest.values(), key=lambda event: int(event["cursor"])
+            )
+            picked: List[Dict[str, Any]] = []
+            for event in rows:
+                cursor = int(event["cursor"])
+                if cursor <= after:
+                    continue
+                if len(picked) >= limit:
+                    break
+                picked.append(
+                    {
+                        "did": event["did"],
+                        "key_version": int(event["key_version"]),
+                        "public_key": event["public_key"],
+                        "status": event["status"],
+                        "uses": list(event["uses"]),
+                        "last_action": event["action"],
+                        "last_cursor": cursor,
+                    }
+                )
+            next_after = picked[-1]["last_cursor"] if picked else after
+            return effective_at, picked, next_after
+
     def list_trust_anchor_entries(
         self,
         tenant_id: str,
