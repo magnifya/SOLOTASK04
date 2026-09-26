@@ -6052,8 +6052,10 @@ class VCStore:
           内容，一律 ConflictError（同步游标冲突）。
 
         新页的原始 events、页摘要与检查点在同一次原子写落盘；同步不写
-        审计。落盘失败回滚全部内存变更并抛 StorageError。并发同一检查
-        点在锁内串行，至多一项推进，其余按重放或冲突处理。
+        审计。落盘失败回滚全部内存变更（检查点、同步页、租户桶及
+        setdefault 产生的临时容器），使内存与重载状态均等于调用前，
+        重试从原游标继续，并抛 StorageError。并发同一检查点在锁内串行，
+        至多一项推进，其余按重放或冲突处理。
 
         返回 (created, next_after, accepted)：created 表示是否首个非空
         页（HTTP 201），其后新页为 False（HTTP 200）；accepted 为本页
@@ -6065,10 +6067,9 @@ class VCStore:
             if not events:
                 return False, next_after, 0
 
-            checkpoints = self._anchor_changes_sync_checkpoints.setdefault(
-                tenant_id, {}
-            )
-            cp = checkpoints.get(signer_did)
+            # 只读获取检查点（不做 setdefault，避免未落盘即产生残留）。
+            by_signer = self._anchor_changes_sync_checkpoints.get(tenant_id)
+            cp = by_signer.get(signer_did) if by_signer is not None else None
             if cp is None:
                 if after != 0:
                     # 首个非空页须从 0 开始，否则为跳页
@@ -6083,12 +6084,19 @@ class VCStore:
                     raise ConflictError("同步游标冲突")
                 created = False
 
-            bucket = self._ensure_bucket_locked(tenant_id)
-            pages = bucket["synced_anchor_change_pages"].setdefault(
-                signer_did, []
-            )
+            # 在任何内存变更（含租户桶、检查点与页面容器）之前快照，
+            # 落盘失败时整体回滚到调用前状态。
             mem_snapshot = self._snapshot_locked()
             try:
+                checkpoints = (
+                    self._anchor_changes_sync_checkpoints.setdefault(
+                        tenant_id, {}
+                    )
+                )
+                bucket = self._ensure_bucket_locked(tenant_id)
+                pages = bucket["synced_anchor_change_pages"].setdefault(
+                    signer_did, []
+                )
                 pages.append(
                     {
                         "after": after,
@@ -6107,6 +6115,54 @@ class VCStore:
                 self._restore_locked(mem_snapshot)
                 raise StorageError("存储失败") from exc
             return created, next_after, len(events)
+
+    def list_anchor_changes_sync_history(
+        self,
+        tenant_id: str,
+        signer_did: str,
+        after: int = 0,
+        limit: int = 50,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """只读分页查询本租户已接收的锚点变更流同步页（同步历史）。
+
+        - 仅当本租户已接收该 signer_did 的至少一个非空同步页时返回，
+          否则（含跨租户）抛 NotFoundError；
+        - 页按来源 next_after 升序，after 排除 next_after 不大于其值
+          的页，至多返回 limit 项；
+        - 每项恰含 after、next_after、digest、events：前两项为非负
+          整数且 after < next_after，digest 为 64 位小写十六进制，
+          events 的值、顺序与键序与落盘时一致；
+        - 返回的 next_after 为本页末项来源 next_after，空页保持
+          after。
+        纯只读：不修改任何状态、不推进检查点、不记审计、不触发落盘。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            pages_map = (
+                bucket.get("synced_anchor_change_pages", {})
+                if bucket is not None
+                else {}
+            )
+            stored = pages_map.get(signer_did)
+            if not stored:
+                raise NotFoundError("未接收该签名方的同步页")
+            rows = sorted(stored, key=lambda page: int(page["next_after"]))
+            picked: List[Dict[str, Any]] = []
+            for row in rows:
+                if int(row["next_after"]) <= after:
+                    continue
+                if len(picked) >= limit:
+                    break
+                picked.append(
+                    {
+                        "after": int(row["after"]),
+                        "next_after": int(row["next_after"]),
+                        "digest": row["digest"],
+                        "events": copy.deepcopy(row["events"]),
+                    }
+                )
+            next_after = int(picked[-1]["next_after"]) if picked else after
+            return picked, next_after
 
     def list_trust_anchor_entries(
         self,
