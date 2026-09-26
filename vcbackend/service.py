@@ -73,7 +73,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/dids/deactivations/manifest/verify-batch 批量校验清单与 NDJSON（只读）
   POST /v1/trust/presentations/verify     跨系统演示验真（无需登记 DID/凭证/演示）
   POST /v1/trust/presentations/verify-synced  以同步锚点验真未绑定外部演示（只读）
-  POST /v1/trust/presentations/verify-synced-with-status  同步锚点验真未绑定演示并合并请求初始状态快照（只读）
+  POST /v1/trust/presentations/verify-synced-with-status  同步锚点验真未绑定/持有者绑定演示并合并请求初始状态快照（只读）
   POST /v1/trust/presentations/verify-synced-batch  批量以同步锚点快照验真未绑定演示（只读）
   POST /v1/trust/presentations/verify-synced-batch-with-status  批量同步锚点验真演示并合并批初状态快照（只读）
   POST /v1/trust/presentations/verify-batch 批量跨系统演示验真（仅未绑定形态，不消费）
@@ -5699,25 +5699,39 @@ def build_handler(store: VCStore) -> type:
             self, tenant: str
         ) -> None:
             # POST /v1/trust/presentations/verify-synced-with-status：以
-            # 同步锚点验真未绑定外部演示并合并请求初始本租户状态快照
-            # （只读）。请求体须恰含 signer_did（非空字符串）、at（非
-            # 布尔非负整数）、presentation（JSON 对象）、challenge
-            # （非空字符串）；空体、非法 JSON、非对象、键集或类型错误
-            # 均 400 且仅 {"error": 非空中文}。signer_did 未同步或跨
-            # 租户 404、at 超过同步检查点 409，同形仅 {"error"}。外层
-            # 合法后任何失败均 HTTP 200 按键序恰返
-            # {"valid":false,"reason":...}：演示九字段、holder_* 禁令、
-            # 挑战、锚点、签名覆盖、格式、验签、期限、校验顺序及原因
-            # 完全沿用 verify-synced，原验真失败不查状态；验真成功后
-            # 以请求初始一次原子读取的本租户状态快照查演示的
-            # (issuer_did, credential_id)：未同步、revoked、unknown
-            # 依次为“外部凭证状态未同步”“外部凭证已吊销：<reason>”
-            # （空或缺失 reason 用“未知原因”）“外部凭证状态未知”，
-            # active 成功；成功仅 {"valid":true}。纯只读：不改同步页、
-            # 检查点、锚点、演示、状态或审计，重启一致；租户头缺省
-            # default、显式空 400 并隔离。
+            # 同步锚点验真外部演示并合并请求初始本租户状态快照（只读）。
+            # 未绑定请求体须恰含 signer_did（非空字符串）、at（非布尔
+            # 非负整数）、presentation（JSON 对象）、challenge（非空
+            # 字符串）；持有者绑定请求在原四键外恰加非空字符串
+            # source_tenant_id，presentation 恰为绑定十二字段。空体、
+            # 非法 JSON、非对象、键集或类型错误均 400 且仅
+            # {"error": 非空中文}。signer_did 未同步或跨租户 404、at
+            # 超过同步检查点 409，同形仅 {"error"}。外层合法后任何失败
+            # 均 HTTP 200 按键序恰返 {"valid":false,"reason":...}：
+            # 未绑定演示九字段、holder_* 禁令、挑战、锚点、签名覆盖、
+            # 格式、验签、期限、校验顺序及原因完全沿用 verify-synced；
+            # 绑定演示签发者与持有者锚点均取该来源 cursor<=at 的
+            # (DID,版本) 末事件（须 active 且 uses 含 vp），不可用依次
+            # 为“同步锚点不可用”“同步持有者锚点不可用”，issuer
+            # proof 覆盖去掉 proof 及 holder_* 的八字段，holder_proof
+            # 覆盖去掉 proof、holder_proof 的对象并加入
+            # tenant_id=source_tenant_id，持有者格式、验签失败恰为
+            # “持有者签名格式错误”“持有者签名校验失败”，顺序为演示、
+            # 挑战、签发锚点/格式/验签、持有者锚点/格式/验签、期限；
+            # 原验真失败不查状态；验真成功后以请求初始一次原子读取的
+            # 本租户状态快照查演示的 (issuer_did, credential_id)：未
+            # 同步、revoked、unknown 依次为“外部凭证状态未同步”
+            # “外部凭证已吊销：<reason>”（空或缺失 reason 用“未知
+            # 原因”）“外部凭证状态未知”，active 成功；成功仅
+            # {"valid":true}。纯只读：不改同步页、检查点、锚点、演示、
+            # 状态或审计，重启一致；租户头缺省 default、显式空 400 并
+            # 隔离。
             data = self._read_json()
-            required = ("signer_did", "at", "presentation", "challenge")
+            base_required = ("signer_did", "at", "presentation", "challenge")
+            is_holder_bound = "source_tenant_id" in data
+            required = base_required + (
+                ("source_tenant_id",) if is_holder_bound else ()
+            )
             if set(data) != set(required):
                 missing = [f for f in required if f not in data]
                 if missing:
@@ -5752,10 +5766,18 @@ def build_handler(store: VCStore) -> type:
                 raise ValidationError(
                     "请求不合法: 字段 challenge 必须为非空字符串"
                 )
+            source_tenant_id: Optional[str] = None
+            if is_holder_bound:
+                source_tenant_id = data["source_tenant_id"]
+                if not isinstance(source_tenant_id, str) or not source_tenant_id:
+                    raise ValidationError(
+                        "请求不合法: 字段 source_tenant_id 必须为非空字符串"
+                    )
             try:
                 valid, reason = (
                     store.verify_trust_presentation_synced_with_status(
-                        tenant, signer_did, at, presentation, challenge
+                        tenant, signer_did, at, presentation, challenge,
+                        source_tenant_id,
                     )
                 )
             except (NotFoundError, ConflictError):
