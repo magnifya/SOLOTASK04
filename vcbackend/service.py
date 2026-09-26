@@ -28,6 +28,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   GET  /v1/trust/anchor-changes           可签名信任锚点变更流（?after=&signer_did=，只读）
   GET  /v1/trust/ac-proof                  锚点变更 Merkle 包含证明（?cursor=&snapshot=&signer_did=，只读）
   POST /v1/trust/ac-proof                  校验锚点变更证明（结构/锚点/签名/包含路径，不依赖本地事件）
+  POST /v1/trust/ac-proof/verify-batch     批量校验锚点变更证明（批初锚点快照、逐项不短路，只读）
   POST /v1/trust/anchor-changes/verify    跨系统信任锚点变更流只读验真（不依赖本地事件）
   POST /v1/trust/anchor-changes/sync      跨系统信任锚点变更流同步接收（验真、检查点防重放，原子落盘不审计）
   GET  /v1/trust/anchor-changes/sync-history  查询锚点变更同步页历史（?signer_did=&limit=&after=，只读）
@@ -535,6 +536,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_anchor_changes_verify(tenant)
                 elif path == "/v1/trust/ac-proof":
                     self._post_trust_ac_proof(tenant)
+                elif path == "/v1/trust/ac-proof/verify-batch":
+                    self._post_trust_ac_proof_verify_batch(tenant)
                 elif path == "/v1/trust/anchor-changes/sync":
                     self._post_trust_anchor_changes_sync(tenant)
                 elif path.startswith("/v1/trust/anchors/") and path.endswith(
@@ -2352,7 +2355,7 @@ def build_handler(store: VCStore) -> type:
         def _anchor_proof_is_well_formed(self, proof: Any) -> bool:
             # 证明结构校验（“证明非法”）：proof 恰含 GET
             # /v1/trust/ac-proof 响应的七键；event 沿用变更流事件协议；
-            # snapshot/sign_key_version 为非布尔正整数；root/hash 为 64
+            # snapshot/signer_key_version 为非布尔正整数；root/hash 为 64
             # 位小写 hex；path 为 list，项恰含 side、hash，side 限
             # left/right；signer_did、signature 非空字符串。
             if not isinstance(proof, dict):
@@ -2447,11 +2450,17 @@ def build_handler(store: VCStore) -> type:
             return True
 
         def _verify_anchor_proof_item(
-            self, tenant: str, proof: Any
+            self,
+            tenant: str,
+            proof: Any,
+            anchor_keys: Optional[Dict[Tuple[str, int], str]] = None,
         ) -> Optional[str]:
             # 锚点变更证明验真：按序返回失败原因（证明非法 -> 锚点不可
             # 用 -> 签名格式错误 -> 签名校验失败 -> 包含证明校验失败），
             # 成功返回 None。不依赖本地事件、纯只读、不记审计。
+            # anchor_keys 为批初原子快照（(signer_did, 版本) -> 公钥
+            # PEM，仅含 active 且含 generic 用途的锚点）；缺省时逐项实
+            # 时查询本租户锚点。
             # 阶段一：proof 结构与事件协议
             if not self._anchor_proof_is_well_formed(proof):
                 return "证明非法"
@@ -2461,12 +2470,17 @@ def build_handler(store: VCStore) -> type:
 
             # 阶段二：本租户同 signer_did/版本且含 generic 用途的
             # active 信任锚点
-            public_pem = store.get_active_trust_anchor_public_key(
-                tenant,
-                signer_did,
-                signer_key_version,
-                required_use="generic",
-            )
+            if anchor_keys is None:
+                public_pem = store.get_active_trust_anchor_public_key(
+                    tenant,
+                    signer_did,
+                    signer_key_version,
+                    required_use="generic",
+                )
+            else:
+                public_pem = anchor_keys.get(
+                    (signer_did, signer_key_version)
+                )
             if public_pem is None:
                 return "锚点不可用"
             try:
@@ -2535,6 +2549,71 @@ def build_handler(store: VCStore) -> type:
                 self._send_json(200, {"valid": False, "reason": reason})
                 return
             self._send_json(200, {"valid": True})
+
+        def _post_trust_ac_proof_verify_batch(self, tenant: str) -> None:
+            # POST /v1/trust/ac-proof/verify-batch：批量校验锚点变更证
+            # 明（只读）。请求体须恰为 {"items": [证明...]}，数组限
+            # 1–100 项；空体、非法 JSON、非对象、键集错误、items 非数
+            # 组/空/超限均 HTTP 200 且按键序恰返
+            # {"results": [], "reason": "请求非法"}。合法批次原子读取
+            # 批初本租户信任锚点快照，逐项不短路，results 等长同序；
+            # 并发吊销或用途收紧不得令同批观察到混合状态。每项须为
+            # POST /v1/trust/ac-proof 的 proof 对象，逐项复用单项校验
+            # 顺序与五类原因；成功项仅 {"valid": true}，失败项键序
+            # valid、reason。顶层 HTTP 200 且仅含 results。不依赖变更
+            # 事件，不写状态、游标或审计。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except Exception:  # noqa: BLE001 请求非法统一 200 处理
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            if not raw:
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            if (
+                not isinstance(data, dict)
+                or set(data) != {"items"}
+                or not isinstance(data["items"], list)
+                or not data["items"]
+                or len(data["items"]) > 100
+            ):
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            items = data["items"]
+
+            # 批初原子快照：仅取 active 且含 generic 用途的锚点，同批
+            # 各项据此解析，不受并发吊销/用途收紧影响。
+            snapshot = store.list_trust_anchor_snapshot(tenant)
+            anchor_keys = {
+                (row["did"], row["key_version"]): row["public_key"]
+                for row in snapshot
+                if row["status"] == "active" and "generic" in row["uses"]
+            }
+
+            results: List[Dict[str, Any]] = []
+            for item in items:  # 顺序校验，失败不短路
+                reason = self._verify_anchor_proof_item(
+                    tenant, item, anchor_keys=anchor_keys
+                )
+                if reason is None:
+                    results.append({"valid": True})
+                else:
+                    results.append({"valid": False, "reason": reason})
+            self._send_json(200, {"results": results})
 
         def _anchor_changes_is_well_formed(
             self, changes: Any, after: Any
