@@ -4604,6 +4604,87 @@ class VCStore:
                 results.append({"valid": False, "reason": reason})
         return results
 
+    def _status_snapshot_locked(
+        self, tenant_id: str
+    ) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        """一次原子读取本租户 credential_status_sync 状态快照（只读）。
+
+        返回 issuer_did -> credential_id -> 记录副本 的映射，供单条
+        verify-synced-with-status 在请求初始读取后于锁外判定。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            status_rows: Dict[str, Dict[str, Dict[str, Any]]] = {}
+            if bucket is not None:
+                for issuer, rows in (
+                    bucket.get("credential_status_sync", {}).items()
+                ):
+                    status_rows[issuer] = {
+                        cid: dict(row) for cid, row in rows.items()
+                    }
+        return status_rows
+
+    @staticmethod
+    def _synced_status_verdict(
+        status_rows: Dict[str, Dict[str, Dict[str, Any]]],
+        issuer_did: str,
+        credential_id: str,
+    ) -> Tuple[bool, str]:
+        """按请求初始状态快照判定 (issuer_did, credential_id)（只读）。
+
+        未同步（含属他租户）为“外部凭证状态未同步”，revoked 为
+        “外部凭证已吊销：<保存的 reason>”（保存记录无 reason 时用
+        “未知原因”），unknown 为“外部凭证状态未知”，active 判成功。
+        """
+        row = status_rows.get(issuer_did, {}).get(credential_id)
+        if row is None:
+            return False, "外部凭证状态未同步"
+        status = row.get("status")
+        if status == "active":
+            return True, ""
+        if status == "revoked":
+            saved_reason = row.get("reason")
+            if not saved_reason:
+                saved_reason = "未知原因"
+            return False, f"外部凭证已吊销：{saved_reason}"
+        # status 仅可能为 active/revoked/unknown（同步入口已约束）。
+        return False, "外部凭证状态未知"
+
+    def verify_trust_credential_synced_with_status(
+        self,
+        tenant_id: str,
+        signer_did: str,
+        at: int,
+        body: Any,
+        signature: Any,
+    ) -> Tuple[bool, str]:
+        """以同步锚点验真外部凭证并合并请求初始状态快照（只读）。
+
+        请求结构（恰含 signer_did/at/body/signature 及类型）由服务层
+        校验（400）。检查点语义、凭证字段、锚点、签名格式、验签、
+        有效期规则、校验顺序及原因分类与
+        :meth:`verify_trust_credential_synced` 完全一致；验真失败原样
+        返回，不查状态。验真通过后按 ``(issuer_did, credential_id)``
+        查请求初始一次原子读取的本租户 ``credential_status_sync``
+        状态快照：未同步（含属他租户）为“外部凭证状态未同步”，
+        revoked 为“外部凭证已吊销：<保存的 reason>”（保存记录无
+        reason 时用“未知原因”），unknown 为“外部凭证状态未知”，
+        active 判成功。
+
+        纯只读：不改同步页、检查点、锚点、凭证、状态或审计，结论随
+        状态文件跨重启稳定。
+        """
+        latest = self._synced_anchor_events_latest(tenant_id, signer_did, at)
+        status_rows = self._status_snapshot_locked(tenant_id)
+        valid, reason = self._verify_synced_credential_against(
+            latest, body, signature
+        )
+        if not valid:
+            return False, reason
+        return self._synced_status_verdict(
+            status_rows, body["issuer_did"], body["credential_id"]
+        )
+
     def verify_trust_credential_with_status(
         self,
         tenant_id: str,
@@ -5514,6 +5595,43 @@ class VCStore:
                 results.append({"valid": False, "reason": reason})
         return results
 
+    def verify_trust_presentation_synced_with_status(
+        self,
+        tenant_id: str,
+        signer_did: str,
+        at: int,
+        presentation: Any,
+        challenge: Any,
+    ) -> Tuple[bool, str]:
+        """以同步锚点验真未绑定外部演示并合并请求初始状态快照（只读）。
+
+        请求结构（恰含 signer_did/at/presentation/challenge 及类型）由
+        服务层校验（400）。检查点语义、演示九字段、holder_* 禁令、
+        挑战、锚点、签名覆盖、格式、验签、期限规则、校验顺序及原因
+        分类与 :meth:`verify_trust_presentation_synced` 完全一致；
+        验真失败原样返回，不查状态。验真通过后按演示的
+        ``(issuer_did, credential_id)`` 查请求初始一次原子读取的本
+        租户 ``credential_status_sync`` 状态快照：未同步（含属他
+        租户）为“外部凭证状态未同步”，revoked 为“外部凭证已吊销：
+        <保存的 reason>”（保存记录无 reason 时用“未知原因”），
+        unknown 为“外部凭证状态未知”，active 判成功。
+
+        纯只读：不改同步页、检查点、锚点、演示、状态或审计，结论随
+        状态文件跨重启稳定。
+        """
+        latest = self._synced_anchor_events_latest(tenant_id, signer_did, at)
+        status_rows = self._status_snapshot_locked(tenant_id)
+        valid, reason = self._verify_synced_presentation_against(
+            latest, presentation, challenge
+        )
+        if not valid:
+            return False, reason
+        return self._synced_status_verdict(
+            status_rows,
+            presentation["issuer_did"],
+            presentation["credential_id"],
+        )
+
     def verify_trust_proof(
         self,
         tenant_id: str,
@@ -6083,6 +6201,43 @@ class VCStore:
             else:
                 results.append({"valid": False, "reason": reason})
         return results
+
+    def verify_trust_proof_synced_with_status(
+        self,
+        tenant_id: str,
+        signer_did: str,
+        at: int,
+        proof: Any,
+        challenge: Any,
+        source_tenant_id: Any,
+    ) -> Tuple[bool, str]:
+        """以同步锚点验真外部谓词证明并合并请求初始状态快照（只读）。
+
+        请求结构（恰含 signer_did/at/proof/challenge/source_tenant_id
+        及类型）由服务层校验（400）。检查点语义、证明九字段、谓词/
+        results、RFC6901 路径、挑战、锚点、签名覆盖、格式、验签、
+        期限规则、校验顺序及原因分类与
+        :meth:`verify_trust_proof_synced` 完全一致；验真失败原样返回，
+        不查状态。验真通过后按证明的 ``(issuer_did, credential_id)``
+        查请求初始一次原子读取的本租户 ``credential_status_sync``
+        状态快照：未同步（含属他租户）为“外部凭证状态未同步”，
+        revoked 为“外部凭证已吊销：<保存的 reason>”（保存记录无
+        reason 时用“未知原因”），unknown 为“外部凭证状态未知”，
+        active 判成功。
+
+        纯只读：不改同步页、检查点、锚点、证明、状态或审计，结论随
+        状态文件跨重启稳定。
+        """
+        latest = self._synced_anchor_events_latest(tenant_id, signer_did, at)
+        status_rows = self._status_snapshot_locked(tenant_id)
+        valid, reason = self._verify_synced_proof_against(
+            latest, proof, challenge, source_tenant_id
+        )
+        if not valid:
+            return False, reason
+        return self._synced_status_verdict(
+            status_rows, proof["issuer_did"], proof["credential_id"]
+        )
 
     def verify_trust_proof_with_status(
         self,
