@@ -10200,6 +10200,80 @@ class VCStore:
         highest_public_pem = methods[-1]["public_key"]
         return did, current_version, highest_public_pem, proof
 
+    @staticmethod
+    def _verify_synced_did_document_against(
+        latest: Dict[Tuple[str, int], Dict[str, Any]],
+        notice_reasons: Dict[str, str],
+        document: Any,
+    ) -> Tuple[bool, str]:
+        """在已解析的同步锚点快照与停用通告快照上验真一份外部 DID
+        文档（只读）。
+
+        文档结构、cursor<=at 末锚点、ES256 proof 覆盖、校验顺序与
+        停用判定的规则及原因分类与
+        :meth:`verify_trust_did_document_synced` 完全一致，供单条与
+        批量同步验真共用同一快照。
+        """
+        # 1. 文档结构：沿用既有 DID 文档验真协议
+        parsed = VCStore._parse_trust_did_document(document)
+        if parsed is None:
+            return False, "DID文档非法"
+        did, current_version, highest_public_pem, proof = parsed
+
+        # 2. 同步锚点：(did, 当前版本) 最后事件，须 active、含 did
+        #    用途且公钥与文档当前版本逐字相同
+        anchor = latest.get((did, current_version))
+        if (
+            anchor is None
+            or anchor["status"] != "active"
+            or "did" not in anchor["uses"]
+            or anchor["public_key"] != highest_public_pem
+        ):
+            return False, SYNCED_ANCHOR_UNAVAILABLE_REASON
+
+        # 3. 签名格式（严格：64 字节裸 R||S 无填充 base64url）
+        try:
+            crypto.validate_signature_format_strict(proof)
+        except crypto.MalformedSignature:
+            return False, IMPORTED_SIGNATURE_MALFORMED_REASON
+
+        # 4. 密码学验签：证明覆盖除 document_proof 外的整个文档
+        unsigned = {k: v for k, v in document.items() if k != "document_proof"}
+        try:
+            crypto.verify(unsigned, proof, highest_public_pem)
+        except crypto.MalformedSignature:
+            return False, IMPORTED_SIGNATURE_MALFORMED_REASON
+        except crypto.InvalidSignature:
+            return False, IMPORTED_SIGNATURE_INVALID_REASON
+        except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
+            return False, IMPORTED_SIGNATURE_INVALID_REASON
+
+        # 5. 验签成功后查批初停用通告快照
+        notice_reason = notice_reasons.get(did)
+        if notice_reason is not None:
+            return (
+                False,
+                f"{EXTERNAL_DID_DEACTIVATED_REASON_PREFIX}{notice_reason}",
+            )
+        return True, ""
+
+    def _did_deactivation_reasons_snapshot(
+        self, tenant_id: str
+    ) -> Dict[str, str]:
+        """一次原子读取本租户外部 DID 停用通告快照（只读）。
+
+        返回 did -> 通告 reason 的映射副本，供单条与批量同步验真在
+        批初读取后于锁外判定，整批共用同一快照。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            rows = (
+                bucket.get("did_deactivation_notices", {})
+                if bucket is not None
+                else {}
+            )
+            return {did: row["reason"] for did, row in rows.items()}
+
     def verify_trust_did_document_synced(
         self,
         tenant_id: str,
@@ -10231,47 +10305,49 @@ class VCStore:
         """
         # 1. 同步检查点（先于文档校验）：未同步 404、at 越界 409
         latest = self._synced_anchor_events_latest(tenant_id, signer_did, at)
+        # 2. 批初一次原子读取本租户停用通告快照
+        notice_reasons = self._did_deactivation_reasons_snapshot(tenant_id)
+        # 3. 文档结构、锚点、签名与停用判定（共用快照）
+        return self._verify_synced_did_document_against(
+            latest, notice_reasons, document
+        )
 
-        # 2. 文档结构：沿用既有 DID 文档验真协议
-        parsed = self._parse_trust_did_document(document)
-        if parsed is None:
-            return False, "DID文档非法"
-        did, current_version, highest_public_pem, proof = parsed
+    def verify_trust_did_documents_synced_batch(
+        self,
+        tenant_id: str,
+        signer_did: str,
+        at: int,
+        documents: Any,
+    ) -> List[Dict[str, Any]]:
+        """批量以同一同步锚点快照与停用通告快照验真外部 DID 文档
+        （只读），返回逐项结果。
 
-        # 3. 同步锚点：(did, 当前版本) 最后事件，须 active、含 did
-        #    用途且公钥与文档当前版本逐字相同
-        anchor = latest.get((did, current_version))
-        if (
-            anchor is None
-            or anchor["status"] != "active"
-            or "did" not in anchor["uses"]
-            or anchor["public_key"] != highest_public_pem
-        ):
-            return False, SYNCED_ANCHOR_UNAVAILABLE_REASON
+        请求级结构（恰含 signer_did/at/documents、类型与 1–100 项
+        上限）由服务层校验（400）。本方法假定三者类型已合法：
+        - 检查点语义与 :meth:`verify_trust_did_document_synced`
+        一致：来源未同步（含跨租户）抛 NotFoundError，at 超检查点
+        抛 ConflictError，均先于逐项校验；合法时在批初原子读取
+        cursor<=at 的同步锚点快照与本租户停用通告快照，整批共用，
+        并发写入不会造成批内混合结论；
+        - 逐项不短路、等长同序：每项即一份 DID 文档，非对象项失败
+          原因为“DID文档非法”，其余逐项复用单条
+          verify-document-synced 的文档结构、锚点、签名格式、验签
+          与停用判定规则及原因分类；
+        - 成功项仅 ``{"valid": true}``，失败项键序为 valid、reason。
 
-        # 4. 签名格式（严格：64 字节裸 R||S 无填充 base64url）
-        try:
-            crypto.validate_signature_format_strict(proof)
-        except crypto.MalformedSignature:
-            return False, IMPORTED_SIGNATURE_MALFORMED_REASON
-
-        # 5. 密码学验签：证明覆盖除 document_proof 外的整个文档
-        unsigned = {k: v for k, v in document.items() if k != "document_proof"}
-        try:
-            crypto.verify(unsigned, proof, highest_public_pem)
-        except crypto.MalformedSignature:
-            return False, IMPORTED_SIGNATURE_MALFORMED_REASON
-        except crypto.InvalidSignature:
-            return False, IMPORTED_SIGNATURE_INVALID_REASON
-        except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
-            return False, IMPORTED_SIGNATURE_INVALID_REASON
-
-        # 6. 验签成功后查本租户外部 DID 停用通告
-        notice = self.get_did_deactivation_notice(tenant_id, did)
-        if notice is not None:
-            return (
-                False,
-                f"{EXTERNAL_DID_DEACTIVATED_REASON_PREFIX}{notice.reason}",
+        纯只读：不改同步页、检查点、锚点、状态或审计，结论随状态
+        文件跨重启稳定。
+        """
+        latest = self._synced_anchor_events_latest(tenant_id, signer_did, at)
+        notice_reasons = self._did_deactivation_reasons_snapshot(tenant_id)
+        results: List[Dict[str, Any]] = []
+        for document in documents:  # 逐项处理，失败不短路
+            valid, reason = self._verify_synced_did_document_against(
+                latest, notice_reasons, document
             )
-        return True, ""
+            if valid:
+                results.append({"valid": True})
+            else:
+                results.append({"valid": False, "reason": reason})
+        return results
 
