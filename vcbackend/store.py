@@ -5465,6 +5465,226 @@ class VCStore:
             return False, deactivation_reason
         return True, ""
 
+    def verify_trust_proof_synced(
+        self,
+        tenant_id: str,
+        signer_did: str,
+        at: int,
+        proof: Any,
+        challenge: Any,
+        source_tenant_id: Any,
+    ) -> Tuple[bool, str]:
+        """以同步锚点验真外部谓词证明，返回 (是否有效, 失败原因)。
+
+        请求结构（恰含 signer_did/at/proof/challenge/source_tenant_id
+        及类型）由服务层校验（400）。本方法假定五键类型已合法：
+        - 该签名方在本租户无同步检查点（含跨租户）抛 NotFoundError；
+          at 超过检查点抛 ConflictError；
+        - 证明九字段、predicates、results、challenge 与 expires_at
+          规则沿用 :meth:`verify_trust_proof`；
+        - 锚点取该来源 cursor<=at 的已同步事件，以 (issuer_did, 版本)
+          最后事件为准；缺失、非 active 或 uses 无 proof 均返回
+          (False, "同步锚点不可用")；
+        - proof 须为 ES256、64 字节裸 R||S 无填充 base64url，覆盖除
+          proof 外八字段并加入 tenant_id=source_tenant_id 的规范化
+          JSON；格式错、验签错、到期依次返回 “签名格式错误”/
+          “签名校验失败”/“证明已过期”，较早错误优先。
+
+        校验顺序：请求 -> 证明字段 -> 挑战 -> 锚点 -> 签名格式 ->
+        验签 -> 期限。纯只读：不改同步页、检查点、锚点、证明、状态或
+        审计，结论随状态文件跨重启稳定。
+        """
+        with self._lock:
+            checkpoints = self._anchor_changes_sync_checkpoints.get(
+                tenant_id
+            )
+            cp = (
+                checkpoints.get(signer_did)
+                if checkpoints is not None else None
+            )
+            if cp is None:
+                raise NotFoundError("该签名方尚未同步锚点变更")
+            checkpoint = int(cp["next_after"])
+            if at > checkpoint:
+                raise ConflictError("查询时间点超过同步检查点")
+            bucket = self._bucket_locked(tenant_id)
+            pages: List[Dict[str, Any]] = []
+            if bucket is not None:
+                pages = bucket.get("synced_anchor_change_pages", {}).get(
+                    signer_did, []
+                )
+            latest: Dict[Tuple[str, int], Dict[str, Any]] = {}
+            for page in pages:
+                for event in page["events"]:
+                    cursor = int(event["cursor"])
+                    if cursor > at:
+                        continue
+                    key = (event["did"], int(event["key_version"]))
+                    existing = latest.get(key)
+                    if existing is None or cursor > int(
+                        existing["cursor"]
+                    ):
+                        latest[key] = event
+
+        # 证明字段（沿用 /v1/trust/proofs/verify 的分类原因）：恰为
+        # prove 响应九字段。
+        required_fields = {
+            "proof_id",
+            "credential_id",
+            "issuer_did",
+            "issuer_key_version",
+            "predicates",
+            "results",
+            "challenge",
+            "expires_at",
+            "proof",
+        }
+        if set(proof) != required_fields:
+            missing = sorted(required_fields - set(proof))
+            if missing:
+                return False, f"证明缺少字段: {', '.join(missing)}"
+            extra = sorted(set(proof) - required_fields)
+            return False, f"证明含多余字段: {', '.join(extra)}"
+        for field in ("proof_id", "credential_id", "issuer_did"):
+            value = proof[field]
+            if not isinstance(value, str) or not value:
+                return False, f"证明字段 {field} 必须为非空字符串"
+        key_version = proof["issuer_key_version"]
+        if (
+            not isinstance(key_version, int)
+            or isinstance(key_version, bool)
+            or key_version < 1
+        ):
+            return False, "证明字段 issuer_key_version 必须为正整数"
+        predicates = proof["predicates"]
+        if not isinstance(predicates, list) or not predicates:
+            return False, "证明字段 predicates 必须为非空数组"
+        seen_tokens: List[Tuple[str, ...]] = []
+        for item in predicates:
+            if not isinstance(item, dict):
+                return False, "证明 predicates 元素必须为 JSON 对象"
+            if set(item) - {"path", "op", "value"}:
+                extra = sorted(set(item) - {"path", "op", "value"})
+                return False, (
+                    f"证明 predicates 元素含多余字段: {', '.join(extra)}"
+                )
+            if "path" not in item:
+                return False, "证明 predicates 元素缺少字段: path"
+            if "op" not in item:
+                return False, "证明 predicates 元素缺少字段: op"
+            op = item["op"]
+            if op not in _PREDICATE_OPS:
+                return False, (
+                    f"证明 predicates 元素 op 非法: {op!r}"
+                    "（仅支持 exists/eq/gte/lte）"
+                )
+            if op == "exists":
+                if "value" in item:
+                    return False, (
+                        "证明 predicates 元素 op 为 exists 时禁止 value 字段"
+                    )
+            elif "value" not in item:
+                return False, (
+                    f"证明 predicates 元素 op 为 {op} 时缺少字段: value"
+                )
+            elif op in ("gte", "lte") and not _is_number(item["value"]):
+                return False, (
+                    f"证明 predicates 元素 op 为 {op} 时 value 必须为非布尔数字"
+                )
+            # 仅做指针语法与重叠校验：不查 claims 命中、不判数组路径。
+            try:
+                tokens = _parse_pointer(item["path"], "证明 predicates")
+            except ValidationError as exc:
+                return False, str(exc)
+            if tokens in seen_tokens:
+                return False, (
+                    f"证明 predicates 路径重复: {item['path']!r}"
+                )
+            for existing in seen_tokens:
+                if tokens[: len(existing)] == existing:
+                    return False, (
+                        "证明 predicates 路径存在祖先重叠: "
+                        f"{item['path']!r} 被已选路径覆盖"
+                    )
+                if existing[: len(tokens)] == tokens:
+                    return False, (
+                        "证明 predicates 路径存在祖先重叠: "
+                        f"已选路径被 {item['path']!r} 覆盖"
+                    )
+            seen_tokens.append(tokens)
+        results = proof["results"]
+        if not isinstance(results, list) or len(results) != len(predicates):
+            return False, (
+                "证明字段 results 必须为与 predicates 等长的数组"
+            )
+        if any(not isinstance(item, bool) for item in results):
+            return False, "证明字段 results 仅能包含布尔值"
+        for field in ("challenge", "expires_at", "proof"):
+            value = proof[field]
+            if not isinstance(value, str) or not value:
+                return False, f"证明字段 {field} 必须为非空字符串"
+
+        # 挑战：请求 challenge 须等于证明 challenge。
+        if challenge != proof["challenge"]:
+            return False, "挑战不匹配: 请求 challenge 与证明 challenge 不一致"
+
+        # 同步锚点：(issuer_did, 版本) 最后事件，须 active 且含 proof
+        # 用途。
+        issuer_did = proof["issuer_did"]
+        anchor = latest.get((issuer_did, key_version))
+        if (
+            anchor is None
+            or anchor["status"] != "active"
+            or "proof" not in anchor["uses"]
+        ):
+            return False, SYNCED_ANCHOR_UNAVAILABLE_REASON
+        public_pem = anchor["public_key"]
+        try:
+            crypto.validate_public_key_pem(public_pem)
+        except (ValueError, TypeError):
+            return False, SYNCED_ANCHOR_UNAVAILABLE_REASON
+
+        # 签名格式（严格：64 字节裸 R||S 无填充 base64url）与密码学
+        # 验签：覆盖范围沿用 /v1/trust/proofs/verify——去掉 proof 后的
+        # 八个字段并加入 tenant_id=source_tenant_id。
+        signature = proof["proof"]
+        message = {k: v for k, v in proof.items() if k != "proof"}
+        message["tenant_id"] = source_tenant_id
+        try:
+            crypto.validate_signature_format_strict(signature)
+        except crypto.MalformedSignature:
+            return False, IMPORTED_SIGNATURE_MALFORMED_REASON
+        try:
+            crypto.verify(message, signature, public_pem)
+        except crypto.MalformedSignature:
+            return False, IMPORTED_SIGNATURE_MALFORMED_REASON
+        except crypto.InvalidSignature:
+            return False, IMPORTED_SIGNATURE_INVALID_REASON
+        except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
+            return False, IMPORTED_SIGNATURE_INVALID_REASON
+
+        # 期限：expires_at 须为 UTC 秒精度 Z 格式；当前时间达到它即
+        # 过期。规则同 /v1/trust/proofs/verify。
+        expires_value = proof["expires_at"]
+        if (
+            not isinstance(expires_value, str)
+            or not _UTC_Z_SHAPE_RE.match(expires_value)
+        ):
+            return False, (
+                "证明字段 expires_at 必须为 UTC 秒精度 Z 格式"
+                "（YYYY-MM-DDTHH:MM:SSZ）"
+            )
+        try:
+            expires_dt = _parse_utc_z(expires_value)
+        except ValueError:
+            return False, (
+                "证明字段 expires_at 必须为 UTC 秒精度 Z 格式"
+                "（YYYY-MM-DDTHH:MM:SSZ）"
+            )
+        if datetime.now(timezone.utc) >= expires_dt:
+            return False, "证明已过期"
+        return True, ""
+
     def verify_trust_proof_with_status(
         self,
         tenant_id: str,
