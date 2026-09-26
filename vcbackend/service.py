@@ -67,6 +67,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/credentials/imported/verify-batch-with-status 批量重验已导入凭证并合并同步状态（只读）
   POST /v1/trust/dids/verify-document     跨系统 DID 文档验真（仅凭提交文档，只读）
   POST /v1/trust/dids/verify-document-batch 批量跨系统 DID 文档验真（不短路，只读）
+  POST /v1/trust/dids/verify-document-synced 以同步锚点快照验真外部 DID 文档（只读）
   POST /v1/trust/dids/deactivate-sync     登记外部 DID 停用通告（active 锚点验签）
   POST /v1/trust/dids/deactivate-sync-batch 批量登记外部 DID 停用通告（逐项不短路）
   GET  /v1/trust/dids/deactivations       查询外部 DID 停用通告审计事件（只读）
@@ -551,6 +552,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_dids_verify_document(tenant)
                 elif path == "/v1/trust/dids/verify-document-batch":
                     self._post_trust_dids_verify_document_batch(tenant)
+                elif path == "/v1/trust/dids/verify-document-synced":
+                    self._post_trust_dids_verify_document_synced(tenant)
                 elif path == "/v1/trust/dids/deactivate-sync":
                     self._post_trust_dids_deactivate_sync(tenant)
                 elif path == "/v1/trust/dids/deactivate-sync-batch":
@@ -4123,6 +4126,77 @@ def build_handler(store: VCStore) -> type:
                 )
                 return
             self._send_json(200, {"results": results})
+
+        def _post_trust_dids_verify_document_synced(self, tenant: str) -> None:
+            # POST /v1/trust/dids/verify-document-synced：以同步锚点快照
+            # 验真外部 DID 文档（只读）。请求体须恰含 signer_did（非空
+            # 字符串）、at（非布尔非负整数）、document（JSON 对象）；
+            # 空体、非法 JSON、非对象、键集或类型错误均 400 且仅
+            # {"error":"请求非法"}。signer_did 未同步或跨租户 404 仅
+            # {"error":"同步来源不存在"}，at 超过同步检查点 409 仅
+            # {"error":"同步游标冲突"}，均先于文档校验。合法时按文档、
+            # 锚点、签名格式、验签、停用通告顺序校验，任何失败均 200
+            # 按键序恰返 {"valid":false,"reason":...}：文档结构沿用既
+            # 有 DID 文档验真协议（四字段、验证方法升序无重、P-256
+            # PEM、禁私钥、当前版本最高、proof 覆盖），失败为
+            # “DID文档非法”；锚点取该来源 cursor<=at 的 (did, 当前
+            # 版本) 末事件，缺失、非 active、uses 无 did 或公钥不逐字
+            # 相同均为“同步锚点不可用”；格式、验签失败依次为“签名
+            # 格式错误”“签名校验失败”；验签成功后命中本租户外部
+            # DID 停用通告为“外部DID已停用：<reason>”；成功仅
+            # {"valid":true}。纯只读：不改同步页、检查点、锚点、状态
+            # 或审计，重启一致；租户头缺省 default、显式空 400 并隔离。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except Exception:  # noqa: BLE001 请求非法绝不暴露内部细节
+                self._send_error(400, "请求非法")
+                return
+            if not raw:
+                self._send_error(400, "请求非法")
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send_error(400, "请求非法")
+                return
+            if not isinstance(data, dict) or set(data) != {
+                "signer_did",
+                "at",
+                "document",
+            }:
+                self._send_error(400, "请求非法")
+                return
+            signer_did = data["signer_did"]
+            at = data["at"]
+            document = data["document"]
+            if (
+                not isinstance(signer_did, str)
+                or not signer_did
+                or not isinstance(at, int)
+                or isinstance(at, bool)
+                or at < 0
+                or not isinstance(document, dict)
+            ):
+                self._send_error(400, "请求非法")
+                return
+            try:
+                valid, reason = store.verify_trust_did_document_synced(
+                    tenant, signer_did, at, document
+                )
+            except NotFoundError:
+                self._send_error(404, "同步来源不存在")
+                return
+            except ConflictError:
+                self._send_error(409, "同步游标冲突")
+                return
+            except Exception:  # noqa: BLE001 验真失败绝不暴露内部细节
+                self._send_error(500, "服务器内部错误")
+                return
+            if not valid:
+                self._send_invalid(reason or "DID文档验真失败")
+                return
+            self._send_json(200, {"valid": True})
 
         def _post_trust_dids_deactivate_sync(self, tenant: str) -> None:
             # 外部 DID 停用通告登记。请求/字段非法由 _read_json 与 store

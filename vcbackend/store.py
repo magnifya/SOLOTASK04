@@ -10110,3 +10110,168 @@ class VCStore:
                 )
         return True, "", results
 
+    @staticmethod
+    def _parse_trust_did_document(
+        document: Any,
+    ) -> Optional[Tuple[str, int, str, str]]:
+        """按既有 DID 文档验真协议解析文档结构（只读）。
+
+        规则与 :meth:`verify_trust_did_document` 的文档校验完全一致：
+        恰含 did（非空字符串）、current_key_version（非布尔正整数）、
+        verification_methods（非空数组，每项恰含 key_version/key_handle/
+        public_key，key_version 非布尔正整数、key_handle 非空字符串、
+        public_key 为可解析 P-256 公钥 PEM，版本严格升序无重复）、
+        document_proof（非空字符串）；文档任何位置不得出现私钥；
+        current_key_version 必须等于最高方法版本。
+
+        合法时返回 ``(did, current_key_version, 当前版本公钥 PEM,
+        document_proof)``；任一结构问题返回 ``None``。
+        """
+        if not isinstance(document, dict):
+            return None
+        required = (
+            "did",
+            "current_key_version",
+            "verification_methods",
+            "document_proof",
+        )
+        if any(f not in document for f in required):
+            return None
+        if set(document) != set(required):
+            return None
+        did = document["did"]
+        if not isinstance(did, str) or not did:
+            return None
+        current_version = document["current_key_version"]
+        if (
+            not isinstance(current_version, int)
+            or isinstance(current_version, bool)
+            or current_version < 1
+        ):
+            return None
+        proof = document["document_proof"]
+        if not isinstance(proof, str) or not proof:
+            return None
+        methods = document["verification_methods"]
+        if not isinstance(methods, list) or not methods:
+            return None
+        method_fields = {"key_version", "key_handle", "public_key"}
+        parsed_versions: List[int] = []
+        for method in methods:
+            if not isinstance(method, dict):
+                return None
+            if any(f not in method for f in method_fields):
+                return None
+            if set(method) != method_fields:
+                return None
+            version = method["key_version"]
+            if (
+                not isinstance(version, int)
+                or isinstance(version, bool)
+                or version < 1
+            ):
+                return None
+            handle = method["key_handle"]
+            if not isinstance(handle, str) or not handle:
+                return None
+            public_pem = method["public_key"]
+            if not isinstance(public_pem, str) or not public_pem:
+                return None
+            try:
+                crypto.validate_public_key_pem(public_pem)
+            except (ValueError, TypeError):
+                return None
+            parsed_versions.append(version)
+        # 文档任何位置都不得携带私钥（PKCS8/PKCS1/SEC1 私钥 PEM 标记）
+        try:
+            serialized = json.dumps(document, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return None
+        if "PRIVATE KEY-----" in serialized:
+            return None
+        # 版本须按升序严格递增（无重复）；当前版本须对应最高版本
+        if any(
+            parsed_versions[i] >= parsed_versions[i + 1]
+            for i in range(len(parsed_versions) - 1)
+        ):
+            return None
+        if current_version != parsed_versions[-1]:
+            return None
+        highest_public_pem = methods[-1]["public_key"]
+        return did, current_version, highest_public_pem, proof
+
+    def verify_trust_did_document_synced(
+        self,
+        tenant_id: str,
+        signer_did: str,
+        at: int,
+        document: Any,
+    ) -> Tuple[bool, str]:
+        """以同步锚点快照验真外部 DID 文档（只读），返回 (是否有效, 原因)。
+
+        请求结构（恰含 signer_did/at/document 及类型）由服务层校验
+        （400）。本方法假定三者类型已合法：
+        - 该签名方在本租户无同步检查点（含跨租户）抛 NotFoundError；
+          at 超过检查点抛 ConflictError，均先于文档校验；
+        - 文档结构沿用 :meth:`verify_trust_did_document` 的完整协议
+          （四字段、验证方法升序无重、P-256 PEM、禁私钥、当前版本
+          最高），任一失败返回 (False, "DID文档非法")；
+        - 锚点取该来源 cursor<=at 的已同步事件，以 (did,
+          current_key_version) 最后事件为准；缺失、非 active、uses
+          无 did 或公钥与文档当前版本不逐字相同均返回
+          (False, "同步锚点不可用")；
+        - document_proof 须为 ES256、64 字节裸 R||S 无填充
+          base64url，覆盖除 document_proof 外整个文档的规范化 JSON；
+          格式错、验签错依次返回“签名格式错误”“签名校验失败”；
+        - 验签成功后查本租户外部 DID 停用通告：命中同 did 返回
+          (False, "外部DID已停用：<reason>")，否则维持原结果。
+
+        纯只读：不改同步页、检查点、锚点、状态或审计，结论随状态
+        文件跨重启稳定。
+        """
+        # 1. 同步检查点（先于文档校验）：未同步 404、at 越界 409
+        latest = self._synced_anchor_events_latest(tenant_id, signer_did, at)
+
+        # 2. 文档结构：沿用既有 DID 文档验真协议
+        parsed = self._parse_trust_did_document(document)
+        if parsed is None:
+            return False, "DID文档非法"
+        did, current_version, highest_public_pem, proof = parsed
+
+        # 3. 同步锚点：(did, 当前版本) 最后事件，须 active、含 did
+        #    用途且公钥与文档当前版本逐字相同
+        anchor = latest.get((did, current_version))
+        if (
+            anchor is None
+            or anchor["status"] != "active"
+            or "did" not in anchor["uses"]
+            or anchor["public_key"] != highest_public_pem
+        ):
+            return False, SYNCED_ANCHOR_UNAVAILABLE_REASON
+
+        # 4. 签名格式（严格：64 字节裸 R||S 无填充 base64url）
+        try:
+            crypto.validate_signature_format_strict(proof)
+        except crypto.MalformedSignature:
+            return False, IMPORTED_SIGNATURE_MALFORMED_REASON
+
+        # 5. 密码学验签：证明覆盖除 document_proof 外的整个文档
+        unsigned = {k: v for k, v in document.items() if k != "document_proof"}
+        try:
+            crypto.verify(unsigned, proof, highest_public_pem)
+        except crypto.MalformedSignature:
+            return False, IMPORTED_SIGNATURE_MALFORMED_REASON
+        except crypto.InvalidSignature:
+            return False, IMPORTED_SIGNATURE_INVALID_REASON
+        except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
+            return False, IMPORTED_SIGNATURE_INVALID_REASON
+
+        # 6. 验签成功后查本租户外部 DID 停用通告
+        notice = self.get_did_deactivation_notice(tenant_id, did)
+        if notice is not None:
+            return (
+                False,
+                f"{EXTERNAL_DID_DEACTIVATED_REASON_PREFIX}{notice.reason}",
+            )
+        return True, ""
+
