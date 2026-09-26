@@ -7211,6 +7211,45 @@ class VCStore:
             next_after = picked[-1].cursor if picked else after
             return picked, next_after
 
+    def list_trust_anchor_change_prefix(
+        self,
+        tenant_id: str,
+        snapshot: int,
+    ) -> Tuple[List[TrustAnchorChangeEvent], int]:
+        """只读返回本租户变更流 cursor<=snapshot 的事件前缀与最大游标。
+
+        事件按 cursor 升序；返回的第二个值为本租户变更流当前最大游标
+        （无事件时为 0）。供锚点变更证明（ac-proof）按 snapshot 前缀
+        构建 Merkle 树使用。纯只读：不修改任何状态、不分配游标、
+        不记审计、不触发落盘。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            entries: List[Dict[str, Any]] = []
+            if bucket is not None:
+                entries = list(bucket.get("trust_anchor_change_events", []))
+            picked: List[TrustAnchorChangeEvent] = []
+            max_cursor = 0
+            for row in entries:
+                cursor = int(row["cursor"])
+                if cursor > max_cursor:
+                    max_cursor = cursor
+                if cursor > snapshot:
+                    continue
+                picked.append(
+                    TrustAnchorChangeEvent(
+                        cursor=cursor,
+                        action=row["action"],
+                        did=row["did"],
+                        key_version=int(row["key_version"]),
+                        public_key=row["public_key"],
+                        status=row["status"],
+                        uses=list(row["uses"]),
+                    )
+                )
+            picked.sort(key=lambda event: event.cursor)
+            return picked, max_cursor
+
     def sync_anchor_changes(
         self,
         tenant_id: str,
