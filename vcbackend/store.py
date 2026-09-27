@@ -11549,6 +11549,84 @@ class VCStore:
                 raise StorageError("存储失败") from exc
             return created, snapshot, next_after, len(events)
 
+    def list_trust_credential_status_receipt_sync_history(
+        self,
+        tenant_id: str,
+        signer_did: str,
+        at: Optional[int] = None,
+        after: int = 0,
+        limit: int = 50,
+    ) -> Tuple[int, List[Dict[str, Any]], int]:
+        """只读查询某签名方已同步凭证状态回执消费事件在 at 时点的历史页。
+
+        语义与 :meth:`list_trust_presentation_sync_history` 完全一致，但
+        使用凭证状态回执同步的独立状态空间：
+        - 检查点为 self._credential_status_receipt_sync_checkpoints 的
+          (tenant_id, signer_did)，其 after 即同步检查点 next_after；
+        - 同步行取租户桶 synced_credential_status_receipt_consumption_
+          events（按 signer_did）。
+
+        - 该签名方在本租户无同步检查点（从未接收非空页，含跨租户）时
+          抛 NotFoundError("同步来源不存在")；
+        - at 为 None 时取检查点 next_after；生效 at 超过检查点抛
+          ConflictError("同步游标冲突")；after 大于生效 at 抛
+          ValidationError；
+        - 以请求初的原子快照取该签名方全部落盘事件中 cursor <= 生效 at
+          者，再按 cursor > after 升序取前 limit 项；每项恰含
+          cursor/receipt_id/verifier_did/nonce/consumed_at；
+        - 返回 (at, events, next_after)：空页 next_after 等于 after，
+          否则等于末项 cursor。
+
+        纯只读：不推进检查点、不改判重索引、不修改任何状态、不记审计、
+        不触发落盘；同一 at 的分页不受后续同步影响，重启逐字节一致。
+        """
+        with self._lock:
+            checkpoints = (
+                self._credential_status_receipt_sync_checkpoints.get(
+                    tenant_id
+                )
+            )
+            cp = (
+                checkpoints.get(signer_did)
+                if checkpoints is not None
+                else None
+            )
+            if cp is None:
+                raise NotFoundError("同步来源不存在")
+            checkpoint = int(cp["after"])
+            effective_at = checkpoint if at is None else at
+            if effective_at > checkpoint:
+                raise ConflictError("同步游标冲突")
+            if after > effective_at:
+                raise ValidationError("查询参数 after 不能大于 at")
+            bucket = self._bucket_locked(tenant_id)
+            rows: List[Dict[str, Any]] = []
+            if bucket is not None:
+                rows = bucket.get(
+                    "synced_credential_status_receipt_consumption_events",
+                    {},
+                ).get(signer_did, [])
+            picked: List[Dict[str, Any]] = []
+            for row in sorted(rows, key=lambda item: int(item["cursor"])):
+                cursor = int(row["cursor"])
+                if cursor > effective_at:
+                    continue
+                if cursor <= after:
+                    continue
+                if len(picked) >= limit:
+                    break
+                picked.append(
+                    {
+                        "cursor": cursor,
+                        "receipt_id": row["receipt_id"],
+                        "verifier_did": row["verifier_did"],
+                        "nonce": row["nonce"],
+                        "consumed_at": row["consumed_at"],
+                    }
+                )
+            next_after = picked[-1]["cursor"] if picked else after
+            return effective_at, picked, next_after
+
     def get_trust_anchor_snapshot_signer(
         self,
         tenant_id: str,

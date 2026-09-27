@@ -120,6 +120,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/credential-status/receipt/consumptions/manifest/verify-batch 批量校验凭证状态回执消费历史清单与 NDJSON（只读）
   POST /v1/trust/credential-status/receipt-sync 同步外系统凭证状态回执消费历史（status 用途清单验真、检查点防重放，原子落盘不审计）
   POST /v1/trust/credential-status/receipt-sync-batch 批量同步外系统凭证状态回执消费历史（逐项不短路，原子落盘不审计）
+  GET  /v1/trust/credential-status/receipt-sync/history 查询已同步凭证状态回执消费事件时点页（?signer_did=&at=&limit=&after=，只读）
   GET  /v1/trust/credential-status/{id}   查询已同步的外部凭证状态
   GET  /v1/trust/credential-status/{id}/history  查询外部凭证状态历史（只读）
   GET  /v1/audit                          查询本租户审计事件
@@ -1014,6 +1015,13 @@ def build_handler(store: VCStore) -> type:
                     )
                 elif path == "/v1/trust/presentation-sync/receipt":
                     self._get_trust_presentation_sync_receipt(
+                        tenant, parsed.query
+                    )
+                elif (
+                    path
+                    == "/v1/trust/credential-status/receipt-sync/history"
+                ):
+                    self._get_trust_credential_status_receipt_sync_history(
                         tenant, parsed.query
                     )
                 elif path == "/v1/trust/anchors/snapshot":
@@ -3351,6 +3359,92 @@ def build_handler(store: VCStore) -> type:
             try:
                 at_value, events, next_after = (
                     store.list_trust_presentation_sync_history(
+                        tenant, signer_did, at, after, limit
+                    )
+                )
+            except ValidationError:
+                # at 缺省时取检查点：after 超过生效 at 同样为请求非法。
+                raise ValidationError("请求非法")
+            self._send_json(
+                200,
+                {
+                    "signer_did": signer_did,
+                    "at": at_value,
+                    "events": events,
+                    "next_after": next_after,
+                },
+            )
+
+        def _get_trust_credential_status_receipt_sync_history(
+            self, tenant: str, query: str
+        ) -> None:
+            # GET /v1/trust/credential-status/receipt-sync/history：只读
+            # 查询某同步来源（签名方）已落盘的凭证状态回执消费事件在
+            # 指定时点的历史页。协议与
+            # GET /v1/trust/presentation-sync/history 完全一致，但事件
+            # 键序恰为 cursor、receipt_id、verifier_did、nonce、
+            # consumed_at（cursor 为正整数，其余四值为非空字符串，
+            # consumed_at 为 UTC 秒精度 Z）。
+            # 查询参数仅允许 signer_did、at、limit、after 且均只能出现
+            # 一次：signer_did 必填非空；at 缺省取该来源同步检查点
+            # next_after、须为 ASCII 非负整数；limit 缺省 50、限 1..200；
+            # after 缺省 0、须为 ASCII 非负整数。空值、重复、未知参数、
+            # 非 ASCII 数字、符号、越界或 after>at 均 400 且仅
+            # {"error":"请求非法"}；该来源未同步（含跨租户）404 仅
+            # {"error":"同步来源不存在"}，at 超过检查点 409 仅
+            # {"error":"同步游标冲突"}。200 键序恰为 signer_did、at、
+            # events、next_after；以请求初原子快照取 cursor<=at 的事件，
+            # 再按 cursor>after 升序取前 limit 项；空页 next_after 等于
+            # after，否则等于末项 cursor。同一 at 的分页不受后续同步
+            # 影响，重启逐字节一致。纯只读：不推进检查点、不改判重
+            # 索引、不修改任何数据、不记审计、不触发落盘。
+            try:
+                params = parse_qs(query, keep_blank_values=True)
+                allowed = {"signer_did", "at", "limit", "after"}
+                if set(params) - allowed:
+                    raise ValidationError("请求非法")
+
+                def _single(name: str) -> Optional[str]:
+                    values = params.get(name)
+                    if values is None:
+                        return None
+                    if len(values) != 1:
+                        raise ValidationError("请求非法")
+                    return values[0]
+
+                signer_did = _single("signer_did")
+                if signer_did is None or not signer_did:
+                    raise ValidationError("请求非法")
+
+                at_raw = _single("at")
+                at = (
+                    _parse_nonneg_int(at_raw, "at")
+                    if at_raw is not None
+                    else None
+                )
+
+                limit_raw = _single("limit")
+                if limit_raw is not None:
+                    limit = _parse_nonneg_int(limit_raw, "limit")
+                    if not 1 <= limit <= 200:
+                        raise ValidationError("请求非法")
+                else:
+                    limit = 50
+
+                after_raw = _single("after")
+                if after_raw is not None:
+                    after = _parse_nonneg_int(after_raw, "after")
+                else:
+                    after = 0
+
+                if at is not None and after > at:
+                    raise ValidationError("请求非法")
+            except ValidationError:
+                raise ValidationError("请求非法")
+
+            try:
+                at_value, events, next_after = (
+                    store.list_trust_credential_status_receipt_sync_history(
                         tenant, signer_did, at, after, limit
                     )
                 )
