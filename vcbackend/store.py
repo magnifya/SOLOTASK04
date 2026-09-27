@@ -8991,6 +8991,60 @@ class VCStore:
             next_after = picked[-1].cursor if picked else after
             return picked, next_after
 
+    def get_credential_status_receipt_material(
+        self,
+        tenant_id: str,
+        issuer_did: str,
+        credential_id: str,
+        verifier_did: str,
+    ) -> Tuple[CredentialStatusSyncRecord, int, str]:
+        """在同一把锁内原子读取凭证状态同步回执所需全部材料。
+
+        供 POST /v1/trust/credential-status/receipt 使用：
+        - 本租户未同步该 (issuer_did, credential_id) 双键（含他租户）抛
+          NotFoundError("资源不存在")；
+        - 验证者 DID 在本租户不存在（含跨租户）同样抛
+          NotFoundError("资源不存在")；已停用抛
+          ConflictError("验证者已停用")；
+        - 原子返回同步记录（status/reason/updated_at/issuer_key_version
+          取同步记录）与验证者当前密钥版本、托管私钥 PEM。
+
+        返回 (sync_record, verifier_key_version, verifier_private_pem)。
+        纯只读：不修改同步记录、状态、历史或审计、不触发落盘；材料完全
+        由持久化状态决定，重启后相同。调用方在锁外用私钥完成签名，保证
+        并发结果全属写前或写后快照。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            row = None
+            if bucket is not None:
+                row = (
+                    bucket.get("credential_status_sync", {})
+                    .get(issuer_did, {})
+                    .get(credential_id)
+                )
+            if row is None:
+                raise NotFoundError("资源不存在")
+            record = self._sync_status_record(issuer_did, credential_id, row)
+
+            verifier_rec = (
+                bucket["dids"].get(verifier_did)
+                if bucket is not None
+                else None
+            )
+            if verifier_rec is None:
+                raise NotFoundError("资源不存在")
+            if verifier_rec.get("status") == "deactivated":
+                raise ConflictError("验证者已停用")
+            verifier_key_version = int(verifier_rec.get("key_version", 1))
+            verifier_private_pem = self._private_key_for_version_locked(
+                bucket, verifier_did, verifier_key_version
+            )
+            if not verifier_private_pem:
+                # 正常不会发生：迁移保证当前版本私钥存在。
+                raise NotFoundError("资源不存在")
+            return record, verifier_key_version, verifier_private_pem
+
     # ------------------------------------------------------------------ #
     # 外部 DID 停用通告
     # ------------------------------------------------------------------ #
