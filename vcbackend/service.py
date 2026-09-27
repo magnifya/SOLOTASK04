@@ -847,6 +847,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_credential_status_receipt_consumptions_manifest_verify_batch(
                         tenant
                     )
+                elif path == "/v1/trust/credential-status/receipt-sync":
+                    self._post_trust_credential_status_receipt_sync(tenant)
                 else:
                     self._send_error(404, f"无此路径: {path}")
             except ValidationError as exc:
@@ -10157,6 +10159,95 @@ def build_handler(store: VCStore) -> type:
                 else:
                     results.append({"valid": False, "reason": reason})
             self._send_json(200, {"results": results})
+
+        def _post_trust_credential_status_receipt_sync(
+            self, tenant: str
+        ) -> None:
+            # POST /v1/trust/credential-status/receipt-sync：同步外系统
+            # 凭证状态回执消费历史并防重放。除下列差异外，请求结构、
+            # 400 外层错误、清单验真五阶段及固定 reason、游标窗口、检查点
+            # 续页与重放/409 冲突、201/200 成功响应、500 回滚、并发、
+            # 重启与不审计语义完整复用 POST /v1/trust/receipt-sync：
+            # 1) 清单验真锚点用途改为 status（复用凭证状态回执消费历史
+            #    清单验真）；
+            # 2) NDJSON 逐字复用同目录凭证状态回执消费历史 export；
+            # 3) 检查点与同步索引独立于普通验真回执同步，仍按租户、
+            #    signer_did 隔离；
+            # 4) 成功响应键序恰为 valid、signer_did、snapshot、
+            #    next_after、count。
+            data = self._read_json()
+            if set(data) != {"manifest", "ndjson"}:
+                missing = [f for f in ("manifest", "ndjson") if f not in data]
+                if missing:
+                    raise ValidationError(
+                        f"请求缺少字段: {', '.join(missing)}"
+                    )
+                extra = sorted(set(data) - {"manifest", "ndjson"})
+                raise ValidationError(f"请求含多余字段: {', '.join(extra)}")
+            manifest = data["manifest"]
+            ndjson = data["ndjson"]
+            if not isinstance(manifest, dict):
+                raise ValidationError(
+                    "请求不合法: 字段 manifest 必须为 JSON 对象"
+                )
+            if not isinstance(ndjson, str):
+                raise ValidationError(
+                    "请求不合法: 字段 ndjson 必须为字符串"
+                )
+
+            # 阶段一：清单验真（锚点用途为 status，五段固定 reason）。
+            reason = (
+                self._verify_credential_status_receipt_consumption_manifest_item(
+                    tenant, manifest, ndjson
+                )
+            )
+            if reason is not None:
+                self._send_json(200, {"valid": False, "reason": reason})
+                return
+
+            signer_did = manifest["signer_did"]
+            snapshot = manifest["snapshot"]
+            after = manifest["filters"]["after"]
+
+            # 阶段二：NDJSON 结构、游标窗口与页内重复键（与普通回执
+            # 同步同一解析协议，行形状逐字复用状态回执消费历史 export）。
+            events = self._parse_receipt_sync_ndjson(
+                ndjson, after, snapshot
+            )
+            if events is None:
+                self._send_json(
+                    200, {"valid": False, "reason": "导出内容非法"}
+                )
+                return
+
+            # 阶段三：独立检查点推进、历史重复键与原子落盘。
+            try:
+                created, effective_snapshot, next_after, count = (
+                    store.sync_credential_status_receipt_consumptions(
+                        tenant, signer_did, snapshot, after, events
+                    )
+                )
+            except ConflictError:
+                self._send_error(409, "同步游标冲突")
+                return
+            except ValidationError:
+                self._send_json(
+                    200, {"valid": False, "reason": "导出内容非法"}
+                )
+                return
+            except StorageError:
+                self._send_error(500, "存储失败")
+                return
+            self._send_json(
+                201 if created else 200,
+                {
+                    "valid": True,
+                    "signer_did": signer_did,
+                    "snapshot": effective_snapshot,
+                    "next_after": next_after,
+                    "count": count,
+                },
+            )
 
         def _get_trust_credential_status(
             self, tenant: str, credential_id: str, query: str
