@@ -82,6 +82,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   GET  /v1/trust/presentations/consumptions/export 确定性 NDJSON 导出外部演示消费历史（快照续传，只读）
   GET  /v1/trust/presentations/consumptions/manifest 外部演示消费历史导出清单（签名摘要，只读）
   POST /v1/trust/presentations/consumptions/manifest/verify 校验外部演示消费历史清单与 NDJSON 内容（只读）
+  POST /v1/trust/presentation-sync     跨系统同步外部演示消费历史（清单验真、NDJSON 防重放检查点，不写审计）
   POST /v1/trust/presentations/verify-synced  以同步锚点验真未绑定外部演示（只读）
   POST /v1/trust/presentations/verify-synced-with-status  同步锚点验真未绑定/持有者绑定演示并合并请求初始状态快照（只读）
   POST /v1/trust/presentations/verify-synced-batch  批量以同步锚点快照验真未绑定演示（只读）
@@ -655,6 +656,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_presentation_consumptions_manifest_verify(
                         tenant
                     )
+                elif path == "/v1/trust/presentation-sync":
+                    self._post_trust_presentation_sync(tenant)
                 elif path == "/v1/trust/receipt-sync":
                     self._post_trust_receipt_sync(tenant)
                 elif path == "/v1/trust/receipt-sync-batch":
@@ -5990,6 +5993,157 @@ def build_handler(store: VCStore) -> type:
             ):
                 return "导出内容不匹配"
             return None
+
+        @staticmethod
+        def _parse_presentation_sync_ndjson(
+            ndjson: str, after: int, snapshot: int
+        ) -> Optional[List[Dict[str, Any]]]:
+            """解析外部演示消费历史同步页 NDJSON：成功返回事件行列表，
+            非法返回 None。
+
+            规则沿用 /v1/trust/presentations/consumptions/export 事件：
+            每行恰为以 LF 结行的 UTF-8 紧凑 JSON（末行亦有 LF、无 CR、无
+            BOM、无空行），行对象恰含且按键序为 cursor、consumption_id、
+            issuer_did、presentation_id、consumed_at；cursor 为非布尔非负
+            整数，consumption_id/issuer_did/presentation_id/consumed_at 为
+            非空字符串；行内 cursor 严格递增且满足
+            after < cursor <= snapshot。与历史重复键由存储层判定，本方法
+            不查状态。空串为零行的合法页。
+            """
+            if not ndjson:
+                return []
+            if not ndjson.endswith("\n") or "\r" in ndjson:
+                return None
+            events: List[Dict[str, Any]] = []
+            prev_cursor = after
+            for line in ndjson.split("\n")[:-1]:
+                if not line:
+                    return None
+                try:
+                    row = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    return None
+                if not isinstance(row, dict):
+                    return None
+                if list(row.keys()) != [
+                    "cursor",
+                    "consumption_id",
+                    "issuer_did",
+                    "presentation_id",
+                    "consumed_at",
+                ]:
+                    return None
+                cursor = row["cursor"]
+                if (
+                    not isinstance(cursor, int)
+                    or isinstance(cursor, bool)
+                    or cursor <= after
+                    or cursor > snapshot
+                    or cursor <= prev_cursor
+                ):
+                    return None
+                for field in (
+                    "consumption_id",
+                    "issuer_did",
+                    "presentation_id",
+                    "consumed_at",
+                ):
+                    if not isinstance(row[field], str) or not row[field]:
+                        return None
+                prev_cursor = cursor
+                events.append(row)
+            return events
+
+        def _post_trust_presentation_sync(self, tenant: str) -> None:
+            # POST /v1/trust/presentation-sync：跨系统同步外部演示消费
+            # 历史并防重放。
+            # 1) 请求体恰含 manifest（对象）、ndjson（字符串）：非法
+            #    JSON/非对象、缺漏或多余字段、类型不符一律 400 且仅
+            #    {"error":"请求非法"}；显式空租户头由路由统一判 400，
+            #    缺省 default、按租户隔离；
+            # 2) 外层合法后沿用演示消费清单验真（五段顺序，锚点须本租户
+            #    同 did/版本 active 且含 vp 用途），任何失败 200 按序恰返
+            #    {valid:false,reason} 且不写入；
+            # 3) 解析 NDJSON：每行须符合既有演示消费 export 事件键序与
+            #    类型，cursor 严格递增且 after<cursor<=snapshot；除同位
+            #    同内容重放外，新行在页内或与同租户历史（本地 consume 或
+            #    他 signer 同步页）重复 (issuer_did,presentation_id) 均
+            #    200 返 {"valid":false,"reason":"导出内容非法"}；
+            # 4) 检查点键为 (租户, signer_did)：首次 after=0；同 snapshot
+            #    续页 after 等于已存 next_after；仅追至旧 snapshot 后方可
+            #    接收更大 snapshot（after=旧 snapshot）；同位同内容重放
+            #    200，旧页、跳页或同位异内容 409 且仅
+            #    {"error":"同步游标冲突"}；
+            # 5) 首次成功 201、新页 200，响应键序恰为 valid、signer_did、
+            #    snapshot、next_after、count（后三为非负整数）；事件、判重
+            #    索引与检查点原子持久化，同步不写审计；落盘失败 500 仅
+            #    {"error":"存储失败"} 并回滚，并发仅一次推进，重启保持。
+            try:
+                data = self._read_json()
+                if set(data) != {"manifest", "ndjson"}:
+                    raise ValidationError("请求非法")
+                manifest = data["manifest"]
+                ndjson = data["ndjson"]
+                if not isinstance(manifest, dict) or not isinstance(
+                    ndjson, str
+                ):
+                    raise ValidationError("请求非法")
+            except (ValidationError, ValueError):
+                # ValueError：JSON 内超长十进制整数触发位数上限。
+                raise ValidationError("请求非法")
+
+            # 阶段一：沿用演示消费清单验真（清单非法 -> 锚点不可用 ->
+            # 签名格式错误 -> 签名校验失败 -> 导出内容不匹配）。
+            reason = self._verify_presentation_consumption_manifest_item(
+                tenant, manifest, ndjson
+            )
+            if reason is not None:
+                self._send_json(200, {"valid": False, "reason": reason})
+                return
+
+            signer_did = manifest["signer_did"]
+            snapshot = manifest["snapshot"]
+            after = manifest["filters"]["after"]
+
+            # 阶段二：NDJSON 结构、游标窗口与严格递增（页内重复键在存储
+            # 层连同历史一并判定）。
+            events = self._parse_presentation_sync_ndjson(
+                ndjson, after, snapshot
+            )
+            if events is None:
+                self._send_json(
+                    200, {"valid": False, "reason": "导出内容非法"}
+                )
+                return
+
+            # 阶段三：检查点推进、重复键与原子落盘。
+            try:
+                created, effective_snapshot, next_after, count = (
+                    store.sync_trust_presentation_consumptions(
+                        tenant, signer_did, snapshot, after, events
+                    )
+                )
+            except ConflictError:
+                self._send_error(409, "同步游标冲突")
+                return
+            except ValidationError:
+                self._send_json(
+                    200, {"valid": False, "reason": "导出内容非法"}
+                )
+                return
+            except StorageError:
+                self._send_error(500, "存储失败")
+                return
+            self._send_json(
+                201 if created else 200,
+                {
+                    "valid": True,
+                    "signer_did": signer_did,
+                    "snapshot": effective_snapshot,
+                    "next_after": next_after,
+                    "count": count,
+                },
+            )
 
         @staticmethod
         def _parse_receipt_sync_ndjson(
