@@ -87,6 +87,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   GET  /v1/trust/presentation-sync/history 查询已同步外部演示消费事件时点页（?signer_did=&at=&limit=&after=，只读）
   GET  /v1/trust/presentation-sync/receipt 演示消费同步进度签名回执（?signer_did=&verifier_did=&nonce=，只读）
   POST /v1/trust/presentation-sync/receipt/verify 验真演示消费同步进度签名回执（只读）
+  POST /v1/trust/presentation-sync/receipt/consume 一次性消费演示同步回执（防重放，首次落盘并审计）
   POST /v1/trust/presentation-sync/receipt/verify-batch 批量验真演示消费同步进度签名回执（批初锚点快照、逐项不短路，只读）
   POST /v1/trust/presentations/verify-synced  以同步锚点验真未绑定外部演示（只读）
   POST /v1/trust/presentations/verify-synced-with-status  同步锚点验真未绑定/持有者绑定演示并合并请求初始状态快照（只读）
@@ -667,6 +668,13 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_presentation_sync_batch(tenant)
                 elif path == "/v1/trust/presentation-sync/receipt/verify":
                     self._post_trust_presentation_sync_receipt_verify(tenant)
+                elif (
+                    path
+                    == "/v1/trust/presentation-sync/receipt/consume"
+                ):
+                    self._post_trust_presentation_sync_receipt_consume(
+                        tenant
+                    )
                 elif (
                     path
                     == "/v1/trust/presentation-sync/receipt/verify-batch"
@@ -3317,6 +3325,85 @@ def build_handler(store: VCStore) -> type:
                 self._send_json(200, {"valid": False, "reason": reason})
                 return
             self._send_json(200, {"valid": True})
+
+        def _post_trust_presentation_sync_receipt_consume(
+            self, tenant: str
+        ) -> None:
+            # POST /v1/trust/presentation-sync/receipt/consume：验真并
+            # 一次性消费演示消费同步进度签名回执（防重放）。
+            # 1) 请求与字段约束同 receipt/verify：恰含 receipt（对象）、
+            #    signature（非空字符串）、ndjson（字符串）、nonce
+            #    （1..256 码点非空字符串）；外层非法一律 400 且仅
+            #    {"error":"请求非法"}；
+            # 2) 外层合法后先按六阶段顺序验真，失败沿用原 HTTP 200、
+            #    固定 reason 及优先级，不写状态、不记审计；
+            # 3) 验真成功后按租户以 (verifier_did, nonce) 为唯一键
+            #    消费：首次 200 按键序恰返 valid、receipt_id、
+            #    consumed_at（valid:true，receipt_id 为完整 receipt
+            #    规范化 JSON 字节的 SHA-256 小写 64 位 hex，
+            #    consumed_at 为 UTC 秒精度 Z）；同键重放（内容可
+            #    不同）或并发后到者 200 恰返
+            #    {"valid":false,"reason":"同步回执已消费"}；
+            # 4) 首次消费与审计（trust.presentation.sync.receipt.
+            #    consumed / presentation_sync_receipt / receipt_id）
+            #    同一次原子落盘；重放与验真失败不记；落盘失败回滚
+            #    二者，500 仅返 {"error":"存储失败"}，可重试；租户
+            #    隔离，重启仍判重。
+            try:
+                data = self._read_json()
+                if set(data) != {"receipt", "signature", "ndjson", "nonce"}:
+                    raise ValidationError("请求非法")
+                receipt = data["receipt"]
+                signature = data["signature"]
+                ndjson = data["ndjson"]
+                nonce = data["nonce"]
+                if not isinstance(receipt, dict):
+                    raise ValidationError("请求非法")
+                if not isinstance(signature, str) or not signature:
+                    raise ValidationError("请求非法")
+                if not isinstance(ndjson, str):
+                    raise ValidationError("请求非法")
+                if not isinstance(nonce, str) or not 1 <= len(nonce) <= 256:
+                    raise ValidationError("请求非法")
+            except (ValidationError, ValueError):
+                # ValueError：JSON 内超长十进制整数触发位数上限。
+                raise ValidationError("请求非法")
+
+            reason = self._verify_presentation_sync_receipt_item(
+                tenant, receipt, signature, ndjson, nonce
+            )
+            if reason is not None:
+                self._send_json(200, {"valid": False, "reason": reason})
+                return
+            receipt_id = hashlib.sha256(
+                crypto.canonicalize(receipt)
+            ).hexdigest()
+            try:
+                consumed, consumed_at = (
+                    store.consume_presentation_sync_receipt(
+                        tenant,
+                        receipt["verifier_did"],
+                        receipt["nonce"],
+                        receipt_id,
+                    )
+                )
+            except StorageError:
+                self._send_error(500, "存储失败")
+                return
+            if not consumed:
+                self._send_json(
+                    200,
+                    {"valid": False, "reason": "同步回执已消费"},
+                )
+                return
+            self._send_json(
+                200,
+                {
+                    "valid": True,
+                    "receipt_id": receipt_id,
+                    "consumed_at": consumed_at,
+                },
+            )
 
         def _post_trust_presentation_sync_receipt_verify_batch(
             self, tenant: str
