@@ -3491,6 +3491,141 @@ class VCStore:
                 revoked_at=rec.get("revoked_at"),
             )
 
+    def export_credential_statuses(
+        self,
+        tenant_id: str,
+        data: Any,
+    ) -> Dict[str, Any]:
+        """导出本租户签发凭证的状态签名，结果可直接提交给既有外部状态
+        批量同步接口 /v1/trust/credential-status/sync-batch。
+
+        请求体须恰为 {"credential_ids": [字符串...]}，数组 1..100 项，
+        值非空且不重复；结构、类型或数量非法抛 ValidationError，消息恰为
+        “请求非法”（HTTP 400 仅返 {"error":"请求非法"}）。
+
+        任一凭证未知或跨租户抛 NotFoundError("资源不存在")（HTTP 404）；
+        任一签发 DID 已停用抛 ConflictError("签发DID已停用")（HTTP 409）；
+        均整批失败，不返回任何部分结果。
+
+        批初在同一把锁内原子读取整批凭证状态、凭证正文与各签发 DID 当前
+        版本私钥，随后逐项构造状态正文并签名，并发变更不会令同批观察到
+        混合时点：未登记状态按 active、updated_at 取凭证签发时间
+        issued_at；其余取当前状态、状态时间与保存原因
+        （suspended/revoked 末尾携带 reason，active 不含 reason）。
+        issuer_key_version 取签发 DID 当前版本，签名为 ES256 裸 R||S
+        无填充 base64url，覆盖 body 的规范化 JSON，与既有状态同步协议
+        完全一致。
+
+        成功返回 {"items": [...]}，与输入等长同序，项键序恰为 body、
+        signature，body 键序恰为 issuer_did、credential_id、status、
+        updated_at、issuer_key_version（suspended/revoked 末尾加
+        reason）。纯只读：不写状态、历史或审计，不触发落盘。
+        """
+        # ---- 请求结构（结构、类型、数量非法一律 -> 400 请求非法）----
+        if not isinstance(data, dict) or set(data) != {"credential_ids"}:
+            raise ValidationError("请求非法")
+        credential_ids = data["credential_ids"]
+        if not isinstance(credential_ids, list) or not (
+            1 <= len(credential_ids) <= 100
+        ):
+            raise ValidationError("请求非法")
+        seen: set = set()
+        for value in credential_ids:
+            if not isinstance(value, str) or not value or value in seen:
+                raise ValidationError("请求非法")
+            seen.add(value)
+
+        # ---- 批初一次原子读取凭证状态、正文与签发者当前版本私钥 ----
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            credentials = (
+                bucket.get("credentials", {}) if bucket is not None else {}
+            )
+
+            # 先解析全部凭证：任一未知（含他租户、租户桶缺失）整批 404。
+            # 仅快照构造 body 所需字段，锁外签名不会观察到并发变更。
+            cred_rows: List[Dict[str, Any]] = []
+            issuer_dids: List[str] = []
+            for credential_id in credential_ids:
+                rec = credentials.get(credential_id)
+                if rec is None:
+                    raise NotFoundError("资源不存在")
+                stored_body = rec.get("body", {})
+                issuer_did = stored_body.get("issuer_did")
+                cred_rows.append(
+                    {
+                        "credential_id": credential_id,
+                        "issuer_did": issuer_did,
+                        "issued_at": stored_body.get("issued_at"),
+                        "status": rec.get("status"),
+                        "status_updated_at": rec.get("status_updated_at"),
+                        "suspend_reason": rec.get("suspend_reason"),
+                        "revoke_reason": rec.get("revoke_reason"),
+                    }
+                )
+                issuer_dids.append(issuer_did)
+
+            # 解析各签发 DID 当前版本与私钥：未知整批 404、已停用整批
+            # 409（消息固定为“签发DID已停用”）。同一 DID 只解析一次。
+            signers: Dict[str, Tuple[int, str]] = {}
+            for issuer_did in dict.fromkeys(issuer_dids):
+                issuer_rec = (
+                    bucket["dids"].get(issuer_did)
+                    if bucket is not None
+                    else None
+                )
+                if issuer_rec is None:
+                    raise NotFoundError("资源不存在")
+                if self._is_did_deactivated_locked(issuer_rec):
+                    raise ConflictError("签发DID已停用")
+                key_version = int(issuer_rec.get("key_version", 1))
+                private_pem = self._private_key_for_version_locked(
+                    bucket, issuer_did, key_version
+                )
+                if not private_pem:
+                    # 正常不会发生：迁移保证当前版本私钥存在。
+                    raise NotFoundError("资源不存在")
+                signers[issuer_did] = (key_version, private_pem)
+
+        # ---- 锁外逐项构造状态正文并签名（快照已定，无混合时点）----
+        items: List[Dict[str, Any]] = []
+        for row in cred_rows:
+            issuer_did = row["issuer_did"]
+            current_status = row["status"]
+            if current_status is None:
+                # 未登记状态按 active，updated_at 取凭证签发时间。
+                status = "active"
+                updated_at = row["issued_at"]
+                reason: Optional[str] = None
+            else:
+                status = current_status
+                updated_at = row["status_updated_at"]
+                if status == "suspended":
+                    reason = row["suspend_reason"]
+                elif status == "revoked":
+                    reason = row["revoke_reason"]
+                else:  # 已登记 active
+                    reason = None
+            key_version, private_pem = signers[issuer_did]
+            body_obj: Dict[str, Any] = {
+                "issuer_did": issuer_did,
+                "credential_id": row["credential_id"],
+                "status": status,
+                "updated_at": updated_at,
+                "issuer_key_version": int(key_version),
+            }
+            # suspended/revoked 末尾加 reason；active 不含该键。
+            if status in ("suspended", "revoked"):
+                body_obj["reason"] = reason
+            items.append(
+                {
+                    "body": body_obj,
+                    "signature": crypto.sign(body_obj, private_pem),
+                }
+            )
+
+        return {"items": items}
+
     def list_credential_status_history(
         self,
         tenant_id: str,

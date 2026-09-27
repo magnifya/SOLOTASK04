@@ -13,6 +13,7 @@
   GET  /v1/dids/{did}/keys/revocations    查询 DID 密钥吊销历史（只读）
 GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（只读）
   POST /v1/credentials                    签发凭证
+  POST /v1/credentials/status-export      批量导出本租户凭证状态签名（结果可直接提交 sync-batch，只读）
   GET  /v1/credentials/{credential_id}    查询凭证
   PUT  /v1/credentials/{credential_id}/status   登记 active（首次 201/重复 200）或暂停/恢复 suspended（200）
   GET  /v1/credentials/{credential_id}/status   查询状态（无状态按 active）
@@ -497,6 +498,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_dids(tenant)
                 elif path == "/v1/credentials":
                     self._post_credentials(tenant)
+                elif path == "/v1/credentials/status-export":
+                    self._post_credentials_status_export(tenant)
                 elif path.startswith("/v1/dids/") and path.endswith(
                     "/keys/rotate"
                 ):
@@ -1471,6 +1474,34 @@ def build_handler(store: VCStore) -> type:
                     "issuer_key_version": record.body["issuer_key_version"],
                 },
             )
+
+        def _post_credentials_status_export(self, tenant: str) -> None:
+            # 凭证状态签名导出：请求体须恰为
+            # {"credential_ids": [字符串...]}，数组 1..100 项、值非空且
+            # 不重复。空体/非法 JSON/非对象、结构、类型或数量非法一律
+            # 400 且恰返 {"error":"请求非法"}；任一凭证未知或跨租户 404
+            # 恰返 {"error":"资源不存在"}；签发 DID 已停用 409 恰返
+            # {"error":"签发DID已停用"}，均整批失败。成功 200 仅返
+            # {"items": [...]}，与输入等长同序，项可直接提交既有
+            # /v1/trust/credential-status/sync-batch。纯只读：不写状态、
+            # 历史或审计。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                raise ValidationError("请求非法")
+            except Exception:  # noqa: BLE001 读取失败按非法请求处理
+                raise ValidationError("请求非法")
+            if not raw:
+                raise ValidationError("请求非法")
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise ValidationError("请求非法")
+            if not isinstance(data, dict):
+                raise ValidationError("请求非法")
+            result = store.export_credential_statuses(tenant, data)
+            self._send_json(200, result)
 
         def _get_credential(self, tenant: str, credential_id: str) -> None:
             record = store.get_credential(tenant, credential_id)
