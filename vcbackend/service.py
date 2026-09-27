@@ -86,6 +86,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/presentation-sync-batch 批量同步外系统外部演示消费历史（逐项不短路，原子落盘不审计）
   GET  /v1/trust/presentation-sync/history 查询已同步外部演示消费事件时点页（?signer_did=&at=&limit=&after=，只读）
   GET  /v1/trust/presentation-sync/receipt 演示消费同步进度签名回执（?signer_did=&verifier_did=&nonce=，只读）
+  POST /v1/trust/presentation-sync/receipt/verify 验真演示消费同步回执（只读）
   POST /v1/trust/presentations/verify-synced  以同步锚点验真未绑定外部演示（只读）
   POST /v1/trust/presentations/verify-synced-with-status  同步锚点验真未绑定/持有者绑定演示并合并请求初始状态快照（只读）
   POST /v1/trust/presentations/verify-synced-batch  批量以同步锚点快照验真未绑定演示（只读）
@@ -663,6 +664,13 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_presentation_sync(tenant)
                 elif path == "/v1/trust/presentation-sync-batch":
                     self._post_trust_presentation_sync_batch(tenant)
+                elif (
+                    path
+                    == "/v1/trust/presentation-sync/receipt/verify"
+                ):
+                    self._post_trust_presentation_sync_receipt_verify(
+                        tenant
+                    )
                 elif path == "/v1/trust/receipt-sync":
                     self._post_trust_receipt_sync(tenant)
                 elif path == "/v1/trust/receipt-sync-batch":
@@ -3264,6 +3272,171 @@ def build_handler(store: VCStore) -> type:
             }
             signature = crypto.sign(receipt, verifier_private_pem)
             self._send_json(200, {"receipt": receipt, "signature": signature})
+
+        def _post_trust_presentation_sync_receipt_verify(
+            self, tenant: str
+        ) -> None:
+            # POST /v1/trust/presentation-sync/receipt/verify：验真演示
+            # 消费同步回执（纯只读）。
+            # 请求体须恰含 receipt（JSON 对象）、signature（非空串）、
+            # ndjson（字符串，允许空串，不解析）、nonce（1..256 码点
+            # 非空串）；空体、非法 JSON、非对象、键集或类型不符一律
+            # 400 且仅 {"error":"请求非法"}。
+            # 外层合法后任何失败均 HTTP 200，按键序恰返
+            # {valid:false, reason}，按序检查：回执非法 -> nonce错误 ->
+            # 摘要错误（ndjson 的 UTF-8 字节 SHA-256 等于 digest）->
+            # 锚点不可用（本租户同 verifier_did/版本且含 vp 用途的
+            # active 锚点）-> 签名格式错误 -> 签名校验失败（signature
+            # 覆盖完整 receipt 的既有规范化 JSON，ES256 裸 R||S 无填充
+            # base64url）；成功仅 {"valid":true}。
+            # 不解析 ndjson，不写状态、游标或审计；显式空 X-Tenant-ID
+            # 由路由统一判 400，缺省 default、租户间隔离，重启稳定。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                raise ValidationError("请求非法")
+            if not raw:
+                raise ValidationError("请求非法")
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise ValidationError("请求非法")
+            if not isinstance(data, dict):
+                raise ValidationError("请求非法")
+            expected_fields = ("receipt", "signature", "ndjson", "nonce")
+            if set(data) != set(expected_fields):
+                raise ValidationError("请求非法")
+            if not isinstance(data["receipt"], dict):
+                raise ValidationError("请求非法")
+            if not isinstance(data["signature"], str) or not data["signature"]:
+                raise ValidationError("请求非法")
+            if not isinstance(data["ndjson"], str):
+                raise ValidationError("请求非法")
+            outer_nonce = data["nonce"]
+            if (
+                not isinstance(outer_nonce, str)
+                or not outer_nonce
+                or not 1 <= len(outer_nonce) <= 256
+            ):
+                raise ValidationError("请求非法")
+
+            reason = self._verify_presentation_sync_receipt_item(
+                tenant, data
+            )
+            if reason is not None:
+                self._send_json(200, {"valid": False, "reason": reason})
+                return
+            self._send_json(200, {"valid": True})
+
+        def _verify_presentation_sync_receipt_item(
+            self, tenant: str, data: Dict[str, Any]
+        ) -> Optional[str]:
+            # 演示消费同步回执验真（只读）：按序返回失败原因
+            # （回执非法 -> nonce错误 -> 摘要错误 -> 锚点不可用 ->
+            # 签名格式错误 -> 签名校验失败），成功返回 None。不解析
+            # ndjson、不写状态或审计。
+            receipt = data["receipt"]
+            signature = data["signature"]
+            ndjson = data["ndjson"]
+            outer_nonce = data["nonce"]
+
+            # 阶段一：回执结构——恰为同步进度回执六字段对象，
+            # 键序（规范形态）恰为 signer_did、next_after、digest、
+            # verifier_did、verifier_key_version、nonce。
+            receipt_fields = (
+                "signer_did",
+                "next_after",
+                "digest",
+                "verifier_did",
+                "verifier_key_version",
+                "nonce",
+            )
+            if set(receipt) != set(receipt_fields):
+                return "回执非法"
+            if (
+                not isinstance(receipt["signer_did"], str)
+                or not receipt["signer_did"]
+            ):
+                return "回执非法"
+            next_after = receipt["next_after"]
+            if (
+                not isinstance(next_after, int)
+                or isinstance(next_after, bool)
+                or next_after < 0
+            ):
+                return "回执非法"
+            digest = receipt["digest"]
+            if not isinstance(digest, str) or not _SHA256_HEX_RE.fullmatch(
+                digest
+            ):
+                return "回执非法"
+            if (
+                not isinstance(receipt["verifier_did"], str)
+                or not receipt["verifier_did"]
+            ):
+                return "回执非法"
+            verifier_key_version = receipt["verifier_key_version"]
+            if (
+                not isinstance(verifier_key_version, int)
+                or isinstance(verifier_key_version, bool)
+                or verifier_key_version < 1
+            ):
+                return "回执非法"
+            receipt_nonce = receipt["nonce"]
+            if (
+                not isinstance(receipt_nonce, str)
+                or not receipt_nonce
+                or not 1 <= len(receipt_nonce) <= 256
+            ):
+                return "回执非法"
+
+            # 阶段二：回执 nonce 与外层 nonce 相等
+            if receipt_nonce != outer_nonce:
+                return "nonce错误"
+
+            # 阶段三：摘要——ndjson 的 UTF-8 字节 SHA-256 等于 digest；
+            # ndjson 本身不解析。含无法编码为 UTF-8 的孤立代理项时按
+            # 摘要不匹配处理。
+            try:
+                want_digest = hashlib.sha256(
+                    ndjson.encode("utf-8")
+                ).hexdigest()
+            except UnicodeEncodeError:
+                return "摘要错误"
+            if digest != want_digest:
+                return "摘要错误"
+
+            # 阶段四：本租户 verifier_did/版本 active 且含 vp 用途锚点
+            public_pem = store.get_active_trust_anchor_public_key(
+                tenant,
+                receipt["verifier_did"],
+                verifier_key_version,
+                required_use="vp",
+            )
+            if public_pem is None:
+                return "锚点不可用"
+            try:
+                crypto.validate_public_key_pem(public_pem)
+            except (ValueError, TypeError):
+                return "锚点不可用"
+
+            # 阶段五：签名格式（ES256 裸 R||S 无填充 base64url）
+            try:
+                crypto.validate_signature_format_strict(signature)
+            except crypto.MalformedSignature:
+                return "签名格式错误"
+
+            # 阶段六：密码学验签——signature 覆盖完整 receipt 的规范化 JSON
+            try:
+                crypto.verify(receipt, signature, public_pem)
+            except crypto.MalformedSignature:
+                return "签名格式错误"
+            except crypto.InvalidSignature:
+                return "签名校验失败"
+            except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露细节
+                return "签名校验失败"
+            return None
 
         def _get_trust_anchor_snapshot(self, tenant: str, query: str) -> None:
             # GET /v1/trust/anchors/snapshot?signer_did=：对本租户全部
