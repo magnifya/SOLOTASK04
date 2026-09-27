@@ -295,9 +295,10 @@ class TrustAnchorDiscoveryRecord:
 class CredentialStatusSyncRecord:
     """一条外部凭证状态同步记录（按租户与 issuer_did#credential_id 双键隔离）。
 
-    status 为 active/revoked/unknown；updated_at 为签发方声明的状态时间
-    （UTC ISO8601 秒精度，Z 结尾）；reason 在状态非 active 时可携带
-    （active/unknown 时通常为 None）。
+    status 为 active/revoked/unknown/suspended；updated_at 为签发方声明的
+    状态时间（UTC ISO8601 秒精度，Z 结尾）；reason 在状态非 active 时可
+    携带（active/unknown 时通常为 None；suspended 时为裁剪后 1..256 个
+    Unicode 码点的暂停原因）。
     """
 
     issuer_did: str
