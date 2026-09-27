@@ -111,6 +111,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/credential-status/sync-batch 批量同步外部凭证状态（逐项不短路）
   POST /v1/trust/credential-status/receipt 凭证状态同步签名回执（只读）
   POST /v1/trust/credential-status/receipt/verify 验真凭证状态同步签名回执（只读）
+  POST /v1/trust/credential-status/receipt/consume 一次性消费凭证状态同步签名回执（验真后按 (verifier_did, nonce) 防重放，首次落盘并审计）
   GET  /v1/trust/credential-status/{id}   查询已同步的外部凭证状态
   GET  /v1/trust/credential-status/{id}/history  查询外部凭证状态历史（只读）
   GET  /v1/audit                          查询本租户审计事件
@@ -800,6 +801,12 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_credential_status_receipt(tenant)
                 elif path == "/v1/trust/credential-status/receipt/verify":
                     self._post_trust_credential_status_receipt_verify(tenant)
+                elif path == (
+                    "/v1/trust/credential-status/receipt/consume"
+                ):
+                    self._post_trust_credential_status_receipt_consume(
+                        tenant
+                    )
                 else:
                     self._send_error(404, f"无此路径: {path}")
             except ValidationError as exc:
@@ -9418,6 +9425,83 @@ def build_handler(store: VCStore) -> type:
             except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露细节
                 return "签名校验失败"
             return None
+
+        def _post_trust_credential_status_receipt_consume(
+            self, tenant: str
+        ) -> None:
+            # POST /v1/trust/credential-status/receipt/consume：验真并
+            # 一次性消费凭证状态同步签名回执（防重放）。
+            # 1) 请求与字段约束同 receipt/verify：恰含 receipt（对象）、
+            #    signature（非空字符串）、nonce（1..256 码点非空字符
+            #    串）；空体、非法 JSON、非对象、键集或类型错一律 400
+            #    且仅 {"error":"请求非法"}；显式空租户头由路由统一判
+            #    400，缺省 default、按租户隔离；
+            # 2) 外层合法后先按五阶段顺序验真（回执非法 -> nonce 错误
+            #    -> 锚点不可用 -> 签名格式错误 -> 签名校验失败），失败
+            #    沿用原 HTTP 200、固定 reason 及优先级，不写状态、不记
+            #    审计、无任何副作用；
+            # 3) 验真成功后按租户以 (verifier_did, nonce) 为唯一键
+            #    消费：首次 200 按键序恰返 valid、receipt_id、
+            #    consumed_at（valid:true，receipt_id 为完整 receipt
+            #    规范化 JSON 的 UTF-8 字节 SHA-256 小写 64 位 hex，
+            #    consumed_at 为 UTC 秒精度 Z）；同键重放（receipt
+            #    内容可不同）或并发后到者 200 恰返
+            #    {"valid":false,"reason":"状态回执已消费"}；
+            # 4) 首次消费与审计（trust.credential.status.receipt.
+            #    consumed / credential_status_receipt / receipt_id）
+            #    同一次原子落盘；验真失败与重放不记；落盘失败全部回滚，
+            #    500 仅返 {"error":"存储失败"}，可重试；重启仍判重。
+            try:
+                data = self._read_json()
+                if set(data) != {"receipt", "signature", "nonce"}:
+                    raise ValidationError("请求非法")
+                receipt = data["receipt"]
+                signature = data["signature"]
+                nonce = data["nonce"]
+                if not isinstance(receipt, dict):
+                    raise ValidationError("请求非法")
+                if not isinstance(signature, str) or not signature:
+                    raise ValidationError("请求非法")
+                if not isinstance(nonce, str) or not 1 <= len(nonce) <= 256:
+                    raise ValidationError("请求非法")
+            except (ValidationError, ValueError):
+                # ValueError：JSON 内超长十进制整数触发位数上限。
+                raise ValidationError("请求非法")
+
+            reason = self._verify_credential_status_receipt_item(
+                tenant, receipt, signature, nonce
+            )
+            if reason is not None:
+                self._send_json(200, {"valid": False, "reason": reason})
+                return
+            receipt_id = hashlib.sha256(
+                crypto.canonicalize(receipt)
+            ).hexdigest()
+            try:
+                consumed, consumed_at = (
+                    store.consume_credential_status_receipt(
+                        tenant,
+                        receipt["verifier_did"],
+                        receipt["nonce"],
+                        receipt_id,
+                    )
+                )
+            except StorageError:
+                self._send_error(500, "存储失败")
+                return
+            if not consumed:
+                self._send_json(
+                    200, {"valid": False, "reason": "状态回执已消费"}
+                )
+                return
+            self._send_json(
+                200,
+                {
+                    "valid": True,
+                    "receipt_id": receipt_id,
+                    "consumed_at": consumed_at,
+                },
+            )
 
         def _get_trust_credential_status(
             self, tenant: str, credential_id: str, query: str
