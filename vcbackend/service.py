@@ -109,6 +109,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/credentials/verify-batch-with-status 批量验真并合并同步状态（只读）
   POST /v1/trust/credential-status/sync   同步外部凭证状态（active 锚点验签）
   POST /v1/trust/credential-status/sync-batch 批量同步外部凭证状态（逐项不短路）
+  POST /v1/trust/credential-status/receipt 凭证状态同步签名回执（只读）
   GET  /v1/trust/credential-status/{id}   查询已同步的外部凭证状态
   GET  /v1/trust/credential-status/{id}/history  查询外部凭证状态历史（只读）
   GET  /v1/audit                          查询本租户审计事件
@@ -794,6 +795,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_credential_status_sync(tenant)
                 elif path == "/v1/trust/credential-status/sync-batch":
                     self._post_trust_credential_status_sync_batch(tenant)
+                elif path == "/v1/trust/credential-status/receipt":
+                    self._post_trust_credential_status_receipt(tenant)
                 else:
                     self._send_error(404, f"无此路径: {path}")
             except ValidationError as exc:
@@ -9183,6 +9186,83 @@ def build_handler(store: VCStore) -> type:
                 )
                 return
             self._send_json(200, {"results": results})
+
+        def _post_trust_credential_status_receipt(self, tenant: str) -> None:
+            # POST /v1/trust/credential-status/receipt：凭证状态同步签名
+            # 回执（纯只读）。
+            # 请求体须恰含 issuer_did、credential_id、verifier_did、
+            # nonce：前三者为非空字符串，nonce 为 1..256 码点非空串。
+            # 空体、非法 JSON、非对象、键集或类型非法均 400 且仅
+            # {"error":"请求非法"}；显式空租户头由路由统一判 400，
+            # 缺省 default、按租户隔离。
+            # 本租户未同步该凭证，或验证者未知（含跨租户）均 404 仅
+            # {"error":"资源不存在"}；验证者已停用 409 仅
+            # {"error":"验证者已停用"}。
+            # 同锁快照同步记录与验证者当前版本/私钥，锁外签名。200
+            # 顶层键序恰为 receipt、signature；receipt 键序恰为
+            # issuer_did、credential_id、status、reason、updated_at、
+            # issuer_key_version、verifier_did、verifier_key_version、
+            # nonce，前六项取同步记录（reason 无值为 null），两版本为
+            # 正整数；signature 由验证者当前私钥按既有 ES256 裸 R||S
+            # 无填充 base64url 对 receipt 递归键升序紧凑 UTF-8 JSON
+            # 生成。接口只读：不写状态、历史或审计；重启稳定。
+            try:
+                data = self._read_json()
+                if set(data) != {
+                    "issuer_did",
+                    "credential_id",
+                    "verifier_did",
+                    "nonce",
+                }:
+                    raise ValidationError("请求非法")
+                issuer_did = data["issuer_did"]
+                credential_id = data["credential_id"]
+                verifier_did = data["verifier_did"]
+                nonce = data["nonce"]
+                if (
+                    not isinstance(issuer_did, str)
+                    or not issuer_did
+                    or not isinstance(credential_id, str)
+                    or not credential_id
+                    or not isinstance(verifier_did, str)
+                    or not verifier_did
+                ):
+                    raise ValidationError("请求非法")
+                if not isinstance(nonce, str) or not 1 <= len(nonce) <= 256:
+                    raise ValidationError("请求非法")
+            except (ValidationError, ValueError):
+                # ValueError：JSON 内超长十进制整数触发位数上限。
+                raise ValidationError("请求非法")
+
+            # 同一次持锁原子读取同步记录与验证者版本/私钥，保证并发
+            # 结果全属写前或写后；NotFoundError/ConflictError 由路由
+            # 统一映射为固定 404/409 响应。
+            (
+                status,
+                reason,
+                updated_at,
+                issuer_key_version,
+                verifier_key_version,
+                verifier_private_pem,
+            ) = store.get_credential_status_receipt_material(
+                tenant, issuer_did, credential_id, verifier_did
+            )
+
+            # 锁外签名：ES256 签名含随机因子，但用验证者当前公钥跨
+            # 重启可验真。
+            receipt = {
+                "issuer_did": issuer_did,
+                "credential_id": credential_id,
+                "status": status,
+                "reason": reason,
+                "updated_at": updated_at,
+                "issuer_key_version": issuer_key_version,
+                "verifier_did": verifier_did,
+                "verifier_key_version": verifier_key_version,
+                "nonce": nonce,
+            }
+            signature = crypto.sign(receipt, verifier_private_pem)
+            self._send_json(200, {"receipt": receipt, "signature": signature})
 
         def _get_trust_credential_status(
             self, tenant: str, credential_id: str, query: str
