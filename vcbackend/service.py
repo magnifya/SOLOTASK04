@@ -85,6 +85,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/presentation-sync 同步外系统外部演示消费历史（清单验真、检查点防重放，原子落盘不审计）
   POST /v1/trust/presentation-sync-batch 批量同步外系统外部演示消费历史（逐项不短路，原子落盘不审计）
   GET  /v1/trust/presentation-sync/history 查询已同步外部演示消费事件时点页（?signer_did=&at=&limit=&after=，只读）
+  GET  /v1/trust/presentation-sync/receipt 演示消费同步进度签名回执（?signer_did=&verifier_did=&nonce=，只读）
   POST /v1/trust/presentations/verify-synced  以同步锚点验真未绑定外部演示（只读）
   POST /v1/trust/presentations/verify-synced-with-status  同步锚点验真未绑定/持有者绑定演示并合并请求初始状态快照（只读）
   POST /v1/trust/presentations/verify-synced-batch  批量以同步锚点快照验真未绑定演示（只读）
@@ -915,6 +916,10 @@ def build_handler(store: VCStore) -> type:
                     )
                 elif path == "/v1/trust/presentation-sync/history":
                     self._get_trust_presentation_sync_history(
+                        tenant, parsed.query
+                    )
+                elif path == "/v1/trust/presentation-sync/receipt":
+                    self._get_trust_presentation_sync_receipt(
                         tenant, parsed.query
                     )
                 elif path == "/v1/trust/anchors/snapshot":
@@ -3186,6 +3191,79 @@ def build_handler(store: VCStore) -> type:
                     "next_after": next_after,
                 },
             )
+
+        def _get_trust_presentation_sync_receipt(
+            self, tenant: str, query: str
+        ) -> None:
+            # GET /v1/trust/presentation-sync/receipt：演示消费同步进度
+            # 签名回执（纯只读）。
+            # 查询参数仅允许 signer_did、verifier_did、nonce 且均只能
+            # 出现一次：三者均须为非空字符串，nonce 长度限 1..256 个
+            # Unicode 码点。缺失、重复、空值或未知参数一律 400 且仅
+            # {"error":"请求非法"}。
+            # 同步来源（signer_did）或验证者 DID 不存在（含跨租户）
+            # 404 仅 {"error":"资源不存在"}；验证者已停用 409 仅
+            # {"error":"验证者已停用"}。
+            # 原子读取该来源检查点及 cursor<=next_after 的事件，200
+            # 顶层键序恰为 receipt、signature；receipt 键序恰为
+            # signer_did、next_after、digest、verifier_did、
+            # verifier_key_version、nonce。事件按 cursor 升序，逐行
+            # 沿用既有 history 五键与 NDJSON 编码（UTF-8 紧凑 JSON、
+            # 非 ASCII 不转义、LF 结行），digest 为行字节的 SHA-256
+            # 小写 64 位 hex；signature 由验证者当前私钥对 receipt 按
+            # 既有规范化 JSON 与 ES256 裸 R||S 无填充 base64url 协议
+            # 生成。不推进检查点、不写状态或审计；重启后 receipt 与
+            # digest 相同且签名可验。
+            try:
+                params = parse_qs(query, keep_blank_values=True)
+                allowed = {"signer_did", "verifier_did", "nonce"}
+                if set(params) - allowed:
+                    raise ValidationError("请求非法")
+
+                def _single(name: str) -> Optional[str]:
+                    values = params.get(name)
+                    if values is None:
+                        return None
+                    if len(values) != 1:
+                        raise ValidationError("请求非法")
+                    return values[0]
+
+                signer_did = _single("signer_did")
+                if signer_did is None or not signer_did:
+                    raise ValidationError("请求非法")
+                verifier_did = _single("verifier_did")
+                if verifier_did is None or not verifier_did:
+                    raise ValidationError("请求非法")
+                nonce = _single("nonce")
+                if nonce is None or not nonce:
+                    raise ValidationError("请求非法")
+                if not 1 <= len(nonce) <= 256:
+                    raise ValidationError("请求非法")
+            except ValidationError:
+                raise ValidationError("请求非法")
+
+            (
+                next_after,
+                events,
+                verifier_key_version,
+                verifier_private_pem,
+            ) = store.get_presentation_sync_receipt_material(
+                tenant, signer_did, verifier_did
+            )
+
+            digest = hashlib.sha256(
+                _presentation_consumption_ndjson_bytes(events)
+            ).hexdigest()
+            receipt = {
+                "signer_did": signer_did,
+                "next_after": next_after,
+                "digest": digest,
+                "verifier_did": verifier_did,
+                "verifier_key_version": verifier_key_version,
+                "nonce": nonce,
+            }
+            signature = crypto.sign(receipt, verifier_private_pem)
+            self._send_json(200, {"receipt": receipt, "signature": signature})
 
         def _get_trust_anchor_snapshot(self, tenant: str, query: str) -> None:
             # GET /v1/trust/anchors/snapshot?signer_did=：对本租户全部

@@ -10151,6 +10151,82 @@ class VCStore:
             next_after = picked[-1]["cursor"] if picked else after
             return effective_at, picked, next_after
 
+    def get_presentation_sync_receipt_material(
+        self,
+        tenant_id: str,
+        signer_did: str,
+        verifier_did: str,
+    ) -> Tuple[int, List[TrustPresentationConsumptionEvent], int, str]:
+        """在同一把锁内原子读取演示消费同步回执所需全部材料。
+
+        - 同步来源（signer_did）在本租户无检查点（含跨租户）时抛
+          NotFoundError("资源不存在")；
+        - 验证者 DID 在本租户不存在（含跨租户）同样抛
+          NotFoundError("资源不存在")；已停用抛
+          ConflictError("验证者已停用")；
+        - 原子取该来源检查点 next_after 与全部 cursor <= next_after
+          的已落盘事件（按 cursor 升序），以及验证者当前密钥版本与
+          托管私钥 PEM。
+
+        返回 (next_after, events, verifier_key_version, verifier_private_pem)。
+        纯只读：不推进检查点、不修改任何状态、不记审计、不触发落盘；
+        材料完全由持久化状态决定，重启后相同。
+        """
+        with self._lock:
+            checkpoints = self._presentation_sync_checkpoints.get(tenant_id)
+            cp = (
+                checkpoints.get(signer_did)
+                if checkpoints is not None
+                else None
+            )
+            if cp is None:
+                raise NotFoundError("资源不存在")
+            next_after = int(cp["after"])
+
+            bucket = self._bucket_locked(tenant_id)
+            verifier_rec = (
+                bucket["dids"].get(verifier_did)
+                if bucket is not None
+                else None
+            )
+            if verifier_rec is None:
+                raise NotFoundError("资源不存在")
+            if verifier_rec.get("status") == "deactivated":
+                raise ConflictError("验证者已停用")
+            verifier_key_version = int(verifier_rec.get("key_version", 1))
+            verifier_private_pem = self._private_key_for_version_locked(
+                bucket, verifier_did, verifier_key_version
+            )
+            if not verifier_private_pem:
+                # 正常不会发生：迁移保证当前版本私钥存在。
+                raise NotFoundError("资源不存在")
+
+            rows: List[Dict[str, Any]] = []
+            if bucket is not None:
+                rows = bucket.get(
+                    "synced_trust_presentation_consumption_events", {}
+                ).get(signer_did, [])
+            events: List[TrustPresentationConsumptionEvent] = []
+            for row in sorted(rows, key=lambda item: int(item["cursor"])):
+                cursor = int(row["cursor"])
+                if cursor > next_after:
+                    continue
+                events.append(
+                    TrustPresentationConsumptionEvent(
+                        cursor=cursor,
+                        consumption_id=row["consumption_id"],
+                        issuer_did=row["issuer_did"],
+                        presentation_id=row["presentation_id"],
+                        consumed_at=row["consumed_at"],
+                    )
+                )
+            return (
+                next_after,
+                events,
+                verifier_key_version,
+                verifier_private_pem,
+            )
+
     def consume_credential_receipt(
         self,
         tenant_id: str,
