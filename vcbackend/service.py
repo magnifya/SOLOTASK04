@@ -117,6 +117,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   GET  /v1/trust/credential-status/receipt/consumptions/export  确定性 NDJSON 导出凭证状态回执消费历史（快照续传，只读）
   GET  /v1/trust/credential-status/receipt/consumptions/manifest 凭证状态回执消费历史导出清单（签名摘要，只读）
   POST /v1/trust/credential-status/receipt/consumptions/manifest/verify 校验凭证状态回执消费历史清单与 NDJSON 内容（只读）
+  POST /v1/trust/credential-status/receipt/consumptions/manifest/verify-batch 批量校验凭证状态回执消费历史清单与 NDJSON（只读）
   GET  /v1/trust/credential-status/{id}   查询已同步的外部凭证状态
   GET  /v1/trust/credential-status/{id}/history  查询外部凭证状态历史（只读）
   GET  /v1/audit                          查询本租户审计事件
@@ -836,6 +837,14 @@ def build_handler(store: VCStore) -> type:
                     "/manifest/verify"
                 ):
                     self._post_trust_credential_status_receipt_consumptions_manifest_verify(
+                        tenant
+                    )
+                elif (
+                    path
+                    == "/v1/trust/credential-status/receipt/consumptions"
+                    "/manifest/verify-batch"
+                ):
+                    self._post_trust_credential_status_receipt_consumptions_manifest_verify_batch(
                         tenant
                     )
                 else:
@@ -9966,12 +9975,21 @@ def build_handler(store: VCStore) -> type:
             self._send_json(200, {"valid": True})
 
         def _verify_credential_status_receipt_consumption_manifest_item(
-            self, tenant: str, manifest: Any, ndjson: str
+            self,
+            tenant: str,
+            manifest: Any,
+            ndjson: str,
+            anchor_snapshot: Optional[
+                Dict[Tuple[str, int], Optional[str]]
+            ] = None,
         ) -> Optional[str]:
             # 单项凭证状态回执消费历史清单验真：按序返回失败原因（清单
             # 非法 -> 锚点不可用 -> 签名格式错误 -> 签名校验失败 ->
             # 导出内容不匹配），成功返回 None。锚点须为本租户同
-            # did/版本 active 且含 status 用途。纯只读。
+            # did/版本 active 且含 status 用途。anchor_snapshot 给定时为
+            # 批量端点在批初原子取得的本租户锚点快照（键 did/版本，值为
+            # 公钥 PEM 或 None），不再即时读锚点；为 None 时按单项协议
+            # 即时读取。纯只读。
             # 阶段一：清单结构（与验真回执消费历史清单同一结构校验）
             if not self._receipt_consumption_manifest_is_well_formed(manifest):
                 return "清单非法"
@@ -9980,9 +9998,12 @@ def build_handler(store: VCStore) -> type:
             key_version = manifest["key_version"]
 
             # 阶段二：本租户同 did/版本且含 status 用途的 active 信任锚点
-            public_pem = store.get_active_trust_anchor_public_key(
-                tenant, signer_did, key_version, required_use="status"
-            )
+            if anchor_snapshot is None:
+                public_pem = store.get_active_trust_anchor_public_key(
+                    tenant, signer_did, key_version, required_use="status"
+                )
+            else:
+                public_pem = anchor_snapshot[(signer_did, key_version)]
             if public_pem is None:
                 return "锚点不可用"
             try:
@@ -10030,6 +10051,112 @@ def build_handler(store: VCStore) -> type:
             ):
                 return "导出内容不匹配"
             return None
+
+        def _post_trust_credential_status_receipt_consumptions_manifest_verify_batch(
+            self, tenant: str
+        ) -> None:
+            # POST /v1/trust/credential-status/receipt/consumptions/
+            # manifest/verify-batch：批量校验凭证状态回执消费历史清单与
+            # NDJSON。任何失败都返回 HTTP 200。请求体须恰为
+            # {"items": [项...]}，数组非空且不超过 100 项；空体、非法
+            # JSON、非对象、键集错误、items 非数组、空数组或超限一律按键
+            # 序恰返 {"results": [], "reason": "请求非法"}。合法批次返回
+            # {"results": [...]}，长度与顺序与输入一致，逐项不短路；每项
+            # 须恰含 manifest 对象与 ndjson 字符串，项非对象、字段或类型
+            # 非法按“清单非法”处理，其余复用单项验真协议。成功项仅
+            # {"valid": true}，失败项键序恰为 valid、reason，reason 恰为
+            # 五种原因之一。批初在同一把锁内原子读取本租户锚点快照，
+            # 并发吊销或用途收紧不会产生批内混合结论。纯只读：不写状态、
+            # 历史或审计，结论跨重启稳定。
+            def _request_invalid() -> None:
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                _request_invalid()
+                return
+            except Exception:  # noqa: BLE001
+                _request_invalid()
+                return
+            if not raw:
+                _request_invalid()
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                # ValueError 含 JSON 解析错误与超长十进制整数位数上限。
+                _request_invalid()
+                return
+            if not isinstance(data, dict) or set(data) != {"items"}:
+                _request_invalid()
+                return
+            items = data["items"]
+            if (
+                not isinstance(items, list)
+                or not items
+                or len(items) > 100
+            ):
+                _request_invalid()
+                return
+
+            # 先判定每项外层结构并收集结构合法项的锚点查询，批初原子
+            # 读取一次本租户锚点快照（required_use 恒为 status）。
+            well_formed: List[bool] = []
+            queries: List[Tuple[str, int, str]] = []
+            for item in items:
+                if (
+                    isinstance(item, dict)
+                    and set(item) == {"manifest", "ndjson"}
+                    and isinstance(item["manifest"], dict)
+                    and isinstance(item["ndjson"], str)
+                    and self._receipt_consumption_manifest_is_well_formed(
+                        item["manifest"]
+                    )
+                ):
+                    well_formed.append(True)
+                    queries.append(
+                        (
+                            item["manifest"]["signer_did"],
+                            item["manifest"]["key_version"],
+                            "status",
+                        )
+                    )
+                else:
+                    well_formed.append(False)
+
+            snapshot_pems = (
+                store.get_active_trust_anchor_public_key_snapshot(
+                    tenant, queries
+                )
+                if queries
+                else []
+            )
+            anchor_snapshot: Dict[Tuple[str, int], Optional[str]] = {}
+            for (did, key_version, _use), public_pem in zip(
+                queries, snapshot_pems
+            ):
+                anchor_snapshot[(did, key_version)] = public_pem
+
+            results: List[Dict[str, Any]] = []
+            for index, item in enumerate(items):  # 顺序校验，失败不短路
+                if not well_formed[index]:
+                    results.append({"valid": False, "reason": "清单非法"})
+                    continue
+                reason = self._verify_credential_status_receipt_consumption_manifest_item(
+                    tenant,
+                    item["manifest"],
+                    item["ndjson"],
+                    anchor_snapshot=anchor_snapshot,
+                )
+                if reason is None:
+                    results.append({"valid": True})
+                else:
+                    results.append({"valid": False, "reason": reason})
+            self._send_json(200, {"results": results})
 
         def _get_trust_credential_status(
             self, tenant: str, credential_id: str, query: str

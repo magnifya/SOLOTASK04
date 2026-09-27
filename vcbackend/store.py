@@ -11362,6 +11362,41 @@ class VCStore:
                 return None
             return row.get("public_key", "")
 
+    def get_active_trust_anchor_public_key_snapshot(
+        self,
+        tenant_id: str,
+        queries: List[Tuple[str, int, Optional[str]]],
+    ) -> List[Optional[str]]:
+        """在同一把锁内原子读取多个 (did, key_version, required_use) 锚点。
+
+        供批量清单验真在批初取得本租户锚点快照：整批查询期间并发吊销或
+        用途收紧不会产生批内混合结论。逐项语义与
+        get_active_trust_anchor_public_key 完全一致（不存在/他租户/已吊销/
+        用途不含返回 None）。纯只读：不写状态、不记审计、不触发落盘。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            anchors = (
+                bucket["trust_anchors"] if bucket is not None else None
+            )
+            results: List[Optional[str]] = []
+            for did, key_version, required_use in queries:
+                row = (
+                    anchors.get(did, {}).get(str(key_version))
+                    if anchors is not None
+                    else None
+                )
+                if row is None or row.get("status") == "revoked":
+                    results.append(None)
+                    continue
+                if required_use is not None and not _anchor_use_allowed(
+                    row, required_use
+                ):
+                    results.append(None)
+                    continue
+                results.append(row.get("public_key", ""))
+            return results
+
     def verify_trust_did_document(
         self,
         tenant_id: str,
