@@ -113,6 +113,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/credential-status/receipt/verify 验真凭证状态同步签名回执（只读）
   POST /v1/trust/credential-status/receipt/consume 一次性消费凭证状态同步签名回执（验真后按 (verifier_did, nonce) 防重放，首次落盘并审计）
   POST /v1/trust/credential-status/receipt/consume-batch 批量一次性消费凭证状态同步签名回执（逐项不短路，批内判重，整批原子落盘）
+  POST /v1/trust/credential-status/receipt-sync 同步外系统状态回执消费清单（清单验真、独立检查点防重放，原子落盘不审计）
   GET  /v1/trust/credential-status/receipt/consumptions  查询凭证状态回执消费历史（只读）
   GET  /v1/trust/credential-status/receipt/consumptions/export  确定性 NDJSON 导出凭证状态回执消费历史（快照续传，只读）
   GET  /v1/trust/credential-status/receipt/consumptions/manifest 凭证状态回执消费历史导出清单（签名摘要，只读）
@@ -831,6 +832,10 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_credential_status_receipt_consume_batch(
                         tenant
                     )
+                elif path == (
+                    "/v1/trust/credential-status/receipt-sync"
+                ):
+                    self._post_trust_credential_status_receipt_sync(tenant)
                 elif (
                     path
                     == "/v1/trust/credential-status/receipt/consumptions"
@@ -9718,6 +9723,116 @@ def build_handler(store: VCStore) -> type:
                             "reason": "状态回执已消费",
                         }
             self._send_json(200, {"results": results})
+
+        def _post_trust_credential_status_receipt_sync(
+            self, tenant: str
+        ) -> None:
+            # POST /v1/trust/credential-status/receipt-sync：同步外系统
+            # 状态回执消费清单并防重放。除下列差异外完整复用
+            # /v1/trust/receipt-sync 的协议：
+            # - 清单验真锚点用途为 status（本租户同 did/版本 active 且含
+            #   status 用途的锚点）；
+            # - NDJSON 逐字复用同目录消费历史 export 的行格式（键序
+            #   cursor、receipt_id、verifier_did、nonce、consumed_at）；
+            # - 检查点与同步判重索引独立于普通验真回执同步，仍按
+            #   (租户, signer_did) 隔离；
+            # - 状态回执 consume / consume-batch 验真后同时查询本地消费
+            #   记录与本同步索引，命中即 200“状态回执已消费”，不写消费
+            #   记录或审计。
+            # 1) 请求体恰含 manifest（对象）、ndjson（字符串）：非法
+            #    JSON/非对象、缺漏或多余字段、类型不符一律 400 且仅
+            #    {"error": "非空中文原因"}；
+            # 2) 外层合法后沿用状态回执消费历史清单验真（五段顺序，含锚
+            #    点 active + status 用途），任何失败 200 恰返
+            #    {valid:false,reason}；
+            # 3) 解析 NDJSON：每行须符合状态回执消费历史 export 事件键
+            #    序与类型，cursor 严格递增且 after < cursor <= snapshot，
+            #    页内不得重复 (verifier_did,nonce)；非法（含与历史重复
+            #    键）200 返 {"valid":false,"reason":"导出内容非法"}；
+            # 4) 检查点键为 (tenant, signer_did)：首 after=0；续页同
+            #    snapshot、after=末 cursor；仅末 cursor=旧 snapshot 时
+            #    才接受递增的新 snapshot（after=旧 snapshot）；旧快照/
+            #    跳页/同位异内容 409 仅 {"error":"同步游标冲突"}；
+            # 5) 首次成功 201、重放 200，成功响应按键序恰为 valid、
+            #    signer_did、snapshot、next_after、count（后三为非负
+            #    整数）。事件与检查点原子落盘，同步不写审计；落盘失败
+            #    500 仅 {"error":"存储失败"} 并回滚，并发只增一次。
+            data = self._read_json()
+            if set(data) != {"manifest", "ndjson"}:
+                missing = [f for f in ("manifest", "ndjson") if f not in data]
+                if missing:
+                    raise ValidationError(
+                        f"请求缺少字段: {', '.join(missing)}"
+                    )
+                extra = sorted(set(data) - {"manifest", "ndjson"})
+                raise ValidationError(f"请求含多余字段: {', '.join(extra)}")
+            manifest = data["manifest"]
+            ndjson = data["ndjson"]
+            if not isinstance(manifest, dict):
+                raise ValidationError(
+                    "请求不合法: 字段 manifest 必须为 JSON 对象"
+                )
+            if not isinstance(ndjson, str):
+                raise ValidationError(
+                    "请求不合法: 字段 ndjson 必须为字符串"
+                )
+
+            # 阶段一：沿用清单验真（清单非法 -> 锚点不可用 -> 签名格式
+            # 错误 -> 签名校验失败 -> 导出内容不匹配），锚点用途为
+            # status。
+            reason = (
+                self._verify_credential_status_receipt_consumption_manifest_item(
+                    tenant, manifest, ndjson
+                )
+            )
+            if reason is not None:
+                self._send_json(200, {"valid": False, "reason": reason})
+                return
+
+            signer_did = manifest["signer_did"]
+            snapshot = manifest["snapshot"]
+            after = manifest["filters"]["after"]
+
+            # 阶段二：NDJSON 结构、游标窗口与页内重复键（行格式与验真
+            # 回执消费历史 export 逐字一致，复用同一解析器）。
+            events = self._parse_receipt_sync_ndjson(
+                ndjson, after, snapshot
+            )
+            if events is None:
+                self._send_json(
+                    200, {"valid": False, "reason": "导出内容非法"}
+                )
+                return
+
+            # 阶段三：检查点推进、历史重复键与原子落盘（独立于普通验真
+            # 回执同步的检查点与判重索引）。
+            try:
+                created, effective_snapshot, next_after, count = (
+                    store.sync_credential_status_receipt_consumptions(
+                        tenant, signer_did, snapshot, after, events
+                    )
+                )
+            except ConflictError:
+                self._send_error(409, "同步游标冲突")
+                return
+            except ValidationError:
+                self._send_json(
+                    200, {"valid": False, "reason": "导出内容非法"}
+                )
+                return
+            except StorageError:
+                self._send_error(500, "存储失败")
+                return
+            self._send_json(
+                201 if created else 200,
+                {
+                    "valid": True,
+                    "signer_did": signer_did,
+                    "snapshot": effective_snapshot,
+                    "next_after": next_after,
+                    "count": count,
+                },
+            )
 
         def _get_trust_credential_status_receipt_consumptions_export(
             self, tenant: str, query: str
