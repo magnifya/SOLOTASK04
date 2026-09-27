@@ -87,6 +87,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   GET  /v1/trust/presentation-sync/history 查询已同步外部演示消费事件时点页（?signer_did=&at=&limit=&after=，只读）
   GET  /v1/trust/presentation-sync/receipt 演示消费同步进度签名回执（?signer_did=&verifier_did=&nonce=，只读）
   POST /v1/trust/presentation-sync/receipt/verify 验真演示消费同步进度签名回执（只读）
+  POST /v1/trust/presentation-sync/receipt/verify-batch 批量验真演示消费同步回执（批初锚点快照、逐项不短路，只读）
   POST /v1/trust/presentations/verify-synced  以同步锚点验真未绑定外部演示（只读）
   POST /v1/trust/presentations/verify-synced-with-status  同步锚点验真未绑定/持有者绑定演示并合并请求初始状态快照（只读）
   POST /v1/trust/presentations/verify-synced-batch  批量以同步锚点快照验真未绑定演示（只读）
@@ -666,6 +667,13 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_presentation_sync_batch(tenant)
                 elif path == "/v1/trust/presentation-sync/receipt/verify":
                     self._post_trust_presentation_sync_receipt_verify(tenant)
+                elif (
+                    path
+                    == "/v1/trust/presentation-sync/receipt/verify-batch"
+                ):
+                    self._post_trust_presentation_sync_receipt_verify_batch(
+                        tenant
+                    )
                 elif path == "/v1/trust/receipt-sync":
                     self._post_trust_receipt_sync(tenant)
                 elif path == "/v1/trust/receipt-sync-batch":
@@ -3317,14 +3325,19 @@ def build_handler(store: VCStore) -> type:
             signature: str,
             ndjson: str,
             nonce: str,
+            anchor_keys: Optional[Dict[Tuple[str, int], str]] = None,
         ) -> Optional[str]:
             # 演示消费同步回执验真：按序返回失败原因（回执非法 ->
             # nonce 错误 -> 摘要错误 -> 锚点不可用 -> 签名格式错误 ->
             # 签名校验失败），成功返回 None。纯只读。
+            # anchor_keys 为批初原子快照（(verifier_did, 版本) -> 公钥
+            # PEM，仅含 active 且含 vp 用途的锚点）；缺省时逐项实时
+            # 查询本租户锚点。
             # 阶段一：回执结构——键序恰为 signer_did、next_after、
             # digest、verifier_did、verifier_key_version、nonce；
             # DID 均非空串，next_after 非布尔非负整数，digest 为 64
-            # 位小写 hex，verifier_key_version 非布尔正整数。
+            # 位小写 hex，verifier_key_version 非布尔正整数，nonce
+            # 为 1..256 码点非空字符串。
             if not isinstance(receipt, dict) or list(receipt) != [
                 "signer_did",
                 "next_after",
@@ -3361,9 +3374,15 @@ def build_handler(store: VCStore) -> type:
                 or verifier_key_version < 1
             ):
                 return "回执非法"
+            receipt_nonce = receipt["nonce"]
+            if (
+                not isinstance(receipt_nonce, str)
+                or not 1 <= len(receipt_nonce) <= 256
+            ):
+                return "回执非法"
 
             # 阶段二：回执 nonce 与外层 nonce 一致。
-            if receipt["nonce"] != nonce:
+            if receipt_nonce != nonce:
                 return "nonce错误"
 
             # 阶段三：ndjson 的 UTF-8 字节 SHA-256 等于 digest
@@ -3377,12 +3396,17 @@ def build_handler(store: VCStore) -> type:
 
             # 阶段四：本租户同 verifier_did/版本且含 vp 用途的
             # active 信任锚点。
-            public_pem = store.get_active_trust_anchor_public_key(
-                tenant,
-                verifier_did,
-                verifier_key_version,
-                required_use="vp",
-            )
+            if anchor_keys is None:
+                public_pem = store.get_active_trust_anchor_public_key(
+                    tenant,
+                    verifier_did,
+                    verifier_key_version,
+                    required_use="vp",
+                )
+            else:
+                public_pem = anchor_keys.get(
+                    (verifier_did, verifier_key_version)
+                )
             if public_pem is None:
                 return "锚点不可用"
             try:
@@ -3407,6 +3431,99 @@ def build_handler(store: VCStore) -> type:
             except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露细节
                 return "签名校验失败"
             return None
+
+        def _post_trust_presentation_sync_receipt_verify_batch(
+            self, tenant: str
+        ) -> None:
+            # POST /v1/trust/presentation-sync/receipt/verify-batch：
+            # 批量验真演示消费同步进度签名回执（只读）。请求体须恰为
+            # {"items": [项...]}，数组限 1–100 项；空体、非法 JSON、
+            # 非对象、键集错误、items 非数组/空/超限均 HTTP 200 且按
+            # 键序恰返 {"results": [], "reason": "请求非法"}。合法批
+            # 次于批初原子读取本租户信任锚点快照（仅 active 且含 vp
+            # 用途），锁外逐项验签，并发吊销或用途收紧不得令同批观察
+            # 到混合状态；逐项不短路，results 等长同序。每项须恰含
+            # receipt（对象）、signature（非空字符串）、ndjson（字符
+            # 串）、nonce（1..256 码点非空字符串），否则该项
+            # {"valid": false, "reason": "请求项非法"}；合法项复用单
+            # 条验真顺序与六类原因；成功项仅 {"valid": true}，失败项
+            # 键序 valid、reason。顶层 HTTP 200 且仅含 results。显式
+            # 空租户头由路由统一判 400，缺省 default、按租户隔离。不
+            # 解析 ndjson，不写状态、游标或审计；重启稳定。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except Exception:  # noqa: BLE001 请求非法统一 200 处理
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            if not raw:
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                # ValueError 含 JSONDecodeError 及超长十进制整数触发
+                # 的位数上限。
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            if (
+                not isinstance(data, dict)
+                or set(data) != {"items"}
+                or not isinstance(data["items"], list)
+                or not data["items"]
+                or len(data["items"]) > 100
+            ):
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            items = data["items"]
+
+            # 批初原子快照：仅取 active 且含 vp 用途的锚点，同批各项
+            # 据此解析，不受并发吊销/用途收紧影响。
+            snapshot = store.list_trust_anchor_snapshot(tenant)
+            anchor_keys = {
+                (row["did"], row["key_version"]): row["public_key"]
+                for row in snapshot
+                if row["status"] == "active" and "vp" in row["uses"]
+            }
+
+            results: List[Dict[str, Any]] = []
+            for item in items:  # 顺序验真，失败不短路
+                if (
+                    not isinstance(item, dict)
+                    or set(item)
+                    != {"receipt", "signature", "ndjson", "nonce"}
+                    or not isinstance(item["receipt"], dict)
+                    or not isinstance(item["signature"], str)
+                    or not item["signature"]
+                    or not isinstance(item["ndjson"], str)
+                    or not isinstance(item["nonce"], str)
+                    or not 1 <= len(item["nonce"]) <= 256
+                ):
+                    results.append(
+                        {"valid": False, "reason": "请求项非法"}
+                    )
+                    continue
+                reason = self._verify_presentation_sync_receipt_item(
+                    tenant,
+                    item["receipt"],
+                    item["signature"],
+                    item["ndjson"],
+                    item["nonce"],
+                    anchor_keys=anchor_keys,
+                )
+                if reason is None:
+                    results.append({"valid": True})
+                else:
+                    results.append({"valid": False, "reason": reason})
+            self._send_json(200, {"results": results})
 
         def _get_trust_anchor_snapshot(self, tenant: str, query: str) -> None:
             # GET /v1/trust/anchors/snapshot?signer_did=：对本租户全部
