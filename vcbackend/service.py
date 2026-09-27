@@ -89,6 +89,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/presentation-sync/receipt/verify 验真演示消费同步进度签名回执（只读）
   POST /v1/trust/presentation-sync/receipt/verify-batch 批量验真演示消费同步进度签名回执（批初锚点快照、逐项不短路，只读）
   POST /v1/trust/presentation-sync/receipt/consume 一次性消费演示同步回执（验真后按 (verifier_did, nonce) 防重放，首次落盘并审计）
+  POST /v1/trust/presentation-sync/receipt/consume-batch 批量一次性消费演示同步回执（逐项不短路，防重放，整批原子落盘并审计）
   POST /v1/trust/presentations/verify-synced  以同步锚点验真未绑定外部演示（只读）
   POST /v1/trust/presentations/verify-synced-with-status  同步锚点验真未绑定/持有者绑定演示并合并请求初始状态快照（只读）
   POST /v1/trust/presentations/verify-synced-batch  批量以同步锚点快照验真未绑定演示（只读）
@@ -680,6 +681,13 @@ def build_handler(store: VCStore) -> type:
                     == "/v1/trust/presentation-sync/receipt/consume"
                 ):
                     self._post_trust_presentation_sync_receipt_consume(
+                        tenant
+                    )
+                elif (
+                    path
+                    == "/v1/trust/presentation-sync/receipt/consume-batch"
+                ):
+                    self._post_trust_presentation_sync_receipt_consume_batch(
                         tenant
                     )
                 elif path == "/v1/trust/receipt-sync":
@@ -3620,6 +3628,147 @@ def build_handler(store: VCStore) -> type:
                     "consumed_at": consumed_at,
                 },
             )
+
+        def _post_trust_presentation_sync_receipt_consume_batch(
+            self, tenant: str
+        ) -> None:
+            # POST /v1/trust/presentation-sync/receipt/consume-batch：
+            # 批量验真并一次性消费演示消费同步进度签名回执（防重放）。
+            # 1) 请求体须恰为 {"items": [项...]}，数组限 1–100 项；空体、
+            #    非法 JSON、非对象、键集错误、items 非数组/空/超限均
+            #    HTTP 200 且按键序恰返
+            #    {"results": [], "reason": "请求非法"}；
+            # 2) 合法批次逐项处理、失败不短路：项须恰含 receipt（对象）、
+            #    signature（非空字符串）、ndjson（字符串）、nonce
+            #    （1..256 码点非空字符串），否则该项
+            #    {"valid": false, "reason": "请求项非法"}；其余复用单条
+            #    六阶段顺序、reason 及优先级（回执非法 -> nonce 错误 ->
+            #    摘要错误 -> 锚点不可用 -> 签名格式错误 -> 签名校验
+            #    失败），失败项不写状态、不记审计；
+            # 3) 验真通过后按租户 (verifier_did, nonce) 判重：批内首项
+            #    成功，后项、历史或并发重放 ->
+            #    {"valid": false, "reason": "同步回执已消费"}；成功项键序
+            #    valid、receipt_id、consumed_at，取值同单条；results
+            #    与输入等长同序；
+            # 4) 本批全部新消费与审计（与单条 consume 同规格）同锁原子
+            #    落盘；失败全回滚，500 仅返 {"error": "存储失败"}，可
+            #    重试；与单条 consume 并发每键仅一次成功，重启保持。
+            #    显式空 X-Tenant-ID 由路由统一判 400，缺省 default、
+            #    按租户隔离。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except Exception:  # noqa: BLE001 请求非法统一 200 处理
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            if not raw:
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                # ValueError 含 JSON 解析错误与超长十进制整数位数上限。
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            if (
+                not isinstance(data, dict)
+                or set(data) != {"items"}
+                or not isinstance(data["items"], list)
+                or not data["items"]
+                or len(data["items"]) > 100
+            ):
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            items = data["items"]
+
+            results: List[Optional[Dict[str, Any]]] = []
+            # 验真通过、待判重消费的项：(结果下标, verifier_did, nonce,
+            # receipt_id)，消费判定在全部验真完成后同锁一次完成。
+            pending: List[Tuple[int, str, str, str]] = []
+            for index, item in enumerate(items):  # 顺序处理，失败不短路
+                if not isinstance(item, dict) or set(item) != {
+                    "receipt",
+                    "signature",
+                    "ndjson",
+                    "nonce",
+                }:
+                    results.append(
+                        {"valid": False, "reason": "请求项非法"}
+                    )
+                    continue
+                receipt = item["receipt"]
+                signature = item["signature"]
+                ndjson = item["ndjson"]
+                nonce = item["nonce"]
+                if (
+                    not isinstance(receipt, dict)
+                    or not isinstance(signature, str)
+                    or not signature
+                    or not isinstance(ndjson, str)
+                    or not isinstance(nonce, str)
+                    or not 1 <= len(nonce) <= 256
+                ):
+                    results.append(
+                        {"valid": False, "reason": "请求项非法"}
+                    )
+                    continue
+                reason = self._verify_presentation_sync_receipt_item(
+                    tenant, receipt, signature, ndjson, nonce
+                )
+                if reason is not None:
+                    results.append({"valid": False, "reason": reason})
+                    continue
+                receipt_id = hashlib.sha256(
+                    crypto.canonicalize(receipt)
+                ).hexdigest()
+                pending.append(
+                    (
+                        index,
+                        receipt["verifier_did"],
+                        receipt["nonce"],
+                        receipt_id,
+                    )
+                )
+                results.append(None)  # 占位，消费判定后回填
+
+            if pending:
+                try:
+                    outcomes = (
+                        store.consume_presentation_sync_receipts_batch(
+                            tenant,
+                            [
+                                (verifier_did, nonce, receipt_id)
+                                for _, verifier_did, nonce, receipt_id
+                                in pending
+                            ],
+                        )
+                    )
+                except StorageError:
+                    self._send_error(500, "存储失败")
+                    return
+                for (index, _, _, receipt_id), (consumed, consumed_at) in zip(
+                    pending, outcomes
+                ):
+                    if consumed:
+                        results[index] = {
+                            "valid": True,
+                            "receipt_id": receipt_id,
+                            "consumed_at": consumed_at,
+                        }
+                    else:
+                        results[index] = {
+                            "valid": False,
+                            "reason": "同步回执已消费",
+                        }
+            self._send_json(200, {"results": results})
 
         def _get_trust_anchor_snapshot(self, tenant: str, query: str) -> None:
             # GET /v1/trust/anchors/snapshot?signer_did=：对本租户全部
