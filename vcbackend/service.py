@@ -114,6 +114,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/credential-status/receipt/consume 一次性消费凭证状态同步签名回执（验真后按 (verifier_did, nonce) 防重放，首次落盘并审计）
   POST /v1/trust/credential-status/receipt/consume-batch 批量一次性消费凭证状态同步签名回执（逐项不短路，批内判重，整批原子落盘）
   GET  /v1/trust/credential-status/receipt/consumptions  查询凭证状态回执消费历史（只读）
+  GET  /v1/trust/credential-status/receipt/consumptions/export  确定性 NDJSON 导出凭证状态回执消费历史（快照续传，只读）
   GET  /v1/trust/credential-status/{id}   查询已同步的外部凭证状态
   GET  /v1/trust/credential-status/{id}/history  查询外部凭证状态历史（只读）
   GET  /v1/audit                          查询本租户审计事件
@@ -993,6 +994,12 @@ def build_handler(store: VCStore) -> type:
                     "/v1/trust/credential-status/receipt/consumptions"
                 ):
                     self._get_trust_credential_status_receipt_consumptions(
+                        tenant, parsed.query
+                    )
+                elif path == (
+                    "/v1/trust/credential-status/receipt/consumptions/export"
+                ):
+                    self._get_trust_credential_status_receipt_consumptions_export(
                         tenant, parsed.query
                     )
                 elif path == "/v1/trust/credentials/receipt/consumptions":
@@ -9757,6 +9764,83 @@ def build_handler(store: VCStore) -> type:
                     "next_after": next_after,
                 },
             )
+
+        def _get_trust_credential_status_receipt_consumptions_export(
+            self, tenant: str, query: str
+        ) -> None:
+            # GET /v1/trust/credential-status/receipt/consumptions/export：
+            # 确定性 NDJSON 导出本租户凭证状态回执消费历史，支持快照续传。
+            # 查询参数仅允许 limit、after、snapshot，且均只能出现一次：
+            # - limit 缺省 1000，须为 1..10000 的非空 ASCII 十进制整数；
+            # - after 缺省 0，须为非负 ASCII 十进制整数；
+            # - snapshot 缺省为请求开始时原子读取的租户最大 cursor
+            #   （无事件为 0），显式提供时须为非负 ASCII 十进制整数且
+            #   不超过当时最大值；
+            # - after 不得大于生效 snapshot。
+            # 空值、重复参数、未知参数、非 ASCII、符号、超长或越界一律
+            # 400 且恰返 {"error": "请求非法"}。取 after < cursor <=
+            # snapshot 按 cursor 升序的前 limit 条。成功 200，类型
+            # application/x-ndjson; charset=utf-8；响应头
+            # X-Snapshot-Cursor 为生效快照、X-Next-After 为末行
+            # cursor（空页为 after）。每行键序 cursor、receipt_id、
+            # verifier_did、nonce、consumed_at，UTF-8 紧凑 JSON、
+            # 非 ASCII 不转义、RFC8259 最短转义、LF 结行（末行亦有
+            # LF）、无 BOM，空页零字节。同一 snapshot 续页天然排除
+            # 快照后新事件，跨重启字节一致。纯只读：不改游标、状态
+            # 或审计。
+            try:
+                params = parse_qs(query, keep_blank_values=True)
+                allowed = {"limit", "after", "snapshot"}
+                if set(params) - allowed:
+                    raise ValidationError("未知查询参数")
+
+                def _single(name: str) -> Optional[str]:
+                    values = params.get(name)
+                    if values is None:
+                        return None
+                    if len(values) != 1:
+                        raise ValidationError("查询参数重复")
+                    return values[0]
+
+                limit_raw = _single("limit")
+                if limit_raw is not None:
+                    limit = _parse_nonneg_int(limit_raw, "limit")
+                    if not 1 <= limit <= 10000:
+                        raise ValidationError("limit 越界")
+                else:
+                    limit = 1000
+
+                after_raw = _single("after")
+                if after_raw is not None:
+                    after = _parse_nonneg_int(after_raw, "after")
+                else:
+                    after = 0
+
+                snapshot_raw = _single("snapshot")
+                snapshot: Optional[int] = (
+                    _parse_nonneg_int(snapshot_raw, "snapshot")
+                    if snapshot_raw is not None
+                    else None
+                )
+
+                events, snapshot_cursor, next_after = (
+                    store.export_credential_status_receipt_consumption_events(
+                        tenant, after, limit, snapshot=snapshot
+                    )
+                )
+            except (ValidationError, ValueError):
+                raise ValidationError("请求非法")
+            body = _receipt_consumption_ndjson_bytes(events)
+            self.send_response(200)
+            self.send_header(
+                "Content-Type", "application/x-ndjson; charset=utf-8"
+            )
+            self.send_header("X-Snapshot-Cursor", str(snapshot_cursor))
+            self.send_header("X-Next-After", str(next_after))
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
 
         def _get_trust_credential_status(
             self, tenant: str, credential_id: str, query: str
