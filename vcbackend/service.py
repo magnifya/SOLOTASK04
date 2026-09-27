@@ -110,6 +110,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/credential-status/sync   同步外部凭证状态（active 锚点验签）
   POST /v1/trust/credential-status/sync-batch 批量同步外部凭证状态（逐项不短路）
   POST /v1/trust/credential-status/receipt 凭证状态同步签名回执（只读）
+  POST /v1/trust/credential-status/receipt/verify 验真凭证状态同步签名回执（只读）
   GET  /v1/trust/credential-status/{id}   查询已同步的外部凭证状态
   GET  /v1/trust/credential-status/{id}/history  查询外部凭证状态历史（只读）
   GET  /v1/audit                          查询本租户审计事件
@@ -797,6 +798,11 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_credential_status_sync_batch(tenant)
                 elif path == "/v1/trust/credential-status/receipt":
                     self._post_trust_credential_status_receipt(tenant)
+                elif (
+                    path
+                    == "/v1/trust/credential-status/receipt/verify"
+                ):
+                    self._post_trust_credential_status_receipt_verify(tenant)
                 else:
                     self._send_error(404, f"无此路径: {path}")
             except ValidationError as exc:
@@ -9263,6 +9269,181 @@ def build_handler(store: VCStore) -> type:
             }
             signature = crypto.sign(receipt, verifier_private_pem)
             self._send_json(200, {"receipt": receipt, "signature": signature})
+
+        def _post_trust_credential_status_receipt_verify(
+            self, tenant: str
+        ) -> None:
+            # POST /v1/trust/credential-status/receipt/verify：验真既有
+            # 凭证状态同步签名回执（纯只读）。
+            # 请求体须恰含 receipt（JSON 对象）、signature（非空字符
+            # 串）、nonce（1..256 码点非空字符串）：空体、非法 JSON、
+            # 非对象、键集或类型非法均 400 且仅 {"error":"请求非法"}；
+            # 显式空租户头由路由统一判 400，缺省 default、按租户隔离。
+            # 外层合法后任何失败均 HTTP 200，按键序恰返
+            # {"valid":false,"reason":...}，按序检查：
+            #   1) 回执结构——receipt 须恰为
+            #      /v1/trust/credential-status/receipt 成功返回的九键
+            #      （issuer_did、credential_id、status、reason、
+            #      updated_at、issuer_key_version、verifier_did、
+            #      verifier_key_version、nonce），字段类型及状态取值
+            #      沿用该公开协议（reason 无值为 null），键出现顺序不
+            #      影响验真，内层 nonce 同限 1..256 码点；
+            #   2) 内外两处 nonce 相等；
+            #   3) 本租户同 verifier_did/版本且含 status 用途的 active
+            #      锚点；
+            #   4) signature 须为 ES256 的 64 字节裸 R||S 无填充
+            #      base64url；
+            #   5) 密码学验签——签名覆盖完整 receipt 的递归键升序紧凑
+            #      UTF-8 JSON。
+            # 失败原因依次恰为“回执非法”“nonce错误”“锚点不可用”
+            # “签名格式错误”“签名校验失败”；成功仅 {"valid":true}。
+            # 不查询当前同步状态、不写状态、历史或审计；重启结论稳定。
+            try:
+                data = self._read_json()
+                if set(data) != {"receipt", "signature", "nonce"}:
+                    raise ValidationError("请求非法")
+                receipt = data["receipt"]
+                signature = data["signature"]
+                nonce = data["nonce"]
+                if not isinstance(receipt, dict):
+                    raise ValidationError("请求非法")
+                if not isinstance(signature, str) or not signature:
+                    raise ValidationError("请求非法")
+                if not isinstance(nonce, str) or not 1 <= len(nonce) <= 256:
+                    raise ValidationError("请求非法")
+            except (ValidationError, ValueError):
+                # ValueError：JSON 内超长十进制整数触发位数上限。
+                raise ValidationError("请求非法")
+
+            reason = self._verify_credential_status_receipt_item(
+                tenant, receipt, signature, nonce
+            )
+            if reason is not None:
+                self._send_json(200, {"valid": False, "reason": reason})
+                return
+            self._send_json(200, {"valid": True})
+
+        def _verify_credential_status_receipt_item(
+            self,
+            tenant: str,
+            receipt: Any,
+            signature: str,
+            nonce: str,
+        ) -> Optional[str]:
+            # 凭证状态同步回执验真（只读）：按序返回失败原因（回执非法
+            # -> nonce错误 -> 锚点不可用 -> 签名格式错误 -> 签名校验
+            # 失败），成功返回 None。不查询当前同步状态、不写状态、
+            # 历史或审计。
+            receipt_fields = (
+                "issuer_did",
+                "credential_id",
+                "status",
+                "reason",
+                "updated_at",
+                "issuer_key_version",
+                "verifier_did",
+                "verifier_key_version",
+                "nonce",
+            )
+            # 阶段一：回执结构——恰为九键对象，字段类型与状态取值沿用
+            # /v1/trust/credential-status/receipt 公开协议；提交键序不
+            # 影响验真（验签前规范化）。
+            if not isinstance(receipt, dict) or set(receipt) != set(
+                receipt_fields
+            ):
+                return "回执非法"
+            for field in (
+                "issuer_did",
+                "credential_id",
+                "status",
+                "updated_at",
+                "verifier_did",
+            ):
+                if not isinstance(receipt[field], str) or not receipt[field]:
+                    return "回执非法"
+            if receipt["status"] not in (
+                "active",
+                "revoked",
+                "unknown",
+                "suspended",
+            ):
+                return "回执非法"
+            updated_at = receipt["updated_at"]
+            if not _UTC_Z_QUERY_RE.match(updated_at):
+                return "回执非法"
+            try:
+                datetime.strptime(
+                    updated_at, "%Y-%m-%dT%H:%M:%SZ"
+                ).replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                return "回执非法"
+            # reason：同步记录无值时为 null（suspended 在同步协议下必有
+            # 裁剪后 1..256 码点原因，故 null 与带首尾空白均不可能）；
+            # 其余为非空字符串（非 suspended 状态按原文保存，不设长度
+            # 上限）。
+            reason_value = receipt["reason"]
+            if reason_value is None:
+                if receipt["status"] == "suspended":
+                    return "回执非法"
+            else:
+                if not isinstance(reason_value, str) or not reason_value:
+                    return "回执非法"
+                if receipt["status"] == "suspended" and (
+                    reason_value != reason_value.strip()
+                    or not 1 <= len(reason_value) <= 256
+                ):
+                    return "回执非法"
+            for field in ("issuer_key_version", "verifier_key_version"):
+                version = receipt[field]
+                if (
+                    not isinstance(version, int)
+                    or isinstance(version, bool)
+                    or version < 1
+                ):
+                    return "回执非法"
+            receipt_nonce = receipt["nonce"]
+            if (
+                not isinstance(receipt_nonce, str)
+                or not 1 <= len(receipt_nonce) <= 256
+            ):
+                return "回执非法"
+
+            # 阶段二：内外两处 nonce 相等。
+            if receipt_nonce != nonce:
+                return "nonce错误"
+
+            # 阶段三：本租户同 verifier_did/版本且含 status 用途的
+            # active 锚点。不查询当前同步状态。
+            public_pem = store.get_active_trust_anchor_public_key(
+                tenant,
+                receipt["verifier_did"],
+                receipt["verifier_key_version"],
+                required_use="status",
+            )
+            if public_pem is None:
+                return "锚点不可用"
+            try:
+                crypto.validate_public_key_pem(public_pem)
+            except (ValueError, TypeError):
+                return "锚点不可用"
+
+            # 阶段四：签名格式（ES256 64 字节裸 R||S 无填充 base64url）。
+            try:
+                crypto.validate_signature_format_strict(signature)
+            except crypto.MalformedSignature:
+                return "签名格式错误"
+
+            # 阶段五：密码学验签——签名覆盖完整 receipt 的递归键升序
+            # 紧凑 UTF-8 JSON（与提交键序无关）。
+            try:
+                crypto.verify(receipt, signature, public_pem)
+            except crypto.MalformedSignature:
+                return "签名格式错误"
+            except crypto.InvalidSignature:
+                return "签名校验失败"
+            except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露细节
+                return "签名校验失败"
+            return None
 
         def _get_trust_credential_status(
             self, tenant: str, credential_id: str, query: str
