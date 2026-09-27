@@ -117,6 +117,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   GET  /v1/trust/credential-status/receipt/consumptions/export  确定性 NDJSON 导出凭证状态回执消费历史（快照续传，只读）
   GET  /v1/trust/credential-status/receipt/consumptions/manifest 凭证状态回执消费历史导出清单（签名摘要，只读）
   POST /v1/trust/credential-status/receipt/consumptions/manifest/verify 校验凭证状态回执消费历史清单与 NDJSON 内容（只读）
+  POST /v1/trust/credential-status/receipt/consumptions/manifest/verify-batch 批量校验清单与 NDJSON（批初锚点快照、逐项不短路，只读）
   GET  /v1/trust/credential-status/{id}   查询已同步的外部凭证状态
   GET  /v1/trust/credential-status/{id}/history  查询外部凭证状态历史（只读）
   GET  /v1/audit                          查询本租户审计事件
@@ -836,6 +837,14 @@ def build_handler(store: VCStore) -> type:
                     "/manifest/verify"
                 ):
                     self._post_trust_credential_status_receipt_consumptions_manifest_verify(
+                        tenant
+                    )
+                elif (
+                    path
+                    == "/v1/trust/credential-status/receipt/consumptions"
+                    "/manifest/verify-batch"
+                ):
+                    self._post_trust_credential_status_receipt_consumptions_manifest_verify_batch(
                         tenant
                     )
                 else:
@@ -9966,12 +9975,19 @@ def build_handler(store: VCStore) -> type:
             self._send_json(200, {"valid": True})
 
         def _verify_credential_status_receipt_consumption_manifest_item(
-            self, tenant: str, manifest: Any, ndjson: str
+            self,
+            tenant: str,
+            manifest: Any,
+            ndjson: str,
+            anchor_keys: Optional[Dict[Tuple[str, int], str]] = None,
         ) -> Optional[str]:
             # 单项凭证状态回执消费历史清单验真：按序返回失败原因（清单
             # 非法 -> 锚点不可用 -> 签名格式错误 -> 签名校验失败 ->
             # 导出内容不匹配），成功返回 None。锚点须为本租户同
             # did/版本 active 且含 status 用途。纯只读。
+            # anchor_keys 为批初原子快照（(signer_did, 版本) -> 公钥
+            # PEM，仅含 active 且含 status 用途的锚点）；缺省时逐项
+            # 实时查询本租户锚点。
             # 阶段一：清单结构（与验真回执消费历史清单同一结构校验）
             if not self._receipt_consumption_manifest_is_well_formed(manifest):
                 return "清单非法"
@@ -9980,9 +9996,12 @@ def build_handler(store: VCStore) -> type:
             key_version = manifest["key_version"]
 
             # 阶段二：本租户同 did/版本且含 status 用途的 active 信任锚点
-            public_pem = store.get_active_trust_anchor_public_key(
-                tenant, signer_did, key_version, required_use="status"
-            )
+            if anchor_keys is None:
+                public_pem = store.get_active_trust_anchor_public_key(
+                    tenant, signer_did, key_version, required_use="status"
+                )
+            else:
+                public_pem = anchor_keys.get((signer_did, key_version))
             if public_pem is None:
                 return "锚点不可用"
             try:
@@ -10030,6 +10049,87 @@ def build_handler(store: VCStore) -> type:
             ):
                 return "导出内容不匹配"
             return None
+
+        def _post_trust_credential_status_receipt_consumptions_manifest_verify_batch(
+            self, tenant: str
+        ) -> None:
+            # POST /v1/trust/credential-status/receipt/consumptions/
+            # manifest/verify-batch：批量校验凭证状态回执消费历史清单
+            # 与 NDJSON（只读）。请求体须恰为 {"items": [项...]}，数组
+            # 限 1–100 项；空体、非法 JSON、非对象、键集错误、items
+            # 非数组/空/超限均 HTTP 200 且按键序恰返
+            # {"results": [], "reason": "请求非法"}。合法批次原子读取
+            # 批初本租户信任锚点快照，逐项不短路，results 等长同序；
+            # 并发吊销或用途收紧不得令同批观察到混合状态。每项须恰含
+            # manifest 对象与 ndjson 字符串，项结构或类型非法按“清单
+            # 非法”处理；其余逐项复用单项验真顺序与五类原因。成功项
+            # 仅 {"valid": true}，失败项键序 valid、reason。顶层
+            # HTTP 200 且仅含 results。不写状态、历史或审计。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except Exception:  # noqa: BLE001 请求非法统一 200 处理
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            if not raw:
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            if (
+                not isinstance(data, dict)
+                or set(data) != {"items"}
+                or not isinstance(data["items"], list)
+                or not data["items"]
+                or len(data["items"]) > 100
+            ):
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            items = data["items"]
+
+            # 批初原子快照：仅取 active 且含 status 用途的锚点，同批
+            # 各项据此解析，不受并发吊销/用途收紧影响。
+            snapshot = store.list_trust_anchor_snapshot(tenant)
+            anchor_keys = {
+                (row["did"], row["key_version"]): row["public_key"]
+                for row in snapshot
+                if row["status"] == "active" and "status" in row["uses"]
+            }
+
+            results: List[Dict[str, Any]] = []
+            for item in items:  # 顺序校验，失败不短路
+                if (
+                    not isinstance(item, dict)
+                    or set(item) != {"manifest", "ndjson"}
+                    or not isinstance(item["manifest"], dict)
+                    or not isinstance(item["ndjson"], str)
+                ):
+                    results.append({"valid": False, "reason": "清单非法"})
+                    continue
+                reason = (
+                    self._verify_credential_status_receipt_consumption_manifest_item(
+                        tenant,
+                        item["manifest"],
+                        item["ndjson"],
+                        anchor_keys=anchor_keys,
+                    )
+                )
+                if reason is None:
+                    results.append({"valid": True})
+                else:
+                    results.append({"valid": False, "reason": reason})
+            self._send_json(200, {"results": results})
 
         def _get_trust_credential_status(
             self, tenant: str, credential_id: str, query: str
