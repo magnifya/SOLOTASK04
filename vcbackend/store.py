@@ -10151,6 +10151,53 @@ class VCStore:
             next_after = picked[-1]["cursor"] if picked else after
             return effective_at, picked, next_after
 
+    def get_trust_presentation_sync_receipt_data(
+        self,
+        tenant_id: str,
+        signer_did: str,
+    ) -> Tuple[int, List[TrustPresentationConsumptionEvent]]:
+        """原子读取某同步来源的检查点与全部已落盘事件（签名回执用）。
+
+        - 该签名方在本租户无同步检查点（从未接收非空页，含跨租户）时
+          抛 NotFoundError；
+        - 在同一把锁内取检查点 next_after（已落盘末行来源 cursor，
+          非负整数）与该签名方 cursor <= next_after 的全部事件，
+          按 cursor 升序返回 (next_after, events)。
+
+        纯只读：不推进检查点、不改判重索引、不修改任何状态、不记审计、
+        不触发落盘；重启后结果逐字节一致。
+        """
+        with self._lock:
+            checkpoints = self._presentation_sync_checkpoints.get(tenant_id)
+            cp = (
+                checkpoints.get(signer_did)
+                if checkpoints is not None
+                else None
+            )
+            if cp is None:
+                raise NotFoundError("资源不存在")
+            next_after = int(cp["after"])
+            bucket = self._bucket_locked(tenant_id)
+            rows: List[Dict[str, Any]] = []
+            if bucket is not None:
+                rows = bucket.get(
+                    "synced_trust_presentation_consumption_events", {}
+                ).get(signer_did, [])
+            events = [
+                TrustPresentationConsumptionEvent(
+                    cursor=int(row["cursor"]),
+                    consumption_id=row["consumption_id"],
+                    issuer_did=row["issuer_did"],
+                    presentation_id=row["presentation_id"],
+                    consumed_at=row["consumed_at"],
+                )
+                for row in sorted(
+                    rows, key=lambda item: int(item["cursor"])
+                )
+                if int(row["cursor"]) <= next_after
+            ]
+            return next_after, events
+
     def consume_credential_receipt(
         self,
         tenant_id: str,
