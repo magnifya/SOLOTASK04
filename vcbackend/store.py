@@ -11402,88 +11402,92 @@ class VCStore:
           synced_receipts 均相互独立；新行与本批、全部历史同步页或本地
           consume 记录重复均抛 ValidationError（导出内容非法）。
 
+        快照须在任何状态变更（含为新租户建桶、setdefault 建立的空映射）
+        之前取得：任何失败（冲突、内容非法、落盘失败）都连同本项新建的
+        空租户容器与空映射一并回滚，内存与重载状态均不残留半写结构。
+
         返回 (created, snapshot, next_after, count)，语义同普通回执同步。
         """
         with self._lock:
-            bucket = self._ensure_bucket_locked(tenant_id)
-            events_by_signer = bucket[
-                "synced_credential_status_receipt_consumption_events"
-            ].setdefault(signer_did, [])
-            checkpoints = (
-                self._credential_status_receipt_sync_checkpoints.setdefault(
-                    tenant_id, {}
-                )
-            )
-            cp = checkpoints.get(signer_did)
-
-            # ---- 检查点游标规则（非法一律 ConflictError）----
-            if cp is None:
-                if after != 0:
-                    raise ConflictError("同步游标冲突")
-                covered_after = 0
-            elif snapshot < cp["snapshot"]:
-                # 旧快照
-                raise ConflictError("同步游标冲突")
-            elif snapshot == cp["snapshot"]:
-                if after > cp["after"]:
-                    # 跳页：声称的进度超过已落盘进度
-                    raise ConflictError("同步游标冲突")
-                covered_after = cp["after"]
-            else:
-                # 新快照：必须旧快照已追平且 after 衔接旧 snapshot
-                if cp["after"] != cp["snapshot"] or after != cp["snapshot"]:
-                    raise ConflictError("同步游标冲突")
-                covered_after = cp["after"]
-
-            # ---- 行游标：窗口 + 同位内容比对 + 新区稠密连续 ----
-            stored_by_cursor = {
-                int(row["cursor"]): row for row in events_by_signer
-            }
-            new_rows: List[Dict[str, Any]] = []
-            expected_new_cursor = covered_after + 1
-            for row in events:
-                cursor = int(row["cursor"])
-                if cursor <= after or cursor > snapshot:
-                    # 窗口外（调用方已先校验，此处兜底）
-                    raise ValidationError("导出内容非法")
-                if cursor <= covered_after:
-                    stored = stored_by_cursor.get(cursor)
-                    if stored is None or stored != row:
-                        # 同位异内容（或同位行缺失）
-                        raise ConflictError("同步游标冲突")
-                else:
-                    if cursor != expected_new_cursor:
-                        raise ConflictError("同步游标冲突")
-                    expected_new_cursor += 1
-                    new_rows.append(row)
-
-            # ---- 新行 (verifier_did, nonce) 唯一性：批内 + 全部历史 ----
-            local_consumed = bucket.get(
-                "consumed_credential_status_receipts", {}
-            )
-            synced_index = bucket.setdefault(
-                "synced_credential_status_receipts", {}
-            )
-            seen_in_batch: set = set()
-            for row in new_rows:
-                key = (row["verifier_did"], row["nonce"])
-                if key in seen_in_batch:
-                    raise ValidationError("导出内容非法")
-                seen_in_batch.add(key)
-                if (
-                    key[0] in local_consumed
-                    and key[1] in local_consumed[key[0]]
-                ):
-                    raise ValidationError("导出内容非法")
-                if (
-                    key[0] in synced_index
-                    and key[1] in synced_index[key[0]]
-                ):
-                    raise ValidationError("导出内容非法")
-
-            created = cp is None
             mem_snapshot = self._snapshot_locked()
             try:
+                bucket = self._ensure_bucket_locked(tenant_id)
+                events_by_signer = bucket[
+                    "synced_credential_status_receipt_consumption_events"
+                ].setdefault(signer_did, [])
+                checkpoints = (
+                    self._credential_status_receipt_sync_checkpoints.setdefault(
+                        tenant_id, {}
+                    )
+                )
+                cp = checkpoints.get(signer_did)
+
+                # ---- 检查点游标规则（非法一律 ConflictError）----
+                if cp is None:
+                    if after != 0:
+                        raise ConflictError("同步游标冲突")
+                    covered_after = 0
+                elif snapshot < cp["snapshot"]:
+                    # 旧快照
+                    raise ConflictError("同步游标冲突")
+                elif snapshot == cp["snapshot"]:
+                    if after > cp["after"]:
+                        # 跳页：声称的进度超过已落盘进度
+                        raise ConflictError("同步游标冲突")
+                    covered_after = cp["after"]
+                else:
+                    # 新快照：必须旧快照已追平且 after 衔接旧 snapshot
+                    if cp["after"] != cp["snapshot"] or after != cp["snapshot"]:
+                        raise ConflictError("同步游标冲突")
+                    covered_after = cp["after"]
+
+                # ---- 行游标：窗口 + 同位内容比对 + 新区稠密连续 ----
+                stored_by_cursor = {
+                    int(row["cursor"]): row for row in events_by_signer
+                }
+                new_rows: List[Dict[str, Any]] = []
+                expected_new_cursor = covered_after + 1
+                for row in events:
+                    cursor = int(row["cursor"])
+                    if cursor <= after or cursor > snapshot:
+                        # 窗口外（调用方已先校验，此处兜底）
+                        raise ValidationError("导出内容非法")
+                    if cursor <= covered_after:
+                        stored = stored_by_cursor.get(cursor)
+                        if stored is None or stored != row:
+                            # 同位异内容（或同位行缺失）
+                            raise ConflictError("同步游标冲突")
+                    else:
+                        if cursor != expected_new_cursor:
+                            raise ConflictError("同步游标冲突")
+                        expected_new_cursor += 1
+                        new_rows.append(row)
+
+                # ---- 新行 (verifier_did, nonce) 唯一性：批内 + 全部历史 ----
+                local_consumed = bucket.get(
+                    "consumed_credential_status_receipts", {}
+                )
+                synced_index = bucket.setdefault(
+                    "synced_credential_status_receipts", {}
+                )
+                seen_in_batch: set = set()
+                for row in new_rows:
+                    key = (row["verifier_did"], row["nonce"])
+                    if key in seen_in_batch:
+                        raise ValidationError("导出内容非法")
+                    seen_in_batch.add(key)
+                    if (
+                        key[0] in local_consumed
+                        and key[1] in local_consumed[key[0]]
+                    ):
+                        raise ValidationError("导出内容非法")
+                    if (
+                        key[0] in synced_index
+                        and key[1] in synced_index[key[0]]
+                    ):
+                        raise ValidationError("导出内容非法")
+
+                created = cp is None
                 for row in new_rows:
                     events_by_signer.append(dict(row))
                     synced_index.setdefault(row["verifier_did"], {})[
@@ -11499,7 +11503,13 @@ class VCStore:
                     "snapshot": snapshot,
                     "after": max(covered_after, next_after),
                 }
-                self._save_locked()
+                try:
+                    self._save_locked()
+                except Exception as exc:
+                    raise StorageError("存储失败") from exc
+            except (ConflictError, ValidationError, StorageError):
+                self._restore_locked(mem_snapshot)
+                raise
             except Exception as exc:
                 self._restore_locked(mem_snapshot)
                 raise StorageError("存储失败") from exc
