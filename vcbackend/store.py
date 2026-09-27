@@ -11402,19 +11402,36 @@ class VCStore:
           synced_receipts 均相互独立；新行与本批、全部历史同步页或本地
           consume 记录重复均抛 ValidationError（导出内容非法）。
 
+        全部游标与判重校验均为只读，不创建租户桶或检查点容器；内存快照
+        先于任何变更，落盘失败连同空租户容器一并回滚（内存与重载状态
+        一致，重试从原游标继续）。
+
         返回 (created, snapshot, next_after, count)，语义同普通回执同步。
         """
         with self._lock:
-            bucket = self._ensure_bucket_locked(tenant_id)
-            events_by_signer = bucket[
-                "synced_credential_status_receipt_consumption_events"
-            ].setdefault(signer_did, [])
-            checkpoints = (
-                self._credential_status_receipt_sync_checkpoints.setdefault(
-                    tenant_id, {}
+            # ---- 只读阶段：不创建租户桶或任何容器 ----
+            existing_bucket = self._bucket_locked(tenant_id)
+            events_container = (
+                existing_bucket.get(
+                    "synced_credential_status_receipt_consumption_events",
+                    {},
+                )
+                if existing_bucket is not None
+                else {}
+            )
+            if not isinstance(events_container, dict):
+                events_container = {}
+            events_by_signer_read = events_container.get(signer_did)
+            checkpoints_read = (
+                self._credential_status_receipt_sync_checkpoints.get(
+                    tenant_id
                 )
             )
-            cp = checkpoints.get(signer_did)
+            cp = (
+                checkpoints_read.get(signer_did)
+                if checkpoints_read is not None
+                else None
+            )
 
             # ---- 检查点游标规则（非法一律 ConflictError）----
             if cp is None:
@@ -11436,9 +11453,14 @@ class VCStore:
                 covered_after = cp["after"]
 
             # ---- 行游标：窗口 + 同位内容比对 + 新区稠密连续 ----
-            stored_by_cursor = {
-                int(row["cursor"]): row for row in events_by_signer
-            }
+            stored_by_cursor = (
+                {
+                    int(row["cursor"]): row
+                    for row in events_by_signer_read
+                }
+                if events_by_signer_read
+                else {}
+            )
             new_rows: List[Dict[str, Any]] = []
             expected_new_cursor = covered_after + 1
             for row in events:
@@ -11458,11 +11480,19 @@ class VCStore:
                     new_rows.append(row)
 
             # ---- 新行 (verifier_did, nonce) 唯一性：批内 + 全部历史 ----
-            local_consumed = bucket.get(
-                "consumed_credential_status_receipts", {}
+            local_consumed = (
+                existing_bucket.get(
+                    "consumed_credential_status_receipts", {}
+                )
+                if existing_bucket is not None
+                else {}
             )
-            synced_index = bucket.setdefault(
-                "synced_credential_status_receipts", {}
+            synced_index_read = (
+                existing_bucket.get(
+                    "synced_credential_status_receipts", {}
+                )
+                if existing_bucket is not None
+                else {}
             )
             seen_in_batch: set = set()
             for row in new_rows:
@@ -11476,14 +11506,28 @@ class VCStore:
                 ):
                     raise ValidationError("导出内容非法")
                 if (
-                    key[0] in synced_index
-                    and key[1] in synced_index[key[0]]
+                    key[0] in synced_index_read
+                    and key[1] in synced_index_read[key[0]]
                 ):
                     raise ValidationError("导出内容非法")
 
             created = cp is None
+            # 快照须先于任何内存变更：落盘失败时检查点、同步行、判重
+            # 索引乃至首次创建的空租户容器均恢复到调用前状态。
             mem_snapshot = self._snapshot_locked()
             try:
+                bucket = self._ensure_bucket_locked(tenant_id)
+                events_by_signer = bucket[
+                    "synced_credential_status_receipt_consumption_events"
+                ].setdefault(signer_did, [])
+                synced_index = bucket.setdefault(
+                    "synced_credential_status_receipts", {}
+                )
+                checkpoints = (
+                    self._credential_status_receipt_sync_checkpoints.setdefault(
+                        tenant_id, {}
+                    )
+                )
                 for row in new_rows:
                     events_by_signer.append(dict(row))
                     synced_index.setdefault(row["verifier_did"], {})[
