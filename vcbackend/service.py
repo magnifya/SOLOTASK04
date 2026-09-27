@@ -5274,9 +5274,10 @@ def build_handler(store: VCStore) -> type:
             # 凭证字段、锚点、签名覆盖、格式、验签、期限、校验顺序及
             # 原因完全沿用 verify-synced，原验真失败不查状态；验真成功
             # 后以请求初始一次原子读取的本租户状态快照查
-            # (issuer_did, credential_id)：未同步、revoked、unknown
-            # 依次为“外部凭证状态未同步”“外部凭证已吊销：<reason>”
-            # （空或缺失 reason 用“未知原因”）“外部凭证状态未知”，
+            # (issuer_did, credential_id)：未同步、revoked、suspended、
+            # unknown 依次为“外部凭证状态未同步”“外部凭证已吊销：
+            # <reason>”（空或缺失 reason 用“未知原因”）“外部凭证已
+            # 暂停：<reason>”“外部凭证状态未知”，
             # active 成功；成功仅 {"valid":true}。纯只读：不改同步页、
             # 检查点、锚点、凭证、状态或审计，重启一致；租户头缺省
             # default、显式空 400 并隔离。
@@ -5420,9 +5421,10 @@ def build_handler(store: VCStore) -> type:
             # verify-synced-batch 的凭证字段、版本兼容、cursor<=at 末
             # 锚点、签名、期限、顺序及原因；验真通过后按 (issuer_did,
             # credential_id) 查批初原子读取的本租户状态快照：未同步、
-            # revoked、unknown 分别返“外部凭证状态未同步”“外部凭证已
-            # 吊销：<reason>”（空原因用“未知原因”）“外部凭证状态未
-            # 知”，active 成功。成功项仅 {"valid":true}，失败项键序
+            # revoked、suspended、unknown 分别返“外部凭证状态未同步”
+            # “外部凭证已吊销：<reason>”（空原因用“未知原因”）“外部
+            # 凭证已暂停：<reason>”“外部凭证状态未知”，active 成功。
+            # 成功项仅 {"valid":true}，失败项键序
             # valid、reason。纯只读：不写状态或审计；租户头缺省
             # default、显式空 400 并隔离。
             try:
@@ -7499,7 +7501,8 @@ def build_handler(store: VCStore) -> type:
             # {"valid":false,"reason":...}；重验成功后查同步状态——未同步
             # “外部凭证状态未同步”，active 仅 {"valid":true}，revoked 为
             # “外部凭证已吊销：<reason>”（空或缺失 reason 固定“未知原因”），
-            # unknown 为“外部凭证状态未知”。失败响应键序固定 valid、reason。
+            # suspended 为“外部凭证已暂停：<reason>”，unknown 为
+            # “外部凭证状态未知”。失败响应键序固定 valid、reason。
             # 纯只读，不写记录、状态、历史或审计。
             if not credential_id:
                 raise ValidationError("路径缺少 credential_id")
@@ -7982,9 +7985,10 @@ def build_handler(store: VCStore) -> type:
             # 挑战、签发锚点/格式/验签、持有者锚点/格式/验签、期限；
             # 原验真失败不查状态；验真成功后以请求初始一次原子读取的
             # 本租户状态快照查演示的 (issuer_did, credential_id)：未
-            # 同步、revoked、unknown 依次为“外部凭证状态未同步”
-            # “外部凭证已吊销：<reason>”（空或缺失 reason 用“未知
-            # 原因”）“外部凭证状态未知”，active 成功；成功仅
+            # 同步、revoked、suspended、unknown 依次为“外部凭证状态
+            # 未同步”“外部凭证已吊销：<reason>”（空或缺失 reason 用
+            # “未知原因”）“外部凭证已暂停：<reason>”“外部凭证状态
+            # 未知”，active 成功；成功仅
             # {"valid":true}。纯只读：不改同步页、检查点、锚点、演示、
             # 状态或审计，重启一致；租户头缺省 default、显式空 400 并
             # 隔离。
@@ -8142,9 +8146,10 @@ def build_handler(store: VCStore) -> type:
             # verify-synced-batch 的 holder_* 禁令、挑战、cursor<=at 末
             # 锚点、proof 覆盖、签名格式、验签、期限、顺序及原因；验真
             # 通过后按演示的 (issuer_did, credential_id) 查批初原子
-            # 读取的本租户状态快照：未同步、revoked、unknown 分别返
-            # “外部凭证状态未同步”“外部凭证已吊销：<reason>”（空原因
-            # 用“未知原因”）“外部凭证状态未知”，active 成功。成功项
+            # 读取的本租户状态快照：未同步、revoked、suspended、unknown
+            # 分别返“外部凭证状态未同步”“外部凭证已吊销：<reason>”（空
+            # 原因用“未知原因”）“外部凭证已暂停：<reason>”“外部凭证
+            # 状态未知”，active 成功。成功项
             # 仅 {"valid":true}，失败项键序 valid、reason。纯只读：不
             # 写状态或审计；租户头缺省 default、显式空 400 并隔离。
             try:
@@ -8495,9 +8500,10 @@ def build_handler(store: VCStore) -> type:
             # 挑战、锚点、签名覆盖、格式、验签、期限、校验顺序及原因
             # 完全沿用 verify-synced，原验真失败不查状态；验真成功后
             # 以请求初始一次原子读取的本租户状态快照查证明的
-            # (issuer_did, credential_id)：未同步、revoked、unknown
-            # 依次为“外部凭证状态未同步”“外部凭证已吊销：<reason>”
-            # （空或缺失 reason 用“未知原因”）“外部凭证状态未知”，
+            # (issuer_did, credential_id)：未同步、revoked、suspended、
+            # unknown 依次为“外部凭证状态未同步”“外部凭证已吊销：
+            # <reason>”（空或缺失 reason 用“未知原因”）“外部凭证已
+            # 暂停：<reason>”“外部凭证状态未知”，
             # active 成功；成功仅 {"valid":true}。纯只读：不改同步页、
             # 检查点、锚点、证明、状态或审计，重启一致；租户头缺省
             # default、显式空 400 并隔离。
@@ -8650,9 +8656,10 @@ def build_handler(store: VCStore) -> type:
             # RFC6901 路径、挑战、cursor<=at 末锚点、签名覆盖、格式、
             # 验签、期限、顺序及原因；验真通过后按证明的
             # (issuer_did, credential_id) 查批初原子读取的本租户状态
-            # 快照：未同步、revoked、unknown 分别返“外部凭证状态未
-            # 同步”“外部凭证已吊销：<reason>”（空或缺失 reason 用
-            # “未知原因”）“外部凭证状态未知”，active 成功。成功项仅
+            # 快照：未同步、revoked、suspended、unknown 分别返“外部
+            # 凭证状态未同步”“外部凭证已吊销：<reason>”（空或缺失
+            # reason 用“未知原因”）“外部凭证已暂停：<reason>”“外部
+            # 凭证状态未知”，active 成功。成功项仅
             # {"valid":true}，失败项键序 valid、reason。纯只读：不写
             # 同步页、检查点、锚点、证明、状态或审计；租户头缺省
             # default、显式空 400 并隔离。

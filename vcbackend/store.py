@@ -4633,7 +4633,9 @@ class VCStore:
         - 验真通过后按 ``(issuer_did, credential_id)`` 查批初状态
           快照：未同步（含属他租户）为“外部凭证状态未同步”，
           revoked 为“外部凭证已吊销：<保存的 reason>”（保存记录无
-          reason 时用“未知原因”），unknown 为“外部凭证状态未知”，
+          reason 时用“未知原因”），suspended 为
+          “外部凭证已暂停：<保存的 reason>”，unknown 为
+          “外部凭证状态未知”，
           active 判成功；
         - 成功项仅 ``{"valid": true}``，失败项键序为 valid、reason。
 
@@ -4682,8 +4684,16 @@ class VCStore:
                             False,
                             f"外部凭证已吊销：{saved_reason}",
                         )
+                    elif status == "suspended":
+                        saved_reason = row.get("reason")
+                        if not saved_reason:
+                            saved_reason = "未知原因"
+                        valid, reason = (
+                            False,
+                            f"外部凭证已暂停：{saved_reason}",
+                        )
                     elif status != "active":
-                        # status 仅可能为 active/revoked/unknown
+                        # status 仅可能为 active/revoked/unknown/suspended
                         # （同步入口已约束）。
                         valid, reason = False, "外部凭证状态未知"
             if valid:
@@ -4722,7 +4732,9 @@ class VCStore:
 
         未同步（含属他租户）为“外部凭证状态未同步”，revoked 为
         “外部凭证已吊销：<保存的 reason>”（保存记录无 reason 时用
-        “未知原因”），unknown 为“外部凭证状态未知”，active 判成功。
+        “未知原因”），suspended 为
+        “外部凭证已暂停：<保存的 reason>”，unknown 为
+        “外部凭证状态未知”，active 判成功。
         """
         row = status_rows.get(issuer_did, {}).get(credential_id)
         if row is None:
@@ -4735,7 +4747,12 @@ class VCStore:
             if not saved_reason:
                 saved_reason = "未知原因"
             return False, f"外部凭证已吊销：{saved_reason}"
-        # status 仅可能为 active/revoked/unknown（同步入口已约束）。
+        if status == "suspended":
+            saved_reason = row.get("reason")
+            if not saved_reason:
+                saved_reason = "未知原因"
+            return False, f"外部凭证已暂停：{saved_reason}"
+        # status 仅可能为 active/revoked/unknown/suspended（同步入口已约束）。
         return False, "外部凭证状态未知"
 
     def verify_trust_credential_synced_with_status(
@@ -4756,7 +4773,9 @@ class VCStore:
         查请求初始一次原子读取的本租户 ``credential_status_sync``
         状态快照：未同步（含属他租户）为“外部凭证状态未同步”，
         revoked 为“外部凭证已吊销：<保存的 reason>”（保存记录无
-        reason 时用“未知原因”），unknown 为“外部凭证状态未知”，
+        reason 时用“未知原因”），suspended 为
+        “外部凭证已暂停：<保存的 reason>”，unknown 为
+        “外部凭证状态未知”，
         active 判成功。
 
         纯只读：不改同步页、检查点、锚点、凭证、状态或审计，结论随
@@ -4792,6 +4811,7 @@ class VCStore:
           - active：``(True, "")``；
           - revoked：``(False, "外部凭证已吊销：<保存的 reason>")``，
             保存记录无 reason 时用“未知原因”；
+          - suspended：``(False, "外部凭证已暂停：<保存的 reason>")``；
           - unknown：``(False, "外部凭证状态未知")``。
 
         纯只读：不创建凭证、不修改本地状态、不写同步记录、不记审计。
@@ -4822,7 +4842,12 @@ class VCStore:
             if not saved_reason:
                 saved_reason = "未知原因"
             return False, f"外部凭证已吊销：{saved_reason}"
-        # status 仅可能为 active/revoked/unknown（同步入口已约束）。
+        if status == "suspended":
+            saved_reason = row.get("reason")
+            if not saved_reason:
+                saved_reason = "未知原因"
+            return False, f"外部凭证已暂停：{saved_reason}"
+        # status 仅可能为 active/revoked/unknown/suspended（同步入口已约束）。
         return False, "外部凭证状态未知"
 
     def verify_trust_credentials_batch(
@@ -5303,6 +5328,7 @@ class VCStore:
           - active：``(True, "")``；
           - revoked：``(False, "外部凭证已吊销：<保存的 reason>")``，
             保存记录无 reason 时用“未知原因”；
+          - suspended：``(False, "外部凭证已暂停：<保存的 reason>")``；
           - unknown：``(False, "外部凭证状态未知")``。
 
         纯只读：不消费、不登记任何资源、不写状态/历史/审计。
@@ -5335,7 +5361,12 @@ class VCStore:
             if not saved_reason:
                 saved_reason = "未知原因"
             return False, f"外部凭证已吊销：{saved_reason}"
-        # status 仅可能为 active/revoked/unknown（同步入口已约束）。
+        if status == "suspended":
+            saved_reason = row.get("reason")
+            if not saved_reason:
+                saved_reason = "未知原因"
+            return False, f"外部凭证已暂停：{saved_reason}"
+        # status 仅可能为 active/revoked/unknown/suspended（同步入口已约束）。
         return False, "外部凭证状态未知"
 
     def verify_trust_presentations_batch_with_status(
@@ -5698,7 +5729,9 @@ class VCStore:
         - 验真通过后按演示的 ``(issuer_did, credential_id)`` 查批初
           状态快照：未同步（含属他租户）为“外部凭证状态未同步”，
           revoked 为“外部凭证已吊销：<保存的 reason>”（保存记录无
-          reason 时用“未知原因”），unknown 为“外部凭证状态未知”，
+          reason 时用“未知原因”），suspended 为
+          “外部凭证已暂停：<保存的 reason>”，unknown 为
+          “外部凭证状态未知”，
           active 判成功；
         - 成功项仅 ``{"valid": true}``，失败项键序为 valid、reason。
 
@@ -5747,8 +5780,16 @@ class VCStore:
                             False,
                             f"外部凭证已吊销：{saved_reason}",
                         )
+                    elif status == "suspended":
+                        saved_reason = row.get("reason")
+                        if not saved_reason:
+                            saved_reason = "未知原因"
+                        valid, reason = (
+                            False,
+                            f"外部凭证已暂停：{saved_reason}",
+                        )
                     elif status != "active":
-                        # status 仅可能为 active/revoked/unknown
+                        # status 仅可能为 active/revoked/unknown/suspended
                         # （同步入口已约束）。
                         valid, reason = False, "外部凭证状态未知"
             if valid:
@@ -6308,7 +6349,9 @@ class VCStore:
         - 验真通过后按证明的 ``(issuer_did, credential_id)`` 查批初
           状态快照：未同步（含属他租户）为“外部凭证状态未同步”，
           revoked 为“外部凭证已吊销：<保存的 reason>”（保存记录无
-          reason 时用“未知原因”），unknown 为“外部凭证状态未知”，
+          reason 时用“未知原因”），suspended 为
+          “外部凭证已暂停：<保存的 reason>”，unknown 为
+          “外部凭证状态未知”，
           active 判成功；
         - 成功项仅 ``{"valid": true}``，失败项键序为 valid、reason。
 
@@ -6362,8 +6405,16 @@ class VCStore:
                             False,
                             f"外部凭证已吊销：{saved_reason}",
                         )
+                    elif status == "suspended":
+                        saved_reason = row.get("reason")
+                        if not saved_reason:
+                            saved_reason = "未知原因"
+                        valid, reason = (
+                            False,
+                            f"外部凭证已暂停：{saved_reason}",
+                        )
                     elif status != "active":
-                        # status 仅可能为 active/revoked/unknown
+                        # status 仅可能为 active/revoked/unknown/suspended
                         # （同步入口已约束）。
                         valid, reason = False, "外部凭证状态未知"
             if valid:
@@ -6392,7 +6443,9 @@ class VCStore:
         查请求初始一次原子读取的本租户 ``credential_status_sync``
         状态快照：未同步（含属他租户）为“外部凭证状态未同步”，
         revoked 为“外部凭证已吊销：<保存的 reason>”（保存记录无
-        reason 时用“未知原因”），unknown 为“外部凭证状态未知”，
+        reason 时用“未知原因”），suspended 为
+        “外部凭证已暂停：<保存的 reason>”，unknown 为
+        “外部凭证状态未知”，
         active 判成功。
 
         纯只读：不改同步页、检查点、锚点、证明、状态或审计，结论随
@@ -6426,6 +6479,7 @@ class VCStore:
           - active：``(True, "")``；
           - revoked：``(False, "外部凭证已吊销：<保存的 reason>")``，
             保存记录无 reason 时用“未知原因”；
+          - suspended：``(False, "外部凭证已暂停：<保存的 reason>")``；
           - unknown：``(False, "外部凭证状态未知")``。
 
         纯只读：不消费、不登记任何资源、不写状态/历史/审计。
@@ -6456,7 +6510,12 @@ class VCStore:
             if not saved_reason:
                 saved_reason = "未知原因"
             return False, f"外部凭证已吊销：{saved_reason}"
-        # status 仅可能为 active/revoked/unknown（同步入口已约束）。
+        if status == "suspended":
+            saved_reason = row.get("reason")
+            if not saved_reason:
+                saved_reason = "未知原因"
+            return False, f"外部凭证已暂停：{saved_reason}"
+        # status 仅可能为 active/revoked/unknown/suspended（同步入口已约束）。
         return False, "外部凭证状态未知"
 
     def verify_trust_proofs_batch(
@@ -8200,6 +8259,7 @@ class VCStore:
           - active：``(True, "")``；
           - revoked：``(False, "外部凭证已吊销：<保存的 reason>")``，
             保存记录无 reason 或 reason 为空串时用“未知原因”；
+          - suspended：``(False, "外部凭证已暂停：<保存的 reason>")``；
           - unknown：``(False, "外部凭证状态未知")``。
 
         纯只读：不写记录、状态、历史或审计，结论随状态文件跨重启稳定。
@@ -8229,7 +8289,12 @@ class VCStore:
             if not saved_reason:
                 saved_reason = "未知原因"
             return False, f"外部凭证已吊销：{saved_reason}"
-        # status 仅可能为 active/revoked/unknown（同步入口已约束）。
+        if status == "suspended":
+            saved_reason = row.get("reason")
+            if not saved_reason:
+                saved_reason = "未知原因"
+            return False, f"外部凭证已暂停：{saved_reason}"
+        # status 仅可能为 active/revoked/unknown/suspended（同步入口已约束）。
         return False, "外部凭证状态未知"
 
     def verify_imported_credentials_batch_with_status(
@@ -8259,6 +8324,7 @@ class VCStore:
           - active：(True, 200, None)；
           - revoked：(False, 200, "外部凭证已吊销：<保存 reason>")，
             reason 为空时用“未知原因”；
+          - suspended：(False, 200, "外部凭证已暂停：<保存 reason>")；
           - unknown：(False, 200, "外部凭证状态未知")。
         每项结果键序固定为 valid、http_status、reason。纯只读：不写
         记录、状态、历史或审计，结论随状态文件跨重启稳定。
@@ -8365,8 +8431,18 @@ class VCStore:
                         False, 200, f"外部凭证已吊销：{saved_reason}"
                     )
                 )
+            elif status == "suspended":
+                saved_reason = status_row.get("reason")
+                if not saved_reason:
+                    saved_reason = "未知原因"
+                results.append(
+                    item_result(
+                        False, 200, f"外部凭证已暂停：{saved_reason}"
+                    )
+                )
             else:
-                # status 仅可能为 active/revoked/unknown（同步入口已约束）。
+                # status 仅可能为 active/revoked/unknown/suspended
+                # （同步入口已约束）。
                 results.append(
                     item_result(False, 200, "外部凭证状态未知")
                 )
@@ -8383,10 +8459,14 @@ class VCStore:
         body 须恰含 issuer_did、credential_id、status、updated_at、
         issuer_key_version，并可选 reason：
           - issuer_did/credential_id/status/updated_at 为非空字符串；
-          - status 仅 active、revoked、unknown；
+          - status 仅 active、revoked、unknown、suspended；
           - issuer_key_version 为非布尔正整数；
           - updated_at 为 UTC 秒精度 Z 格式（YYYY-MM-DDTHH:MM:SSZ）；
-          - reason 提供时须为非空字符串。
+          - status 为 suspended 时 reason 必填：须为字符串且首尾裁剪后
+            为 1..256 个 Unicode 码点，否则抛 ValidationError（消息恰为
+            “非空中文原因”，HTTP 400 仅返 {"error":"非空中文原因"}）；
+            验签通过后保存裁剪值，重放/冲突判定以裁剪后内容为准；
+          - 其余 status 下 reason 提供时须为非空字符串（按原文保存）。
         任何请求/字段非法均抛 ValidationError（HTTP 400）。
 
         签名覆盖 body 的规范化 JSON，用本租户 (issuer_did,
@@ -8451,9 +8531,9 @@ class VCStore:
                 raise ValidationError(
                     f"body 字段 {name} 必须为非空字符串"
                 )
-        if status not in ("active", "revoked", "unknown"):
+        if status not in ("active", "revoked", "unknown", "suspended"):
             raise ValidationError(
-                "body 字段 status 仅支持 active、revoked、unknown"
+                "body 字段 status 仅支持 active、revoked、unknown、suspended"
             )
         if not isinstance(key_version, int) or isinstance(
             key_version, bool
@@ -8469,7 +8549,20 @@ class VCStore:
                 "（YYYY-MM-DDTHH:MM:SSZ）"
             )
         reason: Optional[str] = None
-        if "reason" in body:
+        if status == "suspended":
+            # suspended 的 reason 必填：须为字符串且首尾裁剪后为 1..256
+            # 个 Unicode 码点，否则单项 400 仅返 {"error":"非空中文原因"}
+            # （批量项按序收敛为 valid:false、http_status:400、同一中文
+            # reason），均不写入。签名仍覆盖请求提交的原始 body；验签
+            # 通过后保存裁剪值，重放/冲突判定也以裁剪后内容为准。
+            raw_reason = body.get("reason")
+            if not isinstance(raw_reason, str):
+                raise ValidationError("非空中文原因")
+            trimmed_reason = raw_reason.strip()
+            if not 1 <= len(trimmed_reason) <= 256:
+                raise ValidationError("非空中文原因")
+            reason = trimmed_reason
+        elif "reason" in body:
             reason = body["reason"]
             if not isinstance(reason, str) or not reason:
                 raise ValidationError("body 字段 reason 必须为非空字符串")
