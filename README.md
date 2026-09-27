@@ -111,6 +111,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/trust/credential-status/sync` | 外部凭证状态同步：请求体须恰含 `body`、`signature`，`body` 须恰含 `issuer_did`、`credential_id`、`status`、`updated_at`、`issuer_key_version`，可选 `reason`（`status` 为 `suspended` 时必填：字符串且首尾裁剪后 1–256 码点，非法 400 仅 `{"error":"非空中文原因"}`，验签后保存裁剪值）；请求/字段非法 400；锚点或签名失败 HTTP 200、`valid:false` 且不写入；首次同步 201、相同重放 200 不重复审计、严格更新替换、同时间不同内容 409 |
 | POST | `/v1/trust/credential-status/sync-batch` | 批量外部凭证状态同步：请求体须恰含 `items`（数组 1–100 项），逐项复用单项规则、失败不短路；请求级非法（缺失/非法 JSON/非对象/字段缺失多余/`items` 非数组·空·超限）返 HTTP 200 `{"results":[],"reason":"请求..."}`；失败项键序 `valid,http_status,reason`（字段错 400、同秒冲突 409、锚点/签名失败 200），成功项键序 `valid,http_status,issuer_did,credential_id,status,reason,updated_at,issuer_key_version`（首次 201、重放/更早 200、更晚 200 并记审计），`results` 与输入等长同序 |
 | POST | `/v1/trust/credential-status/receipt` | 凭证状态同步签名回执（只读）：请求体恰含 `issuer_did`、`credential_id`、`verifier_did`、`nonce`，均为非空字符串，`nonce` 限 1–256 码点；空体、非法 JSON、非对象、键集或类型非法均 **400** 仅 `{"error":"请求非法"}`；本租户未同步该凭证，或验证者未知（含跨租户）均 **404** 仅 `{"error":"资源不存在"}`，验证者停用 **409** 仅 `{"error":"验证者已停用"}`；成功 **200** 键序恰为 `receipt`、`signature`，`receipt` 键序恰为 `issuer_did`、`credential_id`、`status`、`reason`、`updated_at`、`issuer_key_version`、`verifier_did`、`verifier_key_version`、`nonce`，前六项取同步记录（`reason` 无值为 `null`），两版本为正整数（禁布尔）；`signature` 由验证者当前私钥按既有 ES256 生成 64 字节裸 `R||S` 无填充 base64url，覆盖 `receipt` 递归键升序紧凑 UTF-8 JSON；同锁快照状态及验证者版本、锁外签名，并发结果须全属写前或写后；接口只读、不写状态/历史/审计，`X-Tenant-ID` 缺省 `default`、显式空 400 并隔离，重启稳定 |
+| POST | `/v1/trust/credential-status/receipt/verify` | 验真既有凭证状态同步签名回执（只读）：请求体恰含 `receipt`（对象）、非空 `signature`、1–256 码点非空 `nonce`；空体、非法 JSON、非对象、键集或类型错误均 **400** 仅 `{"error":"请求非法"}`；`receipt` 须恰含 `POST /v1/trust/credential-status/receipt` 成功返回的九键（键出现顺序不影响验真），字段类型及 `status` 取值（`active`/`revoked`/`unknown`/`suspended`）沿用该公开协议（`updated_at` 为 UTC 秒精度 Z、两版本为禁布尔正整数、内层 `nonce` 同限 1–256 码点、`suspended` 的 `reason` 为裁剪后 1–256 码点非空串）；外层合法后任何失败均 **200**，按键序恰返 `valid`、`reason`，原因依次为“回执非法”“nonce错误”“锚点不可用”“签名格式错误”“签名校验失败”；锚点须为本租户同 `verifier_did`/版本且含 `status` 用途的 active 锚点；`signature` 须为 ES256 的 64 字节裸 `R||S` 无填充 base64url，覆盖完整 `receipt` 的递归键升序紧凑 UTF-8 JSON；成功仅 `{"valid":true}`；接口不查询当前同步状态、不写状态、历史或审计，`X-Tenant-ID` 缺省 `default`、显式空 400 并隔离，重启结论稳定 |
 | GET | `/v1/trust/credential-status/{credential_id}?issuer_did=...` | 查询已同步的外部凭证状态；`issuer_did` 须唯一非空；已同步返回 `status`、`reason`、`updated_at`，未同步（含他租户）404 |
 | GET | `/v1/trust/credential-status/{credential_id}/history?issuer_did=...&limit=&after=` | 只读查询外部凭证状态历史（兼容同步）；按 `updated_at` 升序、同值按 `cursor`；缺/重/空 `issuer_did` 400，`limit`/`after` 非法 400，未同步双键（含他租户）404 |
 | GET | `/v1/audit?limit=&after=` | 查询本租户审计事件，按 seq 升序；返回 `events`、`next_after`，参数校验见下文 |
@@ -1788,6 +1789,7 @@ python3 tests/trust_proof_verify_batch_test.py
 python3 tests/trust_credential_verify_with_status_test.py
 python3 tests/trust_credential_status_sync_test.py
 python3 tests/trust_credential_status_receipt_test.py
+python3 tests/trust_credential_status_receipt_verify_test.py
 python3 tests/trust_credential_status_history_test.py
 python3 tests/trust_credential_import_test.py
 python3 tests/trust_credential_imported_verify_test.py
