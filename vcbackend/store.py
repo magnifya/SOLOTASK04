@@ -46,6 +46,7 @@ from .models import (
     CredentialStatusRecord,
     CredentialStatusSyncRecord,
     CredentialStatusHistoryEvent,
+    CredentialStatusReceiptConsumptionEvent,
     DidDeactivationNoticeRecord,
     DidDeactivationEvent,
     ImportedCredentialRecord,
@@ -672,6 +673,11 @@ class VCStore:
             # 凭证状态同步签名回执一次性消费判重索引：
             # verifier_did -> nonce -> {receipt_id, consumed_at}
             bucket.setdefault("consumed_credential_status_receipts", {})
+            # 凭证状态同步签名回执消费历史：租户内跨验证者共享游标空间，
+            # 按首次消费追加顺序保存事件行。
+            bucket.setdefault(
+                "credential_status_receipt_consumption_events", []
+            )
             for rec in bucket["dids"].values():
                 _migrate_did_row(rec)
         # 外部凭证状态历史游标（租户内持久化正整数，按追加递增）。
@@ -854,6 +860,36 @@ class VCStore:
                 max_cursor = max(max_cursor, int(event.get("cursor", 0)))
             if max_cursor:
                 self._receipt_consumption_cursors[tenant_id] = max_cursor
+        # 凭证状态同步签名回执消费历史游标：按租户各自维护的持久化正
+        # 整数（tenant_id -> cursor），同一租户内跨验证者的首次消费事件
+        # 共享该游标空间，仅首次消费追加；与其他历史游标空间相互独立。
+        # 旧状态文件无该字段时，从各租户已有消费事件的最大 cursor 推导。
+        raw_status_receipt_cursors = data.get(
+            "credential_status_receipt_consumption_cursors", {}
+        )
+        self._credential_status_receipt_consumption_cursors: Dict[str, int] = (
+            {
+                str(tenant_id): int(cursor)
+                for tenant_id, cursor in raw_status_receipt_cursors.items()
+                if int(cursor) > 0
+            }
+            if isinstance(raw_status_receipt_cursors, dict)
+            else {}
+        )
+        for tenant_id, bucket in self._tenants.items():
+            max_cursor = (
+                self._credential_status_receipt_consumption_cursors.get(
+                    tenant_id, 0
+                )
+            )
+            for event in bucket.get(
+                "credential_status_receipt_consumption_events", []
+            ):
+                max_cursor = max(max_cursor, int(event.get("cursor", 0)))
+            if max_cursor:
+                self._credential_status_receipt_consumption_cursors[
+                    tenant_id
+                ] = max_cursor
         # 同步回执事件：按 (租户, signer_did) 分桶，每个签名者保存其来源
         # 导出游标空间内的事件行（按来源 cursor 升序），供续页/重放时做
         # 同位内容比对；另以租户全局 synced_receipts 索引 (verifier_did,
@@ -1027,6 +1063,10 @@ class VCStore:
         # (consumed_at, verifier_did, nonce) 升序稳定补录（内存态）；
         # 重启后 cursor 稳定。
         self._backfill_receipt_consumption_events_locked()
+        # 旧状态文件中已有凭证状态同步签名回执消费记录但无消费历史事件
+        # 的，按 (consumed_at, verifier_did, nonce) 升序稳定补录（内存
+        # 态）；重启后 cursor 稳定。
+        self._backfill_credential_status_receipt_consumption_events_locked()
 
     def _save_locked(self) -> None:
         directory = os.path.dirname(os.path.abspath(self.path))
@@ -1052,6 +1092,9 @@ class VCStore:
             ),
             "trust_anchor_change_cursors": self._trust_anchor_change_cursors,
             "receipt_consumption_cursors": self._receipt_consumption_cursors,
+            "credential_status_receipt_consumption_cursors": (
+                self._credential_status_receipt_consumption_cursors
+            ),
             "receipt_sync_checkpoints": self._receipt_sync_checkpoints,
             "presentation_sync_checkpoints": (
                 self._presentation_sync_checkpoints
@@ -1081,6 +1124,7 @@ class VCStore:
                 self._did_deactivation_event_cursors,
                 self._trust_anchor_change_cursors,
                 self._receipt_consumption_cursors,
+                self._credential_status_receipt_consumption_cursors,
                 self._receipt_sync_checkpoints,
                 self._presentation_sync_checkpoints,
                 self._anchor_changes_sync_checkpoints,
@@ -1102,6 +1146,7 @@ class VCStore:
             did_deactivation_event_cursors,
             trust_anchor_change_cursors,
             receipt_consumption_cursors,
+            credential_status_receipt_consumption_cursors,
             receipt_sync_checkpoints,
             presentation_sync_checkpoints,
             anchor_changes_sync_checkpoints,
@@ -1164,6 +1209,7 @@ class VCStore:
                 "consumed_trust_presentations": {},
                 "consumed_presentation_sync_receipts": {},
                 "consumed_credential_status_receipts": {},
+                "credential_status_receipt_consumption_events": [],
             }
             self._tenants[tenant_id] = bucket
         return bucket
@@ -9794,6 +9840,153 @@ class VCStore:
             next_after = picked[-1].cursor if picked else after
             return picked, next_after
 
+    def _next_credential_status_receipt_consumption_cursor_locked(
+        self, tenant_id: str
+    ) -> int:
+        """分配租户内下一个持久化凭证状态回执消费游标（正整数，按追加
+        递增）。"""
+        cursor = (
+            self._credential_status_receipt_consumption_cursors.get(
+                tenant_id, 0
+            )
+            + 1
+        )
+        self._credential_status_receipt_consumption_cursors[tenant_id] = (
+            cursor
+        )
+        return cursor
+
+    def _append_credential_status_receipt_consumption_event_locked(
+        self,
+        tenant_id: str,
+        verifier_did: str,
+        nonce: str,
+        receipt_id: str,
+        consumed_at: str,
+    ) -> None:
+        """在锁内追加一条凭证状态回执消费历史事件（须与消费记录、审计
+        同一次原子写落盘）。cursor 为租户内跨验证者的持久递增正整数。"""
+        bucket = self._ensure_bucket_locked(tenant_id)
+        bucket[
+            "credential_status_receipt_consumption_events"
+        ].append(
+            {
+                "cursor":
+                    self._next_credential_status_receipt_consumption_cursor_locked(
+                        tenant_id
+                    ),
+                "receipt_id": receipt_id,
+                "verifier_did": verifier_did,
+                "nonce": nonce,
+                "consumed_at": consumed_at,
+            }
+        )
+
+    def _backfill_credential_status_receipt_consumption_events_locked(
+        self,
+    ) -> None:
+        """加载迁移：为缺消费历史的旧凭证状态回执消费记录稳定补录
+        （内存态）。
+
+        对每个租户遍历已持久化的 consumed_credential_status_receipts，
+        将尚无对应消费历史事件的记录按
+        (consumed_at, verifier_did, nonce) 升序稳定补录，cursor 为该
+        租户内新分配的持久化正整数。仅在内存中补录：随下一次原子写
+        一并落盘；即使加载后无写操作，重启时也按相同顺序重建为相同
+        cursor。
+        """
+        for tenant_id in sorted(self._tenants):
+            bucket = self._tenants[tenant_id]
+            events = bucket.setdefault(
+                "credential_status_receipt_consumption_events", []
+            )
+            existing = {
+                (
+                    event.get("verifier_did"),
+                    event.get("nonce"),
+                )
+                for event in events
+            }
+            missing: List[Tuple[str, str, str, Dict[str, Any]]] = []
+            for verifier_did, by_nonce in bucket.get(
+                "consumed_credential_status_receipts", {}
+            ).items():
+                for nonce, row in by_nonce.items():
+                    if (verifier_did, nonce) in existing:
+                        continue
+                    missing.append(
+                        (
+                            row.get("consumed_at") or "",
+                            verifier_did,
+                            nonce,
+                            row,
+                        )
+                    )
+            missing.sort(key=lambda item: (item[0], item[1], item[2]))
+            for _, verifier_did, nonce, row in missing:
+                events.append(
+                    {
+                        "cursor": (
+                            self._next_credential_status_receipt_consumption_cursor_locked(
+                                tenant_id
+                            )
+                        ),
+                        "receipt_id": row.get("receipt_id", ""),
+                        "verifier_did": verifier_did,
+                        "nonce": nonce,
+                        "consumed_at": row.get("consumed_at") or "",
+                    }
+                )
+            events.sort(key=lambda event: int(event.get("cursor", 0)))
+
+    def list_credential_status_receipt_consumptions(
+        self,
+        tenant_id: str,
+        after: int = 0,
+        limit: int = 50,
+        verifier_did: Optional[str] = None,
+    ) -> Tuple[List[CredentialStatusReceiptConsumptionEvent], int]:
+        """只读分页查询本租户凭证状态同步签名回执消费历史事件。
+
+        - 先按 verifier_did 精确过滤（未提供时不过滤）；
+        - 再按 cursor > after 升序取至多 limit 项；
+        - next_after 为本页末项 cursor，空页保持 after。
+        纯只读：不修改任何状态、不记审计、不触发落盘。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            entries: List[Dict[str, Any]] = []
+            if bucket is not None:
+                entries = list(
+                    bucket.get(
+                        "credential_status_receipt_consumption_events", []
+                    )
+                )
+            entries.sort(key=lambda event: int(event.get("cursor", 0)))
+            picked: List[CredentialStatusReceiptConsumptionEvent] = []
+            for row in entries:
+                if (
+                    verifier_did is not None
+                    and row.get("verifier_did") != verifier_did
+                ):
+                    continue
+                cursor = int(row["cursor"])
+                if cursor <= after:
+                    continue
+                if len(picked) >= limit:
+                    break
+                picked.append(
+                    CredentialStatusReceiptConsumptionEvent(
+                        cursor=cursor,
+                        receipt_id=row["receipt_id"],
+                        verifier_did=row["verifier_did"],
+                        nonce=row["nonce"],
+                        consumed_at=row["consumed_at"],
+                    )
+                )
+            next_after = picked[-1].cursor if picked else after
+            return picked, next_after
+
     def export_receipt_consumption_events(
         self,
         tenant_id: str,
@@ -10553,10 +10746,11 @@ class VCStore:
         - 首次消费：记录 consumed_at（UTC 秒精度 Z）并追加一条
           trust.credential.status.receipt.consumed 审计
           （resource_type 为 credential_status_receipt、resource_id
-          为 receipt_id），二者同一次原子写落盘，返回
+          为 receipt_id），同时追加一条消费历史事件（租户内跨验证者的
+          持久递增 cursor），三者同一次原子写落盘，返回
           (True, consumed_at)；并发仅一次成功，跨重启保留；
-        - 落盘失败：回滚内存中的消费标记与审计事件，抛 StorageError
-          （可重试）。
+        - 落盘失败：回滚内存中的消费标记、历史事件与审计事件，抛
+          StorageError（可重试）。
         """
         with self._lock:
             bucket = self._bucket_locked(tenant_id)
@@ -10579,6 +10773,9 @@ class VCStore:
                     "receipt_id": receipt_id,
                     "consumed_at": consumed_at,
                 }
+                self._append_credential_status_receipt_consumption_event_locked(
+                    tenant_id, verifier_did, nonce, receipt_id, consumed_at
+                )
                 self._append_audit_locked(
                     tenant_id,
                     AUDIT_TRUST_CREDENTIAL_STATUS_RECEIPT_CONSUMED,
@@ -10606,9 +10803,11 @@ class VCStore:
         - 首次消费：记录 consumed_at（UTC 秒精度 Z）并追加一条
           trust.credential.status.receipt.consumed 审计（resource_type
           为 credential_status_receipt、resource_id 为 receipt_id），
+          同时追加一条消费历史事件（租户内跨验证者的持久递增 cursor），
           该项返回 (True, consumed_at)；
-        - 本批全部新消费与审计在同一次原子写落盘；落盘失败回滚内存中
-          的全部消费标记与审计事件，抛 StorageError（可重试）；
+        - 本批全部新消费、消费历史与审计在同一次原子写落盘；落盘失败
+          回滚内存中的全部消费标记、历史事件与审计事件，抛 StorageError
+          （可重试）；
         - 与单条 consume 并发时每键仅一次成功，跨重启保留。
         """
         with self._lock:
@@ -10636,6 +10835,9 @@ class VCStore:
                         "receipt_id": receipt_id,
                         "consumed_at": consumed_at,
                     }
+                    self._append_credential_status_receipt_consumption_event_locked(
+                        tenant_id, verifier_did, nonce, receipt_id, consumed_at
+                    )
                     self._append_audit_locked(
                         tenant_id,
                         AUDIT_TRUST_CREDENTIAL_STATUS_RECEIPT_CONSUMED,
