@@ -10086,6 +10086,71 @@ class VCStore:
                 raise StorageError("存储失败") from exc
             return created, snapshot, next_after, len(events)
 
+    def list_presentation_sync_history(
+        self,
+        tenant_id: str,
+        signer_did: str,
+        at: Optional[int] = None,
+        after: int = 0,
+        limit: int = 50,
+    ) -> Tuple[int, List[Dict[str, Any]], int]:
+        """只读查询某签名方已同步外部演示消费事件在 at 时点的历史。
+
+        - 该签名方在本租户无同步检查点（从未接收非空页，含跨租户）时
+          抛 NotFoundError；
+        - at 为 None 时取检查点 next_after；生效 at 超过检查点抛
+          ConflictError；after 大于生效 at 抛 ValidationError；
+        - 以请求初原子快照中该 signer 全部落盘事件里 cursor<=at 的行
+          为准，按 cursor 升序取 cursor>after 的前 limit 项；每项键序
+          恰为 cursor、consumption_id、issuer_did、presentation_id、
+          consumed_at（cursor 为正整数，其余为非空字符串）；
+        - 返回 (at, events, next_after)：非空页 next_after 为末项
+          cursor，空页等于 after。
+
+        纯只读：不推进检查点、不改判重索引、不修改任何状态、不记审计、
+        不触发落盘；同一 at 的分页结果不受并发同步影响，重启逐字节
+        一致。
+        """
+        with self._lock:
+            checkpoints = self._presentation_sync_checkpoints.get(tenant_id)
+            cp = (
+                checkpoints.get(signer_did)
+                if checkpoints is not None
+                else None
+            )
+            if cp is None:
+                raise NotFoundError("该签名方尚未同步演示消费历史")
+            checkpoint = int(cp["after"])
+            effective_at = checkpoint if at is None else at
+            if effective_at > checkpoint:
+                raise ConflictError("查询时间点超过同步检查点")
+            if after > effective_at:
+                raise ValidationError("查询参数 after 不能大于 at")
+            bucket = self._bucket_locked(tenant_id)
+            rows: List[Dict[str, Any]] = []
+            if bucket is not None:
+                rows = bucket.get(
+                    "synced_trust_presentation_consumption_events", {}
+                ).get(signer_did, [])
+            picked: List[Dict[str, Any]] = []
+            for row in sorted(rows, key=lambda item: int(item["cursor"])):
+                cursor = int(row["cursor"])
+                if cursor > effective_at or cursor <= after:
+                    continue
+                if len(picked) >= limit:
+                    break
+                picked.append(
+                    {
+                        "cursor": cursor,
+                        "consumption_id": row["consumption_id"],
+                        "issuer_did": row["issuer_did"],
+                        "presentation_id": row["presentation_id"],
+                        "consumed_at": row["consumed_at"],
+                    }
+                )
+            next_after = picked[-1]["cursor"] if picked else after
+            return effective_at, picked, next_after
+
     def consume_credential_receipt(
         self,
         tenant_id: str,

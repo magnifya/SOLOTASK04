@@ -84,6 +84,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/presentations/consumptions/manifest/verify 校验外部演示消费历史清单与 NDJSON 内容（只读）
   POST /v1/trust/presentation-sync 同步外系统外部演示消费历史（清单验真、检查点防重放，原子落盘不审计）
   POST /v1/trust/presentation-sync-batch 批量同步外系统外部演示消费历史（逐项不短路，原子落盘不审计）
+  GET  /v1/trust/presentation-sync/history 查询已同步演示消费事件（?signer_did=&at=&limit=&after=，只读）
   POST /v1/trust/presentations/verify-synced  以同步锚点验真未绑定外部演示（只读）
   POST /v1/trust/presentations/verify-synced-with-status  同步锚点验真未绑定/持有者绑定演示并合并请求初始状态快照（只读）
   POST /v1/trust/presentations/verify-synced-batch  批量以同步锚点快照验真未绑定演示（只读）
@@ -936,6 +937,10 @@ def build_handler(store: VCStore) -> type:
                     )
                 elif path == "/v1/trust/presentations/consumptions":
                     self._get_trust_presentation_consumptions(
+                        tenant, parsed.query
+                    )
+                elif path == "/v1/trust/presentation-sync/history":
+                    self._get_trust_presentation_sync_history(
                         tenant, parsed.query
                     )
                 elif (
@@ -6152,6 +6157,103 @@ def build_handler(store: VCStore) -> type:
                     "snapshot": effective_snapshot,
                     "next_after": next_after,
                     "count": count,
+                },
+            )
+
+        def _get_trust_presentation_sync_history(
+            self, tenant: str, query: str
+        ) -> None:
+            # GET /v1/trust/presentation-sync/history：只读查询某签名方
+            # 已同步落盘的跨系统外部演示消费事件。
+            # 查询参数仅允许 signer_did、at、limit、after 且均只能出现
+            # 一次：signer_did 必填非空；at 缺省取该签名方同步检查点
+            # next_after、须为 ASCII 非负整数；limit 缺省 50、限
+            # 1..200 的 ASCII 十进制整数；after 缺省 0、须为 ASCII 非
+            # 负整数。空值、未知、重复、格式或范围非法及 after>at 均
+            # 400 且仅 {"error":"请求非法"}；来源未同步（含跨租户）
+            # 404 仅 {"error":"同步来源不存在"}；at 超检查点 409 仅
+            # {"error":"同步游标冲突"}。
+            # 200 键序恰为 signer_did、at、events、next_after；以请求
+            # 初原子快照中 cursor<=at 的事件，取 after<cursor 的前
+            # limit 项按 cursor 升序返回；事件键序恰为 cursor、
+            # consumption_id、issuer_did、presentation_id、
+            # consumed_at（cursor 正整数，余四个非空字符串，
+            # consumed_at 为 UTC 秒精度 Z）；非空页 next_after 为末项
+            # cursor，空页等于 after。纯只读：不推进检查点、不改判重
+            # 索引或审计；at 分页不受并发影响，重启稳定。
+            params = parse_qs(query, keep_blank_values=True)
+            allowed = {"signer_did", "at", "limit", "after"}
+            if set(params) - allowed:
+                self._send_error(400, "请求非法")
+                return
+
+            def _single(name: str) -> Optional[str]:
+                values = params.get(name)
+                if values is None:
+                    return None
+                if len(values) != 1:
+                    raise ValidationError("请求非法")
+                return values[0]
+
+            try:
+                signer_did = _single("signer_did")
+                if signer_did is None or not signer_did:
+                    self._send_error(400, "请求非法")
+                    return
+
+                at_raw = _single("at")
+                at = (
+                    _parse_nonneg_int(at_raw, "at")
+                    if at_raw is not None
+                    else None
+                )
+
+                limit_raw = _single("limit")
+                if limit_raw is not None:
+                    limit = _parse_nonneg_int(limit_raw, "limit")
+                    if not 1 <= limit <= 200:
+                        self._send_error(400, "请求非法")
+                        return
+                else:
+                    limit = 50
+
+                after_raw = _single("after")
+                after = (
+                    _parse_nonneg_int(after_raw, "after")
+                    if after_raw is not None
+                    else 0
+                )
+
+                if at is not None and after > at:
+                    self._send_error(400, "请求非法")
+                    return
+            except ValidationError:
+                self._send_error(400, "请求非法")
+                return
+
+            try:
+                at_value, events, next_after = (
+                    store.list_presentation_sync_history(
+                        tenant, signer_did, at, after, limit
+                    )
+                )
+            except NotFoundError:
+                self._send_error(404, "同步来源不存在")
+                return
+            except ConflictError:
+                self._send_error(409, "同步游标冲突")
+                return
+            except ValidationError:
+                # at 缺省时取检查点：after 超过生效 at 同属非法请求。
+                self._send_error(400, "请求非法")
+                return
+            self._send_json(
+                200,
+                {
+                    "signer_did": signer_did,
+                    "at": at_value,
+                    "events": events,
+                    "next_after": next_after,
                 },
             )
 
