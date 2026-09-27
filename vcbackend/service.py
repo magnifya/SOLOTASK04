@@ -13,6 +13,7 @@
   GET  /v1/dids/{did}/keys/revocations    查询 DID 密钥吊销历史（只读）
 GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（只读）
   POST /v1/credentials                    签发凭证
+  POST /v1/credentials/status-export      凭证状态签名发布（产出可直接提交状态批量同步的签名项，只读）
   GET  /v1/credentials/{credential_id}    查询凭证
   PUT  /v1/credentials/{credential_id}/status   登记 active（首次 201/重复 200）或暂停/恢复 suspended（200）
   GET  /v1/credentials/{credential_id}/status   查询状态（无状态按 active）
@@ -497,6 +498,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_dids(tenant)
                 elif path == "/v1/credentials":
                     self._post_credentials(tenant)
+                elif path == "/v1/credentials/status-export":
+                    self._post_credentials_status_export(tenant)
                 elif path.startswith("/v1/dids/") and path.endswith(
                     "/keys/rotate"
                 ):
@@ -1471,6 +1474,63 @@ def build_handler(store: VCStore) -> type:
                     "issuer_key_version": record.body["issuer_key_version"],
                 },
             )
+
+        def _post_credentials_status_export(self, tenant: str) -> None:
+            # POST /v1/credentials/status-export：新增凭证状态签名发布。
+            # 请求体恰为 {"credential_ids": [字符串...]}，数组 1..100 项，
+            # 值非空且不重复；结构、类型或数量非法一律 400 且恰返
+            # {"error":"请求非法"}。租户头沿用既有缺省、空值与隔离规则。
+            # 批初原子读取状态与密钥：任一凭证未知或跨租户 404（恰返
+            # {"error":"资源不存在"}），签发 DID 停用 409（恰返
+            # {"error":"签发DID已停用"}），均整批失败。成功 200 仅返
+            # {"items":[...]}，与输入等长同序，项键序 body、signature，
+            # body 键序 issuer_did、credential_id、status、updated_at、
+            # issuer_key_version（suspended/revoked 末加 reason）。签名
+            # 可直接提交 /v1/trust/credential-status/sync-batch。接口纯
+            # 只读：不写状态、历史或审计。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                self._send_json(400, {"error": "请求非法"})
+                return
+            if not raw:
+                self._send_json(400, {"error": "请求非法"})
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send_json(400, {"error": "请求非法"})
+                return
+            invalid = (
+                not isinstance(data, dict)
+                or set(data) != {"credential_ids"}
+                or not isinstance(data.get("credential_ids"), list)
+                or not 1 <= len(data["credential_ids"]) <= 100
+                or not all(
+                    isinstance(value, str) and value != ""
+                    for value in data["credential_ids"]
+                )
+                or len(set(data["credential_ids"]))
+                != len(data["credential_ids"])
+            )
+            if invalid:
+                self._send_json(400, {"error": "请求非法"})
+                return
+
+            try:
+                items = store.export_credential_statuses(
+                    tenant, list(data["credential_ids"])
+                )
+            except NotFoundError:
+                # 任一凭证未知或跨租户：存在性不可探测，整批失败。
+                self._send_json(404, {"error": "资源不存在"})
+                return
+            except ConflictError:
+                # 任一签发 DID 已生命周期停用：整批失败。
+                self._send_json(409, {"error": "签发DID已停用"})
+                return
+            self._send_json(200, {"items": items})
 
         def _get_credential(self, tenant: str, credential_id: str) -> None:
             record = store.get_credential(tenant, credential_id)

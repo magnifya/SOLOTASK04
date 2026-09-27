@@ -3656,6 +3656,97 @@ class VCStore:
                 revoked_at=now,
             )
 
+    def export_credential_statuses(
+        self,
+        tenant_id: str,
+        credential_ids: List[str],
+    ) -> List[Dict[str, Any]]:
+        """批量导出发往外部状态同步接口的本租户凭证状态签名（只读）。
+
+        ``credential_ids`` 须为已由服务层校验的 1..100 项非空、不重复
+        字符串。批初在同一把锁内一次性原子读取全部凭证状态行与各签发
+        DID 的当前密钥版本/当前私钥，随后在锁内完成签名：并发的状态
+        变更、吊销、轮换或停用均不得使同一批观察到混合时点。
+
+        每项返回 ``{"body": ..., "signature": ...}``：
+          - body 键序恰为 issuer_did、credential_id、status、updated_at、
+            issuer_key_version，status 为 suspended/revoked 时末尾加
+            reason（保存的暂停/吊销原因）；
+          - 未登记状态按 active，updated_at 取凭证正文 issued_at；其余
+            取当前状态、status_updated_at 与保存原因；
+          - issuer_key_version 取签发 DID 当前密钥版本；
+          - signature 按既有状态同步协议（ES256 裸 R||S 无填充
+            base64url，覆盖 body 递归键升序紧凑 UTF-8 JSON）以签发 DID
+            当前版本私钥签署，产出可直接提交
+            /v1/trust/credential-status/sync(-batch)。
+
+        任一凭证未知或属他租户抛 NotFoundError（404，整批失败，先于
+        停用判定）；任一签发 DID 已生命周期停用抛 ConflictError（409，
+        整批失败）。纯只读：不写状态、状态历史、凭证历史或审计，不触发
+        落盘。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            credentials = (
+                bucket["credentials"] if bucket is not None else {}
+            )
+            # 404 优先：批内任一凭证未知或跨租户，整批失败。
+            rows: List[Dict[str, Any]] = []
+            for credential_id in credential_ids:
+                rec = credentials.get(credential_id)
+                if rec is None:
+                    raise NotFoundError(f"凭证不存在: {credential_id}")
+                rows.append(rec)
+
+            # 同一签发 DID 仅解析一次当前版本与当前私钥；签发 DID 已停用
+            # 时 _active_did_signer_locked 抛 ConflictError（409）。
+            issuer_material: Dict[str, Tuple[int, str]] = {}
+            items: List[Dict[str, Any]] = []
+            for credential_id, rec in zip(credential_ids, rows):
+                stored_body = rec["body"]
+                issuer_did = stored_body["issuer_did"]
+                material = issuer_material.get(issuer_did)
+                if material is None:
+                    material = self._active_did_signer_locked(
+                        bucket, issuer_did
+                    )
+                    issuer_material[issuer_did] = material
+                key_version, private_pem = material
+
+                current_status = rec.get("status")
+                if current_status is None:
+                    # 未登记状态按 active，updated_at 取签发时间。
+                    status = "active"
+                    updated_at = stored_body["issued_at"]
+                    reason: Optional[str] = None
+                else:
+                    status = current_status
+                    updated_at = rec.get("status_updated_at")
+                    if status == "suspended":
+                        reason = rec.get("suspend_reason")
+                    elif status == "revoked":
+                        reason = rec.get("revoke_reason")
+                    else:
+                        reason = None
+
+                body: Dict[str, Any] = {
+                    "issuer_did": issuer_did,
+                    "credential_id": credential_id,
+                    "status": status,
+                    "updated_at": updated_at,
+                    "issuer_key_version": key_version,
+                }
+                # suspended/revoked 在末尾追加保存原因；active 不带 reason。
+                if status in ("suspended", "revoked"):
+                    body["reason"] = reason
+                items.append(
+                    {
+                        "body": body,
+                        "signature": crypto.sign(body, private_pem),
+                    }
+                )
+            return items
+
     def verify_credential(
         self,
         tenant_id: str,
