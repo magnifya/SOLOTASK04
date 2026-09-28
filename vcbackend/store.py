@@ -206,6 +206,9 @@ AUDIT_TRUST_PRESENTATION_SYNC_RECEIPT_CONSUMED = (
 AUDIT_TRUST_CREDENTIAL_STATUS_RECEIPT_CONSUMED = (
     "trust.credential.status.receipt.consumed"
 )
+AUDIT_TRUST_CREDENTIAL_STATUS_SYNC_RECEIPT_CONSUMED = (
+    "trust.credential.status.sync.receipt.consumed"
+)
 
 # 信任锚点用途历史事件动作名（区别于审计动作名）：
 # 新版本注册/轮换分别追加 registered/rotated（from_uses 为 None），实际
@@ -681,6 +684,12 @@ class VCStore:
             # 凭证状态同步签名回执一次性消费判重索引：
             # verifier_did -> nonce -> {receipt_id, consumed_at}
             bucket.setdefault("consumed_credential_status_receipts", {})
+            # 凭证状态回执消费同步进度签名回执一次性消费判重索引：
+            # verifier_did -> nonce -> {receipt_id, consumed_at}。与
+            # consumed_credential_status_receipts 相互独立。
+            bucket.setdefault(
+                "consumed_credential_status_sync_receipts", {}
+            )
             # 凭证状态同步签名回执消费历史（租户内跨验证者递增 cursor）。
             bucket.setdefault(
                 "credential_status_receipt_consumption_events", []
@@ -1282,6 +1291,7 @@ class VCStore:
                 "consumed_trust_presentations": {},
                 "consumed_presentation_sync_receipts": {},
                 "consumed_credential_status_receipts": {},
+                "consumed_credential_status_sync_receipts": {},
                 "credential_status_receipt_consumption_events": [],
             }
             self._tenants[tenant_id] = bucket
@@ -10947,6 +10957,64 @@ class VCStore:
                     tenant_id,
                     AUDIT_TRUST_CREDENTIAL_STATUS_RECEIPT_CONSUMED,
                     "credential_status_receipt",
+                    receipt_id,
+                )
+                self._save_locked()
+            except Exception as exc:
+                self._restore_locked(snapshot)
+                raise StorageError("存储失败") from exc
+            return True, consumed_at
+
+    def consume_credential_status_sync_receipt(
+        self,
+        tenant_id: str,
+        verifier_did: str,
+        nonce: str,
+        receipt_id: str,
+    ) -> Tuple[bool, Optional[str]]:
+        """按 (verifier_did, nonce) 一次性消费凭证状态回执消费同步进度
+        签名回执（credential-status/receipt-sync/receipt）。
+
+        与 consume_presentation_sync_receipt 协议一致，但使用独立状态
+        空间（consumed_credential_status_sync_receipts 桶），与
+        consumed_credential_status_receipts（普通凭证状态同步回执消费）
+        及 synced_credential_status_receipts（回执消费历史同步判重）
+        均相互独立。调用方须先完成回执验真（六阶段全部通过）。本方法
+        在锁内原子判定并标记：
+        - 同键已消费：返回 (False, None)，不写状态、不记审计；
+        - 首次消费：记录 consumed_at（UTC 秒精度 Z）并追加一条
+          trust.credential.status.sync.receipt.consumed 审计
+          （resource_type 为 credential_status_sync_receipt、
+          resource_id 为 receipt_id），二者同一次原子写落盘，返回
+          (True, consumed_at)；并发仅一次成功，跨重启保留；
+        - 落盘失败：回滚内存中的消费标记与审计事件，抛 StorageError
+          （可重试）。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            by_verifier = (
+                bucket["consumed_credential_status_sync_receipts"].get(
+                    verifier_did
+                )
+                if bucket is not None
+                else None
+            )
+            if by_verifier is not None and nonce in by_verifier:
+                return False, None
+            bucket = self._ensure_bucket_locked(tenant_id)
+            snapshot = self._snapshot_locked()
+            try:
+                consumed_at = _utc_now()
+                bucket[
+                    "consumed_credential_status_sync_receipts"
+                ].setdefault(verifier_did, {})[nonce] = {
+                    "receipt_id": receipt_id,
+                    "consumed_at": consumed_at,
+                }
+                self._append_audit_locked(
+                    tenant_id,
+                    AUDIT_TRUST_CREDENTIAL_STATUS_SYNC_RECEIPT_CONSUMED,
+                    "credential_status_sync_receipt",
                     receipt_id,
                 )
                 self._save_locked()
