@@ -121,6 +121,8 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/credential-status/receipt-sync 同步外系统凭证状态回执消费历史（status 用途清单验真、检查点防重放，原子落盘不审计）
   POST /v1/trust/credential-status/receipt-sync-batch 批量同步外系统凭证状态回执消费历史（逐项不短路，原子落盘不审计）
   GET  /v1/trust/credential-status/receipt-sync/history 查询已同步凭证状态回执消费事件时点页（?signer_did=&at=&limit=&after=，只读）
+  GET  /v1/trust/credential-status/receipt-sync/receipt 凭证状态回执消费同步进度签名回执（?signer_did=&verifier_did=&nonce=，只读）
+  POST /v1/trust/credential-status/receipt-sync/receipt/verify 验真凭证状态回执消费同步进度签名回执（只读）
   GET  /v1/trust/credential-status/{id}   查询已同步的外部凭证状态
   GET  /v1/trust/credential-status/{id}/history  查询外部凭证状态历史（只读）
   GET  /v1/audit                          查询本租户审计事件
@@ -854,6 +856,14 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_credential_status_receipt_sync(tenant)
                 elif (
                     path
+                    == "/v1/trust/credential-status/receipt-sync/receipt"
+                    "/verify"
+                ):
+                    self._post_trust_credential_status_receipt_sync_receipt_verify(
+                        tenant
+                    )
+                elif (
+                    path
                     == "/v1/trust/credential-status/receipt-sync-batch"
                 ):
                     self._post_trust_credential_status_receipt_sync_batch(
@@ -1044,6 +1054,13 @@ def build_handler(store: VCStore) -> type:
                     == "/v1/trust/credential-status/receipt-sync/history"
                 ):
                     self._get_trust_credential_status_receipt_sync_history(
+                        tenant, parsed.query
+                    )
+                elif (
+                    path
+                    == "/v1/trust/credential-status/receipt-sync/receipt"
+                ):
+                    self._get_trust_credential_status_receipt_sync_receipt(
                         tenant, parsed.query
                     )
                 elif (
@@ -3601,12 +3618,15 @@ def build_handler(store: VCStore) -> type:
             ndjson: str,
             nonce: str,
             anchor_keys: Optional[Dict[Tuple[str, int], str]] = None,
+            required_use: str = "vp",
         ) -> Optional[str]:
             # 演示消费同步回执验真：按序返回失败原因（回执非法 ->
             # nonce 错误 -> 摘要错误 -> 锚点不可用 -> 签名格式错误 ->
             # 签名校验失败），成功返回 None。纯只读。anchor_keys 提供时
             # 为批初原子快照的 (did, key_version) -> 公钥 PEM 映射
-            # （仅 active 且含 vp 用途），否则按当前状态逐次查询。
+            # （仅 active 且含 required_use 用途），否则按当前状态逐次
+            # 查询。required_use 缺省 "vp"（演示消费）；凭证状态回执
+            # 消费同步进度回执验真传 "status"，其余协议逐字不变。
             # 阶段一：回执结构——键序恰为 signer_did、next_after、
             # digest、verifier_did、verifier_key_version、nonce；
             # DID 均非空串，next_after 非布尔非负整数，digest 为 64
@@ -3668,14 +3688,14 @@ def build_handler(store: VCStore) -> type:
             if hashlib.sha256(raw).hexdigest() != digest:
                 return "摘要错误"
 
-            # 阶段四：本租户同 verifier_did/版本且含 vp 用途的
-            # active 信任锚点（批量时取批初原子快照）。
+            # 阶段四：本租户同 verifier_did/版本且含 required_use 用途
+            # 的 active 信任锚点（批量时取批初原子快照）。
             if anchor_keys is None:
                 public_pem = store.get_active_trust_anchor_public_key(
                     tenant,
                     verifier_did,
                     verifier_key_version,
-                    required_use="vp",
+                    required_use=required_use,
                 )
             else:
                 public_pem = anchor_keys.get(
@@ -10491,6 +10511,121 @@ def build_handler(store: VCStore) -> type:
                     "next_after": next_after,
                 },
             )
+
+        def _get_trust_credential_status_receipt_sync_receipt(
+            self, tenant: str, query: str
+        ) -> None:
+            # GET /v1/trust/credential-status/receipt-sync/receipt：凭证
+            # 状态回执消费同步进度签名回执（纯只读），供接收方离线证明
+            # 来源检查点。
+            # 参数、请求键集、类型、状态码、键序、错误优先级、NDJSON、
+            # 规范化 JSON 与 ES256 协议完整复用
+            # GET /v1/trust/presentation-sync/receipt，仅状态空间与事件
+            # 五键不同：原子读取该来源凭证状态回执消费同步检查点及
+            # cursor<=next_after 的全部已落盘状态回执消费事件（按 cursor
+            # 升序），逐行沿用既有 receipt-sync history 五键（cursor、
+            # receipt_id、verifier_did、nonce、consumed_at）NDJSON 编码，
+            # digest 为行字节的 SHA-256 小写 64 位 hex。同步来源或验证
+            # 者 DID 不存在（含跨租户）404，验证者已停用 409。不推进
+            # 检查点、不写状态或审计；重启后 receipt 与 digest 相同且
+            # 签名可验。
+            try:
+                params = parse_qs(query, keep_blank_values=True)
+                allowed = {"signer_did", "verifier_did", "nonce"}
+                if set(params) - allowed:
+                    raise ValidationError("请求非法")
+
+                def _single(name: str) -> Optional[str]:
+                    values = params.get(name)
+                    if values is None:
+                        return None
+                    if len(values) != 1:
+                        raise ValidationError("请求非法")
+                    return values[0]
+
+                signer_did = _single("signer_did")
+                if signer_did is None or not signer_did:
+                    raise ValidationError("请求非法")
+                verifier_did = _single("verifier_did")
+                if verifier_did is None or not verifier_did:
+                    raise ValidationError("请求非法")
+                nonce = _single("nonce")
+                if nonce is None or not nonce:
+                    raise ValidationError("请求非法")
+                if not 1 <= len(nonce) <= 256:
+                    raise ValidationError("请求非法")
+            except ValidationError:
+                raise ValidationError("请求非法")
+
+            (
+                next_after,
+                events,
+                verifier_key_version,
+                verifier_private_pem,
+            ) = store.get_credential_status_receipt_sync_receipt_material(
+                tenant, signer_did, verifier_did
+            )
+
+            digest = hashlib.sha256(
+                _receipt_consumption_ndjson_bytes(events)
+            ).hexdigest()
+            receipt = {
+                "signer_did": signer_did,
+                "next_after": next_after,
+                "digest": digest,
+                "verifier_did": verifier_did,
+                "verifier_key_version": verifier_key_version,
+                "nonce": nonce,
+            }
+            signature = crypto.sign(receipt, verifier_private_pem)
+            self._send_json(200, {"receipt": receipt, "signature": signature})
+
+        def _post_trust_credential_status_receipt_sync_receipt_verify(
+            self, tenant: str
+        ) -> None:
+            # POST /v1/trust/credential-status/receipt-sync/receipt/verify：
+            # 验真凭证状态回执消费同步进度签名回执（纯只读）。
+            # 请求键集、类型、状态码、键序、错误优先级、NDJSON、规范化
+            # JSON 与 ES256 协议完整复用
+            # POST /v1/trust/presentation-sync/receipt/verify，唯一差异
+            # 为阶段四验真锚点用途：本租户同 verifier_did/版本的 active
+            # 信任锚点须含 status 用途（原接口为 vp）。失败原因及顺序
+            # 沿用原接口（回执非法 -> nonce 错误 -> 摘要错误 -> 锚点
+            # 不可用 -> 签名格式错误 -> 签名校验失败），成功仅
+            # {"valid":true}。不解析 ndjson，不写状态、游标或审计；
+            # 重启稳定。
+            try:
+                data = self._read_json()
+                if set(data) != {"receipt", "signature", "ndjson", "nonce"}:
+                    raise ValidationError("请求非法")
+                receipt = data["receipt"]
+                signature = data["signature"]
+                ndjson = data["ndjson"]
+                nonce = data["nonce"]
+                if not isinstance(receipt, dict):
+                    raise ValidationError("请求非法")
+                if not isinstance(signature, str) or not signature:
+                    raise ValidationError("请求非法")
+                if not isinstance(ndjson, str):
+                    raise ValidationError("请求非法")
+                if not isinstance(nonce, str) or not 1 <= len(nonce) <= 256:
+                    raise ValidationError("请求非法")
+            except (ValidationError, ValueError):
+                # ValueError：JSON 内超长十进制整数触发位数上限。
+                raise ValidationError("请求非法")
+
+            reason = self._verify_presentation_sync_receipt_item(
+                tenant,
+                receipt,
+                signature,
+                ndjson,
+                nonce,
+                required_use="status",
+            )
+            if reason is not None:
+                self._send_json(200, {"valid": False, "reason": reason})
+                return
+            self._send_json(200, {"valid": True})
 
         def _get_trust_credential_status(
             self, tenant: str, credential_id: str, query: str
