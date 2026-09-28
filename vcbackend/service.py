@@ -125,6 +125,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/credential-status/receipt-sync/receipt/verify 验真凭证状态回执消费同步进度签名回执（只读）
   POST /v1/trust/credential-status/receipt-sync/receipt/consume 一次性消费凭证状态回执消费同步进度签名回执（验真后按 (verifier_did, nonce) 持久化防重放，首次落盘并审计）
   POST /v1/trust/credential-status/receipt-sync/receipt/consume-batch 批量一次性消费凭证状态回执消费同步进度签名回执（逐项不短路，批内判重，整批原子落盘）
+  GET  /v1/trust/credential-status/receipt-sync/receipt/consumptions 查询凭证状态同步进度回执消费历史（?limit=&after=&verifier_did=，只读）
   GET  /v1/trust/credential-status/{id}   查询已同步的外部凭证状态
   GET  /v1/trust/credential-status/{id}/history  查询外部凭证状态历史（只读）
   GET  /v1/audit                          查询本租户审计事件
@@ -1084,6 +1085,14 @@ def build_handler(store: VCStore) -> type:
                     == "/v1/trust/credential-status/receipt-sync/receipt"
                 ):
                     self._get_trust_credential_status_receipt_sync_receipt(
+                        tenant, parsed.query
+                    )
+                elif (
+                    path
+                    == "/v1/trust/credential-status/receipt-sync/receipt"
+                    "/consumptions"
+                ):
+                    self._get_trust_credential_status_receipt_sync_receipt_consumptions(
                         tenant, parsed.query
                     )
                 elif (
@@ -10602,6 +10611,92 @@ def build_handler(store: VCStore) -> type:
             }
             signature = crypto.sign(receipt, verifier_private_pem)
             self._send_json(200, {"receipt": receipt, "signature": signature})
+
+        def _get_trust_credential_status_receipt_sync_receipt_consumptions(
+            self, tenant: str, query: str
+        ) -> None:
+            # GET /v1/trust/credential-status/receipt-sync/receipt/
+            # consumptions：只读查询本租户凭证状态回执消费同步进度签名
+            # 回执的消费历史。
+            # 查询参数仅允许 limit、after、verifier_did，且均只能出现
+            # 一次：
+            # - limit 缺省 50，须为 1..200 的非空 ASCII 十进制整数；
+            # - after 缺省 0，须为非空非负 ASCII 十进制整数；
+            # - verifier_did 可省略，提供时须为非空字符串（精确匹配）。
+            # 空值、重复、符号、小数、空白、布尔词、Unicode 数字、超长
+            # 整数、越界或未知参数一律 400 且仅返
+            # {"error":"请求非法"}。
+            # 先按 verifier_did 精确过滤，再取 cursor > after 的前
+            # limit 项并按 cursor 升序。200 键序恰为 events、next_after；
+            # 事件键序恰为 cursor、receipt_id、verifier_did、nonce、
+            # consumed_at（cursor 为正整数，其余四值为非空字符串，
+            # consumed_at 为 UTC 秒精度 Z）；空页 next_after 等于 after。
+            # cursor 为租户内跨验证者持久递增正整数，游标空间独立于
+            # 凭证状态同步签名回执消费历史；单条与批量首次消费时消费
+            # 记录、消费历史、游标与审计原子落盘，重放或验真失败不追加，
+            # 旧记录按 (consumed_at, verifier_did, nonce) 稳定补录、
+            # 重启游标不变。查询取原子快照，纯只读：不写状态或审计。
+            try:
+                params = parse_qs(query, keep_blank_values=True)
+                allowed = {"limit", "after", "verifier_did"}
+                if set(params) - allowed:
+                    raise ValidationError("未知查询参数")
+
+                def _single(name: str) -> Optional[str]:
+                    values = params.get(name)
+                    if values is None:
+                        return None
+                    if len(values) != 1:
+                        raise ValidationError("查询参数重复")
+                    return values[0]
+
+                limit_raw = _single("limit")
+                if limit_raw is not None:
+                    limit = _parse_nonneg_int(limit_raw, "limit")
+                    if not 1 <= limit <= 200:
+                        raise ValidationError("limit 越界")
+                else:
+                    limit = 50
+
+                after_raw = _single("after")
+                if after_raw is not None:
+                    after = _parse_nonneg_int(after_raw, "after")
+                else:
+                    after = 0
+
+                verifier_did = _single("verifier_did")
+                if verifier_did is not None and not verifier_did:
+                    raise ValidationError("verifier_did 为空")
+            except ValidationError:
+                raise ValidationError("请求非法")
+            except ValueError:
+                # 超长 ASCII 十进制串超出解释器整数串转换上限，按非法处理。
+                raise ValidationError("请求非法")
+
+            events, next_after = (
+                store.list_credential_status_sync_receipt_consumptions(
+                    tenant,
+                    after,
+                    limit,
+                    verifier_did=verifier_did,
+                )
+            )
+            self._send_json(
+                200,
+                {
+                    "events": [
+                        {
+                            "cursor": event.cursor,
+                            "receipt_id": event.receipt_id,
+                            "verifier_did": event.verifier_did,
+                            "nonce": event.nonce,
+                            "consumed_at": event.consumed_at,
+                        }
+                        for event in events
+                    ],
+                    "next_after": next_after,
+                },
+            )
 
         def _post_trust_credential_status_receipt_sync_receipt_verify(
             self, tenant: str

@@ -387,6 +387,28 @@ class CredentialStatusReceiptConsumptionEvent:
 
 
 @dataclass
+class CredentialStatusSyncReceiptConsumptionEvent:
+    """凭证状态回执消费同步进度签名回执消费历史中的一条事件（只读查询用）。
+
+    按租户归属、跨验证者共享游标：仅首次成功消费
+    credential-status/receipt-sync/receipt（单条或批量）时追加一条（与消费
+    记录及审计事件在同一次原子写中落盘），重放与验真失败不追加。
+    receipt_id 为完整 receipt 规范化 JSON 字节的 SHA-256 小写 64 位 hex；
+    verifier_did/nonce 为该消费的唯一键；consumed_at 为首次消费时间
+    （UTC ISO8601 秒精度 Z）。cursor 为租户内跨验证者持久递增正整数，
+    独立于其他历史游标空间（含凭证状态同步签名回执消费历史）。旧状态
+    文件中已消费但无消费历史的记录，加载时按
+    (consumed_at, verifier_did, nonce) 升序稳定补录，重启后 cursor 不变。
+    """
+
+    cursor: int
+    receipt_id: str
+    verifier_did: str
+    nonce: str
+    consumed_at: str
+
+
+@dataclass
 class TrustPresentationConsumptionEvent:
     """跨系统外部演示消费历史中的一条事件（只读消费历史查询用）。
 
