@@ -9254,6 +9254,158 @@ class VCStore:
             )
         return True, "", results
 
+    def verify_credential_status_batch(
+        self,
+        tenant_id: str,
+        data: Any,
+    ) -> Tuple[bool, str, List[Dict[str, Any]]]:
+        """只验真外部凭证状态签名声明（批量，纯只读）。
+
+        请求体须恰为 ``{"items": [项...]}``：数组非空且不超过 100 项。
+        请求级结构不合法（非对象、字段缺失或多余、items 非数组、空数组
+        或超过上限）时返回 ``(False, "请求非法", [])``，由调用方回
+        ``{"results": [], "reason": "请求非法"}``；请求级非法不读锚点。
+
+        请求级合法时，在批初同一次持锁原子取得本租户信任锚点快照，
+        整批共用同一份快照，按输入顺序逐项验真且失败不短路；批内即使
+        并发发生锚点吊销或 status 用途收紧，本批结论也全部取自批初
+        快照，不会混入不同锚点状态。
+
+        每项须恰含 body（JSON 对象）与 signature（非空字符串），否则
+        该项 ``{"valid": false, "reason": "请求项非法"}``。body 沿用
+        状态同步声明规则（必填 issuer_did、credential_id、status、
+        updated_at、issuer_key_version，可含 reason；status 仅
+        active/revoked/unknown/suspended；suspended 的 reason 裁剪后
+        须为 1..256 个 Unicode 码点且必填；其余状态提供 reason 时须为
+        非空字符串），任何字段缺失、类型或取值错误均为
+        “状态声明非法”。随后按批初快照解析 (issuer_did,
+        issuer_key_version) 锚点：缺失、已吊销或无 status 用途（含公钥
+        不可用）为“锚点不可用”；签名编码错误为“签名格式错误”；
+        密码学验签失败为“签名校验失败”。成功项仅 ``{"valid": true}``。
+
+        纯只读：不写任何状态、历史或审计，结论完全由持久化状态决定，
+        重启后同一批结论保持一致。results 与输入等长、同序。
+        """
+        if not isinstance(data, dict) or set(data) != {"items"}:
+            return False, "请求非法", []
+        items = data["items"]
+        if not isinstance(items, list) or not items or len(items) > 100:
+            return False, "请求非法", []
+
+        # 批初一次原子读取本租户信任锚点快照，整批共用：批内并发吊销
+        # 或用途收紧不影响本批，保证批内结论一致。
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            anchor_snapshot: Dict[str, Dict[str, Dict[str, Any]]] = {}
+            if bucket is not None:
+                for issuer, versions in (
+                    bucket.get("trust_anchors", {}).items()
+                ):
+                    anchor_snapshot[issuer] = {
+                        version: dict(row) for version, row in versions.items()
+                    }
+
+        results: List[Dict[str, Any]] = []
+        for item in items:  # 顺序处理，失败不短路
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"body", "signature"}
+                or not isinstance(item["body"], dict)
+                or not isinstance(item["signature"], str)
+                or not item["signature"]
+            ):
+                results.append(
+                    {"valid": False, "reason": "请求项非法"}
+                )
+                continue
+            reason = self._verify_credential_status_claim(
+                anchor_snapshot, item["body"], item["signature"]
+            )
+            if reason is None:
+                results.append({"valid": True})
+            else:
+                results.append({"valid": False, "reason": reason})
+        return True, "", results
+
+    @staticmethod
+    def _verify_credential_status_claim(
+        anchor_snapshot: Dict[str, Dict[str, Dict[str, Any]]],
+        body: Dict[str, Any],
+        signature: str,
+    ) -> Optional[str]:
+        """在批初锚点快照上验真一条状态声明（只读）。
+
+        成功返回 None；否则返回非空中文原因（“状态声明非法”/
+        “锚点不可用”/“签名格式错误”/“签名校验失败”）。字段校验
+        规则与 :meth:`sync_credential_status` 一致，但不做任何落盘。
+        """
+        required = (
+            "issuer_did",
+            "credential_id",
+            "status",
+            "updated_at",
+            "issuer_key_version",
+        )
+        if any(field not in body for field in required):
+            return "状态声明非法"
+        if set(body) - set(required) - {"reason"}:
+            return "状态声明非法"
+        issuer_did = body["issuer_did"]
+        credential_id = body["credential_id"]
+        status = body["status"]
+        updated_at = body["updated_at"]
+        key_version = body["issuer_key_version"]
+        for value in (issuer_did, credential_id, status, updated_at):
+            if not isinstance(value, str) or not value:
+                return "状态声明非法"
+        if status not in ("active", "revoked", "unknown", "suspended"):
+            return "状态声明非法"
+        if (
+            not isinstance(key_version, int)
+            or isinstance(key_version, bool)
+            or key_version < 1
+        ):
+            return "状态声明非法"
+        try:
+            _parse_utc_z(updated_at)
+        except (TypeError, ValueError):
+            return "状态声明非法"
+        if status == "suspended":
+            raw_reason = body.get("reason")
+            if not isinstance(raw_reason, str):
+                return "状态声明非法"
+            if not 1 <= len(raw_reason.strip()) <= 256:
+                return "状态声明非法"
+        elif "reason" in body:
+            if not isinstance(body["reason"], str) or not body["reason"]:
+                return "状态声明非法"
+
+        anchor_row = anchor_snapshot.get(issuer_did, {}).get(
+            str(key_version)
+        )
+        if anchor_row is None:
+            return "锚点不可用"
+        if anchor_row.get("status", "active") == "revoked":
+            return "锚点不可用"
+        anchor_uses = anchor_row.get("uses")
+        if anchor_uses is not None and "status" not in anchor_uses:
+            return "锚点不可用"
+        public_pem = anchor_row.get("public_key", "")
+        try:
+            crypto.validate_public_key_pem(public_pem)
+        except (ValueError, TypeError):
+            return "锚点不可用"
+
+        try:
+            crypto.verify(body, signature, public_pem)
+        except crypto.MalformedSignature:
+            return "签名格式错误"
+        except crypto.InvalidSignature:
+            return "签名校验失败"
+        except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
+            return "签名校验失败"
+        return None
+
     def get_synced_credential_status(
         self, tenant_id: str, issuer_did: str, credential_id: str
     ) -> CredentialStatusSyncRecord:
