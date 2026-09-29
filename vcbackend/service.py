@@ -24,6 +24,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/credentials/{credential_id}/present-batch 原子批量生成选择性披露演示
   POST /v1/presentations/{presentation_id}/verify  以存储记录为锚校验演示
   POST /v1/credentials/{credential_id}/prove    生成谓词证明
+  POST /v1/credentials/{credential_id}/prove-batch 原子批量生成谓词证明
   POST /v1/proofs/{proof_id}/verify             以存储记录为锚校验谓词证明
   POST /v1/trust/anchors                  注册信任锚点（同 DID/版本同 PEM 且 uses 相同幂等；可选 uses 用途白名单）
   GET  /v1/trust/anchor-changes           可签名信任锚点变更流（?after=&signer_did=，只读）
@@ -587,6 +588,13 @@ def build_handler(store: VCStore) -> type:
                         path[len("/v1/credentials/") : -len("/present-batch")]
                     )
                     self._post_present_batch(tenant, credential_id)
+                elif path.startswith("/v1/credentials/") and path.endswith(
+                    "/prove-batch"
+                ):
+                    credential_id = unquote(
+                        path[len("/v1/credentials/") : -len("/prove-batch")]
+                    )
+                    self._post_prove_batch(tenant, credential_id)
                 elif path.startswith("/v1/credentials/") and path.endswith(
                     "/prove"
                 ):
@@ -2189,18 +2197,119 @@ def build_handler(store: VCStore) -> type:
                 challenge=challenge,
                 expires_in=expires_in,
             )
+            self._send_json(201, self._proof_payload(record))
+
+        @staticmethod
+        def _proof_payload(record: Any) -> Dict[str, Any]:
+            """单条 prove 成功响应体（prove-batch 逐项复用同一结构）。"""
+            return {
+                "proof_id": record.proof_id,
+                "credential_id": record.credential_id,
+                "issuer_did": record.issuer_did,
+                "issuer_key_version": record.issuer_key_version,
+                "predicates": record.predicates,
+                "results": record.results,
+                "challenge": record.challenge,
+                "expires_at": record.expires_at,
+                "proof": record.proof,
+            }
+
+        def _validate_prove_item(
+            self, item: Any, index: int
+        ) -> Dict[str, Any]:
+            """校验单个谓词证明生成项，返回透传给 store 的关键字参数。
+
+            规则与单项 prove 完全一致：项须为对象，恰含 predicates 及
+            可选 challenge、expires_in；challenge 为非空字符串且按
+            Unicode 码点不超过 256；expires_in 为非布尔整数且在
+            1..86400。predicates 的谓词结构、路径、运算与数值语义由
+            store 结合凭证 claims 校验（单项内重复路径与祖先/后代重叠
+            拒绝，跨项互不约束）。index 为从 0 起的项序号，错误信息
+            带从 1 起的中文项号。
+            """
+            where = f"第 {index + 1} 项"
+            if not isinstance(item, dict):
+                raise ValidationError(f"{where}必须为 JSON 对象")
+            if "predicates" not in item:
+                raise ValidationError(f"{where}缺少字段: predicates")
+            extra = sorted(
+                set(item) - {"predicates", "challenge", "expires_in"}
+            )
+            if extra:
+                raise ValidationError(
+                    f"{where}含多余字段: {', '.join(extra)}"
+                )
+            kwargs: Dict[str, Any] = {"predicates": item["predicates"]}
+            if "challenge" in item:
+                challenge = item["challenge"]
+                if not isinstance(challenge, str) or not challenge:
+                    raise ValidationError(
+                        f"{where}字段 challenge 必须为非空字符串"
+                    )
+                if len(challenge) > 256:
+                    raise ValidationError(
+                        f"{where}字段 challenge 按 Unicode 码点不能超过 256"
+                    )
+                kwargs["challenge"] = challenge
+            if "expires_in" in item:
+                expires_in = item["expires_in"]
+                if not isinstance(expires_in, int) or isinstance(
+                    expires_in, bool
+                ):
+                    raise ValidationError(
+                        f"{where}字段 expires_in 必须为整数"
+                    )
+                if not 1 <= expires_in <= 86400:
+                    raise ValidationError(
+                        f"{where}字段 expires_in 须在 1 到 86400 之间"
+                    )
+                kwargs["expires_in"] = expires_in
+            return kwargs
+
+        def _post_prove_batch(
+            self, tenant: str, credential_id: str
+        ) -> None:
+            # 原子批量谓词证明：请求体须恰为 {"items": [项...]}，数组
+            # 非空且不超过 50 项。外层缺失/非数组/空/超限/多余字段、
+            # 项非对象、缺 predicates 或多余字段、challenge/expires_in
+            # 类型或范围非法一律 400 且不写入任何证明或审计；所有请求
+            # 项的结构校验先于凭证查询，未知或跨租户凭证 404；其后按
+            # 签发 DID 停用 409、签发密钥吊销 400、凭证暂停 409 的顺序
+            # 判定，任一项失败整体回滚，审计序号不前进。谓词结构、路
+            # 径、运算与数值由 store 结合 claims 逐项校验（单项内重复
+            # 路径与祖先重叠拒绝，跨项互不约束）。成功 201 仅返回
+            # {"proofs": [...]}，与输入等长、同序，每项即单条 prove 的
+            # 成功结果；全部记录与每条 proof.created 审计同一次原子提
+            # 交，落盘失败整体回滚并返回 500。
+            data = self._read_json()
+            if "items" not in data:
+                raise ValidationError("缺少字段: items")
+            extra = sorted(set(data) - {"items"})
+            if extra:
+                raise ValidationError(f"多余字段: {', '.join(extra)}")
+            items = data["items"]
+            if not isinstance(items, list):
+                raise ValidationError("字段 items 必须为数组")
+            if not items:
+                raise ValidationError("items 数组不能为空")
+            if len(items) > 50:
+                raise ValidationError(
+                    "items 数组不能超过 50 项"
+                    f"（当前 {len(items)} 项）"
+                )
+            kwargs_list = [
+                self._validate_prove_item(item, index)
+                for index, item in enumerate(items)
+            ]
+            records = store.create_proofs_batch(
+                tenant, credential_id, kwargs_list
+            )
             self._send_json(
                 201,
                 {
-                    "proof_id": record.proof_id,
-                    "credential_id": record.credential_id,
-                    "issuer_did": record.issuer_did,
-                    "issuer_key_version": record.issuer_key_version,
-                    "predicates": record.predicates,
-                    "results": record.results,
-                    "challenge": record.challenge,
-                    "expires_at": record.expires_at,
-                    "proof": record.proof,
+                    "proofs": [
+                        self._proof_payload(record) for record in records
+                    ]
                 },
             )
 
