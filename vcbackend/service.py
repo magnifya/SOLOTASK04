@@ -55,6 +55,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/credentials/receipt/verify  校验验真签名回执（只读）
   POST /v1/trust/credentials/receipt/consume  消费验真签名回执（防重放，首次落盘并审计）
   POST /v1/trust/credentials/receipt/consume-batch  批量消费验真签名回执（逐项不短路，防重放）
+  POST /v1/trust/credentials/receipt/verify-batch  批量校验验真签名回执（批初锚点快照、逐项不短路，只读不消费）
   GET  /v1/trust/credentials/receipt/consumptions  查询验真回执消费历史（只读）
   GET  /v1/trust/credentials/receipt/consumptions/export  确定性 NDJSON 导出回执消费历史（快照续传，只读）
   GET  /v1/trust/credentials/receipt/consumptions/manifest 回执消费历史导出清单（签名摘要，只读）
@@ -695,6 +696,13 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_credentials_receipt_consume(tenant)
                 elif path == "/v1/trust/credentials/receipt/consume-batch":
                     self._post_trust_credentials_receipt_consume_batch(
+                        tenant
+                    )
+                elif (
+                    path
+                    == "/v1/trust/credentials/receipt/verify-batch"
+                ):
+                    self._post_trust_credentials_receipt_verify_batch(
                         tenant
                     )
                 elif (
@@ -6269,6 +6277,93 @@ def build_handler(store: VCStore) -> type:
                         }
             self._send_json(200, {"results": results})
 
+        def _post_trust_credentials_receipt_verify_batch(
+            self, tenant: str
+        ) -> None:
+            # POST /v1/trust/credentials/receipt/verify-batch：批量只
+            # 校验跨系统凭证验真签名回执（只读、不消费）。
+            # 1) 请求体须恰为 {"items": [项...]}，数组 1..100 项；空体、
+            #    非法 JSON、非对象、缺 items/多余外层字段、items 非数组/
+            #    空/超限均 HTTP 200 按键序恰返
+            #    {"results": [], "reason": "请求非法"}；显式空
+            #    X-Tenant-ID 由路由统一判 400；
+            # 2) 合法批次批初原子读取一次本租户含 vc 用途的 active 锚点
+            #    快照，整批共用，并发吊销或用途收紧不混入不同锚点状态；
+            # 3) 按输入顺序逐项处理、失败不短路，results 等长同序；项须
+            #    恰含 receipt、receipt_signature、body、signature、nonce，
+            #    类型与 nonce 规则同单条，项结构/类型非法返
+            #    {"valid": false, "reason": "请求项非法"}；其余完全复用
+            #    单条七阶段验真顺序与固定 reason；成功项仅
+            #    {"valid": true}，失败项键序恰为 valid、reason；
+            # 4) 同验证者与 nonce 重复只逐项验真、不判重，不影响后续
+            #    consume/consume-batch 的防重放；不消费回执，不写状态、
+            #    历史、游标或审计，重启后结论一致。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except Exception:  # noqa: BLE001 请求非法统一 200 处理
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            if not raw:
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                # ValueError 含 JSON 解析错误与超长十进制整数位数上限。
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            if (
+                not isinstance(data, dict)
+                or set(data) != {"items"}
+                or not isinstance(data["items"], list)
+                or not data["items"]
+                or len(data["items"]) > 100
+            ):
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            items = data["items"]
+
+            # 批初原子快照：仅取 active 且含 vc 用途的锚点，同批各项
+            # 据此解析，不受并发吊销/用途收紧影响。
+            snapshot = store.list_trust_anchor_snapshot(tenant)
+            anchor_keys = {
+                (row["did"], row["key_version"]): row["public_key"]
+                for row in snapshot
+                if row["status"] == "active" and "vc" in row["uses"]
+            }
+
+            results: List[Dict[str, Any]] = []
+            for item in items:  # 顺序校验，失败不短路
+                if not isinstance(item, dict):
+                    results.append(
+                        {"valid": False, "reason": "请求项非法"}
+                    )
+                    continue
+                try:
+                    self._validate_receipt_envelope(item)
+                except ValidationError:
+                    results.append(
+                        {"valid": False, "reason": "请求项非法"}
+                    )
+                    continue
+                reason = self._verify_credential_receipt_item(
+                    tenant, item, anchor_keys=anchor_keys
+                )
+                if reason is None:
+                    results.append({"valid": True})
+                else:
+                    results.append({"valid": False, "reason": reason})
+            self._send_json(200, {"results": results})
+
         def _get_trust_credential_receipt_consumptions(
             self, tenant: str, query: str
         ) -> None:
@@ -7681,11 +7776,19 @@ def build_handler(store: VCStore) -> type:
 
         @staticmethod
         def _verify_credential_receipt_item(
-            tenant: str, data: Dict[str, Any]
+            tenant: str,
+            data: Dict[str, Any],
+            anchor_keys: Optional[
+                Dict[Tuple[str, int], str]
+            ] = None,
         ) -> Optional[str]:
             # 回执验真（只读）：按序返回失败原因（回执非法 -> nonce错误
             # -> 绑定错误 -> 摘要错误 -> 锚点不可用 -> 签名格式错误 ->
             # 签名校验失败），成功返回 None。不重验凭证签名、不记审计。
+            # anchor_keys 提供时为批初原子快照的
+            # (verifier_did, verifier_key_version) -> 公钥 PEM 映射（仅
+            # active 且含 vc 用途者），阶段五直接读快照；否则按当前状态
+            # 逐项查询（单条 verify/consume 与 consume-batch 路径）。
             receipt = data["receipt"]
             body = data["body"]
             signature = data["signature"]
@@ -7758,12 +7861,17 @@ def build_handler(store: VCStore) -> type:
                 return "摘要错误"
 
             # 阶段五：本租户 verifier_did/版本 active 且含 vc 用途锚点
-            public_pem = store.get_active_trust_anchor_public_key(
-                tenant,
-                receipt["verifier_did"],
-                verifier_key_version,
-                required_use="vc",
-            )
+            if anchor_keys is None:
+                public_pem = store.get_active_trust_anchor_public_key(
+                    tenant,
+                    receipt["verifier_did"],
+                    verifier_key_version,
+                    required_use="vc",
+                )
+            else:
+                public_pem = anchor_keys.get(
+                    (receipt["verifier_did"], verifier_key_version)
+                )
             if public_pem is None:
                 return "锚点不可用"
             try:
