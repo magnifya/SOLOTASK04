@@ -8901,6 +8901,160 @@ class VCStore:
                 )
         return True, "", results
 
+    def verify_imported_credentials_batch(
+        self,
+        tenant_id: str,
+        data: Any,
+    ) -> Tuple[bool, str, List[Dict[str, Any]]]:
+        """批量重验已导入外部凭证，不查询或合并同步状态。
+
+        请求级结构与每项结构同公开 HTTP 协议。合法批次在同一把锁内原子
+        读取导入记录与本租户 active、含 vc 用途的锚点快照，随后在锁外做
+        PEM 校验、ES256 验签和有效期判断，因此批内并发吊销或用途收紧
+        不会产生混合锚点状态。纯只读，不写记录、同步状态、历史或审计。
+        """
+        if not isinstance(data, dict):
+            return False, "请求非法", []
+        if set(data) != {"items"}:
+            return False, "请求非法", []
+        items = data["items"]
+        if not isinstance(items, list) or not items or len(items) > 100:
+            return False, "请求非法", []
+
+        def item_result(
+            valid: bool, http_status: int, reason: Any
+        ) -> Dict[str, Any]:
+            return {
+                "valid": valid,
+                "http_status": http_status,
+                "reason": reason,
+            }
+
+        prepared: List[
+            Optional[Tuple[Dict[str, Any], str, Optional[str]]]
+        ] = []
+        results: List[Optional[Dict[str, Any]]] = []
+
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            anchors = (
+                bucket["trust_anchors"] if bucket is not None else {}
+            )
+            for item in items:
+                if (
+                    not isinstance(item, dict)
+                    or set(item) != {"issuer_did", "credential_id"}
+                    or not isinstance(item["issuer_did"], str)
+                    or not item["issuer_did"]
+                    or not isinstance(item["credential_id"], str)
+                    or not item["credential_id"]
+                ):
+                    results.append(item_result(False, 400, "请求项非法"))
+                    prepared.append(None)
+                    continue
+
+                issuer_did = item["issuer_did"]
+                credential_id = item["credential_id"]
+                row = None
+                if bucket is not None:
+                    row = (
+                        bucket.get("imported_credentials", {})
+                        .get(issuer_did, {})
+                        .get(credential_id)
+                    )
+                if row is None:
+                    results.append(item_result(False, 404, "资源不存在"))
+                    prepared.append(None)
+                    continue
+
+                body = copy.deepcopy(row["body"])
+                signature = row["signature"]
+                key_version = 1
+                version_obj = (
+                    body.get("issuer_key_version")
+                    if isinstance(body, dict)
+                    else None
+                )
+                if isinstance(version_obj, int) and not isinstance(
+                    version_obj, bool
+                ):
+                    key_version = version_obj
+
+                anchor_row = anchors.get(issuer_did, {}).get(
+                    str(key_version)
+                )
+                public_pem: Optional[str] = None
+                if (
+                    anchor_row is not None
+                    and anchor_row.get("status") != "revoked"
+                    and _anchor_use_allowed(anchor_row, "vc")
+                ):
+                    public_pem = anchor_row.get("public_key", "")
+
+                results.append(None)
+                prepared.append((body, signature, public_pem))
+
+        final_results: List[Dict[str, Any]] = []
+        for placeholder, prepared_item in zip(results, prepared):
+            if placeholder is not None:
+                final_results.append(placeholder)
+                continue
+
+            body, signature, public_pem = prepared_item
+            if public_pem is None:
+                final_results.append(
+                    item_result(False, 200, "锚点不可用")
+                )
+                continue
+            try:
+                crypto.validate_public_key_pem(public_pem)
+            except (ValueError, TypeError):
+                final_results.append(
+                    item_result(False, 200, "锚点不可用")
+                )
+                continue
+
+            try:
+                crypto.verify(body, signature, public_pem)
+            except crypto.MalformedSignature:
+                final_results.append(
+                    item_result(False, 200, "签名格式错误")
+                )
+                continue
+            except crypto.InvalidSignature:
+                final_results.append(
+                    item_result(False, 200, "签名校验失败")
+                )
+                continue
+            except Exception:  # noqa: BLE001
+                final_results.append(
+                    item_result(False, 200, "签名校验失败")
+                )
+                continue
+
+            if isinstance(body, dict) and "expires_at" in body:
+                try:
+                    expires_value = body["expires_at"]
+                    if not isinstance(expires_value, str) or not (
+                        _UTC_Z_SHAPE_RE.match(expires_value)
+                    ):
+                        raise ValueError
+                    expires_dt = _parse_utc_z(expires_value)
+                except ValueError:
+                    final_results.append(
+                        item_result(False, 200, "凭证已过期")
+                    )
+                    continue
+                if datetime.now(timezone.utc) >= expires_dt:
+                    final_results.append(
+                        item_result(False, 200, "凭证已过期")
+                    )
+                    continue
+
+            final_results.append(item_result(True, 200, None))
+
+        return True, "", final_results
+
     def sync_credential_status(
         self,
         tenant_id: str,

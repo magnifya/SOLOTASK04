@@ -68,6 +68,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/credentials/imported/{credential_id}/verify  重启后重新验证已落盘凭证（?issuer_did=，只读）
   POST /v1/trust/credentials/imported/{credential_id}/verify-with-status  重验已导入凭证并合并同步状态（?issuer_did=，只读）
   POST /v1/trust/credentials/imported/verify-batch-with-status 批量重验已导入凭证并合并同步状态（只读）
+  POST /v1/trust/credentials/imported/verify-batch 批量重验已导入凭证（不合并同步状态，只读）
   POST /v1/trust/dids/verify-document     跨系统 DID 文档验真（仅凭提交文档，只读）
   POST /v1/trust/dids/verify-document-batch 批量跨系统 DID 文档验真（不短路，只读）
   POST /v1/trust/dids/verify-document-synced 以同步锚点快照验真外部 DID 文档（只读）
@@ -521,6 +522,7 @@ def build_handler(store: VCStore) -> type:
                 if (
                     path
                     in (
+                        "/v1/trust/credentials/imported/verify-batch",
                         "/v1/trust/credential-status/receipt/consume",
                         "/v1/trust/credential-status/receipt/consume-batch",
                         "/v1/trust/credential-status/receipt-sync"
@@ -755,6 +757,10 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_credentials_import(tenant)
                 elif path == "/v1/trust/credentials/import-batch":
                     self._post_trust_credentials_import_batch(tenant)
+                elif path == "/v1/trust/credentials/imported/verify-batch":
+                    self._post_trust_imported_credentials_verify_batch(
+                        tenant
+                    )
                 elif path == "/v1/trust/credentials/imported/verify-batch-with-status":
                     self._post_trust_imported_credentials_verify_batch_with_status(
                         tenant
@@ -8139,6 +8145,51 @@ def build_handler(store: VCStore) -> type:
             if not ok:
                 self._send_json(
                     200, {"results": [], "reason": reason or "请求不合法"}
+                )
+                return
+            self._send_json(200, {"results": results})
+
+        def _post_trust_imported_credentials_verify_batch(
+            self, tenant: str
+        ) -> None:
+            # 批量重验已导入凭证但不合并同步状态。所有请求级失败均为
+            # HTTP 200 + {"results": [], "reason": "请求非法"}；显式空
+            # X-Tenant-ID 在路由前统一返回 400 {"error": "请求非法"}。
+            # 合法批次由存储层在批初同一把锁内读取导入记录与 active、含
+            # vc 用途的锚点快照，锁外逐项验签，失败不短路。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError, OSError):
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            if not raw:
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+
+            try:
+                ok, _, results = store.verify_imported_credentials_batch(
+                    tenant, data
+                )
+            except Exception:  # noqa: BLE001
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            if not ok:
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
                 )
                 return
             self._send_json(200, {"results": results})
