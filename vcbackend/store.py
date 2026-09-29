@@ -8901,6 +8901,191 @@ class VCStore:
                 )
         return True, "", results
 
+    def verify_imported_credentials_batch(
+        self,
+        tenant_id: str,
+        data: Any,
+    ) -> Tuple[bool, str, List[Dict[str, Any]]]:
+        """批量重验已导入外部凭证（不合同步状态），返回
+        (请求是否合法, 请求级原因, 逐项结果)。
+
+        请求体须恰为 ``{"items": [项...]}``：数组非空且不超过 100 项。
+        请求级结构不合法（非对象、字段缺失或多余、items 非数组、空数组
+        或超过上限）时返回 ``(False, "请求...", [])``，由调用方统一回
+        ``{"results": [], "reason": "请求非法"}``。
+
+        合法批次在批初同一次持锁原子读取本租户导入记录与信任锚点
+        快照（深拷贝），整批共用，全部验签在锁外完成：批内并发吊销
+        锚点或新增导入均不得使同批各项混入不同状态。逐项不短路、等长
+        同序，每项须恰含 issuer_did、credential_id 且均为非空字符串，
+        否则该项为
+        ``{"valid": False, "http_status": 400, "reason": "请求项非法"}``。
+        合法项按本租户 (issuer_did, credential_id) 双键查批初快照中的
+        导入记录：未导入、issuer_did 错配或属他租户为
+        ``{"valid": False, "http_status": 404, "reason": "资源不存在"}``；
+        找到后复用单条 :meth:`verify_imported_credential` 的版本兼容
+        （issuer_key_version 缺省按 1）、active 锚点（含用途白名单与
+        公钥可用性）、签名格式、ES256 验签与有效期规则，但不合并同步
+        状态、不查外部 DID 停用通告：
+          - 锚点缺失/已吊销/公钥不可用 -> (False, 200, "锚点不可用")；
+          - 签名编码错误 -> (False, 200, "签名格式错误")；
+          - ES256 验签失败 -> (False, 200, "签名校验失败")；
+          - 凭证到期 -> (False, 200, "凭证已过期")；
+          - 成功 -> (True, 200, None)。
+        每项结果键序固定为 valid、http_status、reason。纯只读：不写
+        记录、状态、历史或审计、不消费任何内容，结论随状态文件跨重启
+        稳定。
+        """
+        if not isinstance(data, dict):
+            return False, "请求不合法: 请求体必须为 JSON 对象", []
+        if set(data) != {"items"}:
+            missing = [f for f in ("items",) if f not in data]
+            if missing:
+                return False, (
+                    f"请求缺少字段: {', '.join(missing)}"
+                ), []
+            extra = sorted(set(data) - {"items"})
+            return False, f"请求含多余字段: {', '.join(extra)}", []
+        items = data["items"]
+        if not isinstance(items, list):
+            return False, "请求不合法: 字段 items 必须为数组", []
+        if not items:
+            return False, "请求不合法: items 数组不能为空", []
+        if len(items) > 100:
+            return False, (
+                f"请求不合法: items 数组不能超过 100 项（当前 {len(items)} 项）"
+            ), []
+
+        # 批初一次持锁原子读取本租户导入记录与信任锚点快照，整批共用，
+        # 后续逐项查找与验签全部在锁外完成，不受批内并发变更影响。
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            imported_rows: Dict[str, Dict[str, Any]] = {}
+            anchor_rows: Dict[str, Dict[str, Any]] = {}
+            if bucket is not None:
+                imported_rows = copy.deepcopy(
+                    bucket.get("imported_credentials", {})
+                )
+                anchor_rows = copy.deepcopy(bucket["trust_anchors"])
+
+        def item_result(
+            valid: bool, http_status: int, reason: Any
+        ) -> Dict[str, Any]:
+            # 键序固定：valid、http_status、reason。
+            return {
+                "valid": valid,
+                "http_status": http_status,
+                "reason": reason,
+            }
+
+        results: List[Dict[str, Any]] = []
+        for item in items:  # 顺序校验，失败不短路
+            # 每项须恰含 issuer_did、credential_id，均为非空字符串。
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"issuer_did", "credential_id"}
+                or not isinstance(item["issuer_did"], str)
+                or not item["issuer_did"]
+                or not isinstance(item["credential_id"], str)
+                or not item["credential_id"]
+            ):
+                results.append(item_result(False, 400, "请求项非法"))
+                continue
+
+            issuer_did = item["issuer_did"]
+            credential_id = item["credential_id"]
+            row = imported_rows.get(issuer_did, {}).get(credential_id)
+            if row is None:
+                # 记录不存在、issuer_did 错配或跨租户：存在性不可探测。
+                results.append(item_result(False, 404, "资源不存在"))
+                continue
+
+            valid, reason = self._verify_imported_row_against_anchor_snapshot(
+                anchor_rows, issuer_did, row
+            )
+            if valid:
+                results.append(item_result(True, 200, None))
+            else:
+                results.append(item_result(False, 200, reason))
+        return True, "", results
+
+    @staticmethod
+    def _verify_imported_row_against_anchor_snapshot(
+        anchor_rows: Dict[str, Dict[str, Any]],
+        issuer_did: str,
+        row: Dict[str, Any],
+    ) -> Tuple[bool, str]:
+        """以批初信任锚点快照复核一条导入记录原文（只读、锁外）。
+
+        规则与 :meth:`verify_imported_credential` 的版本兼容、active
+        锚点（含用途白名单与公钥可用性）、签名格式、ES256 验签与
+        有效期判定完全一致，原因恰为“锚点不可用”/“签名格式错误”/
+        “签名校验失败”/“凭证已过期”；成功返回 ``(True, "")``。
+        """
+        body = copy.deepcopy(row["body"])
+        signature = row["signature"]
+        key_version = 1
+        version_obj = body.get("issuer_key_version") if isinstance(
+            body, dict
+        ) else None
+        if isinstance(version_obj, int) and not isinstance(
+            version_obj, bool
+        ):
+            key_version = version_obj
+        anchors = anchor_rows.get(issuer_did)
+        anchor_row = (
+            anchors.get(str(key_version)) if anchors is not None else None
+        )
+        public_pem = (
+            anchor_row.get("public_key", "")
+            if anchor_row is not None else ""
+        )
+        anchor_status = (
+            anchor_row.get("status", "active")
+            if anchor_row is not None else None
+        )
+        anchor_uses = (
+            anchor_row.get("uses") if anchor_row is not None else None
+        )
+
+        # 锚点：缺失或 revoked（含公钥不可用）统一为“锚点不可用”
+        if anchor_row is None or anchor_status == "revoked":
+            return False, IMPORTED_ANCHOR_UNAVAILABLE_REASON
+        # 用途白名单：active 锚点无 vc 用途时按锚点不可用处理
+        if anchor_uses is not None and "vc" not in anchor_uses:
+            return False, IMPORTED_ANCHOR_UNAVAILABLE_REASON
+        try:
+            crypto.validate_public_key_pem(public_pem)
+        except (ValueError, TypeError):
+            return False, IMPORTED_ANCHOR_UNAVAILABLE_REASON
+
+        # 签名格式与密码学验签：签名覆盖存储 body 原文的规范化 JSON，
+        # 省略 issuer_key_version 时不注入该字段。
+        try:
+            crypto.verify(body, signature, public_pem)
+        except crypto.MalformedSignature:
+            return False, IMPORTED_SIGNATURE_MALFORMED_REASON
+        except crypto.InvalidSignature:
+            return False, IMPORTED_SIGNATURE_INVALID_REASON
+        except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
+            return False, IMPORTED_SIGNATURE_INVALID_REASON
+
+        # 有效期：body 含 expires_at 且当前时间达到（>=）判到期
+        if isinstance(body, dict) and "expires_at" in body:
+            expires_value = body["expires_at"]
+            try:
+                if not isinstance(expires_value, str) or not (
+                    _UTC_Z_SHAPE_RE.match(expires_value)
+                ):
+                    raise ValueError
+                expires_dt = _parse_utc_z(expires_value)
+            except ValueError:
+                # 存储记录均经导入验签，正常不会到达；防御性归为过期判定。
+                return False, CREDENTIAL_EXPIRED_REASON
+            if datetime.now(timezone.utc) >= expires_dt:
+                return False, CREDENTIAL_EXPIRED_REASON
+        return True, ""
+
     def sync_credential_status(
         self,
         tenant_id: str,

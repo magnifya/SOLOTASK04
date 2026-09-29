@@ -66,8 +66,9 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/credentials/import-batch 批量导入外部凭证（逐项不短路）
   GET  /v1/trust/credentials/imported/{credential_id}  读取已导入的外部凭证（?issuer_did=）
   POST /v1/trust/credentials/imported/{credential_id}/verify  重启后重新验证已落盘凭证（?issuer_did=，只读）
-  POST /v1/trust/credentials/imported/{credential_id}/verify-with-status  重验已导入凭证并合并同步状态（?issuer_did=，只读）
-  POST /v1/trust/credentials/imported/verify-batch-with-status 批量重验已导入凭证并合并同步状态（只读）
+ POST /v1/trust/credentials/imported/{credential_id}/verify-with-status  重验已导入凭证并合并同步状态（?issuer_did=，只读）
+ POST /v1/trust/credentials/imported/verify-batch-with-status 批量重验已导入凭证并合并同步状态（只读）
+ POST /v1/trust/credentials/imported/verify-batch 批量重验已导入凭证（不合并同步状态，只读）
   POST /v1/trust/dids/verify-document     跨系统 DID 文档验真（仅凭提交文档，只读）
   POST /v1/trust/dids/verify-document-batch 批量跨系统 DID 文档验真（不短路，只读）
   POST /v1/trust/dids/verify-document-synced 以同步锚点快照验真外部 DID 文档（只读）
@@ -527,6 +528,7 @@ def build_handler(store: VCStore) -> type:
                         "/receipt/consume",
                         "/v1/trust/credential-status/receipt-sync"
                         "/receipt/consume-batch",
+                        "/v1/trust/credentials/imported/verify-batch",
                     )
                     and self.headers.get("X-Tenant-ID") == ""
                 ):
@@ -757,6 +759,10 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_credentials_import_batch(tenant)
                 elif path == "/v1/trust/credentials/imported/verify-batch-with-status":
                     self._post_trust_imported_credentials_verify_batch_with_status(
+                        tenant
+                    )
+                elif path == "/v1/trust/credentials/imported/verify-batch":
+                    self._post_trust_imported_credentials_verify_batch(
                         tenant
                     )
                 elif path.startswith(
@@ -8139,6 +8145,68 @@ def build_handler(store: VCStore) -> type:
             if not ok:
                 self._send_json(
                     200, {"results": [], "reason": reason or "请求不合法"}
+                )
+                return
+            self._send_json(200, {"results": results})
+
+        def _post_trust_imported_credentials_verify_batch(
+            self, tenant: str
+        ) -> None:
+            # POST /v1/trust/credentials/imported/verify-batch：只做批量
+            # 重验，不合并任何同步状态。任何请求级失败都返回 HTTP 200。
+            # 请求体须恰为 {"items": [项...]}，数组非空且不超过 100 项；
+            # 空体、非法 JSON、非对象、外层缺失或多余字段、items 非数组、
+            # 为空或超限统一返回 {"results": [], "reason": "请求非法"}。
+            # 显式空 X-Tenant-ID 在进入前由路由统一判 400
+            # {"error": "请求非法"}。合法批次批初原子取得本租户导入记录
+            # 与 active 信任锚点快照，整批共用并在锁外验签，批内并发
+            # 吊销锚点不得混入不同状态；逐项按输入顺序等长返回
+            # {"results": [...]}，每项恰含键序固定的
+            # valid、http_status、reason：项非法 false/400/“请求项非法”；
+            # 记录不存在、issuer_did 错配或跨租户 false/404/“资源不存在”；
+            # 锚点缺失/已吊销/公钥不可用 false/200/“锚点不可用”；签名
+            # 编码错误 false/200/“签名格式错误”；密码学验签失败
+            # false/200/“签名校验失败”；凭证到期 false/200/“凭证已过期”；
+            # 成功 true/200/null。任一项失败不影响后续项。纯只读，不写
+            # 记录、状态、历史或审计，不消费任何内容，跨重启结论稳定。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            except Exception:  # noqa: BLE001
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            if not raw:
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+
+            try:
+                ok, _reason, results = (
+                    store.verify_imported_credentials_batch(tenant, data)
+                )
+            except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            if not ok:
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
                 )
                 return
             self._send_json(200, {"results": results})
