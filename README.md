@@ -46,6 +46,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/credentials/{credential_id}/present-batch` | 原子批量生成选择性披露演示，请求体须恰为 `{"presentations":[项...]}`，数组非空且不超过 50 项；每项恰含 `disclose` 及可选 `challenge`、`expires_in`、`holder_binding`，规则同单项 present（challenge 非空串≤256 码点、缺省 32 位小写 hex；`expires_in` 非布尔整数 1–86400、缺省 300；`holder_binding` 布尔、缺省 false，绑定时 subject_did 须本租户已注册 DID）；disclose 按 RFC6901 命中 claims，禁根/数组索引/越界/重复/祖先重叠，`[]` 零披露；外层或任一项非法 400（非空中文原因）且整批不写入、不记审计，未知凭证 404；成功 201 返回 `{"presentations":[...]}`，与输入等长、同序，项键序固定为 `presentation_id`、`credential_id`、`issuer_did`、`issuer_key_version`、`disclose`、`claims`、`challenge`、`expires_at`、`proof`（绑定项末尾加 `holder_did`、`holder_key_version`、`holder_proof`）；全部记录与每条演示的审计事件同一次原子提交，失败整体回滚，ES256 签名与单项一致、重启可验签 |
 | POST | `/v1/presentations/{presentation_id}/verify` | 校验演示，新演示请求体恰为 `{"presentation":对象,"challenge":串}`（旧演示恰为 `{"presentation":对象}`）；**任何失败一律 HTTP 200**，成功 `{"valid":true}`，失败附非空中文 `reason` |
 | POST | `/v1/credentials/{credential_id}/prove` | 生成谓词证明，请求体恰为 `{"predicates":[项...]}` 加可选 `challenge`、`expires_in`；成功 201 返回证明对象；字段问题 400、未知凭证 404 |
+| POST | `/v1/credentials/{credential_id}/prove-batch` | 原子批量生成谓词证明，请求体须恰为 `{"items":[项...]}`，数组非空且不超过 50 项；每项恰含 `predicates` 及可选 `challenge`、`expires_in`，谓词结构/路径/运算、挑战与有效期规则全同单项 prove（challenge 非空串≤256 码点、缺省逐项独立生成 32 位小写 hex；`expires_in` 非布尔整数 1–86400、缺省逐项独立取 300）；单条项内路径禁重复与祖先/后代重叠，不同项互不约束；空体、非法 JSON、非对象、外层缺 `items`、非数组/空/超 50、多余字段或任一项字段、类型、谓词值、challenge、expires_in 非法均 400（非空中文原因），全部项请求级校验通过后才查凭证，未知/跨租户凭证 404，其后依次为签发 DID 停用 409、签发密钥吊销 400、凭证暂停 409，均不留证明或审计；成功 201 仅返回 `{"proofs":[...]}`，与输入等长、同序，每项就是单项 prove 的成功对象（`results` 按该项谓词在凭证 claims 上的计算结果排列）；全部证明记录与每条 `proof.created` 审计同一次原子提交，任一失败或落盘失败整体回滚、审计序号不前进（落盘失败 500 非空 error）；各证明 `proof_id` 独立，重启后仍可经既有 `/v1/proofs/{id}/verify` 验真，挑战、过期与一次性消费行为不变 |
 | POST | `/v1/proofs/{proof_id}/verify` | 校验谓词证明，请求体恰为 `{"proof":对象,"challenge":串}`；**任何失败一律 HTTP 200**，成功 `{"valid":true}`，失败附非空中文 `reason` |
 | POST | `/v1/trust/anchors` | 注册信任锚点，请求体 `{"did","public_key","key_version","uses"?}`（非空字符串、P-256 PEM、非布尔正整数；`uses` 可选，须为非空无重复字符串数组，取值限且按规范序 `generic`、`vc`、`vp`、`proof`、`did`、`status`、`deactivation`，省略为全用途）；返回 201 与 `did`、`public_key`、`key_version`、`status:"active"`、`updated_at:null` |
 | POST | `/v1/trust/anchors/{did}/rotate` | 带前置版本校验的密钥轮换，请求体须恰含 `from_key_version`（非布尔正整数）、`public_key`（P-256 PEM）；目标版本为 `from_key_version+1` 并继承前置 `uses`；新建 201、同前置同 PEM 幂等重试 200，响应字段同 GET 元素 |
@@ -277,7 +278,7 @@ python3 -m vcbackend.cli verify vc_<id>     # 成功输出 true（退出码 0）
   演示/证明、不记审计，恢复后即可正常使用；`revoked` 返回
   `{"valid":false,"reason":"凭证已吊销：<保存的 reason>"}`；过期优先于
   暂停/吊销，`active` 或无状态维持原结果（签名失败仍优先返回签名类原因）。
-- present / present-batch / prove 对已暂停凭证返回 **409** 与非空
+- present / present-batch / prove / prove-batch 对已暂停凭证返回 **409** 与非空
   `error`，不创建演示/证明、不记审计；恢复后可正常生成。已吊销凭证仍
   沿用“可生成、验签处拒绝”的既有行为。
 
@@ -393,7 +394,7 @@ curl "localhost:8080/v1/credentials/vc_<id>/status/history?limit=50&after=0"
   - 谓词证明 verify：验签成功后查**签发密钥**版本，已吊销返回
     “签发密钥已吊销：…”，失败不消费。
   - 以上判定均在密码学验签成功之后：签名/锚定失败仍优先返回各自原因。
-- `present`/`prove` 生成时若凭证的签发密钥版本已吊销，或持有者绑定版本
+- `present`/`prove`/`prove-batch` 生成时若凭证的签发密钥版本已吊销，或持有者绑定版本
   已吊销，返回 **400** 且**不留任何记录/审计**。
 - 旧凭证正文缺 `issuer_key_version` 时按版本 1 兼容判定；密钥吊销按租户
   隔离，跨租户不可探测。

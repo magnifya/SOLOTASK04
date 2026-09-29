@@ -594,6 +594,13 @@ def build_handler(store: VCStore) -> type:
                         path[len("/v1/credentials/") : -len("/prove")]
                     )
                     self._post_prove(tenant, credential_id)
+                elif path.startswith("/v1/credentials/") and path.endswith(
+                    "/prove-batch"
+                ):
+                    credential_id = unquote(
+                        path[len("/v1/credentials/") : -len("/prove-batch")]
+                    )
+                    self._post_prove_batch(tenant, credential_id)
                 elif path.startswith("/v1/proofs/") and path.endswith(
                     "/verify"
                 ):
@@ -2189,18 +2196,118 @@ def build_handler(store: VCStore) -> type:
                 challenge=challenge,
                 expires_in=expires_in,
             )
+            self._send_json(201, self._proof_payload(record))
+
+        @staticmethod
+        def _proof_payload(record: Any) -> Dict[str, Any]:
+            return {
+                "proof_id": record.proof_id,
+                "credential_id": record.credential_id,
+                "issuer_did": record.issuer_did,
+                "issuer_key_version": record.issuer_key_version,
+                "predicates": record.predicates,
+                "results": record.results,
+                "challenge": record.challenge,
+                "expires_at": record.expires_at,
+                "proof": record.proof,
+            }
+
+        @staticmethod
+        def _validate_prove_item(
+            item: Any, index: int
+        ) -> Dict[str, Any]:
+            """校验单个谓词证明生成项，返回透传给 store 的关键字参数。
+
+            规则与单项 prove 的请求级校验完全一致：项须为对象，恰含
+            predicates 及可选 challenge、expires_in；challenge 为非空
+            字符串且按 Unicode 码点不超过 256；expires_in 为非布尔整数
+            且在 1..86400。predicates 的结构、路径、运算与数值语义在
+            store 内结合凭证 claims 校验，与单项 prove 完全一致。
+            index 为从 0 起的项序号，错误信息带从 1 起的中文项号。
+            """
+            where = f"第 {index + 1} 项"
+            if not isinstance(item, dict):
+                raise ValidationError(f"{where}必须为 JSON 对象")
+            if "predicates" not in item:
+                raise ValidationError(f"{where}缺少字段: predicates")
+            extra = sorted(
+                set(item) - {"predicates", "challenge", "expires_in"}
+            )
+            if extra:
+                raise ValidationError(
+                    f"{where}含多余字段: {', '.join(extra)}"
+                )
+            kwargs: Dict[str, Any] = {"predicates": item["predicates"]}
+            if "challenge" in item:
+                challenge = item["challenge"]
+                if not isinstance(challenge, str) or not challenge:
+                    raise ValidationError(
+                        f"{where}字段 challenge 必须为非空字符串"
+                    )
+                if len(challenge) > 256:
+                    raise ValidationError(
+                        f"{where}字段 challenge 按 Unicode 码点不能超过 256"
+                    )
+                kwargs["challenge"] = challenge
+            if "expires_in" in item:
+                expires_in = item["expires_in"]
+                if not isinstance(expires_in, int) or isinstance(
+                    expires_in, bool
+                ):
+                    raise ValidationError(
+                        f"{where}字段 expires_in 必须为整数"
+                    )
+                if not 1 <= expires_in <= 86400:
+                    raise ValidationError(
+                        f"{where}字段 expires_in 须在 1 到 86400 之间"
+                    )
+                kwargs["expires_in"] = expires_in
+            return kwargs
+
+        def _post_prove_batch(
+            self, tenant: str, credential_id: str
+        ) -> None:
+            # 批量谓词证明：请求体须恰为 {"items": [项...]}，数组非空
+            # 且不超过 50 项。外层缺失/非数组/空/超限、项非对象、缺
+            # predicates 或多余字段、challenge/expires_in 类型或范围非法
+            # 一律 400 且不写入任何记录；所有项的请求级校验全部通过后
+            # 才查凭证：路径凭证未知（含他租户）404；其后按签发 DID
+            # 停用 409、签发密钥吊销 400、凭证暂停 409 的顺序拒绝，
+            # 均不留证明或审计；项内 predicates 语义（结构/路径/运算/
+            # 数值、重复与祖先重叠）由 store 逐项校验，任一失败整体
+            # 回滚。成功 201 仅返回 {"proofs": [...]}，与输入等长、同序，
+            # 每项键序与单项 prove 完全一致；缺省 challenge 与有效期逐项
+            # 独立生成。全部证明记录与每条 proof.created 审计同一次原子
+            # 提交，落盘失败 500 且不留下部分记录，审计序号不前进。
+            data = self._read_json()
+            if "items" not in data:
+                raise ValidationError("缺少字段: items")
+            extra = sorted(set(data) - {"items"})
+            if extra:
+                raise ValidationError(f"多余字段: {', '.join(extra)}")
+            items = data["items"]
+            if not isinstance(items, list):
+                raise ValidationError("字段 items 必须为数组")
+            if not items:
+                raise ValidationError("items 数组不能为空")
+            if len(items) > 50:
+                raise ValidationError(
+                    "items 数组不能超过 50 项"
+                    f"（当前 {len(items)} 项）"
+                )
+            kwargs_list = [
+                self._validate_prove_item(item, index)
+                for index, item in enumerate(items)
+            ]
+            records = store.create_proofs_batch(
+                tenant, credential_id, kwargs_list
+            )
             self._send_json(
                 201,
                 {
-                    "proof_id": record.proof_id,
-                    "credential_id": record.credential_id,
-                    "issuer_did": record.issuer_did,
-                    "issuer_key_version": record.issuer_key_version,
-                    "predicates": record.predicates,
-                    "results": record.results,
-                    "challenge": record.challenge,
-                    "expires_at": record.expires_at,
-                    "proof": record.proof,
+                    "proofs": [
+                        self._proof_payload(record) for record in records
+                    ]
                 },
             )
 

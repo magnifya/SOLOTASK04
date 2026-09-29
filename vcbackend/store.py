@@ -3060,72 +3060,15 @@ class VCStore:
         expires_at = _utc_after(expires_in)
         with self._lock:
             bucket = self._bucket_locked(tenant_id)
-            cred = (
-                bucket["credentials"].get(credential_id)
-                if bucket is not None else None
+            # 构建行为纯校验与签名，不改变任何状态；失败直接抛出，不做
+            # 快照恢复，保持调用方可见的租户桶对象引用稳定。
+            row = self._build_proof_row_locked(
+                tenant_id, bucket, credential_id, predicates,
+                challenge, expires_at,
             )
-            if cred is None:
-                raise NotFoundError(f"凭证不存在: {credential_id}")
-            stored_body = cred["body"]
-            claims = stored_body.get("claims", {})
-            if not isinstance(claims, dict):
-                raise ValidationError("凭证 claims 不是 JSON 对象，无法生成谓词证明")
-
-            items = _validate_predicates(claims, predicates)
-            results = _evaluate_predicates(claims, items)
-
-            issuer_did = stored_body["issuer_did"]
-            version = int(stored_body.get("issuer_key_version", 1))
-            # 签发者 DID 已停用：拒绝生成谓词证明，409 且不留记录/审计。
-            issuer_rec = bucket["dids"].get(issuer_did)
-            if self._is_did_deactivated_locked(issuer_rec):
-                raise ConflictError(
-                    f"签发者 DID 已停用，不能生成谓词证明: {issuer_did}"
-                )
-            private_pem = self._private_key_for_version_locked(
-                bucket, issuer_did, version
-            )
-            if not private_pem:
-                raise ValidationError(
-                    "历史私钥不可用: 签发者 "
-                    f"{issuer_did} 密钥版本 {version} 的私钥不存在"
-                )
-            # 签发密钥版本已吊销：拒绝生成，400 且不留任何记录/审计。
-            issuer_entry = self._key_history_entry_by_version_locked(
-                bucket, issuer_did, version
-            )
-            if (
-                issuer_entry is not None
-                and issuer_entry.get("status") == "revoked"
-            ):
-                raise ValidationError(
-                    "签发密钥版本已吊销，不能生成谓词证明: "
-                    f"{issuer_did}#{version}"
-                )
-            # 凭证已暂停：拒绝生成谓词证明，409 且不留任何记录/审计；
-            # 恢复后可用。
-            if cred.get("status") == "suspended":
-                raise ConflictError(
-                    f"凭证已暂停，不能生成谓词证明: {credential_id}"
-                )
-
             snapshot = self._snapshot_locked()
             try:
-                proof_id = f"zp_{uuid.uuid4().hex}"
-                unsigned: Dict[str, Any] = {
-                    "proof_id": proof_id,
-                    "credential_id": credential_id,
-                    "issuer_did": issuer_did,
-                    "issuer_key_version": version,
-                    "predicates": copy.deepcopy(items),
-                    "results": results,
-                    "challenge": challenge,
-                    "expires_at": expires_at,
-                    "tenant_id": tenant_id,
-                }
-                proof = crypto.sign(unsigned, private_pem)
-                row = dict(unsigned)
-                row["proof"] = proof
+                proof_id = row["proof_id"]
                 bucket["proofs"][proof_id] = row
                 self._append_audit_locked(
                     tenant_id, AUDIT_PROOF_CREATED,
@@ -3133,6 +3076,150 @@ class VCStore:
                 )
                 self._save_locked()
                 return self._proof_record(row)
+            except Exception:
+                self._restore_locked(snapshot)
+                raise
+
+    def _build_proof_row_locked(
+        self,
+        tenant_id: str,
+        bucket: Optional[Dict[str, Any]],
+        credential_id: str,
+        predicates: Any,
+        challenge: str,
+        expires_at: str,
+    ) -> Dict[str, Any]:
+        """在锁内完成单项谓词证明的全部校验与签名，返回待落盘证明行。
+
+        校验与签名规则与 :meth:`create_proof` 完全一致：凭证不存在
+        （含他租户资源、租户桶缺失）抛 NotFoundError；claims 非对象或
+        predicates 非法（非非空数组、元素字段/op/路径/数值问题、路径
+        重复或祖先重叠）抛 ValidationError；签发者 DID 已停用或凭证已
+        暂停抛 ConflictError；历史私钥缺失或签发密钥版本已吊销抛
+        ValidationError。调用方负责把返回行写入 proofs 并与审计事件同次
+        原子落盘。
+        """
+        cred = (
+            bucket["credentials"].get(credential_id)
+            if bucket is not None else None
+        )
+        if cred is None:
+            raise NotFoundError(f"凭证不存在: {credential_id}")
+        stored_body = cred["body"]
+        claims = stored_body.get("claims", {})
+        if not isinstance(claims, dict):
+            raise ValidationError("凭证 claims 不是 JSON 对象，无法生成谓词证明")
+
+        items = _validate_predicates(claims, predicates)
+        results = _evaluate_predicates(claims, items)
+
+        issuer_did = stored_body["issuer_did"]
+        version = int(stored_body.get("issuer_key_version", 1))
+        # 签发者 DID 已停用：拒绝生成谓词证明，409 且不留记录/审计。
+        issuer_rec = bucket["dids"].get(issuer_did)
+        if self._is_did_deactivated_locked(issuer_rec):
+            raise ConflictError(
+                f"签发者 DID 已停用，不能生成谓词证明: {issuer_did}"
+            )
+        private_pem = self._private_key_for_version_locked(
+            bucket, issuer_did, version
+        )
+        if not private_pem:
+            raise ValidationError(
+                "历史私钥不可用: 签发者 "
+                f"{issuer_did} 密钥版本 {version} 的私钥不存在"
+            )
+        # 签发密钥版本已吊销：拒绝生成，400 且不留任何记录/审计。
+        issuer_entry = self._key_history_entry_by_version_locked(
+            bucket, issuer_did, version
+        )
+        if (
+            issuer_entry is not None
+            and issuer_entry.get("status") == "revoked"
+        ):
+            raise ValidationError(
+                "签发密钥版本已吊销，不能生成谓词证明: "
+                f"{issuer_did}#{version}"
+            )
+        # 凭证已暂停：拒绝生成谓词证明，409 且不留任何记录/审计；
+        # 恢复后可用。已吊销/已过期凭证仍可生成，由 verify 兜底。
+        if cred.get("status") == "suspended":
+            raise ConflictError(
+                f"凭证已暂停，不能生成谓词证明: {credential_id}"
+            )
+
+        proof_id = f"zp_{uuid.uuid4().hex}"
+        unsigned: Dict[str, Any] = {
+            "proof_id": proof_id,
+            "credential_id": credential_id,
+            "issuer_did": issuer_did,
+            "issuer_key_version": version,
+            "predicates": copy.deepcopy(items),
+            "results": results,
+            "challenge": challenge,
+            "expires_at": expires_at,
+            "tenant_id": tenant_id,
+        }
+        proof = crypto.sign(unsigned, private_pem)
+        row = dict(unsigned)
+        row["proof"] = proof
+        return row
+
+    def create_proofs_batch(
+        self,
+        tenant_id: str,
+        credential_id: str,
+        items: List[Dict[str, Any]],
+    ) -> List[PredicateProofRecord]:
+        """在同一凭证上原子批量生成 1..50 条谓词证明。
+
+        items 为已通过请求级结构校验的项列表（每项为恰含 predicates 及
+        可选 challenge、expires_in 的对象，字段语义校验在本方法内逐项
+        完成，与单项 prove 完全一致）。所有项在同一把锁、同一个快照
+        事务内顺序构建：任一项失败（未知凭证 404、predicates/字段非法
+        400、签发者停用 409、签发密钥吊销 400、凭证暂停 409 等）即整体
+        回滚，此前已构建的证明行与审计事件全部不落盘，对外表现为
+        “非法不写入”，审计序号不前进。缺省 challenge 与 expires_in 逐项
+        独立生成。全部项构建成功后统一写入 proofs 并为每条证明各记一条
+        proof.created 审计（顺序与 items 一致），与记录同次原子落盘，
+        落盘失败同样整体回滚并向上抛出（HTTP 500）。返回与 items 等长、
+        同序的证明记录。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            # 构建阶段为纯校验与签名，不改变任何状态：任一项失败即直接
+            # 抛出，此前构建的行尚未写入，天然“非法不写入”，也无需回滚。
+            built: List[Dict[str, Any]] = []
+            for item in items:
+                challenge = item.get("challenge")
+                if challenge is None:
+                    challenge = uuid.uuid4().hex
+                expires_in = item.get("expires_in")
+                if expires_in is None:
+                    expires_in = DEFAULT_EXPIRES_IN
+                expires_at = _utc_after(expires_in)
+                row = self._build_proof_row_locked(
+                    tenant_id,
+                    bucket,
+                    credential_id,
+                    item["predicates"],
+                    challenge,
+                    expires_at,
+                )
+                built.append(row)
+            # 全部项校验与签名通过后才统一写入并记审计、落盘；记录与
+            # 审计同次原子提交，落盘失败整体回滚。
+            snapshot = self._snapshot_locked()
+            try:
+                for row in built:
+                    proof_id = row["proof_id"]
+                    bucket["proofs"][proof_id] = row
+                    self._append_audit_locked(
+                        tenant_id, AUDIT_PROOF_CREATED,
+                        "predicate_proof", proof_id,
+                    )
+                self._save_locked()
+                return [self._proof_record(row) for row in built]
             except Exception:
                 self._restore_locked(snapshot)
                 raise
@@ -12752,4 +12839,3 @@ class VCStore:
             else:
                 results.append({"valid": False, "reason": reason})
         return results
-
