@@ -134,6 +134,8 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   GET  /v1/trust/credential-status/{id}   查询已同步的外部凭证状态
   GET  /v1/trust/credential-status/{id}/history  查询外部凭证状态历史（只读）
   GET  /v1/audit                          查询本租户审计事件
+  GET  /v1/audit/manifest                 生成某时刻前审计事件的签名清单（?snapshot=&signer_did=&after=&limit=，只读）
+  POST /v1/audit/manifest/verify          验真审计签名清单（只读，不查本地审计原文）
 
 多租户：所有 /v1 请求取 X-Tenant-ID 头，缺省为 "default"；显式
 提供时须非空，否则 400。DID、凭证、演示、key_handle 均按租户隔离，
@@ -536,6 +538,8 @@ def build_handler(store: VCStore) -> type:
                 tenant = self._tenant_id()
                 if path == "/v1/dids":
                     self._post_dids(tenant)
+                elif path == "/v1/audit/manifest/verify":
+                    self._post_audit_manifest_verify(tenant)
                 elif path == "/v1/credentials":
                     self._post_credentials(tenant)
                 elif path == "/v1/credentials/status-export":
@@ -995,6 +999,8 @@ def build_handler(store: VCStore) -> type:
                 tenant = self._tenant_id()
                 if path == "/v1/audit":
                     self._get_audit(tenant, parsed.query)
+                elif path == "/v1/audit/manifest":
+                    self._get_audit_manifest(tenant, parsed.query)
                 elif path.startswith("/v1/dids/") and path.endswith(
                     "/document"
                 ):
@@ -11700,6 +11706,281 @@ def build_handler(store: VCStore) -> type:
                     "next_after": next_after,
                 },
             )
+
+        def _parse_audit_manifest_query(
+            self, query: str
+        ) -> Dict[str, Any]:
+            # 审计清单查询参数：仅允许 snapshot、signer_did、after、
+            # limit，各至多一次。snapshot/signer_did 必填；after 缺省
+            # 0，limit 缺省 50 且限 1..200。空值、重复、未知参数、
+            # 非 ASCII 数字、符号、小数、after>snapshot 均 400。
+            params = parse_qs(query, keep_blank_values=True)
+            allowed = {"snapshot", "signer_did", "after", "limit"}
+            unknown = sorted(set(params) - allowed)
+            if unknown:
+                raise ValidationError(
+                    f"不支持的查询参数: {', '.join(unknown)}"
+                )
+
+            def _single(name: str) -> Optional[str]:
+                values = params.get(name)
+                if values is None:
+                    return None
+                if len(values) != 1:
+                    raise ValidationError(
+                        f"查询参数 {name} 只能提供一次"
+                    )
+                return values[0]
+
+            snapshot_raw = _single("snapshot")
+            if snapshot_raw is None:
+                raise ValidationError("查询参数 snapshot 必填")
+            snapshot = _parse_nonneg_int(snapshot_raw, "snapshot")
+
+            signer_did = _single("signer_did")
+            if signer_did is None or not signer_did:
+                raise ValidationError(
+                    "查询参数 signer_did 必填且必须为非空字符串"
+                )
+
+            after_raw = _single("after")
+            after = (
+                _parse_nonneg_int(after_raw, "after")
+                if after_raw is not None
+                else 0
+            )
+
+            limit_raw = _single("limit")
+            if limit_raw is not None:
+                limit = _parse_nonneg_int(limit_raw, "limit")
+                if not 1 <= limit <= 200:
+                    raise ValidationError(
+                        "查询参数 limit 须在 1 到 200 之间"
+                    )
+            else:
+                limit = 50
+
+            if after > snapshot:
+                raise ValidationError(
+                    "查询参数 after 不得大于 snapshot"
+                )
+            return {
+                "snapshot": snapshot,
+                "signer_did": signer_did,
+                "after": after,
+                "limit": limit,
+            }
+
+        def _get_audit_manifest(self, tenant: str, query: str) -> None:
+            # GET /v1/audit/manifest：生成本租户某一时刻前审计事件的
+            # 签名清单。先做参数与 snapshot 越界校验（400 优先于签名
+            # DID 的 404/409）；签名 DID 未知（含他租户）404、已停用
+            # 409。200 键序 snapshot、after、limit、count、events、
+            # signer_did、key_version、signature；events 保留审计事件
+            # 完整字段并按 seq 升序。signature 由签名 DID 当前版本私钥
+            # 对除 signature 外七键规范化 JSON 做 ES256 裸 R||S 无填充
+            # base64url 签名。纯只读：不写状态或审计。
+            args = self._parse_audit_manifest_query(query)
+
+            events = store.list_audit_manifest(
+                tenant,
+                args["snapshot"],
+                args["after"],
+                args["limit"],
+            )
+
+            key_version, private_pem = store.get_audit_manifest_signer(
+                tenant, args["signer_did"]
+            )
+
+            signed = {
+                "snapshot": args["snapshot"],
+                "after": args["after"],
+                "limit": args["limit"],
+                "count": len(events),
+                "events": [
+                    {
+                        "seq": event.seq,
+                        "timestamp": event.timestamp,
+                        "tenant_id": event.tenant_id,
+                        "action": event.action,
+                        "resource_type": event.resource_type,
+                        "resource_id": event.resource_id,
+                    }
+                    for event in events
+                ],
+                "signer_did": args["signer_did"],
+                "key_version": key_version,
+            }
+            manifest = dict(signed)
+            manifest["signature"] = crypto.sign(signed, private_pem)
+            self._send_json(200, manifest)
+
+        def _audit_manifest_is_well_formed(self, manifest: Any) -> bool:
+            # 清单结构校验（阶段一“清单非法”）：恰含八键，类型/取值
+            # 合法，count 与 events 一致，事件 seq 在 (after, snapshot]
+            # 内严格递增且每事件恰含审计事件六字段。
+            if not isinstance(manifest, dict):
+                return False
+            expected = {
+                "snapshot",
+                "after",
+                "limit",
+                "count",
+                "events",
+                "signer_did",
+                "key_version",
+                "signature",
+            }
+            if set(manifest) != expected:
+                return False
+
+            def _is_nonneg_int(value: Any) -> bool:
+                return (
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value >= 0
+                )
+
+            if not _is_nonneg_int(manifest["snapshot"]):
+                return False
+            if not _is_nonneg_int(manifest["after"]):
+                return False
+            if manifest["after"] > manifest["snapshot"]:
+                return False
+            limit = manifest["limit"]
+            if not (
+                isinstance(limit, int)
+                and not isinstance(limit, bool)
+                and 1 <= limit <= 200
+            ):
+                return False
+            if not _is_nonneg_int(manifest["count"]):
+                return False
+            if not isinstance(manifest["events"], list):
+                return False
+            events = manifest["events"]
+            if manifest["count"] != len(events) or len(events) > limit:
+                return False
+            if (
+                not isinstance(manifest["signer_did"], str)
+                or not manifest["signer_did"]
+            ):
+                return False
+            if not (
+                isinstance(manifest["key_version"], int)
+                and not isinstance(manifest["key_version"], bool)
+                and manifest["key_version"] >= 1
+            ):
+                return False
+            if (
+                not isinstance(manifest["signature"], str)
+                or not manifest["signature"]
+            ):
+                return False
+
+            event_keys = {
+                "seq",
+                "timestamp",
+                "tenant_id",
+                "action",
+                "resource_type",
+                "resource_id",
+            }
+            previous_seq = manifest["after"]
+            for event in events:
+                if not isinstance(event, dict) or set(event) != event_keys:
+                    return False
+                seq = event["seq"]
+                timestamp = event["timestamp"]
+                if (
+                    not isinstance(seq, int)
+                    or isinstance(seq, bool)
+                    or seq <= previous_seq
+                    or seq > manifest["snapshot"]
+                ):
+                    return False
+                if not isinstance(timestamp, int) or isinstance(
+                    timestamp, bool
+                ):
+                    return False
+                for field in (
+                    "tenant_id",
+                    "action",
+                    "resource_type",
+                    "resource_id",
+                ):
+                    value = event[field]
+                    if not isinstance(value, str) or not value:
+                        return False
+                previous_seq = seq
+            return True
+
+        def _post_audit_manifest_verify(self, tenant: str) -> None:
+            # POST /v1/audit/manifest/verify：只读验真审计签名清单。
+            # 外层仅接受 {"manifest": 对象}，结构缺失、多余字段、类型
+            # 错误或非法 JSON 一律 400。外层合法后任何失败均
+            # HTTP 200，按序返回 valid:false：清单非法 -> 锚点不可用
+            # （本租户同 DID/版本且含 generic 用途的 active 锚点）->
+            # 签名格式错误 -> 签名校验失败。不查本地审计原文、不写状态
+            # 或审计；成功仅 {"valid": true}。
+            data = self._read_json()
+            if set(data) != {"manifest"}:
+                if "manifest" not in data:
+                    raise ValidationError("请求缺少字段: manifest")
+                extra = sorted(set(data) - {"manifest"})
+                raise ValidationError(f"请求含多余字段: {', '.join(extra)}")
+            manifest = data["manifest"]
+            if not isinstance(manifest, dict):
+                raise ValidationError(
+                    "请求不合法: 字段 manifest 必须为 JSON 对象"
+                )
+
+            if not self._audit_manifest_is_well_formed(manifest):
+                self._send_invalid("清单非法")
+                return
+
+            signer_did = manifest["signer_did"]
+            key_version = manifest["key_version"]
+            public_pem = store.get_active_trust_anchor_public_key(
+                tenant, signer_did, key_version, required_use="generic"
+            )
+            if public_pem is None:
+                self._send_invalid("锚点不可用")
+                return
+            try:
+                crypto.validate_public_key_pem(public_pem)
+            except (ValueError, TypeError):
+                self._send_invalid("锚点不可用")
+                return
+
+            signed = {
+                "snapshot": manifest["snapshot"],
+                "after": manifest["after"],
+                "limit": manifest["limit"],
+                "count": manifest["count"],
+                "events": manifest["events"],
+                "signer_did": signer_did,
+                "key_version": key_version,
+            }
+            signature = manifest["signature"]
+            try:
+                crypto.validate_signature_format_strict(signature)
+            except crypto.MalformedSignature:
+                self._send_invalid("签名格式错误")
+                return
+            try:
+                crypto.verify(signed, signature, public_pem)
+            except crypto.MalformedSignature:
+                self._send_invalid("签名格式错误")
+                return
+            except crypto.InvalidSignature:
+                self._send_invalid("签名校验失败")
+                return
+            except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露细节
+                self._send_invalid("签名校验失败")
+                return
+            self._send_json(200, {"valid": True})
 
     return Handler
 

@@ -127,6 +127,8 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | GET | `/v1/trust/credential-status/{credential_id}?issuer_did=...` | 查询已同步的外部凭证状态；`issuer_did` 须唯一非空；已同步返回 `status`、`reason`、`updated_at`，未同步（含他租户）404 |
 | GET | `/v1/trust/credential-status/{credential_id}/history?issuer_did=...&limit=&after=` | 只读查询外部凭证状态历史（兼容同步）；按 `updated_at` 升序、同值按 `cursor`；缺/重/空 `issuer_did` 400，`limit`/`after` 非法 400，未同步双键（含他租户）404 |
 | GET | `/v1/audit?limit=&after=` | 查询本租户审计事件，按 seq 升序；返回 `events`、`next_after`，参数校验见下文 |
+| GET | `/v1/audit/manifest?snapshot=&signer_did=&after=&limit=` | 生成某一时刻前本租户审计事件的签名清单（只读、不记审计）：查询参数仅允许唯一 `snapshot`、`signer_did`、`after`、`limit`；`snapshot` 必填且不得超过当时最大审计序号，`signer_did` 必填非空，`after` 缺省 0（ASCII 非负整数）、`limit` 缺省 50 且限 1–200，且 `after≤snapshot`；缺失、空值、重复、未知参数、非 ASCII 数字、符号、小数、布尔词或越界均 **400** 且仅 `{"error":非空中文}`；签名 DID 未知（含他租户）**404**、已停用 **409**，同形仅 `{error}`。返回按 `after<seq≤snapshot` 升序至多一页事件，空页沿用游标；**200** 键序恰为 `snapshot`、`after`、`limit`、`count`、`events`、`signer_did`、`key_version`、`signature`，`events` 保留审计事件完整六字段（`seq`、`timestamp`、`tenant_id`、`action`、`resource_type`、`resource_id`）；`signature` 由该 DID 当前版本私钥对除 `signature` 外七键递归键升序紧凑 UTF-8 JSON 做 ES256（P-256+SHA-256）64 字节裸 `R||S` 无填充 base64url 签名；显式空 `X-Tenant-ID` 400，租户隔离，重启可验真 |
+| POST | `/v1/audit/manifest/verify` | 审计签名清单只读验真（不查本地审计原文、不写状态或审计）：请求体须恰为 `{"manifest":对象}`，结构缺失、多余字段、类型错误或非法 JSON 均 **400** 且仅 `{"error":非空中文}`，显式空租户头 400、缺省 `default`、按租户隔离；外层合法后任何失败均 **HTTP 200** 按键序恰返 `{"valid":false,"reason"}`，顺序为“清单非法”（恰含 `snapshot`、`after`、`limit`、`count`、`events`、`signer_did`、`key_version`、`signature` 八键；非布尔非负整数 `snapshot`/`after`/`count` 且 `after≤snapshot`，`limit` 为 1–200 整数，`count` 等于 `events` 长度且不超过 `limit`，事件恰含审计六字段、`seq` 在 `(after,snapshot]` 内严格递增，四个字符串字段非空，`signer_did`/`signature` 非空字符串、`key_version` 正整数）→“锚点不可用”（本租户同 `signer_did`/版本且含 `generic` 用途的 active 信任锚点；未知/他租户/吊销/无 generic/版本不符均属之）→“签名格式错误”（ES256 裸 `R||S` 无填充 base64url 严格格式）→“签名校验失败”（覆盖清单除 `signature` 外七键规范化 JSON 的密码学验签失败）；成功仅 `{"valid":true}`；结论随状态文件重启稳定 |
 
 - 所有 `/v1` 请求读取 `X-Tenant-ID` 头确定租户：**缺省为 `default`**；显式提供时必须非空，否则 400。
 - DID、凭证、演示与 `key_handle` 均按租户隔离：同一句柄可在不同租户分别注册；访问他租户资源一律按不存在处理（DID/凭证/演示为 404，跨租户引用 DID 签发为 400 并指明 `issuer_did`/`subject_did`，验签类端点仍遵循公开错误协议返回 200/`valid:false`）。
@@ -1802,6 +1804,14 @@ curl "localhost:8080/v1/trust/credentials/imported/vc_ext_1?issuer_did=did:web:e
   - 返回 `{"events":[...], "next_after": n}`，**排除 seq 不大于
     `after`** 的事件；`next_after` 为本页最后一个事件的 seq，
     **空页保持为 `after`**，可直接作为下一页游标。
+- `GET /v1/audit/manifest?snapshot=&signer_did=&after=&limit=` 对
+  `after<seq≤snapshot` 的本租户事件生成至多一页的签名清单（参数与
+  错误协议见接口表；`snapshot` 不得超过当时最大审计序号），清单固定
+  记录 `snapshot`、`after`、`limit`、`count`、`events`、`signer_did`、
+  `key_version`、`signature`，签名沿用 ES256 裸 `R||S` 无填充
+  base64url 规则覆盖除 `signature` 外的清单内容；
+  `POST /v1/audit/manifest/verify` 仅凭同 DID/版本且含 `generic`
+  用途的 active 信任锚点验真，不查本地审计原文，重启后结论不变。
 
 ```bash
 curl -H 'X-Tenant-ID: acme' localhost:8080/v1/dids \
