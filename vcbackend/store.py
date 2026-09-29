@@ -1398,6 +1398,61 @@ class VCStore:
             next_after = picked[-1].seq if picked else after
             return picked, next_after
 
+    def list_audit_until(
+        self,
+        tenant_id: str,
+        after: int,
+        limit: int,
+        snapshot: int,
+    ) -> List[AuditEvent]:
+        """查询某租户 after < seq <= snapshot 的审计事件，按 seq 升序。
+
+        供审计签名清单使用：至多 limit 条，snapshot 不得超过当前最大
+        全局审计序号，否则抛 ValidationError。纯只读，不记审计。
+        """
+        with self._lock:
+            if snapshot > self._audit_seq:
+                raise ValidationError(
+                    "查询参数 snapshot 不得超过当前最大审计序号"
+                )
+            picked: List[AuditEvent] = []
+            for event in self._audit:
+                seq = int(event.get("seq", 0))
+                if seq > snapshot:
+                    break
+                if len(picked) >= limit:
+                    break
+                if event.get("tenant_id") == tenant_id and seq > after:
+                    picked.append(
+                        AuditEvent(
+                            seq=seq,
+                            timestamp=int(event["timestamp"]),
+                            tenant_id=event["tenant_id"],
+                            action=event["action"],
+                            resource_type=event["resource_type"],
+                            resource_id=event["resource_id"],
+                        )
+                    )
+            return picked
+
+    def get_audit_manifest_signer(
+        self,
+        tenant_id: str,
+        signer_did: str,
+    ) -> Tuple[int, str]:
+        """返回本租户活动本地 DID 的（当前密钥版本, 当前私钥 PEM）。
+
+        供审计清单（manifest）签名使用：
+        - DID 不存在（含他租户资源）抛 NotFoundError（HTTP 404）；
+        - DID 已停用抛 ConflictError（HTTP 409）；
+        - 取该 DID 当前密钥版本的托管私钥。
+        纯只读：不修改任何状态、不记审计、不触发落盘。
+        """
+        with self._lock:
+            return self._active_did_signer_locked(
+                self._bucket_locked(tenant_id), signer_did
+            )
+
     # ------------------------------------------------------------------ #
     # DID
     # ------------------------------------------------------------------ #
