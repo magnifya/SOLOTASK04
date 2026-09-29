@@ -110,6 +110,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/credentials/verify-batch-with-status 批量验真并合并同步状态（只读）
   POST /v1/trust/credential-status/sync   同步外部凭证状态（active 锚点验签）
   POST /v1/trust/credential-status/sync-batch 批量同步外部凭证状态（逐项不短路）
+  POST /v1/trust/credential-status/verify-batch 批量只验真外部凭证状态声明（只读不落盘，逐项不短路）
   POST /v1/trust/credential-status/receipt 凭证状态同步签名回执（只读）
   POST /v1/trust/credential-status/receipt/verify 验真凭证状态同步签名回执（只读）
   POST /v1/trust/credential-status/receipt/consume 一次性消费凭证状态同步签名回执（验真后按 (verifier_did, nonce) 防重放，首次落盘并审计）
@@ -839,6 +840,10 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_credential_status_sync(tenant)
                 elif path == "/v1/trust/credential-status/sync-batch":
                     self._post_trust_credential_status_sync_batch(tenant)
+                elif path == (
+                    "/v1/trust/credential-status/verify-batch"
+                ):
+                    self._post_trust_credential_status_verify_batch(tenant)
                 elif path == "/v1/trust/credential-status/receipt":
                     self._post_trust_credential_status_receipt(tenant)
                 elif path == "/v1/trust/credential-status/receipt/verify":
@@ -9529,6 +9534,62 @@ def build_handler(store: VCStore) -> type:
             if not ok:
                 self._send_json(
                     200, {"results": [], "reason": reason or "请求不合法"}
+                )
+                return
+            self._send_json(200, {"results": results})
+
+        def _post_trust_credential_status_verify_batch(
+            self, tenant: str
+        ) -> None:
+            # 批量只验真外部凭证状态签名声明（纯只读，不落盘）。任何
+            # 失败都返回 HTTP 200。请求体须恰为 {"items": [项...]}，
+            # 数组非空且不超过 100 项；空体、非法 JSON、非对象、外层
+            # 多余或缺失字段、items 不是数组、为空或超过 100 一律返回
+            # {"results": [], "reason": "请求非法"}。合法批次由 store
+            # 在批初原子取得本租户含 status 用途的 active 锚点快照后
+            # 按输入顺序逐项处理、失败不短路，results 与输入等长同序：
+            # 成功仅 {"valid": true}，失败为
+            # {"valid": false, "reason": ...}（请求项非法/状态声明非法/
+            # 锚点不可用/签名格式错误/签名校验失败）。不写任何状态、
+            # 历史或审计；显式空 X-Tenant-ID 由路由统一判 400。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            except Exception:  # noqa: BLE001
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            if not raw:
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+
+            try:
+                ok, reason, results = (
+                    store.verify_credential_status_batch(tenant, data)
+                )
+            except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            if not ok:
+                self._send_json(
+                    200, {"results": [], "reason": reason or "请求非法"}
                 )
                 return
             self._send_json(200, {"results": results})
