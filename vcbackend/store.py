@@ -3176,20 +3176,38 @@ class VCStore:
         items 为已通过请求级结构校验的项列表（每项为恰含 predicates 及
         可选 challenge、expires_in 的对象，字段语义校验在本方法内逐项
         完成，与单项 prove 完全一致）。所有项在同一把锁、同一个快照
-        事务内顺序构建：任一项失败（未知凭证 404、predicates/字段非法
-        400、签发者停用 409、签发密钥吊销 400、凭证暂停 409 等）即整体
-        回滚，此前已构建的证明行与审计事件全部不落盘，对外表现为
-        “非法不写入”，审计序号不前进。缺省 challenge 与 expires_in 逐项
-        独立生成。全部项构建成功后统一写入 proofs 并为每条证明各记一条
+        事务内分阶段处理：先定位凭证（未知或他租户 404），再把所有项
+        的 predicates 结构、路径、运算与取值全部校验并求值（任一项非
+        法抛 ValidationError 400，优先于任何资源状态判定），随后才检查
+        签发者 DID 停用 409、历史私钥缺失/签发密钥吊销 400、凭证暂停
+        409；已吊销/已过期凭证仍可生成证明，由验证端拒绝。任一阶段失
+        败即整体回滚，证明行与审计事件全部不落盘，对外表现为“非法不
+        写入”，审计序号不前进。缺省 challenge 与 expires_in 逐项独立
+        生成。全部项构建成功后统一写入 proofs 并为每条证明各记一条
         proof.created 审计（顺序与 items 一致），与记录同次原子落盘，
         落盘失败同样整体回滚并向上抛出（HTTP 500）。返回与 items 等长、
         同序的证明记录。
         """
         with self._lock:
             bucket = self._bucket_locked(tenant_id)
-            # 构建阶段为纯校验与签名，不改变任何状态：任一项失败即直接
-            # 抛出，此前构建的行尚未写入，天然“非法不写入”，也无需回滚。
-            built: List[Dict[str, Any]] = []
+            # 阶段一（404 优先）：凭证必须存在且 claims 为对象。
+            cred = (
+                bucket["credentials"].get(credential_id)
+                if bucket is not None else None
+            )
+            if cred is None:
+                raise NotFoundError(f"凭证不存在: {credential_id}")
+            stored_body = cred["body"]
+            claims = stored_body.get("claims", {})
+            if not isinstance(claims, dict):
+                raise ValidationError(
+                    "凭证 claims 不是 JSON 对象，无法生成谓词证明"
+                )
+
+            # 阶段二（400 优先）：先把所有项的谓词结构、路径、运算和
+            # 取值全部校验并求值，再检查凭证与签发者资源状态；任一项
+            # 非法整体失败，不进入状态判定，也不写入任何记录/审计。
+            prepared: List[Tuple[str, str, List[Dict[str, Any]], List[bool]]] = []
             for item in items:
                 challenge = item.get("challenge")
                 if challenge is None:
@@ -3198,14 +3216,67 @@ class VCStore:
                 if expires_in is None:
                     expires_in = DEFAULT_EXPIRES_IN
                 expires_at = _utc_after(expires_in)
-                row = self._build_proof_row_locked(
-                    tenant_id,
-                    bucket,
-                    credential_id,
-                    item["predicates"],
-                    challenge,
-                    expires_at,
+                validated = _validate_predicates(
+                    claims, item["predicates"]
                 )
+                results = _evaluate_predicates(claims, validated)
+                prepared.append(
+                    (challenge, expires_at, validated, results)
+                )
+
+            # 阶段三：全部项校验通过后才检查资源状态，顺序与单项
+            # prove 一致——签发 DID 停用 409、历史私钥缺失/签发密钥
+            # 吊销 400、凭证暂停 409；已吊销/已过期凭证不拒绝。
+            issuer_did = stored_body["issuer_did"]
+            version = int(stored_body.get("issuer_key_version", 1))
+            issuer_rec = bucket["dids"].get(issuer_did)
+            if self._is_did_deactivated_locked(issuer_rec):
+                raise ConflictError(
+                    "签发者 DID 已停用，不能生成谓词证明: "
+                    f"{issuer_did}"
+                )
+            private_pem = self._private_key_for_version_locked(
+                bucket, issuer_did, version
+            )
+            if not private_pem:
+                raise ValidationError(
+                    "历史私钥不可用: 签发者 "
+                    f"{issuer_did} 密钥版本 {version} 的私钥不存在"
+                )
+            issuer_entry = self._key_history_entry_by_version_locked(
+                bucket, issuer_did, version
+            )
+            if (
+                issuer_entry is not None
+                and issuer_entry.get("status") == "revoked"
+            ):
+                raise ValidationError(
+                    "签发密钥版本已吊销，不能生成谓词证明: "
+                    f"{issuer_did}#{version}"
+                )
+            if cred.get("status") == "suspended":
+                raise ConflictError(
+                    f"凭证已暂停，不能生成谓词证明: {credential_id}"
+                )
+
+            # 阶段四：纯签名构建行，不改变任何状态。
+            built: List[Dict[str, Any]] = []
+            for challenge, expires_at, validated, results in prepared:
+                proof_id = f"zp_{uuid.uuid4().hex}"
+                unsigned: Dict[str, Any] = {
+                    "proof_id": proof_id,
+                    "credential_id": credential_id,
+                    "issuer_did": issuer_did,
+                    "issuer_key_version": version,
+                    "predicates": copy.deepcopy(validated),
+                    "results": results,
+                    "challenge": challenge,
+                    "expires_at": expires_at,
+                    "tenant_id": tenant_id,
+                }
+                proof = crypto.sign(unsigned, private_pem)
+                row = dict(unsigned)
+                row["proof"] = proof
                 built.append(row)
             # 全部项校验与签名通过后才统一写入并记审计、落盘；记录与
             # 审计同次原子提交，落盘失败整体回滚。
@@ -3239,7 +3310,10 @@ class VCStore:
         expires_at）-> 按存储凭证 claims 与存储 predicates 重算
         results 并核对 -> proof 格式与签名。验签成功后在消费锁内
         复查已消费/到期：复查到期即返回“证明已过期”，不消费、不记
-        审计；未到期并发验证仅一次成功，成功时原子标记已消费并记一次
+        审计；签发密钥吊销、签发 DID 停用、凭证过期/暂停/已吊销均在
+        验签与锚定成功后按序拒绝（证明自身过期优先于暂停与吊销），
+        已吊销返回“凭证已吊销：<首次原因>”，同样不消费、不记审计；
+        未到期并发验证仅一次成功，成功时原子标记已消费并记一次
         proof.consumed（同一次原子写，失败回滚），跨重启保留。
         任何失败均返回非空中文原因，绝不抛异常、不泄露私钥。
         """
@@ -3339,6 +3413,7 @@ class VCStore:
             credential_expires_at = cred["body"].get("expires_at")
             credential_status = cred.get("status")
             suspend_reason = cred.get("suspend_reason")
+            revoke_reason = cred.get("revoke_reason")
 
             public_pem = self._public_key_for_version_locked(
                 bucket, issuer_did, stored_version
@@ -3436,6 +3511,12 @@ class VCStore:
         if credential_status == "suspended":
             saved_reason = suspend_reason or "未知原因"
             return False, f"{CREDENTIAL_SUSPENDED_REASON_PREFIX}{saved_reason}"
+        # 绑定、验签与锚定均成功、且凭证未暂停后，拒绝已吊销凭证：
+        # 返回首次吊销原因，不消费证明、不记审计；证明自身过期已在
+        # 更早阶段判定，优先于暂停与吊销。
+        if credential_status == "revoked":
+            saved_reason = revoke_reason or DEFAULT_REVOKE_REASON
+            return False, f"凭证已吊销：{saved_reason}"
 
         # 原子标记已消费：消费锁内复查已消费/到期，并发仅一次成功，
         # 跨重启保留；复查到期不消费、不记审计。
@@ -3487,6 +3568,13 @@ class VCStore:
             if cred is not None and cred.get("status") == "suspended":
                 saved_reason = cred.get("suspend_reason") or "未知原因"
                 return False, f"{CREDENTIAL_SUSPENDED_REASON_PREFIX}{saved_reason}"
+            # 锁内复查凭证吊销状态（防锁外验签期间被吊销的竞态）：
+            # 已吊销不消费、不记审计，返回首次吊销原因。
+            if cred is not None and cred.get("status") == "revoked":
+                saved_reason = (
+                    cred.get("revoke_reason") or DEFAULT_REVOKE_REASON
+                )
+                return False, f"凭证已吊销：{saved_reason}"
             snapshot = self._snapshot_locked()
             try:
                 row["consumed"] = True

@@ -44,6 +44,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   PUT  /v1/trust/anchors/{did}/{key_version}/status  吊销锚点版本
   GET  /v1/trust/anchors/snapshot      本租户锚点签名快照（?signer_did=，只读）
   POST /v1/trust/anchors/snapshot/verify  校验锚点快照签名（只读）
+  POST /v1/trust/anchors/snapshot/verify-batch  批量校验锚点快照签名（批初锚点快照、逐项不短路，只读）
   POST /v1/trust/verify                   用 active 锚点公钥验签
   POST /v1/trust/credentials/verify       跨系统凭证验真（无需登记 DID/凭证）
   POST /v1/trust/credentials/verify-synced  以同步锚点验真外部凭证（只读）
@@ -621,6 +622,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_anchors(tenant)
                 elif path == "/v1/trust/anchors/snapshot/verify":
                     self._post_trust_anchor_snapshot_verify(tenant)
+                elif path == "/v1/trust/anchors/snapshot/verify-batch":
+                    self._post_trust_anchor_snapshot_verify_batch(tenant)
                 elif path == "/v1/trust/anchor-changes/verify":
                     self._post_trust_anchor_changes_verify(tenant)
                 elif path == "/v1/trust/ac-proof":
@@ -4227,10 +4230,16 @@ def build_handler(store: VCStore) -> type:
             return True
 
         def _verify_anchor_snapshot_item(
-            self, tenant: str, snapshot: Any
+            self,
+            tenant: str,
+            snapshot: Any,
+            anchor_keys: Optional[Dict[Tuple[str, int], str]] = None,
         ) -> Optional[str]:
             # 快照验真：按序返回失败原因（快照非法 -> 锚点不可用 ->
             # 签名格式错误 -> 签名校验失败），成功返回 None。纯只读。
+            # anchor_keys 为批初原子快照（(signer_did, 版本) -> 公钥
+            # PEM，仅含 active 且含 generic 用途的锚点）；缺省时逐项
+            # 实时查询本租户锚点。
             # 阶段一：快照键集/类型
             if not self._anchor_snapshot_is_well_formed(snapshot):
                 return "快照非法"
@@ -4249,12 +4258,17 @@ def build_handler(store: VCStore) -> type:
 
             # 阶段三：本租户同 signer_did/版本且含 generic 用途的
             # active 信任锚点
-            public_pem = store.get_active_trust_anchor_public_key(
-                tenant,
-                signer_did,
-                signer_key_version,
-                required_use="generic",
-            )
+            if anchor_keys is None:
+                public_pem = store.get_active_trust_anchor_public_key(
+                    tenant,
+                    signer_did,
+                    signer_key_version,
+                    required_use="generic",
+                )
+            else:
+                public_pem = anchor_keys.get(
+                    (signer_did, signer_key_version)
+                )
             if public_pem is None:
                 return "锚点不可用"
             try:
@@ -4312,6 +4326,76 @@ def build_handler(store: VCStore) -> type:
                 self._send_json(200, {"valid": False, "reason": reason})
                 return
             self._send_json(200, {"valid": True})
+
+        def _post_trust_anchor_snapshot_verify_batch(
+            self, tenant: str
+        ) -> None:
+            # POST /v1/trust/anchors/snapshot/verify-batch：批量校验锚
+            # 点签名快照（只读）。请求体须恰为 {"items": [快照...]}，
+            # 数组限 1–100 项；空体、非法 JSON、非对象、缺 items、多
+            # 余字段、items 非数组/空/超限均 HTTP 200 且按键序恰返
+            # {"results": [], "reason": "请求非法"}（显式空
+            # X-Tenant-ID 仍由租户头解析返回 400）。合法批次批初原子
+            # 取本租户锚点快照（仅 active 且含 generic 用途者），逐项
+            # 按输入顺序处理且不短路，results 等长同序；并发吊销或用
+            # 途收紧不得令同批观察到混合状态。每项沿用单项验真的结
+            # 构、签名方锚点、签名格式与密码学验签顺序：成功项仅
+            # {"valid": true}，失败项键序 valid、reason，原因限快照非
+            # 法、锚点不可用、签名格式错误、签名校验失败。顶层 HTTP
+            # 200 且仅含 results。纯只读：不写锚点、游标、状态或审计，
+            # 重启后结论一致。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except Exception:  # noqa: BLE001 请求非法统一 200 处理
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            if not raw:
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            if (
+                not isinstance(data, dict)
+                or set(data) != {"items"}
+                or not isinstance(data["items"], list)
+                or not data["items"]
+                or len(data["items"]) > 100
+            ):
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+                return
+            items = data["items"]
+
+            # 批初原子快照：仅取 active 且含 generic 用途的锚点，同批
+            # 各项据此解析，不受并发吊销/用途收紧影响。
+            snapshot = store.list_trust_anchor_snapshot(tenant)
+            anchor_keys = {
+                (row["did"], row["key_version"]): row["public_key"]
+                for row in snapshot
+                if row["status"] == "active" and "generic" in row["uses"]
+            }
+
+            results: List[Dict[str, Any]] = []
+            for item in items:  # 顺序校验，失败不短路
+                reason = self._verify_anchor_snapshot_item(
+                    tenant, item, anchor_keys=anchor_keys
+                )
+                if reason is None:
+                    results.append({"valid": True})
+                else:
+                    results.append({"valid": False, "reason": reason})
+            self._send_json(200, {"results": results})
 
         def _get_trust_did_deactivations(self, tenant: str, query: str) -> None:
             # GET /v1/trust/dids/deactivations：只读查询本租户外部 DID
