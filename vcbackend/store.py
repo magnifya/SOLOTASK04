@@ -4073,6 +4073,117 @@ class VCStore:
                 revoked_at=now,
             )
 
+    def revoke_credentials_batch(
+        self,
+        tenant_id: str,
+        items: List[Tuple[str, Any]],
+    ) -> List[CredentialStatusRecord]:
+        """在单次原子事务内批量吊销一组本租户凭证。
+
+        ``items`` 为 (credential_id, reason) 列表（reason 为
+        REASON_UNSET 或已校验的裁剪后非空字符串，credential_id 已由
+        服务层校验为非空且批内不重复），1..100 项，顺序即响应顺序。
+
+        - 在批初同一把锁内逐项确认凭证均属于本租户：任一未知或属他
+          租户抛 NotFoundError（404），整批不产生任何状态、历史、游标
+          或审计变化；
+        - 已吊销凭证保留首次 reason 与 revoked_at，不追加状态历史，但
+          仍按单张重复吊销规则记 credential.revoked 审计；
+        - 首次吊销更新凭证状态（暂停原因随之清除）、追加首条状态历史、
+          推进租户内状态游标并记审计；
+        - 全部状态、历史、游标与审计仅在末轮同一次原子写落盘，落盘
+          失败整体回滚并向上抛错（500）；
+        - 与单张 revoke 或其他批次并发时由同一把锁串行化，仅一个请求
+          能观察到首次吊销，其余均返回该首次结果。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            credentials = (
+                bucket["credentials"] if bucket is not None else {}
+            )
+            # 资源级确认先于任何变更：批初快照上逐项查本租户凭证，任一
+            # 未知或跨租户即整批 404，不产生任何写入。
+            rows: List[Dict[str, Any]] = []
+            for credential_id, _reason in items:
+                rec = credentials.get(credential_id)
+                if rec is None:
+                    raise NotFoundError(f"凭证不存在: {credential_id}")
+                rows.append(rec)
+
+            now = _utc_now()
+            snapshot = self._snapshot_locked()
+            try:
+                results: List[CredentialStatusRecord] = []
+                for (credential_id, reason), rec in zip(items, rows):
+                    if rec.get("status") == "revoked":
+                        # 重复吊销（含与单张 revoke/另一批次并发落败方）：
+                        # 保留首次 reason 与 revoked_at，不追加历史，但
+                        # 仍按既有重复请求规则记审计。
+                        self._append_audit_locked(
+                            tenant_id, AUDIT_CREDENTIAL_REVOKED,
+                            "credential", credential_id,
+                        )
+                        results.append(
+                            CredentialStatusRecord(
+                                credential_id=credential_id,
+                                status="revoked",
+                                updated_at=rec.get("status_updated_at"),
+                                reason=rec.get("revoke_reason"),
+                                revoked_at=rec.get("revoked_at"),
+                            )
+                        )
+                        continue
+
+                    if reason is REASON_UNSET:
+                        final_reason = DEFAULT_REVOKE_REASON
+                    else:
+                        final_reason = reason
+                    rec["status"] = "revoked"
+                    rec["status_updated_at"] = now
+                    rec["revoked_at"] = now
+                    rec["revoke_reason"] = final_reason
+                    # 吊销为终态：暂停原因随终态清除。
+                    rec["suspend_reason"] = None
+                    event = self._append_audit_locked(
+                        tenant_id, AUDIT_CREDENTIAL_REVOKED,
+                        "credential", credential_id,
+                    )
+                    entries = (
+                        self._local_credential_history_entries_locked(
+                            bucket, credential_id
+                        )
+                    )
+                    entries.append(
+                        {
+                            "status": "revoked",
+                            "reason": final_reason,
+                            "updated_at": now,
+                            "revoked_at": now,
+                            "cursor": (
+                                self._next_local_credential_status_cursor_locked(
+                                    tenant_id
+                                )
+                            ),
+                            "audit_seq": int(event["seq"]),
+                            "audit_timestamp": int(event["timestamp"]),
+                        }
+                    )
+                    results.append(
+                        CredentialStatusRecord(
+                            credential_id=credential_id,
+                            status="revoked",
+                            updated_at=now,
+                            reason=final_reason,
+                            revoked_at=now,
+                        )
+                    )
+                # 全批状态、历史、游标与审计同一次原子落盘。
+                self._save_locked()
+            except Exception:
+                self._restore_locked(snapshot)
+                raise
+            return results
+
     def export_credential_statuses(
         self,
         tenant_id: str,

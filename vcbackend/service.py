@@ -19,6 +19,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   GET  /v1/credentials/{credential_id}/status   查询状态（无状态按 active）
   GET  /v1/credentials/{credential_id}/status/history  查询凭证状态历史（只读）
   POST /v1/credentials/{credential_id}/revoke   吊销凭证
+  POST /v1/credentials/revoke-batch           原子批量吊销凭证
   POST /v1/credentials/{credential_id}/verify  以存储记录为锚验签
   POST /v1/credentials/{credential_id}/present 生成选择性披露演示
   POST /v1/credentials/{credential_id}/present-batch 原子批量生成选择性披露演示
@@ -544,6 +545,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_credentials(tenant)
                 elif path == "/v1/credentials/status-export":
                     self._post_credentials_status_export(tenant)
+                elif path == "/v1/credentials/revoke-batch":
+                    self._post_revoke_credentials_batch(tenant)
                 elif path.startswith("/v1/dids/") and path.endswith(
                     "/keys/rotate"
                 ):
@@ -1721,6 +1724,95 @@ def build_handler(store: VCStore) -> type:
                 self._send_json(409, {"error": "签发DID已停用"})
                 return
             self._send_json(200, {"items": items})
+
+        def _post_revoke_credentials_batch(self, tenant: str) -> None:
+            # POST /v1/credentials/revoke-batch：一次性把一组本租户凭证
+            # 转入 revoked 终态。请求体恰为 {"items": [项...]}，数组
+            # 1..100 项且同批 credential_id 不重复；每项恰含
+            # credential_id（必填非空字符串）与可选 reason（省略沿用
+            # “持证人主动吊销”，提供时须为字符串且首尾裁剪后非空）。
+            # 空体、非法 JSON、非对象、外层缺字段或多余字段、items 非
+            # 数组/为空/超限、任一项缺字段/多余字段/类型错误、
+            # credential_id 缺失或为空或重复、reason 非法均 400 且返
+            # 非空 error；显式空 X-Tenant-ID 沿用全局 400。任一凭证
+            # 未知或属他租户 404。所有请求级与资源级错误均整批不产生
+            # 任何状态、历史、游标或审计变化。成功 200 恰返
+            # {"results": [...]}，与输入等长同序，每项沿用单张吊销的
+            # 成功响应；已吊销凭证保留首次 reason/revoked_at，重复项
+            # 仍记审计。全批变更同一次原子落盘，失败回滚为 500。
+            data = self._read_json()
+            if set(data) != {"items"}:
+                missing = "items" if "items" not in data else ""
+                extra = sorted(set(data) - {"items"})
+                if missing:
+                    raise ValidationError("缺少字段: items")
+                raise ValidationError(f"多余字段: {', '.join(extra)}")
+            items = data["items"]
+            if not isinstance(items, list):
+                raise ValidationError("字段 items 必须为数组")
+            if not 1 <= len(items) <= 100:
+                raise ValidationError("字段 items 须包含 1 到 100 项")
+
+            parsed_items: List[Tuple[str, Any]] = []
+            seen_ids = set()
+            for index, item in enumerate(items):
+                prefix = f"items[{index}]"
+                if not isinstance(item, dict):
+                    raise ValidationError(f"{prefix} 必须为 JSON 对象")
+                extra = sorted(set(item) - {"credential_id", "reason"})
+                if extra:
+                    raise ValidationError(
+                        f"{prefix} 多余字段: {', '.join(extra)}"
+                    )
+                if "credential_id" not in item:
+                    raise ValidationError(
+                        f"{prefix} 缺少字段: credential_id"
+                    )
+                credential_id = item["credential_id"]
+                if (
+                    not isinstance(credential_id, str)
+                    or isinstance(credential_id, bool)
+                    or not credential_id
+                ):
+                    raise ValidationError(
+                        f"{prefix}.credential_id 必须为非空字符串"
+                    )
+                if credential_id in seen_ids:
+                    raise ValidationError(
+                        f"凭证在同批中重复: {credential_id}"
+                    )
+                seen_ids.add(credential_id)
+                if "reason" in item:
+                    reason = item["reason"]
+                    if not isinstance(reason, str) or isinstance(reason, bool):
+                        raise ValidationError(
+                            f"{prefix}.reason 必须为字符串"
+                        )
+                    reason = reason.strip()
+                    if not reason:
+                        raise ValidationError(
+                            f"{prefix}.reason 裁剪后不能为空"
+                        )
+                else:
+                    reason = REASON_UNSET
+                parsed_items.append((credential_id, reason))
+
+            records = store.revoke_credentials_batch(tenant, parsed_items)
+            self._send_json(
+                200,
+                {
+                    "results": [
+                        {
+                            "credential_id": record.credential_id,
+                            "status": record.status,
+                            "reason": record.reason,
+                            "revoked_at": record.revoked_at,
+                            "updated_at": record.updated_at,
+                        }
+                        for record in records
+                    ]
+                },
+            )
 
         def _get_credential(self, tenant: str, credential_id: str) -> None:
             record = store.get_credential(tenant, credential_id)
