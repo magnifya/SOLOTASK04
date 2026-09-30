@@ -117,6 +117,27 @@ class DIDHistoryEvent:
 
 
 @dataclass
+class CredentialSchemaRecord:
+    """一条凭证模式（约束）注册记录（按租户与 issuer_did#schema_id#version 隔离）。
+
+    schema_id 仅含小写字母、数字、下划线或连字符且以字母开头（长度
+    1..64）；version 为正整数；issuer_did 为同租户活动 DID；
+    claim_types 将 1..100 个 RFC6901 路径（相对 claims，须以 / 开头、
+    禁根/数组索引）映射到 string/number/integer/boolean/object/array；
+    required_claims 为其键的不重复子集。digest 为注册内容
+    {schema_id,version,issuer_did,claim_types,required_claims}
+    规范化 JSON 的 SHA-256 小写十六进制，同内容重复注册据此幂等。
+    """
+
+    schema_id: str
+    version: int
+    issuer_did: str
+    claim_types: Dict[str, str]
+    required_claims: List[str]
+    digest: str
+
+
+@dataclass
 class CredentialRecord:
     """一条已签发凭证：正文与其 ES256 签名。"""
 
