@@ -137,6 +137,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   GET  /v1/audit                          查询本租户审计事件
   GET  /v1/audit/manifest                 生成 snapshot 前审计记录的签名清单（只读）
   POST /v1/audit/manifest/verify          校验审计签名清单（只读，不查审计原文）
+  POST /v1/audit/manifest/verify-batch    批量校验审计签名清单（只读，不查审计原文）
 
 多租户：所有 /v1 请求取 X-Tenant-ID 头，缺省为 "default"；显式
 提供时须非空，否则 400。DID、凭证、演示、key_handle 均按租户隔离，
@@ -532,6 +533,7 @@ def build_handler(store: VCStore) -> type:
                         "/v1/trust/credential-status/receipt-sync"
                         "/receipt/consume-batch",
                         "/v1/trust/credentials/imported/verify-batch",
+                        "/v1/audit/manifest/verify-batch",
                     )
                     and self.headers.get("X-Tenant-ID") == ""
                 ):
@@ -541,6 +543,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_dids(tenant)
                 elif path == "/v1/audit/manifest/verify":
                     self._post_audit_manifest_verify(tenant)
+                elif path == "/v1/audit/manifest/verify-batch":
+                    self._post_audit_manifest_verify_batch(tenant)
                 elif path == "/v1/credentials":
                     self._post_credentials(tenant)
                 elif path == "/v1/credentials/status-export":
@@ -12019,23 +12023,46 @@ def build_handler(store: VCStore) -> type:
                     "请求不合法: 字段 manifest 必须为 JSON 对象"
                 )
 
-            if not self._audit_manifest_is_well_formed(manifest):
-                self._send_invalid("清单非法")
+            reason = self._verify_audit_manifest_item(tenant, manifest)
+            if reason is not None:
+                self._send_invalid(reason)
                 return
+            self._send_json(200, {"valid": True})
+
+        def _verify_audit_manifest_item(
+            self,
+            tenant: str,
+            manifest: Any,
+            anchor_snapshot: Optional[
+                Dict[Tuple[str, int], Optional[str]]
+            ] = None,
+        ) -> Optional[str]:
+            # 单项审计签名清单验真（供单项与批量端点共用）：按序返回
+            # 失败原因（清单非法 -> 锚点不可用 -> 签名格式错误 ->
+            # 签名校验失败），成功返回 None。锚点须为本租户同
+            # did/版本 active 且含 generic 用途。anchor_snapshot 给定时
+            # 为批量端点在批初原子取得的本租户锚点快照（键 did/版本，
+            # 值为公钥 PEM 或 None），不再即时读锚点；为 None 时按单项
+            # 协议即时读取。纯只读：不查本地审计原文、不写状态或审计。
+            # 阶段一：清单结构（含事件范围与 count 行数一致性）
+            if not self._audit_manifest_is_well_formed(manifest):
+                return "清单非法"
 
             signer_did = manifest["signer_did"]
             key_version = manifest["key_version"]
-            public_pem = store.get_active_trust_anchor_public_key(
-                tenant, signer_did, key_version, required_use="generic"
-            )
+            # 阶段二：本租户同 did/版本且含 generic 用途的 active 锚点
+            if anchor_snapshot is None:
+                public_pem = store.get_active_trust_anchor_public_key(
+                    tenant, signer_did, key_version, required_use="generic"
+                )
+            else:
+                public_pem = anchor_snapshot[(signer_did, key_version)]
             if public_pem is None:
-                self._send_invalid("锚点不可用")
-                return
+                return "锚点不可用"
             try:
                 crypto.validate_public_key_pem(public_pem)
             except (ValueError, TypeError):
-                self._send_invalid("锚点不可用")
-                return
+                return "锚点不可用"
 
             signed = {
                 "snapshot": manifest["snapshot"],
@@ -12047,23 +12074,123 @@ def build_handler(store: VCStore) -> type:
                 "key_version": key_version,
             }
             signature = manifest["signature"]
+            # 阶段三：签名编码格式
             try:
                 crypto.validate_signature_format_strict(signature)
             except crypto.MalformedSignature:
-                self._send_invalid("签名格式错误")
-                return
+                return "签名格式错误"
+            # 阶段四：ES256 裸签名密码学验签（锁外执行）
             try:
                 crypto.verify(signed, signature, public_pem)
             except crypto.MalformedSignature:
-                self._send_invalid("签名格式错误")
-                return
+                return "签名格式错误"
             except crypto.InvalidSignature:
-                self._send_invalid("签名校验失败")
-                return
+                return "签名校验失败"
             except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露细节
-                self._send_invalid("签名校验失败")
+                return "签名校验失败"
+            return None
+
+        def _post_audit_manifest_verify_batch(self, tenant: str) -> None:
+            # POST /v1/audit/manifest/verify-batch：批量校验外系统交付
+            # 的一批审计签名清单。任何失败都返回 HTTP 200。请求体须恰为
+            # {"items": [项...]}，数组非空且不超过 100 项；空体、非法
+            # JSON、非对象、外层字段缺失或多余、items 非数组、空数组或
+            # 超限一律按键序恰返
+            # {"results": [], "reason": "请求非法"}。合法批次返回
+            # {"results": [...]}，长度与顺序与输入一致，逐项不短路；每项
+            # 须恰含 manifest 对象，项非对象、字段或类型非法、清单内容
+            # 或事件范围不合规按“清单非法”处理，其余复用单项验真协议
+            # （锚点不可用 -> 签名格式错误 -> 签名校验失败）。成功项仅
+            # {"valid": true}，失败项键序恰为 valid、reason。批初在同一
+            # 把锁内原子读取本租户锚点快照（required_use 恒为
+            # generic），锁外逐项验签；批内并发吊销或用途收紧不会产生
+            # 混合结论。纯只读：不查本地审计原文、不写锚点、状态、游标
+            # 或审计，结论跨重启稳定。
+            def _request_invalid() -> None:
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                _request_invalid()
                 return
-            self._send_json(200, {"valid": True})
+            except Exception:  # noqa: BLE001
+                _request_invalid()
+                return
+            if not raw:
+                _request_invalid()
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                # ValueError 含 JSON 解析错误与超长十进制整数位数上限。
+                _request_invalid()
+                return
+            if not isinstance(data, dict) or set(data) != {"items"}:
+                _request_invalid()
+                return
+            items = data["items"]
+            if (
+                not isinstance(items, list)
+                or not items
+                or len(items) > 100
+            ):
+                _request_invalid()
+                return
+
+            # 先判定每项外层结构与清单结构，收集结构合法项的锚点查询，
+            # 批初在同一把锁内原子取得本租户锚点快照。
+            well_formed: List[bool] = []
+            queries: List[Tuple[str, int, str]] = []
+            for item in items:
+                if (
+                    isinstance(item, dict)
+                    and set(item) == {"manifest"}
+                    and isinstance(item["manifest"], dict)
+                    and self._audit_manifest_is_well_formed(item["manifest"])
+                ):
+                    well_formed.append(True)
+                    queries.append(
+                        (
+                            item["manifest"]["signer_did"],
+                            item["manifest"]["key_version"],
+                            "generic",
+                        )
+                    )
+                else:
+                    well_formed.append(False)
+
+            snapshot_pems = (
+                store.get_active_trust_anchor_public_key_snapshot(
+                    tenant, queries
+                )
+                if queries
+                else []
+            )
+            anchor_snapshot: Dict[Tuple[str, int], Optional[str]] = {}
+            for (did, key_version, _use), public_pem in zip(
+                queries, snapshot_pems
+            ):
+                anchor_snapshot[(did, key_version)] = public_pem
+
+            results: List[Dict[str, Any]] = []
+            for index, item in enumerate(items):  # 顺序校验，失败不短路
+                if not well_formed[index]:
+                    results.append({"valid": False, "reason": "清单非法"})
+                    continue
+                reason = self._verify_audit_manifest_item(
+                    tenant,
+                    item["manifest"],
+                    anchor_snapshot=anchor_snapshot,
+                )
+                if reason is None:
+                    results.append({"valid": True})
+                else:
+                    results.append({"valid": False, "reason": reason})
+            self._send_json(200, {"results": results})
 
     return Handler
 
