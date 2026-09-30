@@ -12,7 +12,9 @@
   GET  /v1/dids/{did}/keys/{ver}/status   查询 DID 密钥版本吊销状态（只读）
   GET  /v1/dids/{did}/keys/revocations    查询 DID 密钥吊销历史（只读）
 GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（只读）
-  POST /v1/credentials                    签发凭证
+  POST /v1/credentials                    签发凭证（可选 schema_id/schema_version 绑定已注册模式）
+  POST /v1/credential-schemas             注册凭证模式（同内容幂等 200、异内容 409、首次 201 并审计）
+  GET  /v1/credential-schemas/{schema_id}/{version}  查询凭证模式（?issuer_did=，只读）
   POST /v1/credentials/status-export      凭证状态签名发布（产出可直接提交状态批量同步的签名项，只读）
   GET  /v1/credentials/{credential_id}    查询凭证
   PUT  /v1/credentials/{credential_id}/status   登记 active（首次 201/重复 200）或暂停/恢复 suspended（200）
@@ -182,6 +184,7 @@ from .store import (
     USES_UNSET,
     ValidationError,
     VCStore,
+    _validate_schema_id,
 )
 
 
@@ -550,6 +553,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_audit_manifest_verify(tenant)
                 elif path == "/v1/audit/manifest/verify-batch":
                     self._post_audit_manifest_verify_batch(tenant)
+                elif path == "/v1/credential-schemas":
+                    self._post_credential_schemas(tenant)
                 elif path == "/v1/credentials":
                     self._post_credentials(tenant)
                 elif path == "/v1/credentials/status-export":
@@ -1079,6 +1084,18 @@ def build_handler(store: VCStore) -> type:
                     self._get_did_history(tenant, did, parsed.query)
                 elif path.startswith("/v1/dids/"):
                     self._get_did(tenant, unquote(path[len("/v1/dids/") :]))
+                elif path.startswith("/v1/credential-schemas/"):
+                    rest = path[len("/v1/credential-schemas/") :]
+                    schema_id_raw, sep, version_raw = rest.partition("/")
+                    if not sep or not schema_id_raw or "/" in version_raw:
+                        self._send_error(404, f"无此路径: {path}")
+                    else:
+                        self._get_credential_schema(
+                            tenant,
+                            unquote(schema_id_raw),
+                            unquote(version_raw),
+                            parsed.query,
+                        )
                 elif path.startswith("/v1/credentials/") and path.endswith(
                     "/status/history"
                 ):
@@ -1694,6 +1711,41 @@ def build_handler(store: VCStore) -> type:
                 raise ValidationError("缺少字段: claims")
             if not isinstance(data["claims"], dict):
                 raise ValidationError("字段 claims 必须为 JSON 对象")
+            # schema_id/schema_version 可选但必须同时出现或同时省略；
+            # 提供时按 issuer_did 查本租户模式并校验 claims（400/404
+            # 规则由 store 执行）。二者均须为正确类型，否则 400。
+            has_schema_id = "schema_id" in data
+            has_schema_version = "schema_version" in data
+            if has_schema_id != has_schema_version:
+                raise ValidationError(
+                    "schema_id 与 schema_version 必须同时提供或同时省略"
+                )
+            schema_id: Optional[str] = None
+            schema_version: Optional[int] = None
+            if has_schema_id:
+                schema_id = data["schema_id"]
+                if not isinstance(schema_id, str) or not schema_id:
+                    raise ValidationError("字段 schema_id 必须为非空字符串")
+                schema_version = data["schema_version"]
+                if not isinstance(schema_version, int) or isinstance(
+                    schema_version, bool
+                ):
+                    raise ValidationError("字段 schema_version 必须为正整数")
+                if schema_version < 1:
+                    raise ValidationError("字段 schema_version 必须为正整数")
+            extra = sorted(
+                set(data)
+                - {
+                    "issuer_did",
+                    "subject_did",
+                    "claims",
+                    "expires_at",
+                    "schema_id",
+                    "schema_version",
+                }
+            )
+            if extra:
+                raise ValidationError(f"多余字段: {', '.join(extra)}")
             # expires_at 可选：提供时必须为 UTC 秒精度 Z 格式且严格晚于
             # 当前时刻（否则 400）；未提供传哨兵，正文不注入该字段，
             # 凭证保持无期限。
@@ -1706,15 +1758,103 @@ def build_handler(store: VCStore) -> type:
                 data["subject_did"],
                 data["claims"],
                 expires_at=expires_at,
+                schema_id=schema_id,
+                schema_version=schema_version,
+            )
+            response: Dict[str, Any] = {
+                "credential_id": record.credential_id,
+                "signature": record.signature,
+                "issuer_key_version": record.body["issuer_key_version"],
+            }
+            # 仅在模式签发时追加三元组，字段集合与旧流程保持兼容。
+            if "schema_id" in record.body:
+                response["schema_id"] = record.body["schema_id"]
+                response["schema_version"] = record.body["schema_version"]
+                response["schema_digest"] = record.body["schema_digest"]
+            self._send_json(201, response)
+
+        def _post_credential_schemas(self, tenant: str) -> None:
+            # POST /v1/credential-schemas：注册凭证模式。
+            # 请求体恰含 schema_id、version、issuer_did、claim_types、
+            # required_claims（缺一/多字段一律 400）。
+            # - schema_id：1..64 位，小写字母开头，仅小写字母/数字/
+            #   下划线/连字符；
+            # - version：非布尔 JSON 正整数；
+            # - issuer_did：非空字符串，且须为本租户“活动”DID（未知/
+            #   他租户/已停用一律 404，存在性不可探测）；
+            # - claim_types：1..100 项对象，键为不重复合法 RFC6901
+            #   指针（非根、以 / 开头），值为 string/number/integer/
+            #   boolean/object/array 之一；
+            # - required_claims：claim_types 键的不重复子集（可空数组）。
+            # 同 (issuer_did, schema_id, version) 同内容重放 200 返原
+            # 记录（不写入、不记审计）；异内容 409（不写入、不记审计）；
+            # 首次 201 并记 credential_schema.registered。
+            data = self._read_json()
+            required = (
+                "schema_id",
+                "version",
+                "issuer_did",
+                "claim_types",
+                "required_claims",
+            )
+            for field in required:
+                if field not in data:
+                    raise ValidationError(f"缺少字段: {field}")
+            extra = sorted(set(data) - set(required))
+            if extra:
+                raise ValidationError(f"多余字段: {', '.join(extra)}")
+            # issuer_did 须为非空字符串（未知/跨租户/已停用交由 store 判 404）。
+            if not isinstance(data["issuer_did"], str) or not data["issuer_did"]:
+                raise ValidationError("字段 issuer_did 必须为非空字符串")
+            record, created = store.register_credential_schema(
+                tenant,
+                data["schema_id"],
+                data["version"],
+                data["issuer_did"],
+                data["claim_types"],
+                data["required_claims"],
             )
             self._send_json(
-                201,
-                {
-                    "credential_id": record.credential_id,
-                    "signature": record.signature,
-                    "issuer_key_version": record.body["issuer_key_version"],
-                },
+                201 if created else 200,
+                self._credential_schema_payload(record),
             )
+
+        @staticmethod
+        def _credential_schema_payload(record: Any) -> Dict[str, Any]:
+            return {
+                "schema_id": record.schema_id,
+                "version": record.version,
+                "issuer_did": record.issuer_did,
+                "claim_types": record.claim_types,
+                "required_claims": record.required_claims,
+            }
+
+        def _get_credential_schema(
+            self, tenant: str, schema_id: str, version_raw: str, query: str
+        ) -> None:
+            # GET /v1/credential-schemas/{schema_id}/{version}?issuer_did=...
+            # 命中 200 返原记录；缺失或跨租户 404；schema_id 形状非法、
+            # version 非 ASCII 十进制正整数或 issuer_did 缺失/重复/为空
+            # 一律 400。
+            try:
+                _validate_schema_id(schema_id)
+            except ValidationError:
+                self._send_error(400, "路径 schema_id 非法")
+                return
+            version = _parse_positive_int(version_raw, "version")
+            params = parse_qs(query, keep_blank_values=True)
+            issuer_values = params.get("issuer_did")
+            if issuer_values is None:
+                raise ValidationError("缺少查询参数: issuer_did")
+            if len(issuer_values) != 1:
+                raise ValidationError("查询参数 issuer_did 只能提供一次")
+            issuer_did = issuer_values[0]
+            if not issuer_did:
+                raise ValidationError("查询参数 issuer_did 不能为空")
+            record = store.get_credential_schema(
+                tenant, schema_id, version, issuer_did
+            )
+            self._send_json(200, self._credential_schema_payload(record))
 
         def _post_credentials_status_export(self, tenant: str) -> None:
             # POST /v1/credentials/status-export：新增凭证状态签名发布。

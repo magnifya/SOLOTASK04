@@ -43,6 +43,7 @@ from . import crypto
 from .models import (
     AuditEvent,
     CredentialRecord,
+    CredentialSchemaRecord,
     CredentialStatusRecord,
     CredentialStatusSyncRecord,
     CredentialStatusHistoryEvent,
@@ -187,6 +188,7 @@ MAX_EXPIRES_IN = 86400
 # 审计动作名
 AUDIT_DID_CREATED = "did.created"
 AUDIT_CREDENTIAL_ISSUED = "credential.issued"
+AUDIT_CREDENTIAL_SCHEMA_REGISTERED = "credential_schema.registered"
 AUDIT_KEY_ROTATED = "key.rotated"
 AUDIT_STATUS_UPDATED = "status.updated"
 AUDIT_CREDENTIAL_REVOKED = "credential.revoked"
@@ -420,6 +422,190 @@ def _project_claims(
 _PREDICATE_OPS = ("exists", "eq", "gte", "lte")
 
 
+# 凭证模式标识：小写字母开头，仅含小写字母、数字、下划线与连字符，1..64。
+_SCHEMA_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+
+# 凭证模式允许的 JSON 类型名。
+SCHEMA_JSON_TYPES = (
+    "string",
+    "number",
+    "integer",
+    "boolean",
+    "object",
+    "array",
+)
+
+
+def _validate_schema_id(value: Any) -> str:
+    """校验 schema_id：1..64 位，小写字母开头，仅小写字母数字/_-。"""
+    if not isinstance(value, str) or not _SCHEMA_ID_RE.match(value):
+        raise ValidationError(
+            "字段 schema_id 非法（须以小写字母开头，仅含小写字母、数字、"
+            "下划线或连字符，长度 1 到 64）"
+        )
+    return value
+
+
+def _validate_schema_version(value: Any) -> int:
+    """校验 version：非布尔正整数（JSON integer，>=1）。"""
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValidationError("字段 version 必须为正整数")
+    if value < 1:
+        raise ValidationError("字段 version 必须为正整数")
+    return value
+
+
+def _schema_pointer_tokens(pointer: Any) -> Tuple[str, ...]:
+    """解析 claim_types 的 RFC6901 指针（仅语法）：非根、以 / 开头。
+
+    与披露指针共享转义规则，但模式在注册时还没有 claims 可解析，故
+    只做语法校验（允许数组索引 token）；根指针 "" 明确拒绝。
+    """
+    if not isinstance(pointer, str):
+        raise ValidationError("claim_types 的路径必须为字符串")
+    if pointer == "":
+        raise ValidationError("claim_types 不允许根路径（空指针）")
+    return _parse_pointer(pointer, "claim_types 路径")
+
+
+def _validate_schema_claim_types(value: Any) -> "dict[str, str]":
+    """校验 claim_types：1..100 项的对象，键为不重复合法 RFC6901 指针，
+    值为六种 JSON 类型名之一。返回原映射（dict 天然去重）。"""
+    if not isinstance(value, dict):
+        raise ValidationError("字段 claim_types 必须为 JSON 对象")
+    if not 1 <= len(value) <= 100:
+        raise ValidationError("字段 claim_types 须包含 1 到 100 个路径映射")
+    for pointer, declared in value.items():
+        _schema_pointer_tokens(pointer)
+        if not isinstance(declared, str) or declared not in SCHEMA_JSON_TYPES:
+            raise ValidationError(
+                f"claim_types 路径 {pointer!r} 的类型非法: {declared!r}"
+                "（仅支持 string、number、integer、boolean、object、array）"
+            )
+    return value
+
+
+def _validate_schema_required_claims(
+    claim_types: Dict[str, str], value: Any
+) -> List[str]:
+    """校验 required_claims：非空？不要求——允许空数组（无必填）；须为
+    claim_types 键的不重复子集。"""
+    if not isinstance(value, list):
+        raise ValidationError("字段 required_claims 必须为数组")
+    seen: set[str] = set()
+    for pointer in value:
+        if not isinstance(pointer, str):
+            raise ValidationError("required_claims 的路径必须为字符串")
+        if pointer not in claim_types:
+            raise ValidationError(
+                f"required_claims 路径不在 claim_types 中: {pointer!r}"
+            )
+        if pointer in seen:
+            raise ValidationError(f"required_claims 路径重复: {pointer!r}")
+        seen.add(pointer)
+    return list(value)
+
+
+def _schema_resolve_pointer(
+    claims: Any, tokens: Tuple[str, ...], pointer: str
+) -> Any:
+    """按 RFC6901 沿 token 导航 claims：支持数组数字索引（0 基、禁前导
+    零与 "-"），对象按键取值；越界/类型不符抛 ValidationError。"""
+    current: Any = claims
+    for token in tokens:
+        if isinstance(current, list):
+            if token == "-" or not token.isdigit() or (
+                len(token) > 1 and token[0] == "0"
+            ):
+                raise ValidationError(
+                    f"claims 路径数组索引非法: {pointer!r}"
+                )
+            index = int(token)
+            if index >= len(current):
+                raise ValidationError(
+                    f"claims 路径越界或未命中: {pointer!r}"
+                )
+            current = current[index]
+        elif isinstance(current, dict):
+            if token not in current:
+                raise ValidationError(
+                    f"claims 路径越界或未命中属性: {pointer!r}"
+                )
+            current = current[token]
+        else:
+            raise ValidationError(
+                f"claims 路径穿过非容器值: {pointer!r}"
+            )
+    return current
+
+
+def _matches_schema_json_type(value: Any, declared: str) -> bool:
+    """判定 JSON 值是否符合声明类型（布尔不计入 number/integer）。"""
+    if declared == "string":
+        return isinstance(value, str)
+    if declared == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if declared == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if declared == "boolean":
+        return isinstance(value, bool)
+    if declared == "object":
+        return isinstance(value, dict)
+    if declared == "array":
+        return isinstance(value, list)
+    return False
+
+
+def _validate_claims_conform_to_schema(
+    claims: Any,
+    claim_types: Dict[str, str],
+    required_claims: List[str],
+) -> None:
+    """按模式校验 claims：必填路径必须存在；已声明路径若存在值类型必须
+    正确；未声明的额外 claims 允许存在。任何不符抛 ValidationError。"""
+    if not isinstance(claims, dict):
+        raise ValidationError("字段 claims 必须为 JSON 对象")
+    parsed = {
+        pointer: _schema_pointer_tokens(pointer)
+        for pointer in claim_types
+    }
+    for pointer in required_claims:
+        _schema_resolve_pointer(claims, parsed[pointer], pointer)
+    for pointer, declared in claim_types.items():
+        tokens = parsed[pointer]
+        try:
+            value = _schema_resolve_pointer(claims, tokens, pointer)
+        except ValidationError:
+            # 非必填路径允许缺失；必填路径已在上一轮强制命中。
+            if pointer in required_claims:
+                raise
+            continue
+        if not _matches_schema_json_type(value, declared):
+            raise ValidationError(
+                f"claims 路径 {pointer!r} 的值类型不符合模式声明: {declared}"
+            )
+
+
+def _schema_digest(
+    schema_id: str,
+    version: int,
+    issuer_did: str,
+    claim_types: Dict[str, str],
+    required_claims: List[str],
+) -> str:
+    """凭证模式 canonical JSON（与 GET 响应同形）的 SHA-256 小写 hex。"""
+    payload = {
+        "schema_id": schema_id,
+        "version": version,
+        "issuer_did": issuer_did,
+        "claim_types": claim_types,
+        "required_claims": required_claims,
+    }
+    return hashlib.sha256(crypto.canonicalize(payload)).hexdigest()
+
+
+
+
 def _is_number(value: Any) -> bool:
     """非布尔数字（bool 是 int 的子类，须显式排除）。"""
     return isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -643,6 +829,8 @@ class VCStore:
         for bucket in self._tenants.values():
             bucket.setdefault("dids", {})
             bucket.setdefault("credentials", {})
+            # 凭证模式注册表：issuer_did -> schema_id -> str(version) -> row
+            bucket.setdefault("credential_schemas", {})
             bucket.setdefault("presentations", {})
             # 多凭证组合展示记录（与单凭证 presentations 相互独立）
             bucket.setdefault("multi_presentations", {})
@@ -1367,6 +1555,7 @@ class VCStore:
             bucket = {
                 "dids": {},
                 "credentials": {},
+                "credential_schemas": {},
                 "presentations": {},
                 "multi_presentations": {},
                 "proofs": {},
@@ -2301,12 +2490,22 @@ class VCStore:
         subject_did: str,
         claims: Dict[str, Any],
         expires_at: Any = EXPIRES_AT_UNSET,
+        schema_id: Optional[str] = None,
+        schema_version: Optional[int] = None,
     ) -> CredentialRecord:
         """校验签发者/持有者 DID（限本租户），构造正文并签名，记审计。
 
         expires_at 省略（EXPIRES_AT_UNSET）时正文不含该字段，凭证无
         期限；提供时必须为 UTC 秒精度 Z 格式且严格晚于当前时刻，并原样
         写入正文参与 ES256 规范化签名。
+
+        schema_id/schema_version 同时省略（均 None）时为旧流程；同时
+        提供时按 (issuer_did, schema_id, version) 查本租户模式，缺失
+        （含他租户）抛 NotFoundError(404)，claims 不符模式（缺必填
+        路径或已声明路径值类型错误）抛 ValidationError(400)，均不落盘、
+        不记审计。命中时正文追加 schema_id/schema_version/schema_digest
+        （digest 为不含 digest 的正文 canonical JSON 的 SHA-256 小写
+        hex），三字段均参与 ES256 签名。
         """
         if not isinstance(issuer_did, str) or not issuer_did:
             raise ValidationError("缺少字段或字段为空: issuer_did")
@@ -2317,12 +2516,25 @@ class VCStore:
         raw_expires_at = None
         if expires_at is not EXPIRES_AT_UNSET:
             raw_expires_at = _validate_future_utc_z(expires_at, "expires_at")
+        if (schema_id is None) != (schema_version is None):
+            # 服务层已先行拦截，双保险：二者必须同时提供或同时省略。
+            raise ValidationError(
+                "schema_id 与 schema_version 必须同时提供或同时省略"
+            )
 
         with self._lock:
             bucket = self._ensure_bucket_locked(tenant_id)
-            # 逐个指明不存在的是哪一个 DID（他租户 DID 同样不可见）
+            # 逐个指明不存在的是哪一个 DID（他租户 DID 同样不可见）。
+            # 未绑定模式时沿用既有协议（未知 issuer_did 为 400）；一旦
+            # 请求提供模式参数，issuer_did 未知或属他租户即无法“按
+            # issuer_did 查到同租户模式”，按模式缺失/跨租户判 404。
             issuer = bucket["dids"].get(issuer_did)
             if issuer is None:
+                if schema_id is not None:
+                    raise NotFoundError(
+                        f"凭证模式不存在或跨租户: "
+                        f"{issuer_did}#{schema_id}#{schema_version}"
+                    )
                 raise ValidationError(f"issuer_did 不存在: {issuer_did}")
             subject = bucket["dids"].get(subject_did)
             if subject is None:
@@ -2330,6 +2542,26 @@ class VCStore:
             # 已停用 DID 不得再作为 issuer 签发凭证：409 且不写记录。
             if issuer.get("status") == "deactivated":
                 raise ConflictError(f"签发者 DID 已停用，不能签发凭证: {issuer_did}")
+
+            schema_row: Optional[Dict[str, Any]] = None
+            if schema_id is not None:
+                if not isinstance(schema_id, str) or not schema_id:
+                    raise ValidationError("字段 schema_id 必须为非空字符串")
+                schema_row = self._get_schema_row_locked(
+                    bucket, issuer_did, schema_id, int(schema_version)
+                )
+                if schema_row is None:
+                    raise NotFoundError(
+                        "凭证模式不存在或跨租户: "
+                        f"{issuer_did}#{schema_id}#{schema_version}"
+                    )
+                # 模式命中后校验 claims：缺必填路径或已声明路径值类型
+                # 错误一律 400，不保存、不记审计。
+                _validate_claims_conform_to_schema(
+                    claims,
+                    schema_row["claim_types"],
+                    schema_row["required_claims"],
+                )
 
             snapshot = self._snapshot_locked()
             try:
@@ -2345,6 +2577,15 @@ class VCStore:
                 # 仅在请求提供时写入：未提供不得注入字段（旧凭证无期限）。
                 if raw_expires_at is not None:
                     body["expires_at"] = raw_expires_at
+                if schema_row is not None:
+                    # digest 覆盖含 schema_id/schema_version、但不含
+                    # schema_digest 的正文 canonical JSON；digest 随后
+                    # 注入并与其余字段一起参与 ES256 签名。
+                    body["schema_id"] = schema_row["schema_id"]
+                    body["schema_version"] = int(schema_row["version"])
+                    body["schema_digest"] = hashlib.sha256(
+                        crypto.canonicalize(body)
+                    ).hexdigest()
                 signature = crypto.sign(body, issuer["private_key_pem"])
                 bucket["credentials"][credential_id] = {
                     "body": body,
@@ -2361,6 +2602,138 @@ class VCStore:
             except Exception:
                 self._restore_locked(snapshot)
                 raise
+
+    # ------------------------------------------------------------------ #
+    # 凭证模式注册
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _credential_schema_record(row: Dict[str, Any]) -> CredentialSchemaRecord:
+        return CredentialSchemaRecord(
+            schema_id=row["schema_id"],
+            version=int(row["version"]),
+            issuer_did=row["issuer_did"],
+            claim_types=dict(row["claim_types"]),
+            required_claims=list(row["required_claims"]),
+        )
+
+    def _get_schema_row_locked(
+        self,
+        bucket: Optional[Dict[str, Any]],
+        issuer_did: str,
+        schema_id: str,
+        version: int,
+    ) -> Optional[Dict[str, Any]]:
+        if bucket is None:
+            return None
+        return (
+            bucket["credential_schemas"]
+            .get(issuer_did, {})
+            .get(schema_id, {})
+            .get(str(version))
+        )
+
+    def register_credential_schema(
+        self,
+        tenant_id: str,
+        schema_id: Any,
+        version: Any,
+        issuer_did: Any,
+        claim_types: Any,
+        required_claims: Any,
+    ) -> Tuple[CredentialSchemaRecord, bool]:
+        """注册凭证模式，返回 (记录, 是否首次注册)。
+
+        - schema_id/version/claim_types/required_claims 任一形状或内容
+          非法抛 ValidationError(400)；required_claims 须为 claim_types
+          键的不重复子集；
+        - issuer_did 须为本租户活动 DID：未知/他租户/已停用一律
+          NotFoundError(404)；
+        - 同 (issuer_did, schema_id, version) 且内容完全一致：幂等返回
+          原记录（200），不写入、不记审计；内容不同：ConflictError(409)，
+          不写入、不记审计；
+        - 首次注册落盘并记 credential_schema.registered 审计（201）。
+        """
+        schema_id = _validate_schema_id(schema_id)
+        version = _validate_schema_version(version)
+        if not isinstance(issuer_did, str) or not issuer_did:
+            raise ValidationError("字段 issuer_did 必须为非空字符串")
+        claim_types = _validate_schema_claim_types(claim_types)
+        required_claims = _validate_schema_required_claims(
+            claim_types, required_claims
+        )
+
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            issuer = (
+                bucket["dids"].get(issuer_did)
+                if bucket is not None else None
+            )
+            # 未知/他租户/已停用的 issuer_did 一律按 404（存在性不可
+            # 探测：必须是同租户“活动”DID）。
+            if issuer is None or issuer.get("status") == "deactivated":
+                raise NotFoundError(
+                    f"issuer_did 不存在或未处于活动状态: {issuer_did}"
+                )
+
+            existing = self._get_schema_row_locked(
+                bucket, issuer_did, schema_id, version
+            )
+            if existing is not None:
+                if (
+                    existing.get("claim_types") != claim_types
+                    or existing.get("required_claims") != required_claims
+                ):
+                    raise ConflictError(
+                        "凭证模式已存在且内容不同: "
+                        f"{issuer_did}#{schema_id}#{version}"
+                    )
+                # 同内容重放：原样返回，不写入、不记审计。
+                return self._credential_schema_record(existing), False
+
+            snapshot = self._snapshot_locked()
+            try:
+                bucket = self._ensure_bucket_locked(tenant_id)
+                row = {
+                    "schema_id": schema_id,
+                    "version": version,
+                    "issuer_did": issuer_did,
+                    "claim_types": dict(claim_types),
+                    "required_claims": list(required_claims),
+                }
+                bucket["credential_schemas"].setdefault(issuer_did, {}).setdefault(
+                    schema_id, {}
+                )[str(version)] = row
+                self._append_audit_locked(
+                    tenant_id,
+                    AUDIT_CREDENTIAL_SCHEMA_REGISTERED,
+                    "credential_schema",
+                    f"{issuer_did}#{schema_id}#{version}",
+                )
+                self._save_locked()
+                return self._credential_schema_record(row), True
+            except Exception:
+                self._restore_locked(snapshot)
+                raise
+
+    def get_credential_schema(
+        self,
+        tenant_id: str,
+        schema_id: str,
+        version: int,
+        issuer_did: str,
+    ) -> CredentialSchemaRecord:
+        """查询本租户模式；缺失（含他租户资源）抛 NotFoundError。"""
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            row = self._get_schema_row_locked(
+                bucket, issuer_did, schema_id, version
+            )
+            if row is None:
+                raise NotFoundError(
+                    "凭证模式不存在: "
+                    f"{issuer_did}#{schema_id}#{version}"
+                )
+            return self._credential_schema_record(row)
 
     def get_credential(
         self, tenant_id: str, credential_id: str
@@ -5054,6 +5427,31 @@ class VCStore:
             revoke_reason = rec.get("revoke_reason")
             suspend_reason = rec.get("suspend_reason")
 
+            # 模式约束（仅对签发时绑定模式的凭证）：锁内取出存储正文的
+            # 模式三元组与同租户已注册模式记录；具体 digest/claims 校验在
+            # 签名成功后于锁外执行（只读判定，不记审计）。旧凭证三元组
+            # 缺失时 bound_schema 为 None，行为与旧流程完全一致。
+            bound_schema: Optional[Dict[str, Any]] = None
+            stored_schema_id = stored_body.get("schema_id")
+            stored_schema_version = stored_body.get("schema_version")
+            stored_schema_digest = stored_body.get("schema_digest")
+            if stored_schema_id is not None:
+                try:
+                    schema_version_int = int(stored_schema_version)
+                except (TypeError, ValueError):
+                    schema_version_int = -1
+                bound_schema = {
+                    "schema_id": stored_schema_id,
+                    "schema_version": schema_version_int,
+                    "schema_digest": stored_schema_digest,
+                    "row": self._get_schema_row_locked(
+                        bucket,
+                        issuer_did,
+                        stored_schema_id,
+                        schema_version_int,
+                    ),
+                }
+
         if not public_pem:
             return False, (
                 "历史公钥不可用: 签发者 "
@@ -5075,6 +5473,17 @@ class VCStore:
             return False, "签名校验失败，正文或签名可能被改动"
         except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
             return False, "验签过程发生内部错误"
+
+        # 签名合法后的模式约束校验（仅签发时绑定模式的凭证）：提交正文
+        # 的模式三元组须与存储锚定一致、digest 可重算、模式仍在本租户
+        # 注册且 claims 符合模式声明；任一不满足统一返回
+        # “schema validation failed”（只读，不记审计）。
+        if bound_schema is not None:
+            schema_reason = self._check_bound_schema_claims(
+                body, bound_schema
+            )
+            if schema_reason is not None:
+                return False, schema_reason
 
         # 验签成功后按“签发密钥 -> 签发者 DID 停用 -> 有效期 -> 凭证吊销”
         # 顺序判定：签发密钥版本被吊销时 valid:false，沿用原分类协议。
@@ -5106,6 +5515,55 @@ class VCStore:
             saved_reason = revoke_reason or DEFAULT_REVOKE_REASON
             return False, f"凭证已吊销：{saved_reason}"
         return True, ""
+
+    def _check_bound_schema_claims(
+        self,
+        body: Dict[str, Any],
+        bound_schema: Dict[str, Any],
+    ) -> Optional[str]:
+        """签名合法后的模式约束判定（纯只读，绝不抛异常）。
+
+        任一不满足统一返回 "schema validation failed"：
+        - 提交正文的 schema_id/schema_version/schema_digest 与存储锚定
+          三元组不一致（防止正文保留合法签名但改写模式绑定）；
+        - 绑定模式在本租户已不可查（缺失/跨租户）；
+        - schema_digest 不能由提交正文（去除 digest 后）重算复现，或与
+          存储正文锚定的 digest 不一致；
+        - claims 缺必填路径或已声明路径值类型不符。
+        """
+        try:
+            # 提交正文（攻击者可能持有签发密钥重签）的模式三元组必须与
+            # 存储锚定完全一致；锚定三元组在锁内取自存储正文，三者自洽。
+            if (
+                body.get("schema_id") != bound_schema["schema_id"]
+                or body.get("schema_version") != bound_schema["schema_version"]
+                or body.get("schema_digest") != bound_schema["schema_digest"]
+            ):
+                return "schema validation failed"
+            row = bound_schema["row"]
+            if row is None:
+                # 模式在本租户已不可查（缺失/跨租户）。
+                return "schema validation failed"
+            claims = body.get("claims")
+            if not isinstance(claims, dict):
+                return "schema validation failed"
+            # 重算 digest：去除 schema_digest 后的提交正文 canonical JSON，
+            # 必须复现存储锚定 digest。
+            recomputed = dict(body)
+            recomputed.pop("schema_digest", None)
+            digest = hashlib.sha256(
+                crypto.canonicalize(recomputed)
+            ).hexdigest()
+            if digest != bound_schema["schema_digest"]:
+                return "schema validation failed"
+            _validate_claims_conform_to_schema(
+                claims,
+                row["claim_types"],
+                row["required_claims"],
+            )
+        except Exception:  # noqa: BLE001 模式校验失败统一原因，不泄露细节
+            return "schema validation failed"
+        return None
 
     # ------------------------------------------------------------------ #
     # 信任锚点注册表

@@ -126,6 +126,25 @@ class CredentialRecord:
 
 
 @dataclass
+class CredentialSchemaRecord:
+    """一条凭证模式注册记录（按租户与 issuer_did#schema_id#version 隔离）。
+
+    schema_id 为 1..64 个字符的标识（小写字母开头，仅含小写字母、数字、
+    下划线与连字符）；version 为正整数；issuer_did 为本租户活动 DID；
+    claim_types 将 1..100 条不重复 RFC6901 指针映射到 string/number/
+    integer/boolean/object/array；required_claims 为 claim_types 键的不
+    重复子集。内容（claim_types、required_claims）不可变：同内容重放
+    幂等返回原记录，异内容冲突拒绝。
+    """
+
+    schema_id: str
+    version: int
+    issuer_did: str
+    claim_types: Dict[str, str]
+    required_claims: List[str]
+
+
+@dataclass
 class CredentialStatusRecord:
     """凭证状态登记记录。
 
