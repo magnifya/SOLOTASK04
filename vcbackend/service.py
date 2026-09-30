@@ -132,6 +132,9 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/credential-status/receipt-sync/receipt/consume-batch 批量一次性消费凭证状态回执消费同步进度签名回执（逐项不短路，批内判重，整批原子落盘）
   GET  /v1/trust/credential-status/receipt-sync/receipt/consumptions 查询凭证状态同步进度回执消费历史（?limit=&after=&verifier_did=，只读）
   GET  /v1/trust/credential-status/receipt-sync/receipt/consumptions/export 确定性 NDJSON 导出凭证状态同步进度回执消费历史（快照续传，只读）
+  GET  /v1/trust/credential-status/receipt-sync/receipt/consumptions/manifest 凭证状态同步进度回执消费历史导出清单（签名摘要，只读）
+  POST /v1/trust/credential-status/receipt-sync/receipt/consumptions/manifest/verify 校验凭证状态同步进度回执消费历史清单与 NDJSON 内容（只读）
+  POST /v1/trust/credential-status/receipt-sync/receipt/consumptions/manifest/verify-batch 批量校验凭证状态同步进度回执消费历史清单与 NDJSON（只读）
   GET  /v1/trust/credential-status/{id}   查询已同步的外部凭证状态
   GET  /v1/trust/credential-status/{id}/history  查询外部凭证状态历史（只读）
   GET  /v1/audit                          查询本租户审计事件
@@ -929,6 +932,22 @@ def build_handler(store: VCStore) -> type:
                     )
                 elif (
                     path
+                    == "/v1/trust/credential-status/receipt-sync/receipt"
+                    "/consumptions/manifest/verify"
+                ):
+                    self._post_trust_credential_status_receipt_sync_receipt_consumptions_manifest_verify(
+                        tenant
+                    )
+                elif (
+                    path
+                    == "/v1/trust/credential-status/receipt-sync/receipt"
+                    "/consumptions/manifest/verify-batch"
+                ):
+                    self._post_trust_credential_status_receipt_sync_receipt_consumptions_manifest_verify_batch(
+                        tenant
+                    )
+                elif (
+                    path
                     == "/v1/trust/credential-status/receipt-sync-batch"
                 ):
                     self._post_trust_credential_status_receipt_sync_batch(
@@ -1144,6 +1163,14 @@ def build_handler(store: VCStore) -> type:
                     "/consumptions/export"
                 ):
                     self._get_trust_credential_status_receipt_sync_receipt_consumptions_export(
+                        tenant, parsed.query
+                    )
+                elif (
+                    path
+                    == "/v1/trust/credential-status/receipt-sync/receipt"
+                    "/consumptions/manifest"
+                ):
+                    self._get_trust_credential_status_receipt_sync_receipt_consumptions_manifest(
                         tenant, parsed.query
                     )
                 elif (
@@ -11328,6 +11355,92 @@ def build_handler(store: VCStore) -> type:
             self.end_headers()
             if body:
                 self.wfile.write(body)
+
+        def _get_trust_credential_status_receipt_sync_receipt_consumptions_manifest(
+            self, tenant: str, query: str
+        ) -> None:
+            # GET /v1/trust/credential-status/receipt-sync/receipt/
+            # consumptions/manifest：对一次凭证状态同步进度回执消费
+            # 历史的确定性导出（与同目录 export 同 limit/after/snapshot，
+            # snapshot 必填）生成签名摘要清单。参数、缺省值、唯一性、
+            # 状态码、字段类型与键序、规范化 JSON、ES256 签名与错误
+            # 优先级完整沿用凭证状态回执消费历史清单。参数/snapshot
+            # 越界 400（仅 error）；签名 DID 未知（含他租户）404、已
+            # 停用 409（400 判定优先）。200 键序 snapshot、filters、
+            # count、alg、digest、signer_did、key_version、signature；
+            # filters 键序 after、limit，值为生效整数；count 为本页 LF
+            # 行数（非负整数）；alg 恒为 SHA-256；digest 为同
+            # snapshot/after/limit 下同步进度回执消费 export 原始
+            # NDJSON 字节的 64 位小写 hex SHA-256；signature 由签名
+            # DID 当前私钥对前七键规范化 JSON 做 ES256 裸 R||S 无填充
+            # base64url 签名。游标空间为同步进度回执消费独立空间。
+            # 纯只读：不消费回执、不推进检查点、不写状态、历史、游标
+            # 或审计。
+            args = self._parse_receipt_consumption_manifest_query(query)
+
+            # 先做快照越界校验（400 优先于签名 DID 的 404/409）。
+            events, effective_snapshot, _ = (
+                store.export_credential_status_sync_receipt_consumption_events(
+                    tenant,
+                    args["after"],
+                    args["limit"],
+                    snapshot=args["snapshot"],
+                )
+            )
+
+            # 签名 DID 须为本租户活动本地 DID：未知 404、停用 409。
+            signer_did = args["signer_did"]
+            key_version, private_pem = (
+                store.get_credential_status_sync_receipt_consumption_manifest_signer(
+                    tenant, signer_did
+                )
+            )
+
+            ndjson_bytes = _receipt_consumption_ndjson_bytes(events)
+            digest = hashlib.sha256(ndjson_bytes).hexdigest()
+            signed = {
+                "snapshot": effective_snapshot,
+                "filters": args["filters"],
+                "count": len(events),
+                "alg": "SHA-256",
+                "digest": digest,
+                "signer_did": signer_did,
+                "key_version": key_version,
+            }
+            signature = crypto.sign(signed, private_pem)
+            manifest = dict(signed)
+            manifest["signature"] = signature
+            self._send_json(200, manifest)
+
+        def _post_trust_credential_status_receipt_sync_receipt_consumptions_manifest_verify(
+            self, tenant: str
+        ) -> None:
+            # POST /v1/trust/credential-status/receipt-sync/receipt/
+            # consumptions/manifest/verify：校验一次凭证状态同步进度
+            # 回执消费历史导出清单与其 NDJSON 内容。请求外层协议、
+            # 400 规则、HTTP 200 固定 reason 与五阶段顺序（清单非法 ->
+            # 锚点不可用 -> 签名格式错误 -> 签名校验失败 -> 导出内容
+            # 不匹配）完整复用凭证状态回执消费历史清单单项验真
+            # （锚点用途恒为 status）；验真仅基于请求内 manifest 与
+            # ndjson，不读导出、不消费、不推进检查点。纯只读、租户
+            # 隔离、不记审计，结论跨重启稳定。
+            self._post_trust_credential_status_receipt_consumptions_manifest_verify(
+                tenant
+            )
+
+        def _post_trust_credential_status_receipt_sync_receipt_consumptions_manifest_verify_batch(
+            self, tenant: str
+        ) -> None:
+            # POST /v1/trust/credential-status/receipt-sync/receipt/
+            # consumptions/manifest/verify-batch：批量校验凭证状态同步
+            # 进度回执消费历史清单与 NDJSON。请求级非法 200 返
+            # {"results": [], "reason": "请求非法"}；合法批次结果等长
+            # 同序、逐项不短路，批初原子取得本租户锚点快照。协议
+            # 完整复用凭证状态回执消费历史清单批量验真（锚点用途恒
+            # 为 status）。纯只读、租户隔离、不记审计。
+            self._post_trust_credential_status_receipt_consumptions_manifest_verify_batch(
+                tenant
+            )
 
         def _post_trust_credential_status_receipt_sync_receipt_verify(
             self, tenant: str
