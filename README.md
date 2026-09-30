@@ -41,6 +41,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | GET | `/v1/credentials/{credential_id}/status` | 返回 `credential_id`、`status`、`updated_at`；历史无状态按 `active` 返回且 `updated_at` 为 `null`；suspended 为暂停状态、revoked 含吊销信息（本响应仅三键）；不存在或他租户 404 |
 | GET | `/v1/credentials/{credential_id}/status/history?limit=&after=` | 只读查询本地凭证状态历史；响应恰含 `credential_id`、`events`、`next_after`，事件恰含 `{status,reason,updated_at,revoked_at,audit_seq,audit_timestamp,cursor}`；首次 active、每次暂停/恢复与首次 revoke 各追加一条（暂停保存原因、恢复 reason/revoked_at 为 null），同状态幂等、重复吊销与失败路径不追加；按 `updated_at`、`cursor` 升序；未知或跨租户凭证 404，有凭证无状态空页；参数规则同其他历史接口，只读不记审计 |
 | POST | `/v1/credentials/{credential_id}/revoke` | 吊销凭证；`reason` 可省略（默认“持证人主动吊销”），否则须为字符串且首尾裁剪后非空；返回 200 与 `credential_id`、`status:"revoked"`、`reason`、`revoked_at`、`updated_at`；不存在 404 |
+| POST | `/v1/credentials/revoke-batch` | 批量原子吊销，请求体恰含 `items`（1–100 项对象，恰含非空字符串 `credential_id`、批内不重复，可选 `reason` 同单张规则）；空体、非法 JSON、非对象、外层缺/多字段、items 非数组·空·超限、项缺/多字段或类型错误、credential_id 缺失·为空·重复、reason 非法均 400，任一凭证未知或他租户 404，显式空 `X-Tenant-ID` 400，错误整批不落盘；成功 200 恰返 `{"results":[...]}`，与输入等长同序，每项同单张吊销返回；已吊销项保留首次 reason/revoked_at、不追加历史不推进游标但每次留审计；全部状态、历史、游标与审计同一次原子写，落盘失败 500 整体回滚，重启稳定 |
 | POST | `/v1/credentials/{credential_id}/verify` | 验签，请求体 `{"body","signature"}`；**任何失败一律 HTTP 200**，返回 `valid`（失败时附分类中文 `reason`） |
 | POST | `/v1/credentials/{credential_id}/present` | 生成选择性披露演示，请求体恰为 `{"disclose":[路径...]}` 加可选 `challenge`、`expires_in`、`holder_binding`；成功 201 返回演示对象（绑定时另含 `holder_did`、`holder_key_version`、`holder_proof`）；字段问题 400、未知凭证 404 |
 | POST | `/v1/credentials/{credential_id}/present-batch` | 原子批量生成选择性披露演示，请求体须恰为 `{"presentations":[项...]}`，数组非空且不超过 50 项；每项恰含 `disclose` 及可选 `challenge`、`expires_in`、`holder_binding`，规则同单项 present（challenge 非空串≤256 码点、缺省 32 位小写 hex；`expires_in` 非布尔整数 1–86400、缺省 300；`holder_binding` 布尔、缺省 false，绑定时 subject_did 须本租户已注册 DID）；disclose 按 RFC6901 命中 claims，禁根/数组索引/越界/重复/祖先重叠，`[]` 零披露；外层或任一项非法 400（非空中文原因）且整批不写入、不记审计，未知凭证 404；成功 201 返回 `{"presentations":[...]}`，与输入等长、同序，项键序固定为 `presentation_id`、`credential_id`、`issuer_did`、`issuer_key_version`、`disclose`、`claims`、`challenge`、`expires_at`、`proof`（绑定项末尾加 `holder_did`、`holder_key_version`、`holder_proof`）；全部记录与每条演示的审计事件同一次原子提交，失败整体回滚，ES256 签名与单项一致、重启可验签 |
@@ -277,6 +278,30 @@ python3 -m vcbackend.cli verify vc_<id>     # 成功输出 true（退出码 0）
   `updated_at`。已吊销时再次调用，任何 `reason`（含非法值）都被忽略并返回
   首次结果；非法 `reason` 仅首次请求返回 400。已暂停凭证可直接吊销进入
   终态（暂停原因随之清除，状态历史仍保留暂停/恢复事件）。
+- `POST /v1/credentials/revoke-batch`：一次性把一组本租户凭证转入终态，
+  是单张吊销的**整批原子入口**，不改变单张 revoke、状态查询、验签与
+  历史接口语义。请求体须恰为 `{"items":[项...]}`：
+  - `items` 为 **1–100** 个对象的数组，每项须恰含 `credential_id`
+    （必填、非空字符串、同批只能出现一次）与可选 `reason`（省略沿用
+    “持证人主动吊销”；提供时须为字符串且首尾裁剪后非空，规则同单张
+    吊销的首次请求）；
+  - 空体、非法 JSON、非对象、外层缺少或多余字段、`items` 不是数组、
+    为空或超过 100、任一项不是对象、缺字段或含多余字段、字段类型错误、
+    `credential_id` 缺失/为空/批内重复、`reason` 非法，均返回 **400**
+    与非空 `error`；显式空 `X-Tenant-ID` 同样 **400**；
+  - 请求项形状全部通过后，再在**批初原子快照**上逐项确认本租户凭证：
+    任一 `credential_id` 未知或属于他租户返回 **404**；所有请求级与
+    资源级错误都保证整批不产生任何状态、历史、游标或审计变化；
+  - 成功 **200** 恰返 `{"results":[...]}`，与输入**等长、同序**，每项
+    键序同单张吊销（`credential_id`、`status`、`reason`、`revoked_at`、
+    `updated_at`）：首次吊销更新状态并追加首条状态历史、推进租户内状态
+    游标、记 `credential.revoked` 审计；已吊销凭证返回首次 `reason` 与
+    `revoked_at`，**不**追加历史、**不**推进游标，但仍按既有重复请求
+    规则记一次审计；已暂停凭证直接吊销且暂停原因随之清除；
+  - 与单张 revoke 或另一批次并发时由同一把锁串行化，同一凭证只可能有
+    一个首次吊销结果，其余请求得到该首次结果；全部状态、历史、游标与
+    审计**同一次原子写**落盘，落盘失败返回 **500** 与非空 `error` 并
+    整体回滚；重启后状态、历史、审计顺序与重试结论保持一致。
 - 状态随状态文件持久化，**跨重启保留**。
 - verify 在签名、密钥、DID、有效期检查均通过后检查凭证状态（判定位置与
   吊销相同）：`suspended` 返回 200、
