@@ -169,6 +169,7 @@ from .store import (
     DEFAULT_TENANT,
     EXPIRES_AT_UNSET,
     NotFoundError,
+    MultiPresentationRecord,
     PresentationRecord,
     REASON_UNSET,
     StorageError,
@@ -628,6 +629,8 @@ def build_handler(store: VCStore) -> type:
                         path[len("/v1/proofs/") : -len("/verify")]
                     )
                     self._post_verify_proof(tenant, proof_id)
+                elif path == "/v1/presentations/multi":
+                    self._post_multi_presentations(tenant)
                 elif path.startswith("/v1/presentations/") and path.endswith(
                     "/verify"
                 ):
@@ -2305,9 +2308,15 @@ def build_handler(store: VCStore) -> type:
                     return
 
             try:
-                valid, reason = store.verify_presentation(
-                    tenant, presentation_id, data["presentation"], challenge
-                )
+                if presentation_id.startswith("mvp_"):
+                    valid, reason = store.verify_multi_presentation(
+                        tenant, presentation_id, data["presentation"],
+                        challenge,
+                    )
+                else:
+                    valid, reason = store.verify_presentation(
+                        tenant, presentation_id, data["presentation"], challenge
+                    )
             except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
                 self._send_invalid("验签过程发生内部错误")
                 return
@@ -2315,6 +2324,134 @@ def build_handler(store: VCStore) -> type:
             if not valid:
                 payload["reason"] = reason or "验签失败"
             self._send_json(200, payload)
+
+        @staticmethod
+        def _multi_presentation_payload(
+            record: MultiPresentationRecord,
+        ) -> Dict[str, Any]:
+            """按对外契约的固定键序组装多凭证组合展示对象。"""
+            payload: Dict[str, Any] = {
+                "presentation_id": record.presentation_id,
+                "items": [
+                    {
+                        "credential_id": item.credential_id,
+                        "issuer_did": item.issuer_did,
+                        "issuer_key_version": item.issuer_key_version,
+                        "disclose": item.disclose,
+                        "claims": item.projection,
+                        "proof": item.proof,
+                    }
+                    for item in record.items
+                ],
+                "challenge": record.challenge,
+                "expires_at": record.expires_at,
+            }
+            if record.holder_did is not None:
+                payload["holder_did"] = record.holder_did
+                payload["holder_key_version"] = record.holder_key_version
+                payload["holder_proof"] = record.holder_proof
+            return payload
+
+        def _post_multi_presentations(self, tenant: str) -> None:
+            # 多凭证原子组合展示：请求体恰为 {"items": [项...]} 加可选
+            # challenge、expires_in、holder_binding（组合级统一字段）。
+            # items 须为非空且不超过 100 项的数组；每项恰含非空字符串
+            # credential_id 与 disclose，批内 credential_id 不得重复；
+            # disclose 规则同单项 present（RFC6901 claims 叶子：拒根
+            # 路径、越界、重复与嵌套覆盖），语义在 store 内结合凭证
+            # claims 校验。challenge 非空串按码点 ≤256、缺省 32 位小写
+            # hex；expires_in 非布尔整数 1..86400、缺省 300；
+            # holder_binding 布尔、缺省 false，绑定时各凭证 subject_did
+            # 须一致且为本租户已注册 DID。外层/项结构、挑战、期限、
+            # 绑定类型错误一律 400；任一凭证未知或跨租户 404；签发者
+            # 停用/凭证暂停 409。成功 201 返回组合展示对象。
+            data = self._read_json()
+            if "items" not in data:
+                raise ValidationError("缺少字段: items")
+            extra = sorted(
+                set(data)
+                - {"items", "challenge", "expires_in", "holder_binding"}
+            )
+            if extra:
+                raise ValidationError(f"多余字段: {', '.join(extra)}")
+            items = data["items"]
+            if not isinstance(items, list):
+                raise ValidationError("字段 items 必须为数组")
+            if not items:
+                raise ValidationError("items 数组不能为空")
+            if len(items) > 100:
+                raise ValidationError(
+                    "items 数组不能超过 100 项"
+                    f"（当前 {len(items)} 项）"
+                )
+            request_items: List[Dict[str, Any]] = []
+            seen_credential_ids = set()
+            for index, item in enumerate(items):
+                where = f"第 {index + 1} 项"
+                if not isinstance(item, dict):
+                    raise ValidationError(f"{where}必须为 JSON 对象")
+                item_extra = sorted(set(item) - {"credential_id", "disclose"})
+                if item_extra:
+                    raise ValidationError(
+                        f"{where}含多余字段: {', '.join(item_extra)}"
+                    )
+                if "credential_id" not in item:
+                    raise ValidationError(f"{where}缺少字段: credential_id")
+                if "disclose" not in item:
+                    raise ValidationError(f"{where}缺少字段: disclose")
+                credential_id = item["credential_id"]
+                if (
+                    not isinstance(credential_id, str)
+                    or not credential_id
+                ):
+                    raise ValidationError(
+                        f"{where}字段 credential_id 必须为非空字符串"
+                    )
+                if credential_id in seen_credential_ids:
+                    raise ValidationError(
+                        f"items 中 credential_id 重复: {credential_id}"
+                    )
+                seen_credential_ids.add(credential_id)
+                if not isinstance(item["disclose"], list):
+                    raise ValidationError(
+                        f"{where}字段 disclose 必须为数组"
+                    )
+                request_items.append(
+                    {"credential_id": credential_id, "disclose": item["disclose"]}
+                )
+            challenge = None
+            if "challenge" in data:
+                challenge = data["challenge"]
+                if not isinstance(challenge, str) or not challenge:
+                    raise ValidationError("字段 challenge 必须为非空字符串")
+                if len(challenge) > 256:
+                    raise ValidationError(
+                        "字段 challenge 按 Unicode 码点不能超过 256"
+                    )
+            expires_in = None
+            if "expires_in" in data:
+                expires_in = data["expires_in"]
+                if not isinstance(expires_in, int) or isinstance(
+                    expires_in, bool
+                ):
+                    raise ValidationError("字段 expires_in 必须为整数")
+                if not 1 <= expires_in <= 86400:
+                    raise ValidationError(
+                        "字段 expires_in 须在 1 到 86400 之间"
+                    )
+            holder_binding = False
+            if "holder_binding" in data:
+                holder_binding = data["holder_binding"]
+                if not isinstance(holder_binding, bool):
+                    raise ValidationError("字段 holder_binding 必须为布尔值")
+            record = store.create_multi_presentation(
+                tenant,
+                request_items,
+                challenge=challenge,
+                expires_in=expires_in,
+                holder_binding=holder_binding,
+            )
+            self._send_json(201, self._multi_presentation_payload(record))
 
         # ------------------------------------------------------------ #
         # 谓词证明

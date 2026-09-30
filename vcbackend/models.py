@@ -176,6 +176,48 @@ class PresentationRecord:
 
 
 @dataclass
+class MultiPresentationItem:
+    """多凭证组合展示中的单个凭证投影项。
+
+    disclose 为命中该凭证 claims 的 RFC6901 指针列表（"[]" 时为零
+    披露空列表）；projection 为按 disclose 重算出的 claims 投影；
+    proof 为覆盖组合层 challenges/expires_at 与本项投影的签发 ES256
+    签名（base64url 无填充），使用该凭证签发时 issuer_key_version
+    对应的历史私钥。
+    """
+
+    credential_id: str
+    issuer_did: str
+    issuer_key_version: int
+    disclose: list
+    projection: Dict[str, Any]
+    proof: str
+
+
+@dataclass
+class MultiPresentationRecord:
+    """一条多凭证组合展示记录。
+
+    items 为按请求顺序排列的凭证投影项（见 MultiPresentationItem）；
+    challenge 为全组合统一挑战串，expires_at 为统一过期时间（UTC、Z
+    结尾、秒精度），二者随组合一起被各项签发证明与可选持有者证明
+    覆盖并持久化；presentation_id 为 mvp_ 加 32 位小写 hex。
+
+    holder_binding 为 True 时，各凭证 subject_did 必须相同且均为本
+    租户已注册 DID，holder_did/holder_key_version/holder_proof 为
+    该持有者的统一绑定信息（与单凭证演示同构）；未绑定时三者为 None。
+    """
+
+    presentation_id: str
+    items: List[MultiPresentationItem]
+    challenge: str
+    expires_at: str
+    holder_did: Optional[str] = None
+    holder_key_version: Optional[int] = None
+    holder_proof: Optional[str] = None
+
+
+@dataclass
 class PredicateProofRecord:
     """一条谓词证明记录。
 
