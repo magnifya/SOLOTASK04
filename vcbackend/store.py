@@ -60,6 +60,8 @@ from .models import (
     KeyLifecycleEvent,
     PredicateProofRecord,
     PresentationRecord,
+    MultiPresentationRecord,
+    MultiPresentationItemRecord,
     PresentationSyncReceiptConsumptionEvent,
     ReceiptConsumptionEvent,
     TrustPresentationConsumptionEvent,
@@ -182,6 +184,21 @@ TRUST_ANCHOR_USES = (
 DEFAULT_EXPIRES_IN = 300
 MAX_EXPIRES_IN = 86400
 
+# 多凭证组合展示条目数上限
+MAX_MULTI_PRESENTATION_ITEMS = 100
+
+# 多凭证组合展示验真的固定中文 reason
+MULTI_FIELD_MISMATCH_REASON = "字段集不一致"
+MULTI_ANCHOR_REASON = "锚定校验失败"
+MULTI_SIGNATURE_FORMAT_REASON = "签名格式错误"
+MULTI_SIGNATURE_INVALID_REASON = "签名校验失败"
+MULTI_HOLDER_REASON = "持有人绑定失败"
+MULTI_CRED_SUSPENDED_REASON = "凭证已停用"
+MULTI_CRED_REVOKED_REASON = "凭证已吊销"
+MULTI_CRED_EXPIRED_REASON = "凭证已过期"
+MULTI_PRESENTATION_EXPIRED_REASON = "展示已过期"
+MULTI_PRESENTATION_CONSUMED_REASON = "展示已消费"
+
 # 审计动作名
 AUDIT_DID_CREATED = "did.created"
 AUDIT_CREDENTIAL_ISSUED = "credential.issued"
@@ -190,6 +207,8 @@ AUDIT_STATUS_UPDATED = "status.updated"
 AUDIT_CREDENTIAL_REVOKED = "credential.revoked"
 AUDIT_PRESENTATION_CREATED = "presentation.created"
 AUDIT_PRESENTATION_CONSUMED = "presentation.consumed"
+AUDIT_MULTI_PRESENTATION_CREATED = "multi_presentation.created"
+AUDIT_MULTI_PRESENTATION_CONSUMED = "multi_presentation.consumed"
 AUDIT_TRUST_ANCHOR_REGISTERED = "trust.anchor.registered"
 AUDIT_TRUST_ANCHOR_REVOKED = "trust.anchor.revoked"
 AUDIT_TRUST_ANCHOR_ROTATED = "trust.anchor.rotated"
@@ -642,6 +661,7 @@ class VCStore:
             bucket.setdefault("dids", {})
             bucket.setdefault("credentials", {})
             bucket.setdefault("presentations", {})
+            bucket.setdefault("multi_presentations", {})
             bucket.setdefault("proofs", {})
             bucket.setdefault("trust_anchors", {})
             bucket.setdefault("credential_status_sync", {})
@@ -1364,6 +1384,7 @@ class VCStore:
                 "dids": {},
                 "credentials": {},
                 "presentations": {},
+                "multi_presentations": {},
                 "proofs": {},
                 "trust_anchors": {},
                 "credential_status_sync": {},
@@ -3118,6 +3139,651 @@ class VCStore:
                 except Exception:
                     self._restore_locked(snapshot)
                     return False, "验签过程发生内部错误"
+        return True, ""
+
+    # ------------------------------------------------------------------ #
+    # 多凭证组合展示
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _multi_item_record(
+        item: Dict[str, Any],
+    ) -> MultiPresentationItemRecord:
+        return MultiPresentationItemRecord(
+            credential_id=item["credential_id"],
+            issuer_did=item["issuer_did"],
+            issuer_key_version=int(item["issuer_key_version"]),
+            disclose=list(item.get("disclose", [])),
+            projection=item.get("claims", {}),
+            proof=item["proof"],
+        )
+
+    @classmethod
+    def _multi_presentation_record(
+        cls, row: Dict[str, Any]
+    ) -> MultiPresentationRecord:
+        return MultiPresentationRecord(
+            presentation_id=row["presentation_id"],
+            items=[cls._multi_item_record(item) for item in row["items"]],
+            challenge=row["challenge"],
+            expires_at=row["expires_at"],
+            holder_did=row.get("holder_did"),
+            holder_key_version=(
+                int(row["holder_key_version"])
+                if row.get("holder_key_version") is not None
+                else None
+            ),
+            holder_proof=row.get("holder_proof"),
+            consumed=bool(row.get("consumed")),
+            consumed_at=row.get("consumed_at"),
+        )
+
+    @staticmethod
+    def _multi_item_unsigned_locked(
+        presentation_id: str,
+        item_row: Dict[str, Any],
+        challenge: str,
+        expires_at: str,
+    ) -> Dict[str, Any]:
+        """组合条目签发证明覆盖的正文：条目六字段加组合级
+        presentation_id 与统一 challenge/expires_at。"""
+        return {
+            "presentation_id": presentation_id,
+            "credential_id": item_row["credential_id"],
+            "issuer_did": item_row["issuer_did"],
+            "issuer_key_version": int(item_row["issuer_key_version"]),
+            "disclose": list(item_row.get("disclose", [])),
+            "claims": item_row.get("claims", {}),
+            "challenge": challenge,
+            "expires_at": expires_at,
+        }
+
+    def _build_multi_presentation_row_locked(
+        self,
+        tenant_id: str,
+        bucket: Optional[Dict[str, Any]],
+        request_items: List[Dict[str, Any]],
+        challenge: str,
+        expires_at: str,
+        holder_binding: bool,
+    ) -> Dict[str, Any]:
+        """在锁内完成组合展示的全部校验与签名，返回待落盘行（不写状态）。
+
+        任一条目凭证不存在（含他租户资源、租户桶缺失）抛 NotFoundError；
+        claims 非对象或 disclose 非法（非数组、路径语法/越界/重复/祖先
+        重叠）抛 ValidationError；任一签发者 DID 已停用或凭证已暂停抛
+        ConflictError；历史私钥缺失或签发密钥版本已吊销抛
+        ValidationError。holder_binding 为真时，所有条目凭证的
+        subject_did 必须一致且为本租户已注册 DID，持有者当前密钥版本
+        已吊销同样拒绝。
+        """
+        presentation_id = f"mvp_{uuid.uuid4().hex}"
+        item_rows: List[Dict[str, Any]] = []
+        # 绑定时以首条目凭证 subject_did 锚定整个组合的持有者。
+        holder_did: Optional[str] = None
+        holder_key_version: Optional[int] = None
+        holder_private_pem: Optional[str] = None
+
+        for request_item in request_items:
+            credential_id = request_item["credential_id"]
+            cred = (
+                bucket["credentials"].get(credential_id)
+                if bucket is not None else None
+            )
+            if cred is None:
+                raise NotFoundError(f"凭证不存在: {credential_id}")
+            stored_body = cred["body"]
+            claims = stored_body.get("claims", {})
+            if not isinstance(claims, dict):
+                raise ValidationError("凭证 claims 不是 JSON 对象，无法披露")
+
+            parsed = _validate_disclose(claims, request_item["disclose"])
+            projection = _project_claims(claims, parsed)
+
+            issuer_did = stored_body["issuer_did"]
+            version = int(stored_body.get("issuer_key_version", 1))
+            issuer_rec = bucket["dids"].get(issuer_did)
+            if self._is_did_deactivated_locked(issuer_rec):
+                raise ConflictError(
+                    f"签发者 DID 已停用，不能生成组合展示: {issuer_did}"
+                )
+            private_pem = self._private_key_for_version_locked(
+                bucket, issuer_did, version
+            )
+            if not private_pem:
+                raise ValidationError(
+                    "历史私钥不可用: 签发者 "
+                    f"{issuer_did} 密钥版本 {version} 的私钥不存在"
+                )
+            issuer_entry = self._key_history_entry_by_version_locked(
+                bucket, issuer_did, version
+            )
+            if (
+                issuer_entry is not None
+                and issuer_entry.get("status") == "revoked"
+            ):
+                raise ValidationError(
+                    "签发密钥版本已吊销，不能生成组合展示: "
+                    f"{issuer_did}#{version}"
+                )
+
+            if holder_binding:
+                subject_did = stored_body.get("subject_did")
+                if not isinstance(subject_did, str) or not subject_did:
+                    raise ValidationError(
+                        "凭证缺少合法 subject_did，无法进行持有者绑定: "
+                        f"{credential_id}"
+                    )
+                if holder_did is None:
+                    holder_did = subject_did
+                    holder_rec = bucket["dids"].get(holder_did)
+                    if holder_rec is None:
+                        raise ValidationError(
+                            f"subject_did 不是本租户已注册 DID: {holder_did}"
+                        )
+                    holder_key_version = int(holder_rec.get("key_version", 1))
+                    holder_private_pem = self._private_key_for_version_locked(
+                        bucket, holder_did, holder_key_version
+                    )
+                    if not holder_private_pem:
+                        raise ValidationError(
+                            "持有者当前密钥不可用: 持有者 "
+                            f"{holder_did} 密钥版本 "
+                            f"{holder_key_version} 的私钥不存在"
+                        )
+                    holder_entry = self._key_history_entry_by_version_locked(
+                        bucket, holder_did, holder_key_version
+                    )
+                    if (
+                        holder_entry is not None
+                        and holder_entry.get("status") == "revoked"
+                    ):
+                        raise ValidationError(
+                            "持有者密钥版本已吊销，不能生成绑定组合展示: "
+                            f"{holder_did}#{holder_key_version}"
+                        )
+                elif subject_did != holder_did:
+                    raise ValidationError(
+                        "组合内凭证 subject_did 不一致，无法绑定同一持有者: "
+                        f"{subject_did} != {holder_did}"
+                    )
+
+            # 凭证已暂停：拒绝生成（409）；已吊销凭证沿用“可生成、
+            # 验签处拒绝”的既有单张演示语义。
+            if cred.get("status") == "suspended":
+                raise ConflictError(
+                    f"凭证已暂停，不能生成组合展示: {credential_id}"
+                )
+
+            item_row: Dict[str, Any] = {
+                "credential_id": credential_id,
+                "issuer_did": issuer_did,
+                "issuer_key_version": version,
+                "disclose": [pointer for pointer, _ in parsed],
+                "claims": projection,
+            }
+            unsigned = self._multi_item_unsigned_locked(
+                presentation_id, item_row, challenge, expires_at
+            )
+            item_row["proof"] = crypto.sign(unsigned, private_pem)
+            item_rows.append(item_row)
+
+        row: Dict[str, Any] = {
+            "presentation_id": presentation_id,
+            "items": item_rows,
+            "challenge": challenge,
+            "expires_at": expires_at,
+            "consumed": False,
+            "consumed_at": None,
+        }
+        if holder_binding:
+            # holder_proof 覆盖去掉 holder_proof 后的完整组合对象
+            # （含 holder_did/holder_key_version 与全部条目签发证明）
+            # 及 tenant_id。
+            holder_payload = {
+                "presentation_id": presentation_id,
+                "items": item_rows,
+                "challenge": challenge,
+                "expires_at": expires_at,
+                "holder_did": holder_did,
+                "holder_key_version": holder_key_version,
+                "tenant_id": tenant_id,
+            }
+            holder_proof = crypto.sign(holder_payload, holder_private_pem)
+            row["holder_did"] = holder_did
+            row["holder_key_version"] = holder_key_version
+            row["holder_proof"] = holder_proof
+        return row
+
+    def create_multi_presentation(
+        self,
+        tenant_id: str,
+        items: List[Dict[str, Any]],
+        challenge: Optional[str] = None,
+        expires_in: Optional[int] = None,
+        holder_binding: bool = False,
+    ) -> MultiPresentationRecord:
+        """原子生成多凭证组合展示并持久化，记一条审计。
+
+        items 已通过请求级结构校验（每项恰含非空字符串 credential_id
+        与 disclose 数组，批内不重复）；disclose 语义、凭证存在性、
+        签发/持有者状态在锁内逐项校验，任一失败整体不写入。challenge
+        缺省 32 位小写 hex；expires_in 缺省 300（1..86400）；
+        holder_binding 缺省 False，为真时全部条目凭证须同持证人且
+        subject_did 为本租户已注册 DID。presentation_id 为 mvp_ 加
+        32 位小写 hex。
+        """
+        if challenge is None:
+            challenge = uuid.uuid4().hex
+        if expires_in is None:
+            expires_in = DEFAULT_EXPIRES_IN
+        expires_at = _utc_after(expires_in)
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            row = self._build_multi_presentation_row_locked(
+                tenant_id, bucket, items, challenge, expires_at,
+                holder_binding,
+            )
+            snapshot = self._snapshot_locked()
+            try:
+                presentation_id = row["presentation_id"]
+                bucket["multi_presentations"][presentation_id] = row
+                self._append_audit_locked(
+                    tenant_id, AUDIT_MULTI_PRESENTATION_CREATED,
+                    "multi_presentation", presentation_id,
+                )
+                self._save_locked()
+                return self._multi_presentation_record(row)
+            except Exception:
+                self._restore_locked(snapshot)
+                raise
+
+    def get_multi_presentation(
+        self, tenant_id: str, presentation_id: str
+    ) -> MultiPresentationRecord:
+        """查询本租户组合展示记录；不存在（含他租户资源）抛 NotFoundError。"""
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            row = (
+                bucket["multi_presentations"].get(presentation_id)
+                if bucket is not None else None
+            )
+            if row is None:
+                raise NotFoundError(f"组合展示不存在: {presentation_id}")
+            return self._multi_presentation_record(row)
+
+    # 组合展示顶层固定键（未绑定）
+    _MULTI_TOP_KEYS = {
+        "presentation_id",
+        "items",
+        "challenge",
+        "expires_at",
+    }
+    # 组合每个条目的固定键
+    _MULTI_ITEM_KEYS = {
+        "credential_id",
+        "issuer_did",
+        "issuer_key_version",
+        "disclose",
+        "claims",
+        "proof",
+    }
+
+    def verify_multi_presentation(
+        self,
+        tenant_id: str,
+        presentation_id: str,
+        presentation: Any,
+        challenge: str,
+    ) -> Tuple[bool, str]:
+        """以存储记录为锚校验多凭证组合展示，返回 (是否有效, 固定原因)。
+
+        失败原因固定为：字段集不一致 / 锚定校验失败 / 签名校验失败 /
+        持有人绑定失败 / 凭证已停用 / 凭证已吊销 / 凭证已过期 /
+        展示已过期 / 展示已消费。仅首次完整验证成功时在锁内复查后
+        原子消费（失败不消耗），重复验证返回展示已消费。
+        """
+        if not isinstance(presentation, dict):
+            return False, MULTI_FIELD_MISMATCH_REASON
+
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            row = (
+                bucket["multi_presentations"].get(presentation_id)
+                if bucket is not None else None
+            )
+            if row is None:
+                return False, MULTI_ANCHOR_REASON
+
+            is_holder_bound = "holder_did" in row
+            expected_keys = set(self._MULTI_TOP_KEYS)
+            if is_holder_bound:
+                expected_keys |= {
+                    "holder_did",
+                    "holder_key_version",
+                    "holder_proof",
+                }
+            if set(presentation) != expected_keys:
+                return False, MULTI_FIELD_MISMATCH_REASON
+
+            obj_items = presentation.get("items")
+            if not isinstance(obj_items, list):
+                return False, MULTI_FIELD_MISMATCH_REASON
+            stored_items = row.get("items", [])
+            if len(obj_items) != len(stored_items):
+                return False, MULTI_ANCHOR_REASON
+            for obj_item in obj_items:
+                if not isinstance(obj_item, dict):
+                    return False, MULTI_FIELD_MISMATCH_REASON
+                if set(obj_item) != self._MULTI_ITEM_KEYS:
+                    return False, MULTI_FIELD_MISMATCH_REASON
+                proof = obj_item.get("proof")
+                if not isinstance(proof, str) or not proof:
+                    return False, MULTI_FIELD_MISMATCH_REASON
+                version_obj = obj_item.get("issuer_key_version")
+                if (
+                    not isinstance(version_obj, int)
+                    or isinstance(version_obj, bool)
+                ):
+                    return False, MULTI_FIELD_MISMATCH_REASON
+                if not isinstance(obj_item.get("disclose"), list):
+                    return False, MULTI_FIELD_MISMATCH_REASON
+                if not isinstance(obj_item.get("claims"), dict):
+                    return False, MULTI_FIELD_MISMATCH_REASON
+                for key in ("credential_id", "issuer_did"):
+                    if not isinstance(obj_item.get(key), str) or not obj_item.get(
+                        key
+                    ):
+                        return False, MULTI_FIELD_MISMATCH_REASON
+
+            for key in ("presentation_id", "challenge", "expires_at"):
+                if not isinstance(presentation.get(key), str) or not presentation.get(
+                    key
+                ):
+                    return False, MULTI_FIELD_MISMATCH_REASON
+
+            if is_holder_bound:
+                holder_did_value = presentation.get("holder_did")
+                if not isinstance(holder_did_value, str) or not holder_did_value:
+                    return False, MULTI_FIELD_MISMATCH_REASON
+                holder_proof = presentation.get("holder_proof")
+                if not isinstance(holder_proof, str) or not holder_proof:
+                    return False, MULTI_FIELD_MISMATCH_REASON
+                holder_version_obj = presentation.get("holder_key_version")
+                if (
+                    not isinstance(holder_version_obj, int)
+                    or isinstance(holder_version_obj, bool)
+                ):
+                    return False, MULTI_FIELD_MISMATCH_REASON
+
+            # ---- 锚定：与存储记录逐一核对 ---- #
+            if presentation.get("presentation_id") != presentation_id:
+                return False, MULTI_ANCHOR_REASON
+            if presentation.get("presentation_id") != row.get(
+                "presentation_id"
+            ):
+                return False, MULTI_ANCHOR_REASON
+            stored_challenge = row.get("challenge")
+            if presentation.get("challenge") != stored_challenge:
+                return False, MULTI_ANCHOR_REASON
+            if challenge != stored_challenge:
+                return False, MULTI_ANCHOR_REASON
+            if presentation.get("expires_at") != row.get("expires_at"):
+                return False, MULTI_ANCHOR_REASON
+
+            for obj_item, stored_item in zip(obj_items, stored_items):
+                if obj_item["credential_id"] != stored_item["credential_id"]:
+                    return False, MULTI_ANCHOR_REASON
+                if obj_item["issuer_did"] != stored_item["issuer_did"]:
+                    return False, MULTI_ANCHOR_REASON
+                if int(obj_item["issuer_key_version"]) != int(
+                    stored_item["issuer_key_version"]
+                ):
+                    return False, MULTI_ANCHOR_REASON
+                if obj_item["disclose"] != list(
+                    stored_item.get("disclose", [])
+                ):
+                    return False, MULTI_ANCHOR_REASON
+                # proof 不做相等锚定：交由后面的密码学验签区分
+                # “签名校验失败”（与单张演示验签语义一致）。
+
+            if is_holder_bound:
+                if presentation.get("holder_did") != row.get("holder_did"):
+                    return False, MULTI_ANCHOR_REASON
+                if int(presentation.get("holder_key_version")) != int(
+                    row.get("holder_key_version")
+                ):
+                    return False, MULTI_ANCHOR_REASON
+
+            # 已消费优先于过期与后续签名/状态判定
+            if row.get("consumed"):
+                return False, MULTI_PRESENTATION_CONSUMED_REASON
+            try:
+                expires_at = _parse_utc_z(row["expires_at"])
+            except (KeyError, TypeError, ValueError):
+                return False, "验签过程发生内部错误"
+            if datetime.now(timezone.utc) >= expires_at:
+                return False, MULTI_PRESENTATION_EXPIRED_REASON
+
+            # ---- 投影重算 + 凭证/锚点上下文收集 ---- #
+            credentials: List[Dict[str, Any]] = []
+            public_pems: List[str] = []
+            issuer_versions: List[int] = []
+            issuer_dids: List[str] = []
+            for obj_item, stored_item in zip(obj_items, stored_items):
+                credential_id = stored_item["credential_id"]
+                issuer_did = stored_item["issuer_did"]
+                version = int(stored_item["issuer_key_version"])
+                cred = bucket["credentials"].get(credential_id)
+                if cred is None:
+                    return False, MULTI_ANCHOR_REASON
+                source_claims = cred["body"].get("claims", {})
+                try:
+                    parsed_stored = [
+                        (pointer, _parse_pointer(pointer))
+                        for pointer in stored_item.get("disclose", [])
+                    ]
+                    recomputed = _project_claims(source_claims, parsed_stored)
+                except ValidationError:
+                    return False, MULTI_ANCHOR_REASON
+                if obj_item["claims"] != recomputed:
+                    return False, MULTI_ANCHOR_REASON
+                public_pem = self._public_key_for_version_locked(
+                    bucket, issuer_did, version
+                )
+                if not public_pem:
+                    return False, MULTI_ANCHOR_REASON
+                try:
+                    crypto.validate_public_key_pem(public_pem)
+                except (ValueError, TypeError):
+                    return False, MULTI_ANCHOR_REASON
+                issuer_entry = self._key_history_entry_by_version_locked(
+                    bucket, issuer_did, version
+                )
+                if (
+                    issuer_entry is not None
+                    and issuer_entry.get("status") == "revoked"
+                ):
+                    return False, MULTI_ANCHOR_REASON
+                issuer_did_row = bucket["dids"].get(issuer_did)
+                if self._is_did_deactivated_locked(issuer_did_row):
+                    return False, MULTI_ANCHOR_REASON
+                credentials.append(cred)
+                public_pems.append(public_pem)
+                issuer_versions.append(version)
+                issuer_dids.append(issuer_did)
+
+            holder_did_value: Optional[str] = None
+            holder_version_value: Optional[int] = None
+            holder_public_pem: Optional[str] = None
+            if is_holder_bound:
+                holder_did_value = row.get("holder_did")
+                for cred in credentials:
+                    if cred["body"].get("subject_did") != holder_did_value:
+                        return False, MULTI_HOLDER_REASON
+                holder_rec = bucket["dids"].get(holder_did_value)
+                if holder_rec is None:
+                    return False, MULTI_HOLDER_REASON
+                holder_version_value = int(row.get("holder_key_version", 0))
+                holder_public_pem = self._public_key_for_version_locked(
+                    bucket, holder_did_value, holder_version_value
+                )
+                if not holder_public_pem:
+                    return False, MULTI_HOLDER_REASON
+                try:
+                    crypto.validate_public_key_pem(holder_public_pem)
+                except (ValueError, TypeError):
+                    return False, MULTI_HOLDER_REASON
+                holder_entry = self._key_history_entry_by_version_locked(
+                    bucket, holder_did_value, holder_version_value
+                )
+                if (
+                    holder_entry is not None
+                    and holder_entry.get("status") == "revoked"
+                ):
+                    return False, MULTI_HOLDER_REASON
+
+        # ---- 锁外：各条目签发证明逐一验签 ---- #
+        for index, stored_item in enumerate(stored_items):
+            unsigned = self._multi_item_unsigned_locked(
+                presentation_id,
+                stored_item,
+                stored_challenge,
+                row["expires_at"],
+            )
+            try:
+                crypto.verify(
+                    unsigned, obj_items[index]["proof"],
+                    public_pems[index],
+                )
+            except crypto.MalformedSignature:
+                return False, MULTI_SIGNATURE_FORMAT_REASON
+            except crypto.InvalidSignature:
+                return False, MULTI_SIGNATURE_INVALID_REASON
+            except Exception:  # noqa: BLE001 验签绝不向上抛错
+                return False, "验签过程发生内部错误"
+
+        # ---- 锁外：持有者第二签名 ---- #
+        if is_holder_bound:
+            holder_unsigned = {
+                "presentation_id": presentation_id,
+                "items": [
+                    {
+                        "credential_id": stored_item["credential_id"],
+                        "issuer_did": stored_item["issuer_did"],
+                        "issuer_key_version": int(
+                            stored_item["issuer_key_version"]
+                        ),
+                        "disclose": list(stored_item.get("disclose", [])),
+                        "claims": stored_item.get("claims", {}),
+                        "proof": stored_item["proof"],
+                    }
+                    for stored_item in stored_items
+                ],
+                "challenge": stored_challenge,
+                "expires_at": row["expires_at"],
+                "holder_did": holder_did_value,
+                "holder_key_version": holder_version_value,
+                "tenant_id": tenant_id,
+            }
+            try:
+                crypto.verify(
+                    holder_unsigned,
+                    presentation["holder_proof"],
+                    holder_public_pem,
+                )
+            except crypto.MalformedSignature:
+                return False, MULTI_HOLDER_REASON
+            except crypto.InvalidSignature:
+                return False, MULTI_HOLDER_REASON
+            except Exception:  # noqa: BLE001
+                return False, "验签过程发生内部错误"
+
+        # ---- 各凭证当前状态：停用 > 吊销 > 过期，按条目顺序 ---- #
+        for cred in credentials:
+            if cred.get("status") == "suspended":
+                return False, MULTI_CRED_SUSPENDED_REASON
+        for cred in credentials:
+            if cred.get("status") == "revoked":
+                return False, MULTI_CRED_REVOKED_REASON
+        for cred in credentials:
+            if _is_expired(cred["body"].get("expires_at")):
+                return False, MULTI_CRED_EXPIRED_REASON
+
+        # ---- 原子消费：锁内复查后标记 ---- #
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            now_row = (
+                bucket["multi_presentations"].get(presentation_id)
+                if bucket is not None else None
+            )
+            if now_row is None:
+                return False, MULTI_ANCHOR_REASON
+            if now_row.get("consumed"):
+                return False, MULTI_PRESENTATION_CONSUMED_REASON
+            try:
+                now_expires_at = _parse_utc_z(now_row["expires_at"])
+            except (KeyError, TypeError, ValueError):
+                return False, "验签过程发生内部错误"
+            if datetime.now(timezone.utc) >= now_expires_at:
+                return False, MULTI_PRESENTATION_EXPIRED_REASON
+            # 锁内复查条目凭证的锚点与状态（防锁外验签期间变更竞态）。
+            for stored_item in now_row.get("items", []):
+                cred = bucket["credentials"].get(stored_item["credential_id"])
+                if cred is None:
+                    return False, MULTI_ANCHOR_REASON
+                c_issuer_did = stored_item["issuer_did"]
+                c_version = int(stored_item["issuer_key_version"])
+                c_public_pem = self._public_key_for_version_locked(
+                    bucket, c_issuer_did, c_version
+                )
+                if not c_public_pem:
+                    return False, MULTI_ANCHOR_REASON
+                c_entry = self._key_history_entry_by_version_locked(
+                    bucket, c_issuer_did, c_version
+                )
+                if (
+                    c_entry is not None
+                    and c_entry.get("status") == "revoked"
+                ):
+                    return False, MULTI_ANCHOR_REASON
+                c_issuer_row = bucket["dids"].get(c_issuer_did)
+                if self._is_did_deactivated_locked(c_issuer_row):
+                    return False, MULTI_ANCHOR_REASON
+            if is_holder_bound:
+                h_entry = self._key_history_entry_by_version_locked(
+                    bucket, holder_did_value, holder_version_value
+                )
+                if (
+                    h_entry is not None
+                    and h_entry.get("status") == "revoked"
+                ):
+                    return False, MULTI_HOLDER_REASON
+            for stored_item in now_row.get("items", []):
+                cred = bucket["credentials"].get(stored_item["credential_id"])
+                if cred is not None and cred.get("status") == "suspended":
+                    return False, MULTI_CRED_SUSPENDED_REASON
+            for stored_item in now_row.get("items", []):
+                cred = bucket["credentials"].get(stored_item["credential_id"])
+                if cred is not None and cred.get("status") == "revoked":
+                    return False, MULTI_CRED_REVOKED_REASON
+            for stored_item in now_row.get("items", []):
+                cred = bucket["credentials"].get(stored_item["credential_id"])
+                if cred is not None and _is_expired(
+                    cred["body"].get("expires_at")
+                ):
+                    return False, MULTI_CRED_EXPIRED_REASON
+            snapshot = self._snapshot_locked()
+            try:
+                now_row["consumed"] = True
+                now_row["consumed_at"] = _utc_now()
+                self._append_audit_locked(
+                    tenant_id, AUDIT_MULTI_PRESENTATION_CONSUMED,
+                    "multi_presentation", presentation_id,
+                )
+                self._save_locked()
+            except Exception:
+                self._restore_locked(snapshot)
+                return False, "验签过程发生内部错误"
         return True, ""
 
     # ------------------------------------------------------------------ #

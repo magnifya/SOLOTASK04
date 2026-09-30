@@ -24,6 +24,8 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/credentials/{credential_id}/present 生成选择性披露演示
   POST /v1/credentials/{credential_id}/present-batch 原子批量生成选择性披露演示
   POST /v1/presentations/{presentation_id}/verify  以存储记录为锚校验演示
+  POST /v1/presentations/multi                 原子生成多凭证组合展示
+                                                   （mvp_ 前缀复用 verify 路由验真）
   POST /v1/credentials/{credential_id}/prove    生成谓词证明
   POST /v1/proofs/{proof_id}/verify             以存储记录为锚校验谓词证明
   POST /v1/trust/anchors                  注册信任锚点（同 DID/版本同 PEM 且 uses 相同幂等；可选 uses 用途白名单）
@@ -628,15 +630,24 @@ def build_handler(store: VCStore) -> type:
                         path[len("/v1/proofs/") : -len("/verify")]
                     )
                     self._post_verify_proof(tenant, proof_id)
+                elif path == "/v1/presentations/multi":
+                    self._post_presentations_multi(tenant)
                 elif path.startswith("/v1/presentations/") and path.endswith(
                     "/verify"
                 ):
                     presentation_id = unquote(
                         path[len("/v1/presentations/") : -len("/verify")]
                     )
-                    self._post_verify_presentation(
-                        tenant, presentation_id
-                    )
+                    # mvp_ 前缀为多凭证组合展示，走组合验真协议；
+                    # 其余为既有单张选择性披露演示。
+                    if presentation_id.startswith("mvp_"):
+                        self._post_verify_multi_presentation(
+                            tenant, presentation_id
+                        )
+                    else:
+                        self._post_verify_presentation(
+                            tenant, presentation_id
+                        )
                 elif path == "/v1/trust/anchors":
                     self._post_trust_anchors(tenant)
                 elif path == "/v1/trust/anchors/snapshot/verify":
@@ -2307,6 +2318,209 @@ def build_handler(store: VCStore) -> type:
             try:
                 valid, reason = store.verify_presentation(
                     tenant, presentation_id, data["presentation"], challenge
+                )
+            except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
+                self._send_invalid("验签过程发生内部错误")
+                return
+            payload: Dict[str, Any] = {"valid": valid}
+            if not valid:
+                payload["reason"] = reason or "验签失败"
+            self._send_json(200, payload)
+
+        # ------------------------------------------------------------ #
+        # 多凭证组合展示
+        # ------------------------------------------------------------ #
+        @staticmethod
+        def _multi_item_payload(
+            item: Any,
+        ) -> Dict[str, Any]:
+            """组合条目对外固定键序：六字段，投影只含所选叶子 claim。"""
+            return {
+                "credential_id": item.credential_id,
+                "issuer_did": item.issuer_did,
+                "issuer_key_version": item.issuer_key_version,
+                "disclose": item.disclose,
+                "claims": item.projection,
+                "proof": item.proof,
+            }
+
+        def _multi_presentation_payload(
+            self, record: Any
+        ) -> Dict[str, Any]:
+            """组合展示对外固定键序。"""
+            payload: Dict[str, Any] = {
+                "presentation_id": record.presentation_id,
+                "items": [
+                    self._multi_item_payload(item) for item in record.items
+                ],
+                "challenge": record.challenge,
+                "expires_at": record.expires_at,
+            }
+            if record.holder_did is not None:
+                payload["holder_did"] = record.holder_did
+                payload["holder_key_version"] = record.holder_key_version
+                payload["holder_proof"] = record.holder_proof
+            return payload
+
+        @staticmethod
+        def _validate_multi_item(item: Any, index: int) -> Dict[str, Any]:
+            """校验组合 items 的单项：恰含 credential_id、disclose。
+
+            credential_id 须为非空字符串；disclose 仅校验为数组，
+            路径语义（根/越界/重复/嵌套覆盖）在 store 内结合各凭证
+            claims 校验。
+            """
+            where = f"第 {index + 1} 项"
+            if not isinstance(item, dict):
+                raise ValidationError(f"{where}必须为 JSON 对象")
+            if "credential_id" not in item:
+                raise ValidationError(f"{where}缺少字段: credential_id")
+            if "disclose" not in item:
+                raise ValidationError(f"{where}缺少字段: disclose")
+            extra = sorted(set(item) - {"credential_id", "disclose"})
+            if extra:
+                raise ValidationError(
+                    f"{where}含多余字段: {', '.join(extra)}"
+                )
+            credential_id = item["credential_id"]
+            if not isinstance(credential_id, str) or not credential_id:
+                raise ValidationError(
+                    f"{where}字段 credential_id 必须为非空字符串"
+                )
+            if not isinstance(item["disclose"], list):
+                raise ValidationError(
+                    f"{where}字段 disclose 必须为数组"
+                )
+            return {
+                "credential_id": credential_id,
+                "disclose": item["disclose"],
+            }
+
+        def _post_presentations_multi(self, tenant: str) -> None:
+            # POST /v1/presentations/multi：请求体须恰含 items
+            # （1..100 项，项恰含非空字符串 credential_id 与 disclose
+            # 数组，批内 credential_id 不重复）及可选 challenge、
+            # expires_in、holder_binding。字段/披露/挑战/期限/绑定/
+            # subject 非法一律 400；未知或跨租户凭证 404。成功 201
+            # 返回组合展示，presentation_id 为 mvp_ 加 32 位小写 hex。
+            data = self._read_json()
+            if "items" not in data:
+                raise ValidationError("缺少字段: items")
+            extra = sorted(
+                set(data)
+                - {"items", "challenge", "expires_in", "holder_binding"}
+            )
+            if extra:
+                raise ValidationError(f"多余字段: {', '.join(extra)}")
+            items = data["items"]
+            if not isinstance(items, list):
+                raise ValidationError("字段 items 必须为数组")
+            if not items:
+                raise ValidationError("items 数组不能为空")
+            if len(items) > 100:
+                raise ValidationError(
+                    "items 数组不能超过 100 项"
+                    f"（当前 {len(items)} 项）"
+                )
+            kwargs_list = [
+                self._validate_multi_item(item, index)
+                for index, item in enumerate(items)
+            ]
+            seen_credential_ids = set()
+            for kwargs in kwargs_list:
+                credential_id = kwargs["credential_id"]
+                if credential_id in seen_credential_ids:
+                    raise ValidationError(
+                        f"items 中 credential_id 重复: {credential_id}"
+                    )
+                seen_credential_ids.add(credential_id)
+
+            challenge = None
+            if "challenge" in data:
+                challenge = data["challenge"]
+                if not isinstance(challenge, str) or not challenge:
+                    raise ValidationError("字段 challenge 必须为非空字符串")
+                if len(challenge) > 256:
+                    raise ValidationError(
+                        "字段 challenge 按 Unicode 码点不能超过 256"
+                    )
+            expires_in = None
+            if "expires_in" in data:
+                expires_in = data["expires_in"]
+                if not isinstance(expires_in, int) or isinstance(
+                    expires_in, bool
+                ):
+                    raise ValidationError("字段 expires_in 必须为整数")
+                if not 1 <= expires_in <= 86400:
+                    raise ValidationError(
+                        "字段 expires_in 须在 1 到 86400 之间"
+                    )
+            holder_binding = False
+            if "holder_binding" in data:
+                holder_binding = data["holder_binding"]
+                if not isinstance(holder_binding, bool):
+                    raise ValidationError("字段 holder_binding 必须为布尔值")
+
+            record = store.create_multi_presentation(
+                tenant,
+                kwargs_list,
+                challenge=challenge,
+                expires_in=expires_in,
+                holder_binding=holder_binding,
+            )
+            self._send_json(
+                201, self._multi_presentation_payload(record)
+            )
+
+        def _post_verify_multi_presentation(
+            self, tenant: str, presentation_id: str
+        ) -> None:
+            # 组合展示验真：请求体须恰为 {"presentation": 对象,
+            # "challenge": 非空串}；任何语义失败均 HTTP 200 +
+            # {"valid": false, "reason": <固定原因>}，仅请求级结构
+            # 问题同样按验签协议返回 200（语义失败不暴露 4xx）。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                self._send_invalid("请求体缺失或长度声明非法")
+                return
+            except Exception:  # noqa: BLE001
+                self._send_invalid("请求体读取失败")
+                return
+            if not raw:
+                self._send_invalid("请求体缺失")
+                return
+            try:
+                request_data = json.loads(raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                self._send_invalid("请求体不是合法 UTF-8 文本")
+                return
+            except json.JSONDecodeError:
+                self._send_invalid("请求体不是合法 JSON")
+                return
+            if not isinstance(request_data, dict):
+                self._send_invalid("请求体必须为 JSON 对象")
+                return
+            if "presentation" not in request_data:
+                self._send_invalid("请求缺少字段: presentation")
+                return
+            extra = sorted(set(request_data) - {"presentation", "challenge"})
+            if extra:
+                self._send_invalid(f"请求含多余字段: {', '.join(extra)}")
+                return
+            challenge = request_data.get("challenge")
+            if not isinstance(challenge, str) or not challenge:
+                self._send_invalid(
+                    "请求字段 challenge 必须为非空字符串"
+                )
+                return
+            try:
+                valid, reason = store.verify_multi_presentation(
+                    tenant,
+                    presentation_id,
+                    request_data["presentation"],
+                    challenge,
                 )
             except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
                 self._send_invalid("验签过程发生内部错误")
