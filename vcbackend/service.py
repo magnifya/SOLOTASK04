@@ -50,6 +50,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/anchors/snapshot/verify-batch  批量校验锚点快照签名（批初锚点快照、逐项不短路，只读）
   POST /v1/trust/verify                   用 active 锚点公钥验签
   POST /v1/trust/credentials/verify       跨系统凭证验真（无需登记 DID/凭证）
+  POST /v1/trust/credentials/verify-with-schema  跨系统模式约束验真（只读）
   POST /v1/trust/credentials/verify-synced  以同步锚点验真外部凭证（只读）
   POST /v1/trust/credentials/verify-synced-with-status  同步锚点验真外部凭证并合并请求初始状态快照（只读）
   POST /v1/trust/credentials/verify-synced-batch  批量以同步锚点快照验真外部凭证（只读）
@@ -708,6 +709,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_verify(tenant)
                 elif path == "/v1/trust/credentials/verify":
                     self._post_trust_credentials_verify(tenant)
+                elif path == "/v1/trust/credentials/verify-with-schema":
+                    self._post_trust_credentials_verify_with_schema(tenant)
                 elif path == "/v1/trust/credentials/verify-synced":
                     self._post_trust_credentials_verify_synced(tenant)
                 elif (
@@ -6396,6 +6399,54 @@ def build_handler(store: VCStore) -> type:
                 self._send_invalid("验签过程发生内部错误")
                 return
             payload: Dict[str, Any] = {"valid": valid}
+            if not valid:
+                payload["reason"] = reason or "验签失败"
+            self._send_json(200, payload)
+
+        def _post_trust_credentials_verify_with_schema(
+            self, tenant: str
+        ) -> None:
+            # POST /v1/trust/credentials/verify-with-schema：跨系统模式
+            # 约束验真（只读）。请求体须恰含 body、signature、schema_id、
+            # schema_version；schema_id 为非空字符串，schema_version 为
+            # 非布尔正整数。请求缺失、多余、非法 JSON、非对象或模式参数
+            # 类型错误，统一 HTTP 200 返回
+            # {"valid":false,"reason":"请求参数无效"}。
+            # 其余固定顺序与原因由 store 实现：body 基础字段（“凭证”
+            # 分类）-> 模式查找（“凭证模式不存在”）-> 模式绑定与
+            # claims（“凭证模式绑定不一致”/“schema validation
+            # failed”）-> 锚点 -> 签名格式 -> 密码学验签 -> 有效期 ->
+            # 外部签发 DID 停用通告。成功仅 {"valid":true}。纯只读：
+            # 不登记外部 DID/凭证，不改模式、锚点、状态、历史或审计；
+            # 显式空 X-Tenant-ID 仍 400，租户间模式与锚点隔离。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                self._send_invalid("请求参数无效")
+                return
+            except Exception:  # noqa: BLE001
+                self._send_invalid("请求参数无效")
+                return
+            if not raw:
+                self._send_invalid("请求参数无效")
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send_invalid("请求参数无效")
+                return
+            if not isinstance(data, dict):
+                self._send_invalid("请求参数无效")
+                return
+            try:
+                valid, reason = store.verify_trust_credential_with_schema(
+                    tenant, data
+                )
+            except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
+                self._send_invalid("验签过程发生内部错误")
+                return
+            payload = {"valid": valid}
             if not valid:
                 payload["reason"] = reason or "验签失败"
             self._send_json(200, payload)

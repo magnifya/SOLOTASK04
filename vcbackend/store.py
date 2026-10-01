@@ -7034,6 +7034,243 @@ class VCStore:
             return False, "验签过程发生内部错误"
         return True, ""
 
+    @staticmethod
+    def _verify_external_credential_body_fields(
+        body: Any,
+    ) -> Tuple[bool, Any, str]:
+        """校验外部凭证 body 基础字段（静态、无状态）。
+
+        成功返回 (True, (issuer_did, key_version), "")；失败返回
+        (False, None, 原因)。原因分类与 /v1/trust/credentials/verify
+        完全一致：缺少/类型不符均以“凭证”开头；issuer_key_version
+        省略按 1 且不注入正文。调用方须先保证 body 为 JSON 对象。
+        """
+        required_str = (
+            "credential_id",
+            "issuer_did",
+            "subject_did",
+            "issued_at",
+        )
+        for field in required_str:
+            if field not in body:
+                return False, None, f"凭证缺少字段: {field}"
+            value = body[field]
+            if not isinstance(value, str) or not value:
+                return False, None, (
+                    f"凭证字段 {field} 必须为非空字符串"
+                )
+        if "claims" not in body:
+            return False, None, "凭证缺少字段: claims"
+        if not isinstance(body["claims"], dict):
+            return False, None, "凭证字段 claims 必须为 JSON 对象"
+        key_version = 1
+        if "issuer_key_version" in body:
+            version_obj = body["issuer_key_version"]
+            if (
+                not isinstance(version_obj, int)
+                or isinstance(version_obj, bool)
+                or version_obj < 1
+            ):
+                return False, None, (
+                    "凭证字段 issuer_key_version 必须为正整数"
+                )
+            key_version = version_obj
+        return True, (body["issuer_did"], key_version), ""
+
+    def _verify_trust_credential_tail(
+        self,
+        tenant_id: str,
+        body: Dict[str, Any],
+        signature: str,
+        key_version: int,
+        issuer_did: str,
+    ) -> Tuple[bool, str]:
+        """外部凭证验真的后半段：锚点 -> 签名格式 -> 密码学验签 ->
+        有效期 -> 外部签发 DID 停用通告。
+
+        原因与优先级与 /v1/trust/credentials/verify 完全一致，供普通
+        外部凭证验真与跨系统模式约束验真共用。纯只读。
+        """
+        # 锚点：本租户 (issuer_did, 版本)，仅 active 且含 vc 用途的
+        # P-256 公钥可用。
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            anchors = (
+                bucket["trust_anchors"].get(issuer_did)
+                if bucket is not None else None
+            )
+            row = (
+                anchors.get(str(key_version))
+                if anchors is not None else None
+            )
+            public_pem = row.get("public_key", "") if row is not None else ""
+            status = row.get("status", "active") if row is not None else None
+            uses = row.get("uses") if row is not None else None
+        if row is None:
+            return False, (
+                f"锚点不存在: {issuer_did}#{key_version}"
+            )
+        if status == "revoked":
+            return False, f"锚点已吊销: {issuer_did}#{key_version}"
+        # 用途白名单：active 锚点无 vc 用途时按锚点不可用处理
+        if uses is not None and "vc" not in uses:
+            return False, (
+                f"锚点不存在: {issuer_did}#{key_version}"
+            )
+        try:
+            crypto.validate_public_key_pem(public_pem)
+        except (ValueError, TypeError):
+            return False, (
+                f"锚点公钥不可用: {issuer_did}#{key_version} 不是合法 P-256 公钥"
+            )
+
+        # 签名格式与密码学验签：签名覆盖完整 body 的规范化 JSON。
+        # 省略 issuer_key_version 时不得向签名正文注入该字段。
+        try:
+            crypto.verify(body, signature, public_pem)
+        except crypto.MalformedSignature:
+            return False, "签名格式错误: 不是合法的 ES256 签名编码"
+        except crypto.InvalidSignature:
+            return False, "签名校验失败，凭证正文或签名可能被改动"
+        except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
+            return False, "签名校验失败: 验签过程发生内部错误"
+
+        # 有效期：仅在请求 body 提供 expires_at 时检查（缺失保持兼容，
+        # 无期限）。须为 UTC 秒精度 Z 格式；当前时间 >= expires_at 判
+        # 到期。只读，不写任何状态、不记审计。
+        if "expires_at" in body:
+            expires_value = body["expires_at"]
+            if (
+                not isinstance(expires_value, str)
+                or not _UTC_Z_SHAPE_RE.match(expires_value)
+            ):
+                return False, (
+                    "凭证字段 expires_at 必须为 UTC 秒精度 Z 格式"
+                    "（YYYY-MM-DDTHH:MM:SSZ）"
+                )
+            try:
+                expires_dt = _parse_utc_z(expires_value)
+            except ValueError:
+                return False, (
+                    "凭证字段 expires_at 必须为 UTC 秒精度 Z 格式"
+                    "（YYYY-MM-DDTHH:MM:SSZ）"
+                )
+            if datetime.now(timezone.utc) >= expires_dt:
+                return False, CREDENTIAL_EXPIRED_REASON
+
+        # 原验真成功后、合并凭证状态前查本租户 issuer_did 外部停用
+        # 通告：命中返回“外部签发DID已停用：<reason>”；无通告或仅他
+        # 租户有通告维持原结论。只读，不写状态、不记审计。
+        deactivation_reason = self._external_did_deactivation_reason(
+            tenant_id, issuer_did, EXTERNAL_ISSUER_DID_DEACTIVATED_REASON_PREFIX
+        )
+        if deactivation_reason is not None:
+            return False, deactivation_reason
+        return True, ""
+
+    def verify_trust_credential_with_schema(
+        self,
+        tenant_id: str,
+        data: Any,
+    ) -> Tuple[bool, str]:
+        """跨系统模式约束验真，返回 (是否有效, 失败原因)。
+
+        请求体须恰含 body（对象）、signature（非空字符串）、schema_id
+        （非空字符串）、schema_version（非布尔正整数）；缺失、多余、
+        非对象或模式参数类型错误统一返回“请求参数无效”。
+
+        固定校验顺序：
+        1. 请求与模式参数；
+        2. body 基础字段（原因沿用 /v1/trust/credentials/verify 的
+           “凭证”分类）；
+        3. 模式查找：当前租户、body.issuer_did 与请求模式参数，查不到
+           （含跨租户同名模式）返回“凭证模式不存在”；
+        4. 模式绑定与 claims：body 须恰绑定 schema_id/schema_version/
+           schema_digest 且与请求参数、模式内容摘要一致，否则“凭证
+           模式绑定不一致”；claims 缺必填路径或声明路径类型不符为
+           “schema validation failed”，未声明的额外 claims 保留；
+        5-9. 锚点、签名格式、密码学验签、有效期、外部签发 DID 停用
+           通告，原因与优先级沿用现有外部凭证验真。
+        模式版本 deprecated/revoked 不追溯历史凭证：始终按该版本原
+        摘要验真，也不得借用其他版本摘要。只读：不登记外部 DID/凭证，
+        不改模式、锚点、状态、历史或审计；绝不向上抛异常。
+        """
+        # 1. 请求与模式参数
+        if not isinstance(data, dict):
+            return False, "请求参数无效"
+        request_fields = ("body", "signature", "schema_id", "schema_version")
+        if set(data) != set(request_fields):
+            return False, "请求参数无效"
+        body = data["body"]
+        signature = data["signature"]
+        schema_id = data["schema_id"]
+        schema_version = data["schema_version"]
+        if not isinstance(body, dict):
+            return False, "请求参数无效"
+        if not isinstance(signature, str) or not signature:
+            return False, "请求参数无效"
+        if not isinstance(schema_id, str) or not schema_id:
+            return False, "请求参数无效"
+        if (
+            not isinstance(schema_version, int)
+            or isinstance(schema_version, bool)
+            or schema_version < 1
+        ):
+            return False, "请求参数无效"
+
+        # 2. body 基础字段
+        fields_ok, fields_value, reason = (
+            self._verify_external_credential_body_fields(body)
+        )
+        if not fields_ok:
+            return False, reason
+        issuer_did, key_version = fields_value
+
+        # 3. 模式查找：限当前租户、同一 issuer_did、请求指定的版本；
+        #    跨租户同名模式按不存在处理。
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            schema_row = self._get_credential_schema_row_locked(
+                bucket, issuer_did, schema_id, schema_version
+            )
+        if schema_row is None:
+            return False, "凭证模式不存在"
+
+        # 4. 模式绑定与 claims：body 三字段缺一不可，schema_id/
+        #    schema_version 须与请求参数同值同型（布尔不等于整数），
+        #    schema_digest 须恰为该已注册版本五字段规范化内容摘要。
+        bound_id = body.get("schema_id")
+        bound_version = body.get("schema_version")
+        bound_digest = body.get("schema_digest")
+        binding_ok = (
+            "schema_id" in body
+            and "schema_version" in body
+            and "schema_digest" in body
+            and isinstance(bound_id, str)
+            and isinstance(bound_version, int)
+            and not isinstance(bound_version, bool)
+            and isinstance(bound_digest, str)
+            and bound_id == schema_id
+            and bound_version == schema_version
+            and bound_digest == schema_row["digest"]
+        )
+        if not binding_ok:
+            return False, "凭证模式绑定不一致"
+        try:
+            _validate_claims_against_schema(
+                body["claims"],
+                schema_row["claim_types"],
+                schema_row["required_claims"],
+            )
+        except ValidationError:
+            return False, SCHEMA_VALIDATION_FAILED_REASON
+
+        # 5-9. 信任锚点、签名格式、密码学验签、有效期、外部签发 DID
+        #      停用通告：原因与优先级完全沿用现有外部凭证验真。
+        return self._verify_trust_credential_tail(
+            tenant_id, body, signature, key_version, issuer_did
+        )
+
     def verify_trust_credential(
         self,
         tenant_id: str,
@@ -7073,109 +7310,19 @@ class VCStore:
             return False, "请求不合法: 字段 signature 必须为非空字符串"
 
         # 2. 凭证字段
-        required_str = (
-            "credential_id",
-            "issuer_did",
-            "subject_did",
-            "issued_at",
+        fields_ok, fields_value, reason = (
+            self._verify_external_credential_body_fields(body)
         )
-        for field in required_str:
-            if field not in body:
-                return False, f"凭证缺少字段: {field}"
-            value = body[field]
-            if not isinstance(value, str) or not value:
-                return False, f"凭证字段 {field} 必须为非空字符串"
-        if "claims" not in body:
-            return False, "凭证缺少字段: claims"
-        if not isinstance(body["claims"], dict):
-            return False, "凭证字段 claims 必须为 JSON 对象"
-        key_version = 1
-        if "issuer_key_version" in body:
-            version_obj = body["issuer_key_version"]
-            if (
-                not isinstance(version_obj, int)
-                or isinstance(version_obj, bool)
-                or version_obj < 1
-            ):
-                return False, "凭证字段 issuer_key_version 必须为正整数"
-            key_version = version_obj
-        issuer_did = body["issuer_did"]
+        if not fields_ok:
+            return False, reason
+        issuer_did, key_version = fields_value
 
-        # 3. 锚点：本租户 (issuer_did, 版本)，仅 active 的 P-256 公钥
-        with self._lock:
-            bucket = self._bucket_locked(tenant_id)
-            anchors = (
-                bucket["trust_anchors"].get(issuer_did)
-                if bucket is not None else None
-            )
-            row = (
-                anchors.get(str(key_version))
-                if anchors is not None else None
-            )
-            public_pem = row.get("public_key", "") if row is not None else ""
-            status = row.get("status", "active") if row is not None else None
-            uses = row.get("uses") if row is not None else None
-        if row is None:
-            return False, (
-                f"锚点不存在: {issuer_did}#{key_version}"
-            )
-        if status == "revoked":
-            return False, f"锚点已吊销: {issuer_did}#{key_version}"
-        # 用途白名单：active 锚点无 vc 用途时按锚点不可用处理
-        if uses is not None and "vc" not in uses:
-            return False, (
-                f"锚点不存在: {issuer_did}#{key_version}"
-            )
-        try:
-            crypto.validate_public_key_pem(public_pem)
-        except (ValueError, TypeError):
-            return False, (
-                f"锚点公钥不可用: {issuer_did}#{key_version} 不是合法 P-256 公钥"
-            )
-
-        # 4/5. 签名格式与密码学验签：签名覆盖完整 body 的规范化 JSON。
-        # 省略 issuer_key_version 时不得向签名正文注入该字段。
-        try:
-            crypto.verify(body, signature, public_pem)
-        except crypto.MalformedSignature:
-            return False, "签名格式错误: 不是合法的 ES256 签名编码"
-        except crypto.InvalidSignature:
-            return False, "签名校验失败，凭证正文或签名可能被改动"
-        except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
-            return False, "签名校验失败: 验签过程发生内部错误"
-
-        # 6. 有效期：仅在请求 body 提供 expires_at 时检查（缺失保持兼容，
-        # 无期限）。须为 UTC 秒精度 Z 格式；当前时间 >= expires_at 判
-        # 到期。只读，不写任何状态、不记审计。
-        if "expires_at" in body:
-            expires_value = body["expires_at"]
-            if (
-                not isinstance(expires_value, str)
-                or not _UTC_Z_SHAPE_RE.match(expires_value)
-            ):
-                return False, (
-                    "凭证字段 expires_at 必须为 UTC 秒精度 Z 格式"
-                    "（YYYY-MM-DDTHH:MM:SSZ）"
-                )
-            try:
-                expires_dt = _parse_utc_z(expires_value)
-            except ValueError:
-                return False, (
-                    "凭证字段 expires_at 必须为 UTC 秒精度 Z 格式"
-                    "（YYYY-MM-DDTHH:MM:SSZ）"
-                )
-            if datetime.now(timezone.utc) >= expires_dt:
-                return False, CREDENTIAL_EXPIRED_REASON
-
-        # 7. 原验真成功后、合并凭证状态前查本租户 issuer_did 外部停用
-        #    通告：命中返回“外部签发DID已停用：<reason>”；无通告或仅他
-        #    租户有通告维持原结论。只读，不写状态、不记审计。
-        deactivation_reason = self._external_did_deactivation_reason(
-            tenant_id, issuer_did, EXTERNAL_ISSUER_DID_DEACTIVATED_REASON_PREFIX
+        # 3-7. 锚点 -> 签名格式 -> 密码学验签 -> 有效期 -> 外部签发
+        # DID 停用通告：与跨系统模式约束验真共用同一后半段，原因与
+        # 优先级保持历史完全一致。
+        return self._verify_trust_credential_tail(
+            tenant_id, body, signature, key_version, issuer_did
         )
-        if deactivation_reason is not None:
-            return False, deactivation_reason
-        return True, ""
 
     def _synced_anchor_events_latest(
         self,
