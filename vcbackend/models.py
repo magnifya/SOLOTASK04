@@ -224,6 +224,10 @@ class PresentationRecord:
     proof: str
     challenge: Optional[str] = None
     expires_at: Optional[str] = None
+    # 验证方展示请求模式：request_id 为该演示应答的展示请求标识，
+    # 随演示一起被 issuer proof（及绑定时 holder_proof）覆盖并持久化；
+    # 非请求模式演示为 None。
+    request_id: Optional[str] = None
     # 可选持有者绑定（holder_binding=true 时写入并持久化）：
     # holder_did 为持有者（即凭证 subject_did）；holder_key_version 为
     # 生成绑定时持有者的当前密钥版本；holder_proof 为持有者私钥对
@@ -232,6 +236,26 @@ class PresentationRecord:
     holder_did: Optional[str] = None
     holder_key_version: Optional[int] = None
     holder_proof: Optional[str] = None
+
+
+@dataclass
+class PresentationRequestRecord:
+    """一条验证方展示请求记录（按租户隔离）。
+
+    challenge 为验证方给出的非空挑战串；expires_at 为请求过期时间
+    （UTC、Z 结尾、秒精度）；disclose 为要求的披露路径（空列表表示
+    零披露）；issuer_dids 为限定的签发者 DID 列表（None 表示不限定）；
+    holder_binding 为是否要求持有者绑定；status 为 pending/consumed，
+    仅验证成功（valid true）时置为 consumed。
+    """
+
+    request_id: str
+    challenge: str
+    expires_at: str
+    disclose: list
+    issuer_dids: Optional[List[str]]
+    holder_binding: bool
+    status: str
 
 
 @dataclass

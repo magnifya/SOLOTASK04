@@ -23,6 +23,8 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/credentials/{credential_id}/verify  以存储记录为锚验签
   POST /v1/credentials/{credential_id}/present 生成选择性披露演示
   POST /v1/credentials/{credential_id}/present-batch 原子批量生成选择性披露演示
+  POST /v1/presentation-requests           创建验证方展示请求
+  GET  /v1/presentation-requests/{request_id} 查询验证方展示请求
   POST /v1/presentations/{presentation_id}/verify  以存储记录为锚校验演示
   POST /v1/credentials/{credential_id}/prove    生成谓词证明
   POST /v1/proofs/{proof_id}/verify             以存储记录为锚校验谓词证明
@@ -172,6 +174,7 @@ from .store import (
     MultiPresentationRecord,
     PresentationRecord,
     REASON_UNSET,
+    REQUEST_ID_UNSET,
     SCHEMA_ID_RE,
     SchemaUnavailableError,
     StorageError,
@@ -554,6 +557,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_audit_manifest_verify_batch(tenant)
                 elif path == "/v1/credentials":
                     self._post_credentials(tenant)
+                elif path == "/v1/presentation-requests":
+                    self._post_presentation_requests(tenant)
                 elif path == "/v1/credential-schemas":
                     self._post_credential_schemas(tenant)
                 elif path.startswith("/v1/credential-schemas/") and path.endswith(
@@ -1132,6 +1137,11 @@ def build_handler(store: VCStore) -> type:
                     self._get_credential(
                         tenant, unquote(path[len("/v1/credentials/") :])
                     )
+                elif path.startswith("/v1/presentation-requests/"):
+                    request_id = unquote(
+                        path[len("/v1/presentation-requests/") :]
+                    )
+                    self._get_presentation_request(tenant, request_id)
                 elif path == "/v1/trust/anchors":
                     self._get_trust_anchor_discovery(tenant, parsed.query)
                 elif path == "/v1/trust/anchor-changes":
@@ -2408,8 +2418,9 @@ def build_handler(store: VCStore) -> type:
         ) -> Dict[str, Any]:
             """按对外契约的固定键序组装演示对象。
 
-            未绑定恰为九字段；持有者绑定在末尾追加 holder_did、
-            holder_key_version、holder_proof。
+            未绑定恰为九字段；展示请求模式在 proof 前插入 request_id；
+            持有者绑定在末尾追加 holder_did、holder_key_version、
+            holder_proof。
             """
             payload: Dict[str, Any] = {
                 "presentation_id": record.presentation_id,
@@ -2420,8 +2431,11 @@ def build_handler(store: VCStore) -> type:
                 "claims": record.projection,
                 "challenge": record.challenge,
                 "expires_at": record.expires_at,
-                "proof": record.proof,
             }
+            # 仅展示请求模式演示携带 request_id（在 proof 之前）。
+            if record.request_id is not None:
+                payload["request_id"] = record.request_id
+            payload["proof"] = record.proof
             # 仅持有者绑定演示返回 holder_did、holder_key_version、
             # holder_proof；未绑定响应字段集合与旧流程完全一致。
             if record.holder_did is not None:
@@ -2498,7 +2512,22 @@ def build_handler(store: VCStore) -> type:
             # challenge 须为非空字符串且按 Unicode 码点不超过 256，
             # 缺省生成 32 位小写 hex；expires_in 须为非布尔整数且
             # 在 1..86400 之间，缺省 300。成功 201 返回演示记录。
+            # 展示请求模式：请求体恰为 {"request_id": "..."}，演示的
+            # challenge/expires_at/disclose/holder_binding 全部取自展示
+            # 请求；请求不存在/已过期/签发者不符/持有人不符依次 400。
             data = self._read_json()
+            if "request_id" in data:
+                extra = sorted(set(data) - {"request_id"})
+                if extra:
+                    raise ValidationError(f"多余字段: {', '.join(extra)}")
+                request_id = data["request_id"]
+                if not isinstance(request_id, str) or not request_id:
+                    raise ValidationError("字段 request_id 必须为非空字符串")
+                record = store.create_presentation_for_request(
+                    tenant, credential_id, request_id
+                )
+                self._send_json(201, self._presentation_payload(record))
+                return
             if "disclose" not in data:
                 raise ValidationError("缺少字段: disclose")
             extra = sorted(
@@ -2589,6 +2618,96 @@ def build_handler(store: VCStore) -> type:
                 },
             )
 
+        # ------------------------------------------------------------ #
+        # 验证方展示请求
+        # ------------------------------------------------------------ #
+        @staticmethod
+        def _presentation_request_payload(record: Any) -> Dict[str, Any]:
+            """按对外契约的固定键序组装展示请求对象。"""
+            return {
+                "request_id": record.request_id,
+                "challenge": record.challenge,
+                "expires_at": record.expires_at,
+                "disclose": record.disclose,
+                "issuer_dids": record.issuer_dids,
+                "holder_binding": record.holder_binding,
+                "status": record.status,
+            }
+
+        def _post_presentation_requests(self, tenant: str) -> None:
+            # 创建验证方展示请求：请求体恰含非空 challenge 及可选
+            # expires_in、disclose、issuer_dids、holder_binding。
+            # challenge 为非空字符串且按 Unicode 码点不超过 256；
+            # expires_in 非布尔整数 1..86400、缺省 300；disclose 为
+            # RFC6901 路径数组（空列表零披露，语法/重复/祖先重叠非法
+            # 400）；issuer_dids 为非空字符串数组（限定签发者）；
+            # holder_binding 为布尔、缺省 false。非法字段一律 400。
+            # 成功 201 返回请求记录（status 为 pending）。
+            data = self._read_json()
+            if "challenge" not in data:
+                raise ValidationError("缺少字段: challenge")
+            extra = sorted(
+                set(data)
+                - {
+                    "challenge",
+                    "expires_in",
+                    "disclose",
+                    "issuer_dids",
+                    "holder_binding",
+                }
+            )
+            if extra:
+                raise ValidationError(f"多余字段: {', '.join(extra)}")
+            challenge = data["challenge"]
+            if not isinstance(challenge, str) or not challenge:
+                raise ValidationError("字段 challenge 必须为非空字符串")
+            if len(challenge) > 256:
+                raise ValidationError(
+                    "字段 challenge 按 Unicode 码点不能超过 256"
+                )
+            expires_in = None
+            if "expires_in" in data:
+                expires_in = data["expires_in"]
+                if not isinstance(expires_in, int) or isinstance(
+                    expires_in, bool
+                ):
+                    raise ValidationError("字段 expires_in 必须为整数")
+                if not 1 <= expires_in <= 86400:
+                    raise ValidationError(
+                        "字段 expires_in 须在 1 到 86400 之间"
+                    )
+            disclose = None
+            if "disclose" in data:
+                disclose = data["disclose"]
+                if not isinstance(disclose, list):
+                    raise ValidationError("字段 disclose 必须为数组")
+            issuer_dids = None
+            if "issuer_dids" in data:
+                issuer_dids = data["issuer_dids"]
+                if not isinstance(issuer_dids, list):
+                    raise ValidationError("字段 issuer_dids 必须为数组")
+            holder_binding = False
+            if "holder_binding" in data:
+                holder_binding = data["holder_binding"]
+                if not isinstance(holder_binding, bool):
+                    raise ValidationError("字段 holder_binding 必须为布尔值")
+            record = store.create_presentation_request(
+                tenant,
+                challenge,
+                expires_in=expires_in,
+                disclose=disclose,
+                issuer_dids=issuer_dids,
+                holder_binding=holder_binding,
+            )
+            self._send_json(201, self._presentation_request_payload(record))
+
+        def _get_presentation_request(
+            self, tenant: str, request_id: str
+        ) -> None:
+            # 查询本租户展示请求；不存在（含他租户同 ID）404。
+            record = store.get_presentation_request(tenant, request_id)
+            self._send_json(200, self._presentation_request_payload(record))
+
         def _post_verify_presentation(
             self, tenant: str, presentation_id: str
         ) -> None:
@@ -2621,9 +2740,14 @@ def build_handler(store: VCStore) -> type:
             if "presentation" not in data:
                 self._send_invalid("请求缺少字段: presentation")
                 return
-            extra = sorted(set(data) - {"presentation", "challenge"})
+            extra = sorted(
+                set(data) - {"presentation", "challenge", "request_id"}
+            )
             if extra:
                 self._send_invalid(f"请求含多余字段: {', '.join(extra)}")
+                return
+            if "challenge" in data and "request_id" in data:
+                self._send_invalid("请求含多余字段: challenge")
                 return
             challenge = CHALLENGE_UNSET
             if "challenge" in data:
@@ -2633,9 +2757,24 @@ def build_handler(store: VCStore) -> type:
                         "请求字段 challenge 必须为非空字符串"
                     )
                     return
+            # 展示请求模式：请求体以 request_id 替代 challenge，挑战串
+            # 与策略取自展示请求；未知 presentation_id 返回 404。
+            request_id = REQUEST_ID_UNSET
+            if "request_id" in data:
+                request_id = data["request_id"]
+                if not isinstance(request_id, str) or not request_id:
+                    self._send_invalid(
+                        "请求字段 request_id 必须为非空字符串"
+                    )
+                    return
 
             try:
-                if presentation_id.startswith("mvp_"):
+                if request_id is not REQUEST_ID_UNSET:
+                    valid, reason = store.verify_presentation(
+                        tenant, presentation_id, data["presentation"],
+                        request_id=request_id,
+                    )
+                elif presentation_id.startswith("mvp_"):
                     valid, reason = store.verify_multi_presentation(
                         tenant, presentation_id, data["presentation"],
                         challenge,
@@ -2644,6 +2783,9 @@ def build_handler(store: VCStore) -> type:
                     valid, reason = store.verify_presentation(
                         tenant, presentation_id, data["presentation"], challenge
                     )
+            except NotFoundError as exc:
+                self._send_error(404, str(exc))
+                return
             except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
                 self._send_invalid("验签过程发生内部错误")
                 return

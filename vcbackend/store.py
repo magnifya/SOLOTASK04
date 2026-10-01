@@ -65,6 +65,7 @@ from .models import (
     MultiPresentationItem,
     PredicateProofRecord,
     PresentationRecord,
+    PresentationRequestRecord,
     PresentationSyncReceiptConsumptionEvent,
     ReceiptConsumptionEvent,
     TrustPresentationConsumptionEvent,
@@ -171,6 +172,9 @@ REASON_UNSET = object()
 
 # 哨兵：演示验签请求未提供 challenge 字段（区别于显式传非法值）
 CHALLENGE_UNSET = object()
+
+# 哨兵：演示验签请求未提供 request_id 字段（区别于显式传非法值）
+REQUEST_ID_UNSET = object()
 
 # 哨兵：签发请求未提供 expires_at（区别于显式传 null 等非法值）；
 # 未提供时凭证正文不得注入该字段，凭证保持无期限。
@@ -419,6 +423,33 @@ def _validate_disclose(
         parsed.append((pointer, tokens))
         seen_tokens.append(tokens)
     return parsed
+
+
+def _validate_disclose_paths(disclose: Any) -> None:
+    """校验展示请求 disclose 列表的路径语法（不结合具体凭证 claims）。
+
+    规则与 _validate_disclose 的请求无关部分一致：disclose 必须为
+    列表；元素须为以 / 开头的合法 RFC6901 指针字符串；路径不得重复、
+    不得存在祖先/后代重叠；空列表表示零披露。路径是否命中具体凭证
+    claims 由生成演示时结合凭证再行校验。
+    """
+    if not isinstance(disclose, list):
+        raise ValidationError("字段 disclose 必须为数组")
+    seen_tokens: List[Tuple[str, ...]] = []
+    for pointer in disclose:
+        tokens = _parse_pointer(pointer)
+        if tokens in seen_tokens:
+            raise ValidationError(f"disclose 路径重复: {pointer!r}")
+        for existing in seen_tokens:
+            if tokens[: len(existing)] == existing:
+                raise ValidationError(
+                    f"disclose 路径存在祖先重叠: {pointer!r} 被已选路径覆盖"
+                )
+            if existing[: len(tokens)] == tokens:
+                raise ValidationError(
+                    f"disclose 路径存在祖先重叠: 已选路径被 {pointer!r} 覆盖"
+                )
+        seen_tokens.append(tokens)
 
 
 def _project_claims(
@@ -867,6 +898,8 @@ class VCStore:
             # issuer_did -> schema_id -> version -> [事件...]
             bucket.setdefault("credential_schema_history", {})
             bucket.setdefault("presentations", {})
+            # 验证方展示请求（按租户隔离，与 presentations 相互独立）
+            bucket.setdefault("presentation_requests", {})
             # 多凭证组合展示记录（与单凭证 presentations 相互独立）
             bucket.setdefault("multi_presentations", {})
             bucket.setdefault("proofs", {})
@@ -1631,6 +1664,7 @@ class VCStore:
                 "credential_schemas": {},
                 "credential_schema_history": {},
                 "presentations": {},
+                "presentation_requests": {},
                 "multi_presentations": {},
                 "proofs": {},
                 "trust_anchors": {},
@@ -3173,6 +3207,7 @@ class VCStore:
             proof=row["proof"],
             challenge=row.get("challenge"),
             expires_at=row.get("expires_at"),
+            request_id=row.get("request_id"),
             holder_did=row.get("holder_did"),
             holder_key_version=(
                 int(row["holder_key_version"])
@@ -3191,6 +3226,7 @@ class VCStore:
         challenge: str,
         expires_at: str,
         holder_binding: bool,
+        request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """在锁内完成单项演示的全部校验与签名，返回待落盘演示行（不写状态）。
 
@@ -3199,8 +3235,10 @@ class VCStore:
         或 disclose 非法（非数组、路径语法/越界/重复/祖先重叠）抛
         ValidationError；签发者 DID 已停用或凭证已暂停抛 ConflictError；
         历史私钥缺失或签发/持有者当前密钥版本已吊销抛 ValidationError；
-        持有者绑定要求 subject_did 为本租户已注册 DID。调用方负责把返回
-        行写入 presentations 并与审计事件同次原子落盘。
+        持有者绑定要求 subject_did 为本租户已注册 DID。request_id 非
+        None 时（验证方展示请求模式）写入被签名正文与演示行，issuer
+        proof 与 holder_proof 均覆盖之。调用方负责把返回行写入
+        presentations 并与审计事件同次原子落盘。
         """
         cred = (
             bucket["credentials"].get(credential_id)
@@ -3304,6 +3342,11 @@ class VCStore:
             "challenge": challenge,
             "expires_at": expires_at,
         }
+        if request_id is not None:
+            # 展示请求模式：request_id 纳入 issuer proof 覆盖范围；
+            # holder_payload 由 unsigned 派生，绑定时同样被 holder_proof
+            # 覆盖。
+            unsigned["request_id"] = request_id
         proof = crypto.sign(unsigned, private_pem)
         row = dict(unsigned)
         row["proof"] = proof
@@ -3451,12 +3494,173 @@ class VCStore:
                 raise NotFoundError(f"演示不存在: {presentation_id}")
             return self._presentation_record(row)
 
+    # ------------------------------------------------------------------ #
+    # 验证方展示请求
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _presentation_request_record(
+        row: Dict[str, Any],
+    ) -> "PresentationRequestRecord":
+        issuer_dids = row.get("issuer_dids")
+        return PresentationRequestRecord(
+            request_id=row["request_id"],
+            challenge=row["challenge"],
+            expires_at=row["expires_at"],
+            disclose=list(row.get("disclose", [])),
+            issuer_dids=list(issuer_dids) if issuer_dids is not None else None,
+            holder_binding=bool(row.get("holder_binding", False)),
+            status=row.get("status", "pending"),
+        )
+
+    def create_presentation_request(
+        self,
+        tenant_id: str,
+        challenge: str,
+        expires_in: Optional[int] = None,
+        disclose: Any = None,
+        issuer_dids: Any = None,
+        holder_binding: bool = False,
+    ) -> "PresentationRequestRecord":
+        """创建验证方展示请求并持久化，初始状态 pending。
+
+        - challenge 为调用方已校验的非空挑战串；expires_in 缺省 300 秒，
+          expires_at 为当前 UTC 时间加 expires_in 秒（Z 结尾秒精度）；
+        - disclose 缺省零披露（空列表）；提供时按 RFC6901 路径语法、
+          重复与祖先重叠规则校验（不结合具体凭证 claims）；
+        - issuer_dids 缺省 None（不限定签发者）；提供时须为非空数组
+          且元素均为非空字符串；
+        - holder_binding 缺省 False；request_id 为 pr_ 加 32 位小写 hex。
+        """
+        if expires_in is None:
+            expires_in = DEFAULT_EXPIRES_IN
+        if disclose is None:
+            disclose = []
+        _validate_disclose_paths(disclose)
+        if issuer_dids is not None:
+            if not isinstance(issuer_dids, list) or not issuer_dids:
+                raise ValidationError("字段 issuer_dids 必须为非空数组")
+            for did in issuer_dids:
+                if not isinstance(did, str) or not did:
+                    raise ValidationError(
+                        "issuer_dids 元素必须为非空字符串"
+                    )
+        expires_at = _utc_after(expires_in)
+        with self._lock:
+            bucket = self._ensure_bucket_locked(tenant_id)
+            request_id = f"pr_{uuid.uuid4().hex}"
+            row = {
+                "request_id": request_id,
+                "challenge": challenge,
+                "expires_at": expires_at,
+                "disclose": list(disclose),
+                "issuer_dids": (
+                    list(issuer_dids) if issuer_dids is not None else None
+                ),
+                "holder_binding": bool(holder_binding),
+                "status": "pending",
+            }
+            snapshot = self._snapshot_locked()
+            try:
+                bucket["presentation_requests"][request_id] = row
+                self._save_locked()
+                return self._presentation_request_record(row)
+            except Exception:
+                self._restore_locked(snapshot)
+                raise
+
+    def get_presentation_request(
+        self, tenant_id: str, request_id: str
+    ) -> "PresentationRequestRecord":
+        """查询本租户展示请求；不存在（含他租户资源）抛 NotFoundError。"""
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            row = (
+                bucket["presentation_requests"].get(request_id)
+                if bucket is not None else None
+            )
+            if row is None:
+                raise NotFoundError(f"展示请求不存在: {request_id}")
+            return self._presentation_request_record(row)
+
+    def create_presentation_for_request(
+        self, tenant_id: str, credential_id: str, request_id: str
+    ) -> PresentationRecord:
+        """按展示请求约束对本租户凭证生成选择性披露演示并持久化，记审计。
+
+        依次拒绝：请求不存在（含他租户请求）400“展示请求不存在”、
+        请求已过期 400“展示请求已过期”、凭证不存在（含他租户）404、
+        签发者不在请求 issuer_dids 内 400“凭证签发者不符合展示请求”、
+        请求要求持有者绑定但 subject_did 非本租户已注册 DID 400
+        “持有人不符合展示请求”。演示的 challenge/expires_at/disclose/
+        holder_binding 全部取自请求，request_id 纳入 issuer proof（绑定
+        时亦纳入 holder_proof）并持久化。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            req_row = (
+                bucket["presentation_requests"].get(request_id)
+                if bucket is not None else None
+            )
+            if req_row is None:
+                raise ValidationError("展示请求不存在")
+            try:
+                request_expired = datetime.now(timezone.utc) >= _parse_utc_z(
+                    req_row["expires_at"]
+                )
+            except (KeyError, TypeError, ValueError):
+                request_expired = False
+            if request_expired:
+                raise ValidationError("展示请求已过期")
+            cred = (
+                bucket["credentials"].get(credential_id)
+                if bucket is not None else None
+            )
+            if cred is None:
+                raise NotFoundError(f"凭证不存在: {credential_id}")
+            issuer_dids = req_row.get("issuer_dids")
+            issuer_did = cred["body"].get("issuer_did")
+            if issuer_dids is not None and issuer_did not in issuer_dids:
+                raise ValidationError("凭证签发者不符合展示请求")
+            holder_binding = bool(req_row.get("holder_binding"))
+            if holder_binding:
+                subject_did = cred["body"].get("subject_did")
+                holder_rec = (
+                    bucket["dids"].get(subject_did)
+                    if isinstance(subject_did, str) else None
+                )
+                if holder_rec is None:
+                    raise ValidationError("持有人不符合展示请求")
+            row = self._build_presentation_row_locked(
+                tenant_id,
+                bucket,
+                credential_id,
+                list(req_row.get("disclose", [])),
+                req_row["challenge"],
+                req_row["expires_at"],
+                holder_binding,
+                request_id=request_id,
+            )
+            snapshot = self._snapshot_locked()
+            try:
+                presentation_id = row["presentation_id"]
+                bucket["presentations"][presentation_id] = row
+                self._append_audit_locked(
+                    tenant_id, AUDIT_PRESENTATION_CREATED,
+                    "presentation", presentation_id,
+                )
+                self._save_locked()
+                return self._presentation_record(row)
+            except Exception:
+                self._restore_locked(snapshot)
+                raise
+
     def verify_presentation(
         self,
         tenant_id: str,
         presentation_id: str,
         presentation: Any,
         challenge: Any = CHALLENGE_UNSET,
+        request_id: Any = REQUEST_ID_UNSET,
     ) -> Tuple[bool, str]:
         """以存储记录为锚校验选择性披露演示，返回 (是否有效, 失败原因)。
 
@@ -3466,6 +3670,17 @@ class VCStore:
         与 challenge，且请求 challenge、演示 challenge 与 proof 覆盖的
         存储 challenge 三者一致；旧演示（无 challenge）只接受恰含
         presentation 的请求，不做挑战、过期与消费检查。
+
+        request_id 非 REQUEST_ID_UNSET 时为展示请求模式：演示必须是
+        请求绑定演示（存储记录含 request_id），请求体不再携带
+        challenge，挑战串取自展示请求；依次执行请求策略（披露路径、
+        签发者限定、持有者绑定要求，不满足返回“展示请求策略不满足”）、
+        请求匹配（演示 request_id 与请求 challenge，不符返回“展示请求
+        不匹配”，请求不存在亦同）、请求过期（“展示请求已过期”）、
+        请求消费（“展示请求已消费”）检查，失败均不消费请求。仅全部
+        验签通过（valid true）才将请求置为 consumed 并记
+        presentation.consumed；未知 presentation_id 抛 NotFoundError。
+        请求绑定演示在 challenge 模式下拒绝（须走请求模式）。
 
         验签成功后在消费锁内复查已消费/到期/暂停/吊销：复查到期即返回
         “演示已过期”，不消费、不记审计；未到期并发验证仅一次成功，
@@ -3478,6 +3693,7 @@ class VCStore:
         if not isinstance(presentation, dict):
             return False, "请求不合法: 字段 presentation 必须为 JSON 对象"
 
+        request_mode = request_id is not REQUEST_ID_UNSET
         with self._lock:
             bucket = self._bucket_locked(tenant_id)
             row = (
@@ -3485,6 +3701,9 @@ class VCStore:
                 if bucket is not None else None
             )
             if row is None:
+                if request_mode:
+                    # 请求模式下未知演示按 404 处理（HTTP 层映射）
+                    raise NotFoundError(f"演示不存在: {presentation_id}")
                 return False, f"演示不存在: {presentation_id}"
 
             # 新/旧演示按存储记录是否含 challenge 判定
@@ -3492,11 +3711,21 @@ class VCStore:
             # 持有者绑定演示按存储记录是否含 holder_did 判定（绑定演示
             # 一定也是防重放新演示）。
             is_holder_bound = "holder_did" in row
-            if is_replay_protected:
-                if challenge is CHALLENGE_UNSET:
-                    return False, "请求缺少字段: challenge"
-            elif challenge is not CHALLENGE_UNSET:
-                return False, "请求含多余字段: challenge"
+            # 请求绑定演示按存储记录是否含 request_id 判定（请求绑定
+            # 演示一定也是防重放新演示）。
+            is_request_bound = "request_id" in row
+            if request_mode:
+                if not is_request_bound:
+                    return False, "展示请求不匹配"
+            else:
+                if is_request_bound:
+                    # 请求绑定演示必须走展示请求模式验签
+                    return False, "请求缺少字段: request_id"
+                if is_replay_protected:
+                    if challenge is CHALLENGE_UNSET:
+                        return False, "请求缺少字段: challenge"
+                elif challenge is not CHALLENGE_UNSET:
+                    return False, "请求含多余字段: challenge"
 
             expected_keys = {
                 "presentation_id",
@@ -3509,6 +3738,8 @@ class VCStore:
             }
             if is_replay_protected:
                 expected_keys |= {"challenge", "expires_at"}
+            if is_request_bound:
+                expected_keys |= {"request_id"}
             if is_holder_bound:
                 expected_keys |= {
                     "holder_did",
@@ -3569,15 +3800,24 @@ class VCStore:
                         "请求不合法: 字段 holder_proof 必须为非空字符串"
                     )
 
+            if is_request_bound:
+                # request_id 与存储记录逐一锚定（请求模式下请求体
+                # request_id 与演示 request_id 的一致性在请求匹配段判定）。
+                if presentation.get("request_id") != row.get("request_id"):
+                    return False, (
+                        "锚定校验失败: request_id 与存储记录不一致"
+                    )
+
             if is_replay_protected:
                 # 请求 challenge、演示 challenge 与 proof 覆盖的存储
-                # challenge 三者必须一致
+                # challenge 三者必须一致（请求模式无请求侧 challenge，
+                # 挑战串取自展示请求，在请求匹配段判定）
                 stored_challenge = row.get("challenge")
                 if presentation.get("challenge") != stored_challenge:
                     return False, (
                         "锚定校验失败: challenge 与存储记录不一致"
                     )
-                if challenge != stored_challenge:
+                if not request_mode and challenge != stored_challenge:
                     return False, (
                         "锚定校验失败: 请求 challenge 与存储记录不一致"
                     )
@@ -3585,15 +3825,60 @@ class VCStore:
                     return False, (
                         "锚定校验失败: expires_at 与存储记录不一致"
                     )
-                # 已消费优先于过期与吊销
-                if row.get("consumed"):
-                    return False, "演示已消费"
-                try:
-                    expires_at = _parse_utc_z(row["expires_at"])
-                except (KeyError, TypeError, ValueError):
-                    return False, "验签过程发生内部错误"
-                if datetime.now(timezone.utc) >= expires_at:
-                    return False, "演示已过期"
+                if request_mode:
+                    # 展示请求检查，优先级：策略不满足 -> 不匹配 ->
+                    # 过期 -> 已消费；任何失败均不消费请求。
+                    req_row = (
+                        bucket["presentation_requests"].get(request_id)
+                        if bucket is not None else None
+                    )
+                    if req_row is None:
+                        return False, "展示请求不匹配"
+                    # 策略：披露路径、签发者限定与持有者绑定要求均须
+                    # 与演示一致。
+                    if list(row.get("disclose", [])) != list(
+                        req_row.get("disclose", [])
+                    ):
+                        return False, "展示请求策略不满足"
+                    req_issuer_dids = req_row.get("issuer_dids")
+                    if (
+                        req_issuer_dids is not None
+                        and row.get("issuer_did") not in req_issuer_dids
+                    ):
+                        return False, "展示请求策略不满足"
+                    if is_holder_bound != bool(
+                        req_row.get("holder_binding")
+                    ):
+                        return False, "展示请求策略不满足"
+                    # 匹配：演示必须应答该请求，且使用请求的挑战串。
+                    if row.get("request_id") != request_id:
+                        return False, "展示请求不匹配"
+                    if row.get("challenge") != req_row.get("challenge"):
+                        return False, "展示请求不匹配"
+                    # 过期：当前时间 >= 请求 expires_at
+                    try:
+                        req_expires_at = _parse_utc_z(
+                            req_row["expires_at"]
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        return False, "验签过程发生内部错误"
+                    if datetime.now(timezone.utc) >= req_expires_at:
+                        return False, "展示请求已过期"
+                    # 已消费：请求仅允许一次 valid:true 消费
+                    if req_row.get("status") == "consumed":
+                        return False, "展示请求已消费"
+                    if row.get("consumed"):
+                        return False, "演示已消费"
+                else:
+                    # 已消费优先于过期与吊销
+                    if row.get("consumed"):
+                        return False, "演示已消费"
+                    try:
+                        expires_at = _parse_utc_z(row["expires_at"])
+                    except (KeyError, TypeError, ValueError):
+                        return False, "验签过程发生内部错误"
+                    if datetime.now(timezone.utc) >= expires_at:
+                        return False, "演示已过期"
 
             obj_claims = presentation.get("claims")
             if not isinstance(obj_claims, dict):
@@ -3714,6 +3999,9 @@ class VCStore:
         if is_replay_protected:
             unsigned["challenge"] = row.get("challenge")
             unsigned["expires_at"] = row.get("expires_at")
+        if is_request_bound:
+            # 请求绑定演示的 issuer proof 覆盖 request_id
+            unsigned["request_id"] = row.get("request_id")
         try:
             crypto.verify(unsigned, proof, public_pem)
         except crypto.MalformedSignature:
@@ -3813,6 +4101,25 @@ class VCStore:
                 )
                 if row is None:
                     return False, f"演示不存在: {presentation_id}"
+                req_row_now: Optional[Dict[str, Any]] = None
+                if request_mode:
+                    # 请求模式锁内复查（防锁外验签期间请求被消费/到期
+                    # 的竞态）：顺序与锁外一致，失败均不消费请求。
+                    req_row_now = bucket["presentation_requests"].get(
+                        request_id
+                    )
+                    if req_row_now is None:
+                        return False, "展示请求不匹配"
+                    try:
+                        req_expires_now = _parse_utc_z(
+                            req_row_now["expires_at"]
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        return False, "验签过程发生内部错误"
+                    if datetime.now(timezone.utc) >= req_expires_now:
+                        return False, "展示请求已过期"
+                    if req_row_now.get("status") == "consumed":
+                        return False, "展示请求已消费"
                 if row.get("consumed"):
                     return False, "演示已消费"
                 try:
@@ -3820,6 +4127,8 @@ class VCStore:
                 except (KeyError, TypeError, ValueError):
                     return False, "验签过程发生内部错误"
                 if datetime.now(timezone.utc) >= expires_at:
+                    if request_mode:
+                        return False, "展示请求已过期"
                     return False, "演示已过期"
                 cred = bucket["credentials"].get(credential_id)
                 # 锁内复查密钥版本吊销状态（防锁外验签期间被吊销的竞态）：
@@ -3882,6 +4191,11 @@ class VCStore:
                 try:
                     row["consumed"] = True
                     row["consumed_at"] = _utc_now()
+                    if request_mode and req_row_now is not None:
+                        # 仅 valid:true 将展示请求置为 consumed，与演示
+                        # 消费标记及 presentation.consumed 审计同次原子写。
+                        req_row_now["status"] = "consumed"
+                        req_row_now["consumed_at"] = row["consumed_at"]
                     self._append_audit_locked(
                         tenant_id, AUDIT_PRESENTATION_CONSUMED,
                         "presentation", presentation_id,
