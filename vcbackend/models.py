@@ -95,6 +95,39 @@ class KeyLifecycleEvent:
 
 
 @dataclass
+class RotationProofEvent:
+    """一次成功密钥轮换的可独立验证证明（按 (租户, did) 归属）。
+
+    仅在轮换成功时与新版本、历史和审计在同一次原子写中追加；失败不
+    写记录。升级前已存在的版本不补造证明。记录恰含：
+    did、from_key_version、to_key_version、from_key_handle、
+    to_key_handle、from_public_key、to_public_key、rotated_at、
+    previous_proof_digest、from_proof、to_proof、proof_digest。
+    - 首条证明 previous_proof_digest 为 None，后续等于上一条的
+      proof_digest，形成哈希链；
+    - from_proof/to_proof 分别由旧、新私钥对去掉三个 proof 字段
+      （from_proof、to_proof、proof_digest）的记录按规范化 JSON 做
+      ES256 裸 R||S 无填充 base64url 签名；
+    - proof_digest 为不含自身而含两个 proof 的记录规范化 JSON 的
+      SHA-256 小写十六进制。
+    记录只含公钥，绝不包含私钥；旧钥事后吊销不使证明失效。
+    """
+
+    did: str
+    from_key_version: int
+    to_key_version: int
+    from_key_handle: str
+    to_key_handle: str
+    from_public_key: str
+    to_public_key: str
+    rotated_at: str
+    previous_proof_digest: Optional[str]
+    from_proof: str
+    to_proof: str
+    proof_digest: str
+
+
+@dataclass
 class DIDHistoryEvent:
     """DID 生命周期历史中的一条事件（只读历史查询用）。
 

@@ -12,6 +12,8 @@
   GET  /v1/dids/{did}/keys/{ver}/status   查询 DID 密钥版本吊销状态（只读）
   GET  /v1/dids/{did}/keys/revocations    查询 DID 密钥吊销历史（只读）
 GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（只读）
+  GET  /v1/dids/{did}/keys/rotations      查询 DID 密钥轮换可验证证明（只读）
+  POST /v1/dids/rotation-proofs/verify    独立验真轮换证明链（只读，不依赖本地状态）
   POST /v1/credentials                    签发凭证
   POST /v1/credentials/status-export      凭证状态签名发布（产出可直接提交状态批量同步的签名项，只读）
   GET  /v1/credentials/{credential_id}    查询凭证
@@ -319,6 +321,28 @@ _UTC_Z_QUERY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 # SHA-256 摘要的 64 位小写十六进制串。
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
+# 密钥轮换证明记录协议：恰含 12 个字段。
+_ROTATION_PROOF_FIELDS = (
+    "did",
+    "from_key_version",
+    "to_key_version",
+    "from_key_handle",
+    "to_key_handle",
+    "from_public_key",
+    "to_public_key",
+    "rotated_at",
+    "previous_proof_digest",
+    "from_proof",
+    "to_proof",
+    "proof_digest",
+)
+# from_proof/to_proof 的签名负载：去掉三个 proof 字段后的 9 个字段。
+_ROTATION_PROOF_SIGNED_FIELDS = _ROTATION_PROOF_FIELDS[:9]
+# proof_digest 的覆盖范围：含两个 proof、不含 proof_digest 自身。
+_ROTATION_PROOF_DIGEST_FIELDS = _ROTATION_PROOF_FIELDS[:11]
+# verify 请求一次最多提交的轮换记录数。
+_ROTATION_PROOF_MAX_EVENTS = 100
+
 # 跨系统信任锚点变更流验真：事件结构与动作名沿用 GET
 # /v1/trust/anchor-changes 响应协议。
 _ANCHOR_CHANGES_RESPONSE_KEYS = (
@@ -553,6 +577,8 @@ def build_handler(store: VCStore) -> type:
                 tenant = self._tenant_id()
                 if path == "/v1/dids":
                     self._post_dids(tenant)
+                elif path == "/v1/dids/rotation-proofs/verify":
+                    self._post_rotation_proofs_verify(tenant)
                 elif path == "/v1/audit/manifest/verify":
                     self._post_audit_manifest_verify(tenant)
                 elif path == "/v1/audit/manifest/verify-batch":
@@ -1080,6 +1106,7 @@ def build_handler(store: VCStore) -> type:
                     path.endswith("/status")
                     or path.endswith("/keys/revocations")
                     or path.endswith("/keys/history")
+                    or path.endswith("/keys/rotations")
                 ):
                     middle = path[len("/v1/dids/") :]
                     did_raw, sep, rest = middle.partition("/keys/")
@@ -1090,6 +1117,10 @@ def build_handler(store: VCStore) -> type:
                         )
                     elif rest == "history":
                         self._get_key_history(
+                            tenant, did, parsed.query
+                        )
+                    elif rest == "rotations":
+                        self._get_key_rotations(
                             tenant, did, parsed.query
                         )
                     else:
@@ -1699,6 +1730,194 @@ def build_handler(store: VCStore) -> type:
             self._require_fields(data, ("key_handle",))
             record = store.rotate_key(tenant, did, data["key_handle"])
             self._send_json(200, self._did_payload(record))
+
+        def _get_key_rotations(
+            self, tenant: str, did: str, query: str
+        ) -> None:
+            # GET /v1/dids/{did}/keys/rotations?limit=&after=：只读密钥
+            # 轮换证明。响应恰含 did、events、next_after；事件恰含 12 个
+            # 证明字段（只含公钥，绝不暴露私钥），按 to_key_version
+            # 升序。分页语义与 keys/history 一致：limit 缺省 50、须
+            # 1..200 的 ASCII 十进制整数；after 缺省 0、须非负，游标为
+            # to_key_version；重复/空白/布尔词/小数/符号/Unicode 数字
+            # 一律 400。未知或他租户 DID 404；尚无证明（含升级前未产生
+            # 证明的版本）返回空页，空页 next_after 保持 after。纯只读：
+            # 不写任何状态、不记审计。
+            if not did:
+                raise ValidationError("路径缺少 did")
+            params = parse_qs(query, keep_blank_values=True)
+
+            limit_values = params.get("limit")
+            if limit_values is not None:
+                if len(limit_values) != 1:
+                    raise ValidationError("查询参数 limit 只能提供一次")
+                limit = _parse_nonneg_int(limit_values[0], "limit")
+                if not 1 <= limit <= 200:
+                    raise ValidationError(
+                        "查询参数 limit 须在 1 到 200 之间"
+                    )
+            else:
+                limit = 50
+
+            after_values = params.get("after")
+            if after_values is not None:
+                if len(after_values) != 1:
+                    raise ValidationError("查询参数 after 只能提供一次")
+                after = _parse_nonneg_int(after_values[0], "after")
+            else:
+                after = 0
+
+            events, next_after = store.list_rotation_proofs(
+                tenant, did, after, limit
+            )
+            self._send_json(
+                200,
+                {
+                    "did": did,
+                    "events": [
+                        {
+                            "did": event.did,
+                            "from_key_version": event.from_key_version,
+                            "to_key_version": event.to_key_version,
+                            "from_key_handle": event.from_key_handle,
+                            "to_key_handle": event.to_key_handle,
+                            "from_public_key": event.from_public_key,
+                            "to_public_key": event.to_public_key,
+                            "rotated_at": event.rotated_at,
+                            "previous_proof_digest": (
+                                event.previous_proof_digest
+                            ),
+                            "from_proof": event.from_proof,
+                            "to_proof": event.to_proof,
+                            "proof_digest": event.proof_digest,
+                        }
+                        for event in events
+                    ],
+                    "next_after": next_after,
+                },
+            )
+
+        @staticmethod
+        def _rotation_proof_is_int(value: Any) -> bool:
+            # 证明内版本号须为 JSON 整数（布尔值虽为 int 子类也拒绝）。
+            return isinstance(value, int) and not isinstance(value, bool)
+
+        def _verify_rotation_proofs(
+            self, did: str, rotations: List[Dict[str, Any]]
+        ) -> Optional[str]:
+            # 按版本升序验证自版本 1 起的连续轮换证明链，按优先级返回首
+            # 个失败原因：DID 不一致 -> 版本不连续 -> 前序摘要不匹配 ->
+            # 记录摘要不匹配 -> 旧钥签名失败 -> 新钥签名失败；成功返回
+            # None。纯密码学校验，仅凭提交内容，不依赖本地状态。
+            expected_from = 1
+            expected_previous: Optional[str] = None
+            for row in rotations:
+                # 阶段一：每条记录的 did 须与请求 did 完全一致。
+                if row.get("did") != did:
+                    return "DID 不一致"
+
+                # 阶段二：版本自 1 起连续升序：from 等于上一条 to，
+                # to 恰为 from + 1。
+                from_version = row.get("from_key_version")
+                to_version = row.get("to_key_version")
+                if not (
+                    self._rotation_proof_is_int(from_version)
+                    and self._rotation_proof_is_int(to_version)
+                    and from_version == expected_from
+                    and to_version == expected_from + 1
+                ):
+                    return "版本不连续"
+
+                # 阶段三：哈希链：首条 previous_proof_digest 为 null，
+                # 后续等于上一条 proof_digest。
+                if row.get("previous_proof_digest") != expected_previous:
+                    return "前序摘要不匹配"
+
+                # 阶段四：记录摘要：提交记录须恰为 12 字段，且
+                # proof_digest 等于含两个 proof、不含自身的规范 JSON 的
+                # SHA-256 小写十六进制。
+                if set(row) != set(_ROTATION_PROOF_FIELDS):
+                    return "记录摘要不匹配"
+                digest_body = {
+                    key: row[key]
+                    for key in _ROTATION_PROOF_DIGEST_FIELDS
+                }
+                recomputed = hashlib.sha256(
+                    crypto.canonicalize(digest_body)
+                ).hexdigest()
+                if row.get("proof_digest") != recomputed:
+                    return "记录摘要不匹配"
+
+                # 阶段五/六：旧、新私钥分别对去掉三个 proof 字段的记录
+                # 的 ES256 签名；格式或密码学错误归入对应签名失败。
+                signed_body = {
+                    key: row[key]
+                    for key in _ROTATION_PROOF_SIGNED_FIELDS
+                }
+                try:
+                    crypto.verify(
+                        signed_body,
+                        row["from_proof"],
+                        row["from_public_key"],
+                    )
+                except Exception:  # noqa: BLE001 任何验签异常均为失败
+                    return "旧钥签名失败"
+                try:
+                    crypto.verify(
+                        signed_body,
+                        row["to_proof"],
+                        row["to_public_key"],
+                    )
+                except Exception:  # noqa: BLE001 任何验签异常均为失败
+                    return "新钥签名失败"
+
+                expected_from = to_version
+                expected_previous = row["proof_digest"]
+            return None
+
+        def _post_rotation_proofs_verify(self, tenant: str) -> None:
+            # POST /v1/dids/rotation-proofs/verify：对提交的轮换证明链
+            # 做独立只读验真，不依赖本地 DID/密钥状态（租户头仅作隔离
+            # 约束，显式空值 400）。请求体须恰含 did（非空字符串）与
+            # rotations（1..100 个 JSON 对象的数组）；缺字段、JSON 非法、
+            # 非对象、多余字段、数组元素非对象或数量越界均 400 且仅
+            # {"error": 非空中文}。外层合法后任何内容问题均 HTTP 200：
+            # 成功 {"valid":true}，篡改返回 {"valid":false,"reason":...}，
+            # 原因按 DID 不一致、版本不连续、前序摘要不匹配、记录摘要
+            # 不匹配、旧钥签名失败、新钥签名失败排序。纯只读：不写状态、
+            # 不记审计。
+            data = self._read_json()
+            if set(data) != {"did", "rotations"}:
+                missing = [f for f in ("did", "rotations") if f not in data]
+                if missing:
+                    raise ValidationError(
+                        f"请求缺少字段: {', '.join(missing)}"
+                    )
+                extra = sorted(set(data) - {"did", "rotations"})
+                raise ValidationError(f"请求含多余字段: {', '.join(extra)}")
+            did = data["did"]
+            if not isinstance(did, str) or not did:
+                raise ValidationError(
+                    "请求不合法: 字段 did 必须为非空字符串"
+                )
+            rotations = data["rotations"]
+            if not isinstance(rotations, list):
+                raise ValidationError(
+                    "请求不合法: 字段 rotations 必须为 JSON 数组"
+                )
+            if not 1 <= len(rotations) <= _ROTATION_PROOF_MAX_EVENTS:
+                raise ValidationError(
+                    "请求不合法: 字段 rotations 须为 1 到 100 个 JSON 对象"
+                )
+            if not all(isinstance(item, dict) for item in rotations):
+                raise ValidationError(
+                    "请求不合法: 字段 rotations 的每项必须为 JSON 对象"
+                )
+            reason = self._verify_rotation_proofs(did, rotations)
+            if reason is not None:
+                self._send_json(200, {"valid": False, "reason": reason})
+                return
+            self._send_json(200, {"valid": True})
 
         def _post_revoke_key(
             self, tenant: str, did: str, key_version: str

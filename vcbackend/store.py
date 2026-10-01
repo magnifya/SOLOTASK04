@@ -61,6 +61,7 @@ from .models import (
     KeyVersionStatusRecord,
     KeyRevocationEvent,
     KeyLifecycleEvent,
+    RotationProofEvent,
     MultiPresentationRecord,
     MultiPresentationItem,
     PredicateProofRecord,
@@ -957,6 +958,10 @@ class VCStore:
             bucket.setdefault("credential_status_history", {})
             bucket.setdefault("key_revocations", {})
             bucket.setdefault("key_lifecycle", {})
+            # 密钥轮换可独立验证证明：did -> [证明记录...]，按轮换成功
+            # 顺序追加（to_key_version 升序）。仅升级后的轮换产生证明，
+            # 旧版本不补造。
+            bucket.setdefault("key_rotation_proofs", {})
             bucket.setdefault("trust_anchor_history", {})
             bucket.setdefault("trust_anchor_uses_history", {})
             bucket.setdefault("local_credential_status_history", {})
@@ -1721,6 +1726,7 @@ class VCStore:
                 "credential_status_history": {},
                 "key_revocations": {},
                 "key_lifecycle": {},
+                "key_rotation_proofs": {},
                 "trust_anchor_history": {},
                 "trust_anchor_uses_history": {},
                 "local_credential_status_history": {},
@@ -2282,7 +2288,19 @@ class VCStore:
             try:
                 priv_pem = crypto.generate_private_key_pem()
                 pub_pem = crypto.public_key_pem_from_private(priv_pem).strip()
-                new_version = int(rec.get("key_version", 1)) + 1
+                old_version = int(rec.get("key_version", 1))
+                new_version = old_version + 1
+                old_entry = self._key_history_entry_by_version_locked(
+                    bucket, did, old_version
+                )
+                if old_entry is None:
+                    # 正常不会发生：迁移保证当前版本在 key_history 中。
+                    raise NotFoundError(
+                        f"DID {did} 的密钥版本不存在: {old_version}"
+                    )
+                old_private_pem = old_entry["private_key_pem"]
+                old_handle = old_entry.get("key_handle", "")
+                old_public_pem = old_entry.get("public_key", "")
                 audit_event = self._append_audit_locked(
                     tenant_id, AUDIT_KEY_ROTATED, "did", did
                 )
@@ -2319,6 +2337,40 @@ class VCStore:
                         "audit_timestamp": audit_event["timestamp"],
                     }
                 )
+                # 轮换证明与新版本、历史、审计在同一次原子写中落盘：
+                # 旧、新私钥分别对去掉三个 proof 字段的记录签名，
+                # proof_digest 覆盖含两个 proof 但不含自身的记录；
+                # previous_proof_digest 首条为 None，后续接续上一条
+                # proof_digest。任何失败随快照回滚，证明不留痕。
+                proof_entries = (
+                    bucket.setdefault("key_rotation_proofs", {})
+                    .setdefault(did, [])
+                )
+                previous_proof_digest = (
+                    proof_entries[-1]["proof_digest"] if proof_entries else None
+                )
+                unsigned_proof: Dict[str, Any] = {
+                    "did": did,
+                    "from_key_version": old_version,
+                    "to_key_version": new_version,
+                    "from_key_handle": old_handle,
+                    "to_key_handle": handle,
+                    "from_public_key": old_public_pem,
+                    "to_public_key": pub_pem,
+                    "rotated_at": rotated_at,
+                    "previous_proof_digest": previous_proof_digest,
+                }
+                from_proof = crypto.sign(unsigned_proof, old_private_pem)
+                to_proof = crypto.sign(unsigned_proof, priv_pem)
+                proof_with_signatures = dict(unsigned_proof)
+                proof_with_signatures["from_proof"] = from_proof
+                proof_with_signatures["to_proof"] = to_proof
+                proof_digest = hashlib.sha256(
+                    crypto.canonicalize(proof_with_signatures)
+                ).hexdigest()
+                proof_record = dict(proof_with_signatures)
+                proof_record["proof_digest"] = proof_digest
+                proof_entries.append(proof_record)
                 self._save_locked()
                 return self._did_record(did, rec)
             except Exception:
@@ -10008,6 +10060,60 @@ class VCStore:
                     )
                 )
             next_after = picked[-1].cursor if picked else after
+            return picked, next_after
+
+    def list_rotation_proofs(
+        self,
+        tenant_id: str,
+        did: str,
+        after: int = 0,
+        limit: int = 50,
+    ) -> Tuple[List[RotationProofEvent], int]:
+        """只读分页查询某 DID 的密钥轮换证明，按 to_key_version 升序。
+
+        - DID 在本租户不存在（含他租户）抛 NotFoundError（HTTP 404）；
+          DID 存在但尚无证明（含升级前未产生证明的版本）返回空页；
+        - after 语义与密钥生命周期历史一致：以 to_key_version 为游标，
+          排除 to_key_version 不大于 after 的证明，至多返回 limit 项；
+        - next_after 为本页末项 to_key_version，空页保持 after。
+        纯只读：不修改任何状态、不记审计、不触发落盘；记录只含公钥，
+        绝不暴露私钥。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            rec = bucket["dids"].get(did) if bucket is not None else None
+            if rec is None:
+                raise NotFoundError(f"DID 不存在: {did}")
+            rows = sorted(
+                bucket.get("key_rotation_proofs", {}).get(did, []),
+                key=lambda row: int(row.get("to_key_version", 0)),
+            )
+            picked: List[RotationProofEvent] = []
+            for row in rows:
+                to_version = int(row["to_key_version"])
+                if to_version <= after:
+                    continue
+                picked.append(
+                    RotationProofEvent(
+                        did=row["did"],
+                        from_key_version=int(row["from_key_version"]),
+                        to_key_version=to_version,
+                        from_key_handle=row["from_key_handle"],
+                        to_key_handle=row["to_key_handle"],
+                        from_public_key=row["from_public_key"],
+                        to_public_key=row["to_public_key"],
+                        rotated_at=row["rotated_at"],
+                        previous_proof_digest=row.get(
+                            "previous_proof_digest"
+                        ),
+                        from_proof=row["from_proof"],
+                        to_proof=row["to_proof"],
+                        proof_digest=row["proof_digest"],
+                    )
+                )
+                if len(picked) >= limit:
+                    break
+            next_after = picked[-1].to_key_version if picked else after
             return picked, next_after
 
     def _next_trust_anchor_cursor_locked(self, tenant_id: str) -> int:
