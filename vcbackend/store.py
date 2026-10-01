@@ -44,6 +44,8 @@ from .models import (
     AuditEvent,
     CredentialRecord,
     CredentialSchemaRecord,
+    CredentialSchemaStatusHistoryEvent,
+    CredentialSchemaStatusRecord,
     CredentialStatusRecord,
     CredentialStatusSyncRecord,
     CredentialStatusHistoryEvent,
@@ -124,6 +126,15 @@ CREDENTIAL_SUSPENDED_REASON_PREFIX = "凭证已暂停："
 # 暂停原因首尾裁剪后允许的最大 Unicode 码点长度
 MAX_SUSPEND_REASON = 256
 
+# 弃用凭证模式版本时未提供 reason 的默认原因
+DEFAULT_SCHEMA_DEPRECATE_REASON = "模式版本已弃用"
+
+# 吊销凭证模式版本时未提供 reason 的默认原因
+DEFAULT_SCHEMA_REVOKE_REASON = "模式版本已吊销"
+
+# 签发请求显式引用已弃用/已吊销模式版本时的统一冲突原因
+SCHEMA_UNAVAILABLE_REASON = "credential schema unavailable"
+
 # 重新验证已落盘的导入凭证时的统一中文原因
 IMPORTED_ANCHOR_UNAVAILABLE_REASON = "锚点不可用"
 IMPORTED_SIGNATURE_MALFORMED_REASON = "签名格式错误"
@@ -189,6 +200,8 @@ MAX_EXPIRES_IN = 86400
 AUDIT_DID_CREATED = "did.created"
 AUDIT_CREDENTIAL_ISSUED = "credential.issued"
 AUDIT_CREDENTIAL_SCHEMA_REGISTERED = "credential.schema.registered"
+AUDIT_CREDENTIAL_SCHEMA_DEPRECATED = "credential.schema.deprecated"
+AUDIT_CREDENTIAL_SCHEMA_REVOKED = "credential.schema.revoked"
 AUDIT_KEY_ROTATED = "key.rotated"
 AUDIT_STATUS_UPDATED = "status.updated"
 AUDIT_CREDENTIAL_REVOKED = "credential.revoked"
@@ -1027,6 +1040,35 @@ class VCStore:
                     max_cursor = max(max_cursor, int(event.get("cursor", 0)))
             if max_cursor:
                 self._local_credential_status_history_cursors[tenant_id] = max_cursor
+        # 凭证模式版本生命周期历史游标：按租户各自维护的持久化正整数
+        # （tenant_id -> cursor），同一租户内不同模式版本的注册/弃用/
+        # 吊销事件共享该游标空间，与其他历史游标空间相互独立。旧状态
+        # 文件无该字段时，从各租户已有历史项的最大 cursor 推导。
+        raw_schema_status_cursors = data.get(
+            "credential_schema_status_history_cursors", {}
+        )
+        self._credential_schema_status_history_cursors: Dict[str, int] = {
+            str(tenant_id): int(cursor)
+            for tenant_id, cursor in raw_schema_status_cursors.items()
+            if int(cursor) > 0
+        } if isinstance(raw_schema_status_cursors, dict) else {}
+        for tenant_id, bucket in self._tenants.items():
+            max_cursor = self._credential_schema_status_history_cursors.get(
+                tenant_id, 0
+            )
+            for by_schema in bucket.get(
+                "credential_schema_status_history", {}
+            ).values():
+                for by_version in by_schema.values():
+                    for entries in by_version.values():
+                        for event in entries:
+                            max_cursor = max(
+                                max_cursor, int(event.get("cursor", 0))
+                            )
+            if max_cursor:
+                self._credential_schema_status_history_cursors[
+                    tenant_id
+                ] = max_cursor
         # DID 生命周期历史游标：按租户各自维护的持久化正整数
         # （tenant_id -> cursor），同一租户内不同 DID 的 did.created/
         # did.deactivated 事件共享该游标空间，但与其他历史游标空间
@@ -1402,6 +1444,10 @@ class VCStore:
         # （created_at, did, 动作）稳定补兼容项（内存态，audit 字段为
         # None）；重启后 cursor 稳定。
         self._backfill_did_history_locked()
+        # 旧状态文件中已注册模式版本但无生命周期历史的按
+        # （租户、issuer、schema_id、version）稳定补注册事件（内存态，
+        # updated_at/audit 字段为 None）；重启后 cursor 稳定。
+        self._backfill_credential_schema_status_history_locked()
         # 旧状态文件中已存在外部 DID 停用通告但无审计事件列表的，按
         # (deactivated_at, did) 升序稳定补录（内存态）；重启后 cursor 稳定。
         self._backfill_did_deactivation_events_locked()
@@ -1443,6 +1489,9 @@ class VCStore:
             ),
             "local_credential_status_history_cursors": (
                 self._local_credential_status_history_cursors
+            ),
+            "credential_schema_status_history_cursors": (
+                self._credential_schema_status_history_cursors
             ),
             "did_history_cursors": self._did_history_cursors,
             "did_deactivation_event_cursors": (
@@ -1487,6 +1536,7 @@ class VCStore:
                 self._trust_anchor_history_cursors,
                 self._trust_anchor_uses_history_cursors,
                 self._local_credential_status_history_cursors,
+                self._credential_schema_status_history_cursors,
                 self._did_history_cursors,
                 self._did_deactivation_event_cursors,
                 self._trust_anchor_change_cursors,
@@ -1512,6 +1562,7 @@ class VCStore:
             trust_anchor_history_cursors,
             trust_anchor_uses_history_cursors,
             local_credential_status_history_cursors,
+            credential_schema_status_history_cursors,
             did_history_cursors,
             did_deactivation_event_cursors,
             trust_anchor_change_cursors,
@@ -1536,6 +1587,9 @@ class VCStore:
         )
         self._local_credential_status_history_cursors = (
             local_credential_status_history_cursors
+        )
+        self._credential_schema_status_history_cursors = (
+            credential_schema_status_history_cursors
         )
         self._did_history_cursors = did_history_cursors
         self._did_deactivation_event_cursors = did_deactivation_event_cursors
@@ -1582,6 +1636,7 @@ class VCStore:
                 "trust_anchor_history": {},
                 "trust_anchor_uses_history": {},
                 "local_credential_status_history": {},
+                "credential_schema_status_history": {},
                 "did_history": {},
                 "did_deactivation_notices": {},
                 "did_deactivation_events": [],
@@ -2515,10 +2570,13 @@ class VCStore:
 
         schema_id/schema_version 须同时提供或同时省略（调用层保证，
         二者只给其一本方法抛 ValidationError）；提供时按 issuer_did 查
-        同租户模式（缺失抛 NotFoundError），claims 必须包含全部必填
+        同租户模式（缺失抛 NotFoundError），模式版本已弃用或已吊销抛
+        ConflictError（统一 "credential schema unavailable"，不签发、
+        不写入），claims 必须包含全部必填
         RFC6901 路径且已声明路径的值类型正确，否则 ValidationError；
         均不保存、不审计。成功时正文追加 schema_id、schema_version、
         schema_digest（模式内容规范化 JSON 的 SHA-256 小写十六进制）。
+        已签发凭证的既有结论不受模式后续弃用或吊销影响。
         """
         if not isinstance(issuer_did, str) or not issuer_did:
             raise ValidationError("缺少字段或字段为空: issuer_did")
@@ -2554,7 +2612,8 @@ class VCStore:
                 raise ConflictError(f"签发者 DID 已停用，不能签发凭证: {issuer_did}")
 
             # 模式查找限同租户、同 issuer_did：缺失（含他租户）404；
-            # claims 约束不符 400，均在任何写入之前判定。
+            # 已弃用/已吊销版本统一 409（不签发、不写入，先于 claims
+            # 校验判定）；claims 约束不符 400，均在任何写入之前判定。
             schema_digest = None
             if schema_bound:
                 schema_row = self._get_credential_schema_row_locked(
@@ -2565,6 +2624,8 @@ class VCStore:
                         f"凭证模式不存在: {issuer_did}/{schema_id}/"
                         f"{schema_version}"
                     )
+                if schema_row.get("status") in ("deprecated", "revoked"):
+                    raise ConflictError(SCHEMA_UNAVAILABLE_REASON)
                 _validate_claims_against_schema(
                     claims,
                     schema_row["claim_types"],
@@ -2683,6 +2744,7 @@ class VCStore:
 
             snapshot = self._snapshot_locked()
             try:
+                now = _utc_now()
                 row = {
                     "schema_id": schema_id,
                     "version": version,
@@ -2690,12 +2752,35 @@ class VCStore:
                     "claim_types": claim_types,
                     "required_claims": required_claims,
                     "digest": digest,
+                    # 生命周期：注册即 active，无状态原因
+                    "status": "active",
+                    "status_reason": None,
+                    "status_updated_at": now,
                 }
                 by_schema[version_key] = row
-                self._append_audit_locked(
+                event = self._append_audit_locked(
                     tenant_id, AUDIT_CREDENTIAL_SCHEMA_REGISTERED,
                     "credential_schema",
                     f"{issuer_did}:{schema_id}:{version}",
+                )
+                # 注册事件进入版本生命周期历史（reason 为 None）
+                entries = self._schema_status_history_entries_locked(
+                    bucket, issuer_did, schema_id, version
+                )
+                entries.append(
+                    {
+                        "action": AUDIT_CREDENTIAL_SCHEMA_REGISTERED,
+                        "status": "active",
+                        "reason": None,
+                        "updated_at": now,
+                        "cursor": (
+                            self._next_credential_schema_status_cursor_locked(
+                                tenant_id
+                            )
+                        ),
+                        "audit_seq": int(event["seq"]),
+                        "audit_timestamp": int(event["timestamp"]),
+                    }
                 )
                 self._save_locked()
                 return _schema_row_record(row), True
@@ -2745,6 +2830,285 @@ class VCStore:
             .get(schema_id, {})
             .get(str(version))
         )
+
+    # ------------------------------------------------------------------ #
+    # 凭证模式版本生命周期（deprecated/revoked）与历史
+    # ------------------------------------------------------------------ #
+    def _schema_status_history_entries_locked(
+        self,
+        bucket: Dict[str, Any],
+        issuer_did: str,
+        schema_id: str,
+        version: int,
+    ) -> List[Dict[str, Any]]:
+        """取（并按需建立）某模式版本的生命周期历史事件列表。"""
+        history = bucket.setdefault("credential_schema_status_history", {})
+        by_issuer = history.setdefault(issuer_did, {})
+        by_schema = by_issuer.setdefault(schema_id, {})
+        return by_schema.setdefault(str(version), [])
+
+    def _next_credential_schema_status_cursor_locked(
+        self, tenant_id: str
+    ) -> int:
+        """分配租户内下一个持久化模式版本生命周期历史游标（正整数，递增）。"""
+        cursor = (
+            self._credential_schema_status_history_cursors.get(tenant_id, 0)
+            + 1
+        )
+        self._credential_schema_status_history_cursors[tenant_id] = cursor
+        return cursor
+
+    @staticmethod
+    def _schema_status_row_record(
+        row: Dict[str, Any]
+    ) -> CredentialSchemaStatusRecord:
+        """由模式行构造生命周期状态记录；旧数据无状态字段时按 active。"""
+        return CredentialSchemaStatusRecord(
+            schema_id=row["schema_id"],
+            version=int(row["version"]),
+            issuer_did=row["issuer_did"],
+            status=row.get("status") or "active",
+            reason=row.get("status_reason"),
+            updated_at=row.get("status_updated_at"),
+        )
+
+    def set_credential_schema_status(
+        self,
+        tenant_id: str,
+        schema_id: str,
+        version: int,
+        issuer_did: str,
+        status: Any,
+        reason: Any = REASON_UNSET,
+    ) -> Tuple[CredentialSchemaStatusRecord, bool]:
+        """变更凭证模式版本生命周期状态，返回 (状态记录, 是否首次进入该状态)。
+
+        状态机：deprecated 只能由 active 进入；revoked 可由 active 或
+        deprecated 进入；二者均不能恢复（revoked 为终态）。目标状态与
+        当前相同且生效 reason 相同为幂等（200，保持首次 updated_at，
+        不追加历史、不记审计）；同状态 reason 不同、逆向（revoked 后
+        任何变更）均抛 ConflictError（409）。reason 省略时用默认原因
+        （deprecated“模式版本已弃用”/revoked“模式版本已吊销”）；显式
+        提供时须为字符串且首尾裁剪后非空，否则 ValidationError（400，
+        先于存在性判定）。模式版本缺失或属他租户抛 NotFoundError
+        （404）。首次进入目标状态返回 created=True（201），状态、历史、
+        游标与审计（credential.schema.deprecated/revoked）在同一把锁内
+        经同一次原子写落盘，失败整体回滚。
+        """
+        if status not in ("deprecated", "revoked"):
+            raise ValidationError(
+                f"字段 status 非法: {status!r}（仅接受 deprecated、revoked）"
+            )
+        if reason is REASON_UNSET:
+            final_reason = (
+                DEFAULT_SCHEMA_DEPRECATE_REASON
+                if status == "deprecated"
+                else DEFAULT_SCHEMA_REVOKE_REASON
+            )
+        else:
+            if not isinstance(reason, str):
+                raise ValidationError("字段 reason 必须为字符串")
+            final_reason = reason.strip()
+            if not final_reason:
+                raise ValidationError("字段 reason 裁剪后不能为空")
+
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            row = self._get_credential_schema_row_locked(
+                bucket, issuer_did, schema_id, version
+            )
+            if row is None:
+                raise NotFoundError(
+                    f"凭证模式不存在: {issuer_did}/{schema_id}/{version}"
+                )
+            current = row.get("status") or "active"
+            if current == status:
+                if row.get("status_reason") == final_reason:
+                    # 同状态同原因幂等（200）：保持首次 updated_at，
+                    # 不追加历史、不记审计。
+                    return self._schema_status_row_record(row), False
+                # 同状态不同原因：409，不改变状态、不追加历史、不记审计。
+                raise ConflictError(
+                    f"凭证模式版本已 {status} 且原因不同: "
+                    f"{issuer_did}/{schema_id}/{version}"
+                )
+            if current == "revoked":
+                # revoked 为终态：任何逆向/越级变更均 409。
+                raise ConflictError(
+                    "凭证模式版本已吊销，不能变更状态: "
+                    f"{issuer_did}/{schema_id}/{version}"
+                )
+
+            snapshot = self._snapshot_locked()
+            try:
+                now = _utc_now()
+                row["status"] = status
+                row["status_reason"] = final_reason
+                row["status_updated_at"] = now
+                action = (
+                    AUDIT_CREDENTIAL_SCHEMA_DEPRECATED
+                    if status == "deprecated"
+                    else AUDIT_CREDENTIAL_SCHEMA_REVOKED
+                )
+                event = self._append_audit_locked(
+                    tenant_id, action,
+                    "credential_schema",
+                    f"{issuer_did}:{schema_id}:{version}",
+                )
+                entries = self._schema_status_history_entries_locked(
+                    bucket, issuer_did, schema_id, version
+                )
+                entries.append(
+                    {
+                        "action": action,
+                        "status": status,
+                        "reason": final_reason,
+                        "updated_at": now,
+                        "cursor": (
+                            self._next_credential_schema_status_cursor_locked(
+                                tenant_id
+                            )
+                        ),
+                        "audit_seq": int(event["seq"]),
+                        "audit_timestamp": int(event["timestamp"]),
+                    }
+                )
+                self._save_locked()
+            except Exception:
+                self._restore_locked(snapshot)
+                raise
+            return self._schema_status_row_record(row), True
+
+    def get_credential_schema_status(
+        self,
+        tenant_id: str,
+        schema_id: str,
+        version: int,
+        issuer_did: str,
+    ) -> CredentialSchemaStatusRecord:
+        """读取模式版本当前生命周期状态；缺失或跨租户抛 NotFoundError。
+
+        旧数据无状态字段时按 active 返回（reason/updated_at 为 None）。
+        纯只读：不修改任何状态、不记审计。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            row = self._get_credential_schema_row_locked(
+                bucket, issuer_did, schema_id, version
+            )
+            if row is None:
+                raise NotFoundError(
+                    f"凭证模式不存在: {issuer_did}/{schema_id}/{version}"
+                )
+            return self._schema_status_row_record(row)
+
+    def list_credential_schema_status_history(
+        self,
+        tenant_id: str,
+        schema_id: str,
+        version: int,
+        issuer_did: str,
+        after: int = 0,
+        limit: int = 50,
+    ) -> Tuple[List[CredentialSchemaStatusHistoryEvent], int]:
+        """只读查询某模式版本的生命周期历史，按页返回。
+
+        - 模式版本在本租户不存在（含他租户）抛 NotFoundError（404，
+          跨租户不可探测）；版本存在但无历史返回空页；
+        - 事件按 cursor 升序；after 排除 cursor 不大于其值的事件，
+          至多返回 limit 项；
+        - next_after 为本页末项 cursor，空页保持 after。
+        纯只读：不修改任何状态、不记审计、不触发落盘。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            row = self._get_credential_schema_row_locked(
+                bucket, issuer_did, schema_id, version
+            )
+            if row is None:
+                raise NotFoundError(
+                    f"凭证模式不存在: {issuer_did}/{schema_id}/{version}"
+                )
+            entries = sorted(
+                bucket.get("credential_schema_status_history", {})
+                .get(issuer_did, {})
+                .get(schema_id, {})
+                .get(str(version), []),
+                key=lambda event: int(event.get("cursor", 0)),
+            )
+            picked: List[CredentialSchemaStatusHistoryEvent] = []
+            for event_row in entries:
+                if len(picked) >= limit:
+                    break
+                cursor = int(event_row["cursor"])
+                if cursor <= after:
+                    continue
+                picked.append(
+                    CredentialSchemaStatusHistoryEvent(
+                        action=event_row["action"],
+                        status=event_row["status"],
+                        reason=event_row.get("reason"),
+                        updated_at=event_row.get("updated_at"),
+                        cursor=cursor,
+                        audit_seq=(
+                            int(event_row["audit_seq"])
+                            if event_row.get("audit_seq") is not None
+                            else None
+                        ),
+                        audit_timestamp=(
+                            int(event_row["audit_timestamp"])
+                            if event_row.get("audit_timestamp") is not None
+                            else None
+                        ),
+                    )
+                )
+            next_after = picked[-1].cursor if picked else after
+            return picked, next_after
+
+    def _backfill_credential_schema_status_history_locked(self) -> None:
+        """加载迁移：为无生命周期历史的已注册模式版本补注册事件（内存态）。
+
+        对每个租户内已有模式版本（旧数据无状态字段、无任何历史项），
+        按 (租户, issuer_did, schema_id, version) 稳定顺序补录一条
+        registered 事件：status 为 active、reason/updated_at 为 None、
+        audit_seq/audit_timestamp 为 None（无法追溯原始审计），cursor
+        为该租户内新分配的持久化正整数。仅在内存中补录：随下一次任意
+        原子写一并落盘；若此后无写操作则重启时按相同顺序重建，cursor
+        稳定。
+        """
+        for tenant_id in sorted(self._tenants):
+            bucket = self._tenants[tenant_id]
+            schemas = bucket.get("credential_schemas", {})
+            for issuer_did in sorted(schemas):
+                by_schema = schemas[issuer_did]
+                for schema_id in sorted(by_schema):
+                    by_version = by_schema[schema_id]
+                    for version_key in sorted(
+                        by_version, key=lambda key: int(key)
+                    ):
+                        entries = (
+                            self._schema_status_history_entries_locked(
+                                bucket, issuer_did, schema_id,
+                                int(version_key),
+                            )
+                        )
+                        if entries:
+                            continue
+                        entries.append(
+                            {
+                                "action": AUDIT_CREDENTIAL_SCHEMA_REGISTERED,
+                                "status": "active",
+                                "reason": None,
+                                "updated_at": None,
+                                "cursor": (
+                                    self._next_credential_schema_status_cursor_locked(
+                                        tenant_id
+                                    )
+                                ),
+                                "audit_seq": None,
+                                "audit_timestamp": None,
+                            }
+                        )
 
     # ------------------------------------------------------------------ #
     # 选择性披露演示

@@ -18,6 +18,9 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   PUT  /v1/credentials/{credential_id}/status   登记 active（首次 201/重复 200）或暂停/恢复 suspended（200）
   GET  /v1/credentials/{credential_id}/status   查询状态（无状态按 active）
   GET  /v1/credentials/{credential_id}/status/history  查询凭证状态历史（只读）
+  POST /v1/credential-schemas/{schema_id}/{version}/status  变更模式版本生命周期状态（deprecated/revoked，首次 201/幂等 200）
+  GET  /v1/credential-schemas/{schema_id}/{version}/status  查询模式版本生命周期状态（?issuer_did=，只读）
+  GET  /v1/credential-schemas/{schema_id}/{version}/history 查询模式版本生命周期历史（?issuer_did=&limit=&after=，只读）
   POST /v1/credentials/{credential_id}/revoke   吊销凭证
   POST /v1/credentials/revoke-batch          批量原子吊销凭证
   POST /v1/credentials/{credential_id}/verify  以存储记录为锚验签
@@ -555,6 +558,13 @@ def build_handler(store: VCStore) -> type:
                     self._post_credentials(tenant)
                 elif path == "/v1/credential-schemas":
                     self._post_credential_schemas(tenant)
+                elif path.startswith("/v1/credential-schemas/") and path.endswith(
+                    "/status"
+                ):
+                    suffix = path[
+                        len("/v1/credential-schemas/") : -len("/status")
+                    ]
+                    self._post_credential_schema_status(tenant, suffix)
                 elif path == "/v1/credentials/status-export":
                     self._post_credentials_status_export(tenant)
                 elif path == "/v1/credentials/revoke-batch":
@@ -1083,11 +1093,23 @@ def build_handler(store: VCStore) -> type:
                 elif path.startswith("/v1/dids/"):
                     self._get_did(tenant, unquote(path[len("/v1/dids/") :]))
                 elif path.startswith("/v1/credential-schemas/"):
-                    self._get_credential_schema(
-                        tenant,
-                        path[len("/v1/credential-schemas/") :],
-                        parsed.query,
-                    )
+                    suffix = path[len("/v1/credential-schemas/") :]
+                    if suffix.endswith("/status"):
+                        self._get_credential_schema_status(
+                            tenant,
+                            suffix[: -len("/status")],
+                            parsed.query,
+                        )
+                    elif suffix.endswith("/history"):
+                        self._get_credential_schema_status_history(
+                            tenant,
+                            suffix[: -len("/history")],
+                            parsed.query,
+                        )
+                    else:
+                        self._get_credential_schema(
+                            tenant, suffix, parsed.query
+                        )
                 elif path.startswith("/v1/credentials/") and path.endswith(
                     "/status/history"
                 ):
@@ -1782,18 +1804,16 @@ def build_handler(store: VCStore) -> type:
                 201 if created else 200, self._schema_payload(record)
             )
 
-        def _get_credential_schema(
-            self, tenant: str, suffix: str, query: str
-        ) -> None:
-            # GET /v1/credential-schemas/{schema_id}/{version}
-            # ?issuer_did=...：路径段非法（schema_id 格式、version 非
-            # ASCII 正整数、段数不对）400；issuer_did 须唯一且非空，
-            # 缺失/重复/空值 400；命中 200，模式缺失或跨租户 404
-            # （存在性不可探测）。纯只读、不记审计。
+        @staticmethod
+        def _parse_schema_version_segments(
+            suffix: str, tail: str
+        ) -> Tuple[str, int]:
+            """解析并校验 {schema_id}/{version} 路径段（非法一律 400）。"""
             raw_segments = suffix.split("/")
             if len(raw_segments) != 2:
                 raise ValidationError(
-                    "路径必须为 /v1/credential-schemas/{schema_id}/{version}"
+                    "路径必须为 /v1/credential-schemas/"
+                    f"{{schema_id}}/{{version}}{tail}"
                 )
             schema_id = unquote(raw_segments[0])
             version_raw = unquote(raw_segments[1])
@@ -1807,7 +1827,11 @@ def build_handler(store: VCStore) -> type:
                 raise ValidationError(
                     "路径参数 version 必须为 ASCII 十进制正整数"
                 )
-            params = parse_qs(query, keep_blank_values=True)
+            return schema_id, int(version_raw)
+
+        @staticmethod
+        def _schema_issuer_did_param(params: Dict[str, Any]) -> str:
+            """校验并取出查询参数 issuer_did（必填、唯一、非空）。"""
             issuer_values = params.get("issuer_did")
             if issuer_values is None:
                 raise ValidationError("查询参数 issuer_did 必填")
@@ -1818,15 +1842,175 @@ def build_handler(store: VCStore) -> type:
                 raise ValidationError(
                     "查询参数 issuer_did 必须为非空字符串"
                 )
+            return issuer_did
+
+        def _get_credential_schema(
+            self, tenant: str, suffix: str, query: str
+        ) -> None:
+            # GET /v1/credential-schemas/{schema_id}/{version}
+            # ?issuer_did=...：路径段非法（schema_id 格式、version 非
+            # ASCII 正整数、段数不对）400；issuer_did 须唯一且非空，
+            # 缺失/重复/空值 400；命中 200，模式缺失或跨租户 404
+            # （存在性不可探测）。纯只读、不记审计。
+            schema_id, version = self._parse_schema_version_segments(
+                suffix, ""
+            )
+            params = parse_qs(query, keep_blank_values=True)
+            issuer_did = self._schema_issuer_did_param(params)
             unknown = sorted(set(params) - {"issuer_did"})
             if unknown:
                 raise ValidationError(
                     f"不支持的查询参数: {', '.join(unknown)}"
                 )
             record = store.get_credential_schema(
-                tenant, schema_id, int(version_raw), issuer_did
+                tenant, schema_id, version, issuer_did
             )
             self._send_json(200, self._schema_payload(record))
+
+        @staticmethod
+        def _schema_status_payload(record: Any) -> Dict[str, Any]:
+            """模式版本生命周期状态响应的固定键序负载。"""
+            return {
+                "schema_id": record.schema_id,
+                "version": record.version,
+                "issuer_did": record.issuer_did,
+                "status": record.status,
+                "reason": record.reason,
+                "updated_at": record.updated_at,
+            }
+
+        def _post_credential_schema_status(
+            self, tenant: str, suffix: str
+        ) -> None:
+            # POST /v1/credential-schemas/{schema_id}/{version}/status：
+            # 变更模式版本生命周期状态。请求体恰含 issuer_did、status
+            # 与可选 reason；status 仅接受 deprecated（仅 active 可进
+            # 入）或 revoked（active/deprecated 可进入），均不能恢复。
+            # reason 缺省固定为“模式版本已弃用”/“模式版本已吊销”，
+            # 显式值须为裁剪后非空字符串。路径段、字段集、类型或
+            # reason 非法 400（先于存在性判定）；版本缺失或跨租户
+            # 404；首次进入目标状态 201；目标状态与 reason 相同的重复
+            # 请求幂等 200（不追加历史）；reason 变化、逆向或越级转换
+            # 409。响应恰含 schema_id、version、issuer_did、status、
+            # reason、updated_at；失败不留下部分状态或审计事件。
+            schema_id, version = self._parse_schema_version_segments(
+                suffix, "/status"
+            )
+            data = self._read_json()
+            required = ("issuer_did", "status")
+            missing = [field for field in required if field not in data]
+            if missing:
+                raise ValidationError(f"缺少字段: {', '.join(missing)}")
+            extra = sorted(set(data) - {"issuer_did", "status", "reason"})
+            if extra:
+                raise ValidationError(f"多余字段: {', '.join(extra)}")
+            issuer_did = data["issuer_did"]
+            if not isinstance(issuer_did, str) or not issuer_did:
+                raise ValidationError("字段 issuer_did 必须为非空字符串")
+            status = data["status"]
+            if status not in ("deprecated", "revoked"):
+                raise ValidationError(
+                    "字段 status 仅接受 deprecated 或 revoked"
+                )
+            reason = data["reason"] if "reason" in data else REASON_UNSET
+            record, created = store.set_credential_schema_status(
+                tenant, schema_id, version, issuer_did, status, reason
+            )
+            self._send_json(
+                201 if created else 200, self._schema_status_payload(record)
+            )
+
+        def _get_credential_schema_status(
+            self, tenant: str, suffix: str, query: str
+        ) -> None:
+            # GET /v1/credential-schemas/{schema_id}/{version}/status
+            # ?issuer_did=...：只读模式版本当前生命周期状态。路径段与
+            # issuer_did 参数规则同模式读取（非法 400）；版本缺失或跨
+            # 租户 404；命中 200 恰返 schema_id、version、issuer_did、
+            # status、reason、updated_at（active 且旧数据无记录时
+            # reason/updated_at 为 null）。纯只读、不记审计。
+            schema_id, version = self._parse_schema_version_segments(
+                suffix, "/status"
+            )
+            params = parse_qs(query, keep_blank_values=True)
+            issuer_did = self._schema_issuer_did_param(params)
+            unknown = sorted(set(params) - {"issuer_did"})
+            if unknown:
+                raise ValidationError(
+                    f"不支持的查询参数: {', '.join(unknown)}"
+                )
+            record = store.get_credential_schema_status(
+                tenant, schema_id, version, issuer_did
+            )
+            self._send_json(200, self._schema_status_payload(record))
+
+        def _get_credential_schema_status_history(
+            self, tenant: str, suffix: str, query: str
+        ) -> None:
+            # GET /v1/credential-schemas/{schema_id}/{version}/history
+            # ?issuer_did=...&limit=&after=：只读模式版本生命周期历史。
+            # 响应恰含 schema_id、version、issuer_did、events、
+            # next_after；事件按 cursor 升序，每项恰含 action、status、
+            # reason、updated_at、audit_seq、audit_timestamp、cursor，
+            # 注册事件（credential.schema.registered）reason 为 null。
+            # issuer_did 必填唯一非空；limit 缺省 50，须为 1..200；
+            # after 缺省 0，须非负；重复/空白/未知参数均 400。版本缺
+            # 失或跨租户 404；空页 next_after 保持 after。纯只读。
+            schema_id, version = self._parse_schema_version_segments(
+                suffix, "/history"
+            )
+            params = parse_qs(query, keep_blank_values=True)
+            unknown = sorted(set(params) - {"issuer_did", "limit", "after"})
+            if unknown:
+                raise ValidationError(
+                    f"不支持的查询参数: {', '.join(unknown)}"
+                )
+            issuer_did = self._schema_issuer_did_param(params)
+
+            limit_values = params.get("limit")
+            if limit_values is not None:
+                if len(limit_values) != 1:
+                    raise ValidationError("查询参数 limit 只能提供一次")
+                limit = _parse_nonneg_int(limit_values[0], "limit")
+                if not 1 <= limit <= 200:
+                    raise ValidationError(
+                        "查询参数 limit 须在 1 到 200 之间"
+                    )
+            else:
+                limit = 50
+
+            after_values = params.get("after")
+            if after_values is not None:
+                if len(after_values) != 1:
+                    raise ValidationError("查询参数 after 只能提供一次")
+                after = _parse_nonneg_int(after_values[0], "after")
+            else:
+                after = 0
+
+            events, next_after = store.list_credential_schema_status_history(
+                tenant, schema_id, version, issuer_did, after, limit
+            )
+            self._send_json(
+                200,
+                {
+                    "schema_id": schema_id,
+                    "version": version,
+                    "issuer_did": issuer_did,
+                    "events": [
+                        {
+                            "action": event.action,
+                            "status": event.status,
+                            "reason": event.reason,
+                            "updated_at": event.updated_at,
+                            "audit_seq": event.audit_seq,
+                            "audit_timestamp": event.audit_timestamp,
+                            "cursor": event.cursor,
+                        }
+                        for event in events
+                    ],
+                    "next_after": next_after,
+                },
+            )
 
         def _post_credentials_status_export(self, tenant: str) -> None:
             # POST /v1/credentials/status-export：新增凭证状态签名发布。

@@ -138,6 +138,50 @@ class CredentialSchemaRecord:
 
 
 @dataclass
+class CredentialSchemaStatusRecord:
+    """凭证模式版本的生命周期状态记录。
+
+    status 为 "active"、"deprecated" 或 "revoked"；deprecated 只能由
+    active 进入，revoked 可由 active 或 deprecated 进入，均为终态方向
+    （不能恢复 active，revoked 为终态）。reason 为状态原因（deprecated
+    缺省“模式版本已弃用”、revoked 缺省“模式版本已吊销”，显式值须
+    裁剪后非空）；active 时 reason 为 None。updated_at 为最近一次生命
+    周期事件（注册或状态变更）时间（UTC ISO8601 秒精度 Z）；旧状态补
+    录前注册的版本无时间记录时为 None。
+    """
+
+    schema_id: str
+    version: int
+    issuer_did: str
+    status: str
+    reason: Optional[str]
+    updated_at: Optional[str]
+
+
+@dataclass
+class CredentialSchemaStatusHistoryEvent:
+    """凭证模式版本生命周期历史中的一条事件（只读历史查询用）。
+
+    按 (租户, issuer_did, schema_id, version) 归属；首次注册追加
+    registered（action 为 credential.schema.registered、status 为
+    active、reason 为 None），首次弃用/吊销各追加一条（action 沿用
+    对应审计动作名，reason 为生效原因）；幂等重试与失败路径不追加。
+    updated_at 为事件时间（UTC ISO8601 秒精度 Z），旧版本补录的注册
+    事件为 None。audit_seq/audit_timestamp 关联产生该事件的审计事件，
+    无法追溯（旧数据补录）时为 None。cursor 为租户内跨模式版本持久
+    递增正整数，独立于其他历史游标空间。
+    """
+
+    action: str
+    status: str
+    reason: Optional[str]
+    updated_at: Optional[str]
+    cursor: int
+    audit_seq: Optional[int] = None
+    audit_timestamp: Optional[int] = None
+
+
+@dataclass
 class CredentialRecord:
     """一条已签发凭证：正文与其 ES256 签名。"""
 
