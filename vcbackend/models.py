@@ -138,6 +138,44 @@ class CredentialSchemaRecord:
 
 
 @dataclass
+class CredentialSchemaStatusRecord:
+    """一条凭证模式版本的生命周期状态（按租户与 issuer#schema#version 隔离）。
+
+    status 为 "active"、"deprecated" 或 "revoked"：注册即为 active，
+    active 可转 deprecated，active/deprecated 可转 revoked，均不可恢复。
+    active 时 reason/updated_at 均为 None；deprecated/revoked 时 reason
+    为首次变更的裁剪原因（缺省分别为“模式版本已弃用”“模式版本已吊销”），
+    updated_at 为首次变更的 UTC 秒精度 Z 时间（与审计同秒）。
+    """
+
+    schema_id: str
+    version: int
+    issuer_did: str
+    status: str
+    reason: Optional[str]
+    updated_at: Optional[str]
+
+
+@dataclass
+class CredentialSchemaHistoryEvent:
+    """模式版本生命周期历史中的一条事件（注册/弃用/吊销）。
+
+    按 cursor 升序；注册事件 action 为 credential.schema.registered、
+    status 为 active、reason 为 None；弃用/吊销分别为
+    credential.schema.deprecated/revoked。补录事件 audit_seq/
+    audit_timestamp 为 None。
+    """
+
+    action: str
+    status: str
+    reason: Optional[str]
+    updated_at: Optional[str]
+    cursor: int
+    audit_seq: Optional[int] = None
+    audit_timestamp: Optional[int] = None
+
+
+@dataclass
 class CredentialRecord:
     """一条已签发凭证：正文与其 ES256 签名。"""
 
