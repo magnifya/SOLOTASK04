@@ -61,6 +61,7 @@ from .models import (
     KeyVersionStatusRecord,
     KeyRevocationEvent,
     KeyLifecycleEvent,
+    KeyRotationProof,
     MultiPresentationRecord,
     MultiPresentationItem,
     PredicateProofRecord,
@@ -292,6 +293,57 @@ def _parse_utc_z(text: str) -> datetime:
     return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(
         tzinfo=timezone.utc
     )
+
+
+# 轮换证明记录的字段（即持久化与对外输出的固定键序）。
+ROTATION_PROOF_FIELDS = (
+    "did",
+    "from_key_version",
+    "to_key_version",
+    "from_key_handle",
+    "to_key_handle",
+    "from_public_key",
+    "to_public_key",
+    "rotated_at",
+    "previous_proof_digest",
+    "from_proof",
+    "to_proof",
+    "proof_digest",
+)
+# 签名时需去掉的三个 proof 字段。
+ROTATION_PROOF_SIGN_STRIP = ("from_proof", "to_proof", "proof_digest")
+
+
+def _rotation_proof_payload(row: Dict[str, Any]) -> Dict[str, Any]:
+    """按固定键序从存储行构造轮换证明记录（对外输出/验签用）。"""
+    return {field: row[field] for field in ROTATION_PROOF_FIELDS}
+
+
+def _rotation_proof_signed_payload(row: Dict[str, Any]) -> Dict[str, Any]:
+    """去掉 from_proof/to_proof/proof_digest 三字段后的记录（双签覆盖）。"""
+    return {
+        field: row[field]
+        for field in ROTATION_PROOF_FIELDS
+        if field not in ROTATION_PROOF_SIGN_STRIP
+    }
+
+
+def _rotation_proof_digest_payload(row: Dict[str, Any]) -> Dict[str, Any]:
+    """去掉 proof_digest 自身、保留 from_proof/to_proof 的记录。"""
+    return {
+        field: row[field]
+        for field in ROTATION_PROOF_FIELDS
+        if field != "proof_digest"
+    }
+
+
+def _rotation_proof_digest(row: Dict[str, Any]) -> str:
+    """proof_digest：对去掉自身而含两个 proof 的记录规范化 JSON 求
+    SHA-256，返回小写十六进制。"""
+    return hashlib.sha256(
+        crypto.canonicalize(_rotation_proof_digest_payload(row))
+    ).hexdigest()
+
 
 
 # 凭证 expires_at 的严格形状：YYYY-MM-DDTHH:MM:SSZ（秒精度、无偏移、
@@ -957,6 +1009,9 @@ class VCStore:
             bucket.setdefault("credential_status_history", {})
             bucket.setdefault("key_revocations", {})
             bucket.setdefault("key_lifecycle", {})
+            # 密钥轮换可独立验证证明：did -> [证明记录...]（按轮换次序）。
+            # 仅升级后的成功轮换写入；升级前的历史版本不补造签名。
+            bucket.setdefault("key_rotation_proofs", {})
             bucket.setdefault("trust_anchor_history", {})
             bucket.setdefault("trust_anchor_uses_history", {})
             bucket.setdefault("local_credential_status_history", {})
@@ -1721,6 +1776,7 @@ class VCStore:
                 "credential_status_history": {},
                 "key_revocations": {},
                 "key_lifecycle": {},
+                "key_rotation_proofs": {},
                 "trust_anchor_history": {},
                 "trust_anchor_uses_history": {},
                 "local_credential_status_history": {},
@@ -2283,6 +2339,11 @@ class VCStore:
                 priv_pem = crypto.generate_private_key_pem()
                 pub_pem = crypto.public_key_pem_from_private(priv_pem).strip()
                 new_version = int(rec.get("key_version", 1)) + 1
+                # 捕获轮换前版本（旧钥）信息，供轮换证明 from_* 与旧钥签名。
+                from_version = new_version - 1
+                from_handle = rec.get("key_handle", "")
+                from_pub_pem = rec.get("public_key", "")
+                from_priv_pem = rec.get("private_key_pem")
                 audit_event = self._append_audit_locked(
                     tenant_id, AUDIT_KEY_ROTATED, "did", did
                 )
@@ -2318,6 +2379,45 @@ class VCStore:
                         "audit_seq": audit_event["seq"],
                         "audit_timestamp": audit_event["timestamp"],
                     }
+                )
+                # 可独立验证的轮换证明：与新版本、生命周期事件、审计在同一
+                # 次原子写中追加；首条 previous_proof_digest 为 None，后续
+                # 取上一条 proof_digest 形成哈希链。旧、新私钥分别对去掉
+                # 三个 proof 字段的记录做 ES256；proof_digest 对不含自身
+                # 而含两个 proof 的记录求 SHA-256 小写 hex。旧版本（升级
+                # 前已存在的轮换）不补造。任一步失败随快照整体回滚。
+                proof_entries = (
+                    bucket.setdefault("key_rotation_proofs", {})
+                    .setdefault(did, [])
+                )
+                previous_digest = (
+                    proof_entries[-1]["proof_digest"] if proof_entries else None
+                )
+                proof_row: Dict[str, Any] = {
+                    "did": did,
+                    "from_key_version": from_version,
+                    "to_key_version": new_version,
+                    "from_key_handle": from_handle,
+                    "to_key_handle": handle,
+                    "from_public_key": from_pub_pem,
+                    "to_public_key": pub_pem,
+                    "rotated_at": rotated_at,
+                    "previous_proof_digest": previous_digest,
+                }
+                if not isinstance(from_priv_pem, str) or not from_priv_pem:
+                    # 正常不会发生：迁移保证每个版本私钥可用。
+                    raise StorageError(
+                        f"DID {did} 旧版本 {from_version} 私钥不可用，"
+                        "无法生成轮换证明"
+                    )
+                signed_payload = _rotation_proof_signed_payload(proof_row)
+                proof_row["from_proof"] = crypto.sign(
+                    signed_payload, from_priv_pem
+                )
+                proof_row["to_proof"] = crypto.sign(signed_payload, priv_pem)
+                proof_row["proof_digest"] = _rotation_proof_digest(proof_row)
+                proof_entries.append(
+                    {field: proof_row[field] for field in ROTATION_PROOF_FIELDS}
                 )
                 self._save_locked()
                 return self._did_record(did, rec)
@@ -10008,6 +10108,58 @@ class VCStore:
                     )
                 )
             next_after = picked[-1].cursor if picked else after
+            return picked, next_after
+
+    def list_key_rotation_proofs(
+        self,
+        tenant_id: str,
+        did: str,
+        after: int = 0,
+        limit: int = 50,
+    ) -> Tuple[List[KeyRotationProof], int]:
+        """只读分页查询某 DID 的密钥轮换可验证证明。
+
+        - DID 在本租户不存在（含他租户）抛 NotFoundError（HTTP 404）；
+          DID 存在但升级后从未轮换（尚无证明）返回空页；
+        - 证明按 to_key_version 升序（即轮换先后次序）；after 排除
+          to_key_version 不大于其值的记录，至多返回 limit 项；
+        - next_after 为本页末项 to_key_version，空页保持 after。
+        纯只读：不修改状态、不记审计、不触发落盘；记录仅含公钥，绝不
+        暴露私钥。升级前已存在的历史版本无证明，不补造。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            rec = bucket["dids"].get(did) if bucket is not None else None
+            if rec is None:
+                raise NotFoundError(f"DID 不存在: {did}")
+            rows = sorted(
+                bucket.get("key_rotation_proofs", {}).get(did, []),
+                key=lambda row: int(row.get("to_key_version", 0)),
+            )
+            picked: List[KeyRotationProof] = []
+            for row in rows:
+                if len(picked) >= limit:
+                    break
+                to_version = int(row["to_key_version"])
+                if to_version <= after:
+                    continue
+                picked.append(
+                    KeyRotationProof(
+                        did=row["did"],
+                        from_key_version=int(row["from_key_version"]),
+                        to_key_version=to_version,
+                        from_key_handle=row["from_key_handle"],
+                        to_key_handle=row["to_key_handle"],
+                        from_public_key=row["from_public_key"],
+                        to_public_key=row["to_public_key"],
+                        rotated_at=row["rotated_at"],
+                        previous_proof_digest=row["previous_proof_digest"],
+                        from_proof=row["from_proof"],
+                        to_proof=row["to_proof"],
+                        proof_digest=row["proof_digest"],
+                    )
+                )
+            next_after = picked[-1].to_key_version if picked else after
             return picked, next_after
 
     def _next_trust_anchor_cursor_locked(self, tenant_id: str) -> int:
