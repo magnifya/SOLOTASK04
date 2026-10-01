@@ -232,6 +232,38 @@ class PresentationRecord:
     holder_did: Optional[str] = None
     holder_key_version: Optional[int] = None
     holder_proof: Optional[str] = None
+    # 验证方展示请求模式（present 提交 request_id 生成）：展示行记录所
+    # 采用的展示请求 ID，并随 challenge/expires_at 一并纳入 issuer proof
+    # 与持有者 proof 的签名覆盖范围。普通展示为 None。
+    request_id: Optional[str] = None
+
+
+@dataclass
+class PresentationRequestRecord:
+    """验证方发起的展示请求（按租户隔离）。
+
+    request_id 为 pr_ 加 32 位小写 hex；challenge 为请求方给定的非空
+    挑战串；expires_at 为按 expires_in（缺省 300、上限 86400 秒）算出
+    的 UTC 秒精度 Z 过期时刻；disclose 为请求要求披露的 RFC6901 路径
+    列表（空列表表示零披露）；issuer_dids 为 None 时不限定签发者，
+    否则展示凭证的签发者必须在列表内（显式空列表为不接受任何签发者
+    的空白名单）；holder_binding 为 True 时要求持有人即凭证
+    subject_did 且为本租户已注册 DID。
+
+    status 为 "pending" 或 "consumed"：仅 request_id 模式验真成功时
+    原子置为 consumed 并记录 consumed_at 与 consumed_presentation_id；
+    验真失败不改变状态。请求与演示在同一次原子写中一起消费。
+    """
+
+    request_id: str
+    challenge: str
+    expires_at: str
+    disclose: list
+    issuer_dids: Optional[List[str]]
+    holder_binding: bool
+    status: str = "pending"
+    consumed_at: Optional[str] = None
+    consumed_presentation_id: Optional[str] = None
 
 
 @dataclass
