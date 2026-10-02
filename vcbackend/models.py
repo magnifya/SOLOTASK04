@@ -281,9 +281,13 @@ class PresentationRequestRecord:
     的空白名单）；holder_binding 为 True 时要求持有人即凭证
     subject_did 且为本租户已注册 DID。
 
-    status 为 "pending" 或 "consumed"：仅 request_id 模式验真成功时
-    原子置为 consumed 并记录 consumed_at 与 consumed_presentation_id；
-    验真失败不改变状态。请求与演示在同一次原子写中一起消费。
+    status 为 "pending"、"consumed" 或 "cancelled"：仅 request_id
+    模式验真成功时原子置为 consumed 并记录 consumed_at 与
+    consumed_presentation_id；验真失败不改变状态。请求与演示在同一次
+    原子写中一起消费。cancelled 为验证方主动取消的终态（不可恢复），
+    记录首次裁剪原因 cancel_reason 与 UTC 秒精度 Z 时间 cancelled_at；
+    已取消请求拒绝 present 的 request_id 模式，verify 的 request_id
+    模式在绑定校验通过后返回 valid:false（展示请求已取消）。
     """
 
     request_id: str
@@ -295,6 +299,8 @@ class PresentationRequestRecord:
     status: str = "pending"
     consumed_at: Optional[str] = None
     consumed_presentation_id: Optional[str] = None
+    cancel_reason: Optional[str] = None
+    cancelled_at: Optional[str] = None
 
 
 @dataclass
