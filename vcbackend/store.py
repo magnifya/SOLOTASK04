@@ -1070,6 +1070,11 @@ class VCStore:
         for bucket in self._tenants.values():
             bucket.setdefault("dids", {})
             bucket.setdefault("credentials", {})
+            # 签发幂等键绑定（POST /v1/credentials 的 Idempotency-Key）：
+            # key -> {"credential_id", "request"}。仅在成功签发时与凭证、
+            # 首次 credential.issued 审计同一次原子写落盘；旧状态文件
+            # 不为历史凭证补造绑定。
+            bucket.setdefault("idempotency_keys", {})
             # 凭证模式（约束）注册表：
             # issuer_did -> schema_id -> version -> 模式行
             bucket.setdefault("credential_schemas", {})
@@ -1847,6 +1852,7 @@ class VCStore:
             bucket = {
                 "dids": {},
                 "credentials": {},
+                "idempotency_keys": {},
                 "credential_schemas": {},
                 "credential_schema_history": {},
                 "presentations": {},
@@ -2846,28 +2852,139 @@ class VCStore:
         均不保存、不审计。成功时正文追加 schema_id、schema_version、
         schema_digest（模式内容规范化 JSON 的 SHA-256 小写十六进制）。
         """
-        if not isinstance(issuer_did, str) or not issuer_did:
-            raise ValidationError("缺少字段或字段为空: issuer_did")
-        if not isinstance(subject_did, str) or not subject_did:
-            raise ValidationError("缺少字段或字段为空: subject_did")
-        if not isinstance(claims, dict):
-            raise ValidationError("字段 claims 必须为 JSON 对象")
-        raw_expires_at = None
-        if expires_at is not EXPIRES_AT_UNSET:
-            raw_expires_at = _validate_future_utc_z(expires_at, "expires_at")
-        if schema_id is not None or schema_version is not None:
-            if not isinstance(schema_id, str) or not schema_id:
-                raise ValidationError("字段 schema_id 必须为非空字符串")
-            if (
-                isinstance(schema_version, bool)
-                or not isinstance(schema_version, int)
-                or schema_version < 1
-            ):
-                raise ValidationError("字段 schema_version 必须为正整数")
-        schema_bound = schema_id is not None and schema_version is not None
+        record, _created = self._create_credential_impl(
+            tenant_id,
+            issuer_did,
+            subject_did,
+            claims,
+            expires_at=expires_at,
+            schema_id=schema_id,
+            schema_version=schema_version,
+            idempotency=None,
+        )
+        return record
 
+    def replay_idempotent_credential(
+        self, tenant_id: str, idempotency_key: str, request_fingerprint: str
+    ) -> Optional[CredentialRecord]:
+        """幂等键重放判定（只读）：未绑定返回 None；同内容返回首签记录。
+
+        已绑定键的异内容请求抛 ConflictError（409，不覆盖首次绑定）。
+        即使签发者已轮换/停用、模式已弃用/吊销、凭证已过期/吊销，同
+        内容重放仍返回首次签发结果；不推进审计序号、不改变任何状态。
+        绑定按租户隔离，他租户的绑定情况不可见。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            bound = (
+                bucket.get("idempotency_keys", {}).get(idempotency_key)
+                if bucket is not None
+                else None
+            )
+            if bound is None:
+                return None
+            if bound.get("request") != request_fingerprint:
+                raise ConflictError("幂等键已绑定不同签发请求")
+            rec = bucket["credentials"].get(bound["credential_id"])
+            if rec is None:  # 绑定与凭证原子写入，缺失即数据损坏
+                raise StorageError(
+                    f"幂等键绑定缺失对应凭证: {idempotency_key}"
+                )
+            return CredentialRecord(
+                credential_id=bound["credential_id"],
+                body=rec["body"],
+                signature=rec["signature"],
+            )
+
+    def create_credential_idempotent(
+        self,
+        tenant_id: str,
+        idempotency_key: str,
+        request_fingerprint: str,
+        issuer_did: str,
+        subject_did: str,
+        claims: Dict[str, Any],
+        expires_at: Any = EXPIRES_AT_UNSET,
+        schema_id: Any = None,
+        schema_version: Any = None,
+    ) -> Tuple[CredentialRecord, bool]:
+        """按租户隔离的幂等签发；返回 (记录, 是否本次新签发)。
+
+        键未绑定时沿用 create_credential 的全部校验与 400/404/409
+        错误协议，失败不占键；仅成功签发才把键绑定到本次请求指纹与
+        结果，绑定、凭证与首次 credential.issued 审计同一次原子写
+        落盘（保存失败三者均不生效，重试仍可首次签发）。键已绑定：
+        同内容返回 (首签记录, False)，异内容抛 ConflictError。
+        """
+        return self._create_credential_impl(
+            tenant_id,
+            issuer_did,
+            subject_did,
+            claims,
+            expires_at=expires_at,
+            schema_id=schema_id,
+            schema_version=schema_version,
+            idempotency=(idempotency_key, request_fingerprint),
+        )
+
+    def _create_credential_impl(
+        self,
+        tenant_id: str,
+        issuer_did: str,
+        subject_did: str,
+        claims: Dict[str, Any],
+        expires_at: Any,
+        schema_id: Any,
+        schema_version: Any,
+        idempotency: Optional[Tuple[str, str]],
+    ) -> Tuple[CredentialRecord, bool]:
         with self._lock:
             bucket = self._ensure_bucket_locked(tenant_id)
+            # 重放判定先于一切签发校验：已绑定键的同内容请求直接返回
+            # 首次结果（即使签发者/模式/凭证状态此后已变化），异内容
+            # 统一 409；两者均不推进审计序号。
+            if idempotency is not None:
+                idem_key, idem_fingerprint = idempotency
+                bound = bucket["idempotency_keys"].get(idem_key)
+                if bound is not None:
+                    if bound.get("request") == idem_fingerprint:
+                        rec = bucket["credentials"].get(
+                            bound["credential_id"]
+                        )
+                        if rec is None:  # 绑定与凭证原子写入
+                            raise StorageError(
+                                f"幂等键绑定缺失对应凭证: {idem_key}"
+                            )
+                        return (
+                            CredentialRecord(
+                                credential_id=bound["credential_id"],
+                                body=rec["body"],
+                                signature=rec["signature"],
+                            ),
+                            False,
+                        )
+                    raise ConflictError("幂等键已绑定不同签发请求")
+            if not isinstance(issuer_did, str) or not issuer_did:
+                raise ValidationError("缺少字段或字段为空: issuer_did")
+            if not isinstance(subject_did, str) or not subject_did:
+                raise ValidationError("缺少字段或字段为空: subject_did")
+            if not isinstance(claims, dict):
+                raise ValidationError("字段 claims 必须为 JSON 对象")
+            raw_expires_at = None
+            if expires_at is not EXPIRES_AT_UNSET:
+                raw_expires_at = _validate_future_utc_z(
+                    expires_at, "expires_at"
+                )
+            if schema_id is not None or schema_version is not None:
+                if not isinstance(schema_id, str) or not schema_id:
+                    raise ValidationError("字段 schema_id 必须为非空字符串")
+                if (
+                    isinstance(schema_version, bool)
+                    or not isinstance(schema_version, int)
+                    or schema_version < 1
+                ):
+                    raise ValidationError("字段 schema_version 必须为正整数")
+            schema_bound = schema_id is not None and schema_version is not None
             # 逐个指明不存在的是哪一个 DID（他租户 DID 同样不可见）
             issuer = bucket["dids"].get(issuer_did)
             if issuer is None:
@@ -2931,13 +3048,25 @@ class VCStore:
                     "body": body,
                     "signature": signature,
                 }
+                # 幂等键绑定与凭证、首次审计同一次原子写落盘；键本身
+                # 不写入凭证正文、签名内容或任何公开查询响应。
+                if idempotency is not None:
+                    bucket["idempotency_keys"][idem_key] = {
+                        "credential_id": credential_id,
+                        "request": idem_fingerprint,
+                    }
                 self._append_audit_locked(
                     tenant_id, AUDIT_CREDENTIAL_ISSUED,
                     "credential", credential_id,
                 )
                 self._save_locked()
-                return CredentialRecord(
-                    credential_id=credential_id, body=body, signature=signature
+                return (
+                    CredentialRecord(
+                        credential_id=credential_id,
+                        body=body,
+                        signature=signature,
+                    ),
+                    True,
                 )
             except Exception:
                 self._restore_locked(snapshot)

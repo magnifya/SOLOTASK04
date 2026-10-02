@@ -14,7 +14,7 @@
   GET  /v1/dids/{did}/keys/{ver}/status   查询 DID 密钥版本吊销状态（只读）
   GET  /v1/dids/{did}/keys/revocations    查询 DID 密钥吊销历史（只读）
 GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（只读）
-  POST /v1/credentials                    签发凭证
+  POST /v1/credentials                    签发凭证（可选 Idempotency-Key 按租户幂等重试）
   POST /v1/credentials/status-export      凭证状态签名发布（产出可直接提交状态批量同步的签名项，只读）
   GET  /v1/credentials/{credential_id}    查询凭证
   PUT  /v1/credentials/{credential_id}/status   登记 active（首次 201/重复 200）或暂停/恢复 suspended（200）
@@ -165,6 +165,7 @@ import json
 import re
 import sys
 from datetime import datetime, timezone
+from fractions import Fraction
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
@@ -198,6 +199,39 @@ from .store import (
 
 def _json_dumps(payload: Any) -> bytes:
     return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+# Idempotency-Key：1-64 个 ASCII 字母/数字/下划线/连字符，键值区分大小写。
+IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _idempotency_fingerprint(payload: Any) -> str:
+    """请求对象的规范化指纹（用于幂等键的同内容判定）。
+
+    忽略 JSON 空白与递归对象键顺序；保留数组次序及字段是否出现；
+    字符串、布尔值、数字与 null 互不替代；1 与 1.0 视为相同数值。
+    """
+
+    def canon(value: Any) -> str:
+        if isinstance(value, bool):
+            return "b:" + ("1" if value else "0")
+        if value is None:
+            return "z"
+        if isinstance(value, (int, float)):
+            try:
+                return "n:" + str(Fraction(value))
+            except (OverflowError, ValueError):  # inf/nan 字面量兜底
+                return "n:" + repr(value)
+        if isinstance(value, str):
+            return "s:" + json.dumps(value, ensure_ascii=False)
+        if isinstance(value, list):
+            return "l:[" + ",".join(canon(item) for item in value) + "]"
+        return "d:{" + ",".join(
+            json.dumps(str(key), ensure_ascii=False) + ":" + canon(val)
+            for key, val in sorted(value.items())
+        ) + "}"
+
+    return canon(payload)
 
 
 def _deactivation_event_obj(event: Any) -> Dict[str, Any]:
@@ -682,6 +716,21 @@ def build_handler(store: VCStore) -> type:
             if raw == "":
                 raise ValidationError("X-Tenant-ID 不能为空")
             return raw
+
+        def _idempotency_key(self) -> Optional[str]:
+            """解析 Idempotency-Key：缺省 None；重复头/空值/非法字符/超长 400。"""
+            values = self.headers.get_all("Idempotency-Key")
+            if not values:
+                return None
+            if len(values) > 1:
+                raise ValidationError("Idempotency-Key 头只能提供一次")
+            key = values[0]
+            if key is None or not IDEMPOTENCY_KEY_RE.fullmatch(key):
+                raise ValidationError(
+                    "Idempotency-Key 非法: 须为 1-64 个 ASCII 字母、"
+                    "数字、下划线或连字符"
+                )
+            return key
 
         def _read_json(self) -> Dict[str, Any]:
             length = int(self.headers.get("Content-Length") or 0)
@@ -2046,8 +2095,34 @@ def build_handler(store: VCStore) -> type:
                 },
             )
 
+        @staticmethod
+        def _credential_issue_payload(record: Any) -> Dict[str, Any]:
+            """签发成功/幂等重放响应的固定键序负载（不含幂等键本身）。"""
+            return {
+                "credential_id": record.credential_id,
+                "signature": record.signature,
+                "issuer_key_version": record.body["issuer_key_version"],
+            }
+
         def _post_credentials(self, tenant: str) -> None:
+            # 可选 Idempotency-Key：租户头、键格式与 JSON 对象格式的校验
+            # 先于重放判定；未提供该头时保持原有签发行为（每次新凭证）。
+            idempotency_key = self._idempotency_key()
             data = self._read_json()
+            fingerprint = None
+            if idempotency_key is not None:
+                fingerprint = _idempotency_fingerprint(data)
+                # 重放判定先于签发校验：同内容返回首次结果（200，不重新
+                # 签名、不新增凭证或审计事件）；异内容统一 409，不覆盖
+                # 首次绑定。两者均不推进审计序号。
+                replay = store.replay_idempotent_credential(
+                    tenant, idempotency_key, fingerprint
+                )
+                if replay is not None:
+                    self._send_json(
+                        200, self._credential_issue_payload(replay)
+                    )
+                    return
             self._require_fields(data, ("issuer_did", "subject_did"))
             if "claims" not in data:
                 raise ValidationError("缺少字段: claims")
@@ -2068,19 +2143,39 @@ def build_handler(store: VCStore) -> type:
                     "schema_id 与 schema_version 必须同时出现或同时省略"
                 )
             try:
-                record = store.create_credential(
-                    tenant,
-                    data["issuer_did"],
-                    data["subject_did"],
-                    data["claims"],
-                    expires_at=expires_at,
-                    schema_id=(
-                        data["schema_id"] if has_schema_id else None
-                    ),
-                    schema_version=(
-                        data["schema_version"] if has_schema_version else None
-                    ),
-                )
+                if idempotency_key is None:
+                    record = store.create_credential(
+                        tenant,
+                        data["issuer_did"],
+                        data["subject_did"],
+                        data["claims"],
+                        expires_at=expires_at,
+                        schema_id=(
+                            data["schema_id"] if has_schema_id else None
+                        ),
+                        schema_version=(
+                            data["schema_version"] if has_schema_version else None
+                        ),
+                    )
+                    created = True
+                else:
+                    # 只有成功签发才占用键；绑定、凭证与首次审计同一次
+                    # 原子写落盘，保存失败 500 且三者均不生效。
+                    record, created = store.create_credential_idempotent(
+                        tenant,
+                        idempotency_key,
+                        fingerprint,
+                        data["issuer_did"],
+                        data["subject_did"],
+                        data["claims"],
+                        expires_at=expires_at,
+                        schema_id=(
+                            data["schema_id"] if has_schema_id else None
+                        ),
+                        schema_version=(
+                            data["schema_version"] if has_schema_version else None
+                        ),
+                    )
             except SchemaUnavailableError:
                 # 显式引用已弃用/吊销模式版本：统一固定 409 原因，不签发、
                 # 不写入、不记审计；未引用或引用 active 版本时走既有路径。
@@ -2089,12 +2184,8 @@ def build_handler(store: VCStore) -> type:
                 )
                 return
             self._send_json(
-                201,
-                {
-                    "credential_id": record.credential_id,
-                    "signature": record.signature,
-                    "issuer_key_version": record.body["issuer_key_version"],
-                },
+                201 if created else 200,
+                self._credential_issue_payload(record),
             )
 
         @staticmethod
