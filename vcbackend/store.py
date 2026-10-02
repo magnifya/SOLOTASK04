@@ -246,6 +246,7 @@ AUDIT_TRUST_CREDENTIAL_STATUS_SYNCED = "trust.credential.status.synced"
 AUDIT_TRUST_CREDENTIAL_IMPORTED = "trust.credential.imported"
 AUDIT_TRUST_CREDENTIAL_RECEIPT_CONSUMED = "trust.credential.receipt.consumed"
 AUDIT_TRUST_PRESENTATION_CONSUMED = "trust.presentation.consumed"
+AUDIT_TRUST_PROOF_CONSUMED = "trust.proof.consumed"
 AUDIT_TRUST_PRESENTATION_SYNC_RECEIPT_CONSUMED = (
     "trust.presentation.sync.receipt.consumed"
 )
@@ -1121,6 +1122,10 @@ class VCStore:
             # 跨系统外部演示一次性消费判重索引：
             # issuer_did -> presentation_id -> {consumption_id, consumed_at}
             bucket.setdefault("consumed_trust_presentations", {})
+            # 跨系统外部谓词证明一次性消费判重索引：
+            # source_tenant_id -> issuer_did -> proof_id ->
+            # {consumption_id, consumed_at}
+            bucket.setdefault("consumed_trust_proofs", {})
             # 演示消费同步进度签名回执一次性消费判重索引：
             # verifier_did -> nonce -> {receipt_id, consumed_at}
             bucket.setdefault("consumed_presentation_sync_receipts", {})
@@ -1872,6 +1877,7 @@ class VCStore:
                 "synced_trust_presentations": {},
                 "synced_trust_presentation_consumption_events": {},
                 "consumed_trust_presentations": {},
+                "consumed_trust_proofs": {},
                 "consumed_presentation_sync_receipts": {},
                 "consumed_credential_status_receipts": {},
                 "consumed_credential_status_sync_receipts": {},
@@ -14331,6 +14337,63 @@ class VCStore:
                 self._restore_locked(snapshot)
                 raise StorageError("存储失败") from exc
             return outcomes
+
+    def consume_trust_proof(
+        self,
+        tenant_id: str,
+        source_tenant_id: str,
+        issuer_did: str,
+        proof_id: str,
+        consumption_id: str,
+    ) -> Tuple[bool, Optional[str]]:
+        """按 (source_tenant_id, issuer_did, proof_id) 一次性消费跨系统
+        外部谓词证明。
+
+        调用方须先完成证明验真（/v1/trust/proofs/verify 全部规则通
+        过）。本方法在锁内原子判定并标记：
+        - 同键已消费：返回 (False, None)，不写消费标记、不记审计；
+        - 首次消费：记录 consumed_at（UTC 秒精度 Z）并追加一条
+          trust.proof.consumed 审计（resource_type 为 trust_proof、
+          resource_id 为 consumption_id），与消费标记同一次原子写落
+          盘，返回 (True, consumed_at)；并发仅一次成功，跨重启保留；
+        - 落盘失败：回滚内存中的消费标记与审计事件，抛 StorageError
+          （可重试）。
+
+        仅保存消费所需标识、摘要与时间，不保存证明原文。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            by_source = (
+                bucket["consumed_trust_proofs"].get(source_tenant_id)
+                if bucket is not None
+                else None
+            )
+            by_issuer = (
+                by_source.get(issuer_did) if by_source is not None else None
+            )
+            if by_issuer is not None and proof_id in by_issuer:
+                return False, None
+            bucket = self._ensure_bucket_locked(tenant_id)
+            snapshot = self._snapshot_locked()
+            try:
+                consumed_at = _utc_now()
+                bucket["consumed_trust_proofs"].setdefault(
+                    source_tenant_id, {}
+                ).setdefault(issuer_did, {})[proof_id] = {
+                    "consumption_id": consumption_id,
+                    "consumed_at": consumed_at,
+                }
+                self._append_audit_locked(
+                    tenant_id,
+                    AUDIT_TRUST_PROOF_CONSUMED,
+                    "trust_proof",
+                    consumption_id,
+                )
+                self._save_locked()
+            except Exception as exc:
+                self._restore_locked(snapshot)
+                raise StorageError("存储失败") from exc
+            return True, consumed_at
 
     def list_trust_presentation_consumptions(
         self,
