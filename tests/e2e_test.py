@@ -695,14 +695,27 @@ def main():
                       {"presentation": r, "challenge": r["challenge"]})
         check("零披露 verify valid=true", st == 200 and r == {"valid": True})
 
-        # 23.4 数组整值可披露、数组索引禁止
+        # 23.4 数组整值披露与数组元素选择性披露
         st, r = _http("POST", f"{base}/v1/credentials/{sd_cid}/present",
                       {"disclose": ["/tags"]})
         check("数组整值披露 -> 201 且投影保留完整数组",
               st == 201 and r.get("claims") == {"tags": ["a", "b"]})
+        st, r = _http("POST", f"{base}/v1/credentials/{sd_cid}/present",
+                      {"disclose": ["/tags/1"]})
+        check("数组元素披露 -> 201 且保留下标、空位填 null",
+              st == 201 and r.get("claims") == {"tags": [None, "b"]})
+        st, vp = _http("POST", f"{base}/v1/presentations/{r['presentation_id']}/verify",
+                       {"presentation": r, "challenge": r["challenge"]})
+        check("数组元素演示验真 valid=true", st == 200 and vp == {"valid": True})
+        for bad_path in ["/tags/-1", "/tags/+1", "/tags/01",
+                         "/tags/-", "/tags/2", "/tags/٠"]:
+            st, rr = _http("POST", f"{base}/v1/credentials/{sd_cid}/present",
+                           {"disclose": [bad_path]})
+            check(f"非法数组索引 {bad_path} -> 400",
+                  st == 400 and bool(rr.get("error")))
         st, rr = _http("POST", f"{base}/v1/credentials/{sd_cid}/present",
-                       {"disclose": ["/tags/0"]})
-        check("数组索引 -> 400", st == 400 and rr.get("error"))
+                       {"disclose": ["/tags/0/0"]})
+        check("穿过标量 -> 400", st == 400 and bool(rr.get("error")))
 
         # 23.5 RFC6901 转义路径
         st, r = _http("POST", f"{base}/v1/credentials/{sd_cid}/present",

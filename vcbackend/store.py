@@ -440,20 +440,38 @@ def _resolve_pointer(
     tokens: Tuple[str, ...],
     pointer: str,
     label: str = "disclose",
+    allow_arrays: bool = True,
 ) -> Any:
     """沿 token 导航 claims 并返回目标值。
 
-    禁根（空 token）、禁数组索引（任一步进入数组）、键不存在或
-    经过非对象叶子均按越界/未命中拒绝。
+    禁根（空 token）、键不存在或经过非容器叶子均按越界/未命中
+    拒绝。allow_arrays 为 True 时允许进入数组：数组下标只接受
+    RFC6901 的 "0" 或无前导零 ASCII 十进制非负索引，负数、正号、
+    前导零、非 ASCII 数字与 "-" 均非法，越界按未命中拒绝；对象中
+    的数字字符串始终按普通属性名处理。allow_arrays 为 False 时
+    保持谓词证明的叶子规则（任一步进入数组即非法）。
     """
     if not tokens:
         raise ValidationError(f"{label} 不允许根路径（零披露请传空列表）")
     current: Any = claims
     for token in tokens:
         if isinstance(current, list):
-            raise ValidationError(
-                f"{label} 路径不允许数组索引: {pointer!r}"
-            )
+            if not allow_arrays:
+                raise ValidationError(
+                    f"{label} 路径不允许数组索引: {pointer!r}"
+                )
+            if not _JSON_POINTER_ARRAY_INDEX_RE.fullmatch(token):
+                raise ValidationError(
+                    f"{label} 数组索引非法（仅接受 0 或无前导零的"
+                    f"非负十进制索引）: {pointer!r}"
+                )
+            index = int(token)
+            if index >= len(current):
+                raise ValidationError(
+                    f"{label} 路径越界或未命中 claims 属性: {pointer!r}"
+                )
+            current = current[index]
+            continue
         if not isinstance(current, dict) or token not in current:
             raise ValidationError(
                 f"{label} 路径越界或未命中 claims 属性: {pointer!r}"
@@ -468,7 +486,9 @@ def _validate_disclose(
     """校验 disclose 列表并返回 (原路径, token 元组) 列表。
 
     - disclose 必须为列表；元素须为以 / 开头的合法 RFC6901 指针字符串；
-    - 路径须命中 claims 属性：禁根、禁数组索引、禁越界；
+    - 路径须命中 claims：禁根、禁越界、禁止穿过标量；数组只接受
+      RFC6901 合法非负索引（0 或无前导零 ASCII 十进制），对象中的
+      数字字符串按属性名处理，可继续访问嵌套数组与元素内对象；
     - 路径不得重复、不得存在祖先/后代重叠（含已覆盖的深层路径）。
     """
     if not isinstance(disclose, list):
@@ -498,15 +518,68 @@ def _project_claims(
     claims: Dict[str, Any],
     parsed: List[Tuple[str, Tuple[str, ...]]],
 ) -> Dict[str, Any]:
-    """按解析后的路径从 claims 提取投影；路径值整体保留（数组作叶子）。"""
-    projection: Dict[str, Any] = {}
-    for pointer, tokens in parsed:
-        value = _resolve_pointer(claims, tokens, pointer)
-        target = projection
-        for key in tokens[:-1]:
-            target = target.setdefault(key, {})
-        target[tokens[-1]] = value
-    return projection
+    """按解析后的路径从 claims 构建选择性披露投影。
+
+    投影中的对象只保留被选属性；部分披露的数组保持原下标：长度为
+    最大被选下标加一，未选位置填 null，不输出剩余元素，也不保留原
+    数组长度。直接选中对象或数组（路径终点）时整值披露；同一元素的
+    多个属性合并到同一对象；所选值本身为 null 时正常保留；嵌套容器
+    按相同规则递归处理。disclose 保持输入次序回显，本投影结果不依赖
+    无重叠路径的先后次序；空列表投影为 {}。
+    """
+    whole = object()
+
+    def insert(node: Dict[Any, Any], source: Any,
+               node_tokens: Tuple[str, ...]) -> None:
+        # 选择树节点为 dict：对象按字符串键、数组按下标（int）；
+        # 值为 whole 表示叶子直接选中，值为 dict 表示继续深入容器。
+        if not node_tokens:
+            node[whole] = whole
+            return
+        token = node_tokens[0]
+        rest = node_tokens[1:]
+        key: Any = int(token) if isinstance(source, list) else token
+        child_source = (
+            source[int(token)] if isinstance(source, list)
+            else source[token]
+        )
+        if rest:
+            child = node.setdefault(key, {})
+            insert(child, child_source, rest)
+        else:
+            node[key] = whole
+
+    selection: Dict[Any, Any] = {}
+    for _, tokens in parsed:
+        insert(selection, claims, tokens)
+
+    def build(source: Any, node: Dict[Any, Any]) -> Any:
+        if whole in node:
+            return source
+        if isinstance(source, list):
+            indices = sorted(k for k in node if isinstance(k, int))
+            result: List[Any] = []
+            for index in range(indices[-1] + 1):
+                if index in node:
+                    child_node = node[index]
+                    if child_node is whole:
+                        result.append(source[index])
+                    else:
+                        result.append(build(source[index], child_node))
+                else:
+                    result.append(None)
+            return result
+        result_obj: Dict[str, Any] = {}
+        for key, child_node in node.items():
+            if child_node is whole:
+                result_obj[key] = source[key]
+            else:
+                result_obj[key] = build(source[key], child_node)
+        return result_obj
+
+    if not parsed:
+        return {}
+    return build(claims, selection)
 
 
 def _validate_request_disclose(disclose: Any) -> List[str]:
@@ -856,7 +929,7 @@ def _validate_predicates(
                 raise ValidationError(
                     f"predicates 路径存在祖先重叠: 已选路径被 {pointer!r} 覆盖"
                 )
-        hit = _resolve_pointer(claims, tokens, pointer, "predicates")
+        hit = _resolve_pointer(claims, tokens, pointer, "predicates", allow_arrays=False)
         if op in ("gte", "lte"):
             if not _is_number(item["value"]):
                 raise ValidationError(
@@ -879,7 +952,7 @@ def _evaluate_predicates(
     results: List[bool] = []
     for item in predicates:
         tokens = _parse_pointer(item["path"], "predicates")
-        hit = _resolve_pointer(claims, tokens, item["path"], "predicates")
+        hit = _resolve_pointer(claims, tokens, item["path"], "predicates", allow_arrays=False)
         op = item["op"]
         if op == "exists":
             results.append(True)

@@ -54,8 +54,8 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/presentation-requests` | 验证方创建展示请求（按 `X-Tenant-ID` 隔离），请求体恰含非空 `challenge`（≤256 码点）与可选 `expires_in`（非布尔整数 1–86400、缺省 300）、`disclose`（RFC6901 路径数组，禁根/重复/祖先重叠，缺省 `[]` 零披露；命中 claims 的校验在 present 时结合凭证执行）、`issuer_dids`（非空无重复字符串数组，省略或 `null` 为不限定，显式 `[]` 为不接受任何签发者的空白名单）、`holder_binding`（布尔、缺省 false）；非法字段一律 400；成功 201 返回 `request_id`（`pr_` 加 32 位小写 hex）、`challenge`、`expires_at`、`disclose`、`issuer_dids`（不限定为 `null`）、`holder_binding`、`status:"pending"`；记 `presentation.request.created` 审计 |
 | GET | `/v1/presentation-requests/{request_id}` | 查询本租户展示请求，200 返回创建对象（消费后 `status:"consumed"` 并附 `consumed_at`、`consumed_presentation_id`；取消后 `status:"cancelled"` 并附 `cancel_reason`、`cancelled_at`，不含消费字段；pending/consumed 其余字段不变）；未知 ID 或跨租户同 ID 一律 404 |
 | POST | `/v1/presentation-requests/{request_id}/cancel` | 验证方主动取消展示请求（终态不可恢复）；请求体须为 `{}` 或仅含 `reason`（字符串，裁剪后 1–256 Unicode 码点；省略时默认“展示请求主动取消”）；空体、非法 JSON、非对象、多余字段或非法 reason 一律 400，先校验 `X-Tenant-ID`（缺省 default、显式空值 400）与请求体再查资源，未知或他租户请求 404；首次取消仅接受 pending（含已过期 pending），consumed 返回 409「展示请求已消费」；成功 200，状态保存为 `cancelled`，响应在查询对象末尾追加 `cancel_reason`（首次裁剪原因）与 `cancelled_at`（UTC 秒精度 Z），不含消费字段；有效重复取消幂等返回首次结果（即使原因不同也不改原因与时间），重复取消与任何失败均不追加审计；首次取消仅追加一条 `presentation.request.cancelled` 审计（resource_type 为 presentation_request、resource_id 为请求 ID），状态与审计同一次原子写，落盘失败 500 并回滚状态与审计序号，结果跨重启保留 |
-| POST | `/v1/credentials/{credential_id}/present-batch` | 原子批量生成选择性披露演示，请求体须恰为 `{"presentations":[项...]}`，数组非空且不超过 50 项；每项恰含 `disclose` 及可选 `challenge`、`expires_in`、`holder_binding`，规则同单项 present（challenge 非空串≤256 码点、缺省 32 位小写 hex；`expires_in` 非布尔整数 1–86400、缺省 300；`holder_binding` 布尔、缺省 false，绑定时 subject_did 须本租户已注册 DID）；disclose 按 RFC6901 命中 claims，禁根/数组索引/越界/重复/祖先重叠，`[]` 零披露；外层或任一项非法 400（非空中文原因）且整批不写入、不记审计，未知凭证 404；成功 201 返回 `{"presentations":[...]}`，与输入等长、同序，项键序固定为 `presentation_id`、`credential_id`、`issuer_did`、`issuer_key_version`、`disclose`、`claims`、`challenge`、`expires_at`、`proof`（绑定项末尾加 `holder_did`、`holder_key_version`、`holder_proof`）；全部记录与每条演示的审计事件同一次原子提交，失败整体回滚，ES256 签名与单项一致、重启可验签 |
-| POST | `/v1/presentations/multi` | 多凭证原子组合展示，请求体恰为 `{"items":[项...]}` 加可选组合级 `challenge`、`expires_in`、`holder_binding`；items 非空且不超过 100 项，每项恰含非空字符串 `credential_id` 与 `disclose`，批内 credential_id 不重复；disclose 沿用 RFC6901 claims 叶子规则（拒根路径、数组索引、越界、重复、祖先/后代嵌套覆盖，`[]` 零披露）；challenge 非空串≤256 码点、缺省 32 位小写 hex；`expires_in` 非布尔整数 1–86400、缺省 300；`holder_binding` 仅布尔、缺省 false，绑定时各凭证 subject_did 须一致且为本租户已注册 DID；items 为空/超 100/重复、字段、披露、挑战、期限、holder_binding 或 subject_did 错误统一 400，未知或跨租户凭证 404，签发者停用/凭证暂停 409，失败不落盘不记审计；成功 201，`presentation_id` 为 `mvp_` 加 32 位小写 hex，响应含凭证投影、各凭证签发证明、统一 challenge、expires_at（项键序 `credential_id`、`issuer_did`、`issuer_key_version`、`disclose`、`claims`、`proof`），绑定时另含 `holder_did`、`holder_key_version`、`holder_proof`（持有者当前私钥对整个组合加 tenant_id 的单次 ES256 签名），输出只含所选叶子 claim |
+| POST | `/v1/credentials/{credential_id}/present-batch` | 原子批量生成选择性披露演示，请求体须恰为 `{"presentations":[项...]}`，数组非空且不超过 50 项；每项恰含 `disclose` 及可选 `challenge`、`expires_in`、`holder_binding`，规则同单项 present（challenge 非空串≤256 码点、缺省 32 位小写 hex；`expires_in` 非布尔整数 1–86400、缺省 300；`holder_binding` 布尔、缺省 false，绑定时 subject_did 须本租户已注册 DID）；disclose 按 RFC6901 命中 claims，支持数组元素选择（索引为 0 或无前导零 ASCII 十进制非负整数，负数/正号/前导零/非 ASCII 数字/`-` 非法），禁根/越界/穿标量/重复/祖先重叠，部分披露数组按最大下标+1 保留下标、空位填 null，`[]` 零披露；外层或任一项非法 400（非空中文原因）且整批不写入、不记审计，未知凭证 404；成功 201 返回 `{"presentations":[...]}`，与输入等长、同序，项键序固定为 `presentation_id`、`credential_id`、`issuer_did`、`issuer_key_version`、`disclose`、`claims`、`challenge`、`expires_at`、`proof`（绑定项末尾加 `holder_did`、`holder_key_version`、`holder_proof`）；全部记录与每条演示的审计事件同一次原子提交，失败整体回滚，ES256 签名与单项一致、重启可验签 |
+| POST | `/v1/presentations/multi` | 多凭证原子组合展示，请求体恰为 `{"items":[项...]}` 加可选组合级 `challenge`、`expires_in`、`holder_binding`；items 非空且不超过 100 项，每项恰含非空字符串 `credential_id` 与 `disclose`，批内 credential_id 不重复；disclose 沿用 RFC6901 规则（拒根路径、非法/越界数组索引、穿标量、重复、祖先/后代嵌套覆盖，支持数组元素选择与 null 占位投影，`[]` 零披露）；challenge 非空串≤256 码点、缺省 32 位小写 hex；`expires_in` 非布尔整数 1–86400、缺省 300；`holder_binding` 仅布尔、缺省 false，绑定时各凭证 subject_did 须一致且为本租户已注册 DID；items 为空/超 100/重复、字段、披露、挑战、期限、holder_binding 或 subject_did 错误统一 400，未知或跨租户凭证 404，签发者停用/凭证暂停 409，失败不落盘不记审计；成功 201，`presentation_id` 为 `mvp_` 加 32 位小写 hex，响应含凭证投影、各凭证签发证明、统一 challenge、expires_at（项键序 `credential_id`、`issuer_did`、`issuer_key_version`、`disclose`、`claims`、`proof`），绑定时另含 `holder_did`、`holder_key_version`、`holder_proof`（持有者当前私钥对整个组合加 tenant_id 的单次 ES256 签名），输出只含所选 claim |
 | POST | `/v1/presentations/{presentation_id}/verify` | 校验演示，支持两种模式：①challenge 模式（行为不变），新演示（含 `mvp_` 多凭证组合展示）请求体恰为 `{"presentation":对象,"challenge":串}`（旧演示恰为 `{"presentation":对象}`）；②request_id 模式，请求体恰为 `{"presentation":对象,"request_id":非空串}`，不接受 challenge（绑定/非绑定均使用请求 challenge）并执行请求策略（disclose 全等、issuer_dids 白名单、holder_binding 与本租户已注册持有人），未知 presentation_id（含跨租户）404；**任何语义失败一律 HTTP 200**，成功 `{"valid":true}`，失败附非空中文 `reason`；request_id 模式在保留展示存在性与请求绑定校验的前提下，绑定通过后请求已取消即返回 `{"valid":false,"reason":"展示请求已取消"}`，该判定先于过期与后续凭证校验（适用于绑定与非绑定展示）且不消费演示或请求；其余固定 reason 按策略不满足、不匹配、过期、已消费依次为 `展示请求策略不满足`、`展示请求不匹配`、`展示请求已过期`、`展示请求已消费`，演示重复消费沿用 `展示已消费`，凭证/密钥状态原因沿用现有文案；组合展示全部凭证的签发锚定、密钥版本、投影、签发证明、统一 challenge、有效期、可选持有人签名与当前状态通过才有效；request_id 模式仅首次完整验证成功时在同一次原子写把演示与请求同时置为已消费（记 presentation.consumed、`presentation.consumed_presentation_id`），失败均不消费请求，重复验证 reason 为展示已消费；challenge 模式组合消费语义不变 |
 | POST | `/v1/credentials/{credential_id}/prove` | 生成谓词证明，请求体恰为 `{"predicates":[项...]}` 加可选 `challenge`、`expires_in`；成功 201 返回证明对象；字段问题 400、未知凭证 404 |
 | POST | `/v1/credentials/{credential_id}/prove-batch` | 原子批量生成谓词证明，请求体须恰为 `{"items":[项...]}`，数组非空且不超过 50 项；每项恰含 `predicates` 及可选 `challenge`、`expires_in`，谓词结构/路径/运算、挑战与有效期规则全同单项 prove（challenge 非空串≤256 码点、缺省逐项独立生成 32 位小写 hex；`expires_in` 非布尔整数 1–86400、缺省逐项独立取 300）；单条项内路径禁重复与祖先/后代重叠，不同项互不约束；空体、非法 JSON、非对象、外层缺 `items`、非数组/空/超 50、多余字段或任一项字段、类型、谓词值、challenge、expires_in 非法均 400（非空中文原因），全部项请求级校验通过后才查凭证，未知/跨租户凭证 404，随后把所有项的谓词结构、路径、运算与取值对照凭证 claims 全部校验完（任一项非法仍 400），再依次检查签发 DID 停用 409、签发密钥吊销 400、凭证暂停 409，任一失败均不留证明或审计；成功 201 仅返回 `{"proofs":[...]}`，与输入等长、同序，每项就是单项 prove 的成功对象（`results` 按该项谓词在凭证 claims 上的计算结果排列）；全部证明记录与每条 `proof.created` 审计同一次原子提交，任一失败或落盘失败整体回滚、审计序号不前进（落盘失败 500 非空 error）；各证明 `proof_id` 独立，重启后仍可经既有 `/v1/proofs/{id}/verify` 验真，挑战、过期与一次性消费行为不变 |
@@ -702,10 +702,22 @@ curl "localhost:8080/v1/dids/did:example:<id>/document?version=1"
   **400**（未注册或属他租户）。
 - 路径按 [RFC 6901](https://www.rfc-editor.org/rfc/rfc6901) JSON Pointer
   解释，相对于凭证 `claims`：
-  - 必须以 `/` 开头并命中实际 `claims` 属性，支持 `~0`/`~1` 转义；
-  - **禁止根路径**（零披露请传 `[]`）、**禁止数组索引**（数组只能整值披露）、
-    越界/经过非对象叶子均 400；
+  - 必须以 `/` 开头并命中实际 `claims`，支持 `~0`/`~1` 转义；
+  - **禁止根路径**（零披露请传 `[]`）、越界、经过标量均 400；
+  - 对象按属性名导航（对象中的数字字符串仍是普通属性名）；进入数组
+    时下标只接受 RFC 6901 的 `0` 或无前导零 ASCII 十进制非负索引，
+    负数、正号、前导零、非 ASCII 数字（如 `٠`、`１`）与末尾指针 `-`
+    均 400，下标越界 400；可继续访问嵌套数组与数组元素内对象；
   - 路径不得重复、不得存在祖先/后代重叠（如 `/a` 与 `/a/b`）。
+- **数组元素选择性披露投影**：投影中的对象只保留被选属性；部分披露
+  的数组保持原下标，长度为**最大被选下标加一**，未选位置填 `null`，
+  不输出剩余元素，也不保留原数组长度。例如 claims 为
+  `{"rows":[{"name":"甲","secret":1},{"name":"乙","secret":2}]}`，选择
+  `/rows/1/name` 后投影为 `{"rows":[null,{"name":"乙"}]}`。所选值本身
+  为 `null` 时正常保留；同一元素的多个属性合并到同一对象；嵌套容器按
+  相同规则递归处理；路径终点直接选中对象或数组时**整值披露**（数组
+  整值披露与旧演示保持兼容）。`disclose` 按输入次序原样回显，调换无
+  重叠路径的次序不改变投影；`[]` 仍表示零披露（投影为 `{}`）。
 - 成功返回 201，未绑定（缺省/`false`）字段恰为：
   `presentation_id`（`vp_` 加 32 位小写 hex）、`credential_id`、`issuer_did`、
   `issuer_key_version`（旧凭证缺省按 1）、`disclose`（原样回显）、
@@ -780,9 +792,10 @@ curl -X POST localhost:8080/v1/presentations/vp_<id>/verify \
   字符串且按 Unicode 码点不超过 256，缺省生成 32 位小写 hex；
   `expires_in` 须为非布尔整数且在 1–86400 之间，缺省 300。
 - `path` 按 RFC 6901 解释（相对凭证 `claims`），规则与选择性披露
-  一致：必须以 `/` 开头并命中实际属性、支持 `~0`/`~1` 转义、
-  **禁根路径、禁数组索引**、越界 400；路径不得重复、不得存在
-  祖先/后代重叠。
+  一致但**不支持数组元素选择**（谓词仍沿用叶子规则）：必须以 `/`
+  开头并命中实际属性、支持 `~0`/`~1` 转义、**禁根路径、禁数组索引**
+  （数组只能整值命中）、越界 400；路径不得重复、不得存在祖先/后代
+  重叠。
 - `op ∈ {exists, eq, gte, lte}`：`eq` 为 JSON 精确相等（布尔与数字
   不互通，容器递归比较）；`gte`/`lte` 要求谓词 `value` 与 claims
   命中值**均为非布尔数字**，否则 400。
@@ -1891,7 +1904,8 @@ PEM 句柄与非法 key_mode 拒绝、密钥轮换（含 404/400 路径）、轮
 状态登记（201/200 幂等、严格 400、未知 404、已吊销 409）、吊销（默认/裁剪
 reason、重复吊销忽略 reason、非法 reason 仅首次 400）、verify 对已吊销凭证
 返回 valid:false、状态跨重启保留，以及旧状态文件迁移与旧凭证按版本 1 验签；
-选择性披露覆盖：present 201 字段与投影、零披露、数组整值/数组索引拒绝、
+选择性披露覆盖：present 201 字段与投影、零披露、数组整值与数组元素选择
+（含保留下标/null 占位投影）、非法或越界数组索引拒绝、
 `~0`/`~1` 转义、各类 400（缺字段/类型/不以 `/` 开头/根路径/重复/祖先重叠/
 越界/非法 JSON/challenge 与 expires_in 非法值及边界）、未知凭证 404、
 演示 verify 的全部分类失败与中文 reason、challenge 三方一致、过期、

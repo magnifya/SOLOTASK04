@@ -252,8 +252,10 @@ def main():
         # ---------- 5. store 级非法（整体回滚） ---------- #
         expect_400("根指针 -> 400",
                    {"presentations": [{"disclose": ["/"]}]})
-        expect_400("数组索引 -> 400",
-                   {"presentations": [{"disclose": ["/tags/0"]}]})
+        expect_400("非法数组索引 -> 400",
+                   {"presentations": [{"disclose": ["/tags/01"]}]})
+        expect_400("数组下标越界 -> 400",
+                   {"presentations": [{"disclose": ["/tags/2"]}]})
         expect_400("越界 -> 400",
                    {"presentations": [{"disclose": ["/nope"]}]})
         expect_400("重复路径 -> 400",
