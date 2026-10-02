@@ -201,15 +201,28 @@ curl -X POST localhost:8080/v1/presentations/vp_<id>/verify \
 CLI 通过 HTTP 与服务通信（`verify` 调用服务端验签端点，由服务端按
 `issuer_key_version` 从签发者公钥历史中取公钥验签）。
 用 `--base-url` 或环境变量 `VCBACKEND_URL` 指定服务地址（默认 `http://127.0.0.1:8080`）。
+用子命令**之前**的全局选项 `--tenant-id` 或环境变量 `VCBACKEND_TENANT_ID`
+选择租户，CLI 将其原样放入每个请求的 `X-Tenant-ID` 头（`did-create`、
+`did-show`、`issue` 与 `verify` 的取凭证和服务端验签两次请求都携带同一个
+值；不写入请求正文、凭证正文或签名内容，也不落盘任何配置）。优先级为
+显式 `--tenant-id` > `VCBACKEND_TENANT_ID` > 缺省：两者都未提供时不发送
+租户头（由服务端归入 `default`），显式 `--tenant-id default` 则发送
+`default`。显式选项存在时完全覆盖环境变量，即使显式值为空串也不回退。
+租户值只接受一个或多个 ASCII 可打印非空白字符，保持原始大小写、不裁剪；
+空串、纯空白、控制字符或非 ASCII 字符属于配置错误：在发起任何 HTTP 请求
+前退出，退出码 2，stdout 为空，stderr 输出单行中文原因。
+`serve` 忽略 `VCBACKEND_TENANT_ID` 并继续服务全部租户；显式为 `serve`
+提供 `--tenant-id` 按配置错误退出（退出码 2）且不启动服务。
 
 ```bash
 export VCBACKEND_URL=http://127.0.0.1:8080
+export VCBACKEND_TENANT_ID=tenant-a
 
-python3 -m vcbackend.cli did-create --method example --public-key alice-key
-python3 -m vcbackend.cli did-show  did:example:<id>
-python3 -m vcbackend.cli issue --issuer did:example:<a> --subject did:example:<b> \
+python3 -m vcbackend.cli did-create --method example --public-key alice-key   # 用环境变量租户
+python3 -m vcbackend.cli --tenant-id tenant-b did-show  did:example:<id>      # 显式覆盖
+python3 -m vcbackend.cli --tenant-id tenant-b issue --issuer did:example:<a> --subject did:example:<b> \
     --claims '{"role":"admin"}'
-python3 -m vcbackend.cli verify vc_<id>     # 成功输出 true（退出码 0）
+python3 -m vcbackend.cli verify vc_<id>     # 取凭证与验签均带租户头；成功 true（退出码 0）
                                            # 正文被改动或 GET 凭证失败均输出 false，
                                            # stderr 说明原因（退出码 1）
 ```
