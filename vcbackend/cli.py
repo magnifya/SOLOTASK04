@@ -10,10 +10,16 @@
 CLI 通过 HTTP 与服务通信；verify 由服务端以存储记录为锚、按
 issuer_key_version 从签发者公钥历史中取公钥验签。
 可用 --base-url 或环境变量 VCBACKEND_URL 指定服务地址。
+租户可用子命令前的全局选项 --tenant-id 或环境变量
+VCBACKEND_TENANT_ID 选择，优先级为显式选项 > 环境变量 > 默认
+（不发送 X-Tenant-ID，由服务端归入 default）。serve 忽略租户
+环境变量、服务全部租户；显式为 serve 提供 --tenant-id 属于配置
+错误，退出码 2 且不启动服务。
 """
 
 import argparse
 import json
+import os
 import sys
 from typing import Any, Dict, List, Optional
 from urllib import error as urlerror
@@ -22,6 +28,62 @@ from urllib import request as urlrequest
 from .service import run as serve_run
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8080"
+TENANT_ENV_VAR = "VCBACKEND_TENANT_ID"
+TENANT_HEADER = "X-Tenant-ID"
+
+
+def _valid_tenant_id(value: str) -> bool:
+    """租户标识：一个或多个 ASCII 可打印非空白字符，区分大小写。"""
+    return (
+        isinstance(value, str)
+        and len(value) >= 1
+        and all(33 <= ord(ch) <= 126 for ch in value)
+    )
+
+
+def _config_error(reason: str) -> int:
+    """配置错误：退出码 2，仅向 stderr 输出单行中文原因，无堆栈。"""
+    print(reason, file=sys.stderr)
+    return 2
+
+
+def _resolve_tenant_id(
+    explicit: Optional[str],
+    command: str,
+    environ: Optional[Dict[str, str]] = None,
+) -> "tuple[Optional[int], Optional[str]]":
+    """解析租户选择。
+
+    返回 ``(status, tenant_id)``：``status`` 非 None 表示应直接
+    以该退出码结束；否则 ``tenant_id`` 为 None（不发送租户头）或
+    已校验通过的租户标识原文。显式选项存在时完全覆盖环境变量，
+    即使其为空或非法也不退回环境变量。
+    """
+    env = os.environ if environ is None else environ
+    # serve 服务全部租户：忽略环境变量；显式提供 --tenant-id 一律
+    # 按配置错误处理（含非法值），且绝不启动服务。
+    if command == "serve":
+        if explicit is not None:
+            return _config_error(
+                "配置错误：serve 不接受 --tenant-id 选项"
+            ), None
+        return None, None
+    if explicit is not None:
+        if not _valid_tenant_id(explicit):
+            return _config_error(
+                "配置错误：--tenant-id 必须为一个或多个 ASCII 可打印"
+                "非空白字符"
+            ), None
+        return None, explicit
+    env_value = env.get(TENANT_ENV_VAR)
+    if env_value is not None:
+        if not _valid_tenant_id(env_value):
+            return _config_error(
+                f"配置错误：环境变量 {TENANT_ENV_VAR} 必须为一个或多个"
+                " ASCII 可打印非空白字符"
+            ), None
+        return None, env_value
+    return None, None
 
 
 # ---------------------------------------------------------------------- #
@@ -39,12 +101,15 @@ def _request(
     method: str,
     path: str,
     payload: Optional[Dict[str, Any]] = None,
+    tenant_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     url = f"{base_url.rstrip('/')}{path}"
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     req = urlrequest.Request(url, data=data, method=method)
     if data is not None:
         req.add_header("Content-Type", "application/json")
+    if tenant_id is not None:
+        req.add_header(TENANT_HEADER, tenant_id)
     try:
         with urlrequest.urlopen(req) as resp:  # noqa: S310 (CLI 目标地址)
             body = resp.read().decode("utf-8")
@@ -71,13 +136,19 @@ def _cmd_did_create(args: argparse.Namespace) -> int:
         "POST",
         "/v1/dids",
         {"method": args.method, "public_key": args.public_key},
+        tenant_id=args.tenant_id,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
 
 def _cmd_did_show(args: argparse.Namespace) -> int:
-    result = _request(args.base_url, "GET", f"/v1/dids/{args.did}")
+    result = _request(
+        args.base_url,
+        "GET",
+        f"/v1/dids/{args.did}",
+        tenant_id=args.tenant_id,
+    )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
@@ -100,6 +171,7 @@ def _cmd_issue(args: argparse.Namespace) -> int:
             "subject_did": args.subject,
             "claims": claims,
         },
+        tenant_id=args.tenant_id,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -111,7 +183,10 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     # 在 stderr 说明原因并以退出码 1 结束；成功输出 true 并退出 0。
     try:
         vc = _request(
-            args.base_url, "GET", f"/v1/credentials/{args.credential_id}"
+            args.base_url,
+            "GET",
+            f"/v1/credentials/{args.credential_id}",
+            tenant_id=args.tenant_id,
         )
     except ClientError as exc:
         print("false")
@@ -135,6 +210,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
             "POST",
             f"/v1/credentials/{args.credential_id}/verify",
             {"body": body, "signature": signature},
+            tenant_id=args.tenant_id,
         )
     except ClientError as exc:
         print("false")
@@ -180,6 +256,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="HTTP 服务地址（默认取 VCBACKEND_URL 或 %(default)s）",
     )
+    parser.add_argument(
+        "--tenant-id",
+        default=None,
+        help=(
+            "租户标识（须为 ASCII 可打印非空白字符，区分大小写）；"
+            f"默认取 {TENANT_ENV_VAR}，均未提供时不发送租户头；"
+            "仅可放在子命令前，serve 不支持该选项"
+        ),
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_create = sub.add_parser("did-create", help="注册 DID")
@@ -210,16 +295,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.set_defaults(func=_cmd_serve)
 
     parser.set_defaults(base_url=None)
+    parser.set_defaults(tenant_id=None)
     return parser
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    import os
-
     parser = build_parser()
     args = parser.parse_args(argv)
     if not getattr(args, "base_url", None):
         args.base_url = os.environ.get("VCBACKEND_URL", DEFAULT_BASE_URL)
+    status, tenant_id = _resolve_tenant_id(args.tenant_id, args.command)
+    if status is not None:
+        return status
+    args.tenant_id = tenant_id
     try:
         return args.func(args)
     except ClientError as exc:

@@ -214,6 +214,32 @@ python3 -m vcbackend.cli verify vc_<id>     # 成功输出 true（退出码 0）
                                            # stderr 说明原因（退出码 1）
 ```
 
+### 租户选择
+
+`did-create`、`did-show`、`issue`、`verify` 支持在**子命令前**加全局
+选项 `--tenant-id`，或设置环境变量 `VCBACKEND_TENANT_ID`，为本次调用的
+每个 HTTP 请求（`verify` 的“先取凭证、再服务端验签”两个请求）携带同一个
+`X-Tenant-ID` 头：
+
+```bash
+python3 -m vcbackend.cli --tenant-id tenant-a did-create --method example --public-key alice-key
+VCBACKEND_TENANT_ID=tenant-a python3 -m vcbackend.cli verify vc_<id>
+python3 -m vcbackend.cli --tenant-id default did-show did:example:<id>  # 显式 default 也发送该头
+```
+
+- 优先级：显式 `--tenant-id` > 环境变量 `VCBACKEND_TENANT_ID` > 默认。
+  两者都未提供时不发送租户头，由服务端归入 `default`；显式指定 `default`
+  时照常发送 `X-Tenant-ID: default`。
+- 显式选项一旦提供就完全覆盖环境变量：即使选项为空或非法，也不会退回
+  环境变量；环境变量非法同样不会影响一个合法的显式选项。
+- 取值只接受一个或多个 ASCII 可打印非空白字符（区分大小写，不裁剪、不改写）。
+  空串、纯空白、控制字符、非 ASCII 一律视为配置错误：在发起任何 HTTP 请求前
+  退出，退出码 `2`，stdout 为空，stderr 输出单行中文原因且不含堆栈。
+- 租户标识只进入请求头，不写入请求正文、凭证正文或签名内容，CLI 也不在
+  本地保存任何新的配置文件。
+- `serve` 忽略 `VCBACKEND_TENANT_ID` 并继续服务全部租户；显式为
+  `serve` 提供 `--tenant-id`（无论合法与否）按配置错误退出（`2`）且不启动服务。
+
 ## 签名与验真
 
 - 算法为 **ES256**：ECDSA over P-256 与 SHA-256，签名编码为 64 字节裸 `R||S` 的 base64url（无填充）。
