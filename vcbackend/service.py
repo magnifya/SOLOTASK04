@@ -26,6 +26,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/credentials/{credential_id}/present 生成选择性披露演示（现有 disclose 模式或验证方展示请求 request_id 模式）
   POST /v1/presentation-requests 验证方创建展示请求（challenge/expires_in/disclose/issuer_dids/holder_binding）
   GET  /v1/presentation-requests/{request_id} 查询展示请求（租户隔离，跨租户同 ID 404）
+  POST /v1/presentation-requests/{request_id}/cancel 主动取消展示请求（仅 pending，含已过期；幂等）
   POST /v1/credentials/{credential_id}/present-batch 原子批量生成选择性披露演示
   POST /v1/presentations/{presentation_id}/verify  以存储记录为锚校验演示（challenge 模式或 request_id 模式）
   POST /v1/credentials/{credential_id}/prove    生成谓词证明
@@ -835,6 +836,22 @@ def build_handler(store: VCStore) -> type:
                         path[len("/v1/proofs/") : -len("/verify")]
                     )
                     self._post_verify_proof(tenant, proof_id)
+                elif (
+                    path.startswith("/v1/presentation-requests/")
+                    and path.endswith("/cancel")
+                ):
+                    request_id = unquote(
+                        path[
+                            len("/v1/presentation-requests/")
+                            : -len("/cancel")
+                        ]
+                    )
+                    if not request_id:
+                        self._send_error(404, f"无此路径: {path}")
+                    else:
+                        self._cancel_presentation_request(
+                            tenant, request_id
+                        )
                 elif path == "/v1/presentation-requests":
                     self._post_presentation_request(tenant)
                 elif path == "/v1/presentations/multi":
@@ -2756,8 +2773,9 @@ def build_handler(store: VCStore) -> type:
 
             固定键序：request_id、challenge、expires_at、disclose、
             issuer_dids（不限定时为 null）、holder_binding、status
-            （pending/consumed）；已消费时末尾追加 consumed_at 与
-            consumed_presentation_id。
+            （pending/cancelled/consumed）；已取消时末尾追加
+            cancel_reason 与 cancelled_at（不含消费字段）；已消费时
+            末尾追加 consumed_at 与 consumed_presentation_id。
             """
             payload: Dict[str, Any] = {
                 "request_id": record.request_id,
@@ -2768,6 +2786,9 @@ def build_handler(store: VCStore) -> type:
                 "holder_binding": record.holder_binding,
                 "status": record.status,
             }
+            if record.status == "cancelled":
+                payload["cancel_reason"] = record.cancel_reason
+                payload["cancelled_at"] = record.cancelled_at
             if record.status == "consumed":
                 payload["consumed_at"] = record.consumed_at
                 payload["consumed_presentation_id"] = (
@@ -2843,6 +2864,51 @@ def build_handler(store: VCStore) -> type:
             # GET /v1/presentation-requests/{request_id}：查询本租户展示
             # 请求；未知 ID（含他租户同 ID）一律 404。
             record = store.get_presentation_request(tenant, request_id)
+            self._send_json(
+                200, self._presentation_request_payload(record)
+            )
+
+        def _cancel_presentation_request(
+            self, tenant: str, request_id: str
+        ) -> None:
+            # POST /v1/presentation-requests/{request_id}/cancel：主动
+            # 取消展示请求。先校验租户头（路由前）与请求体，再查资源：
+            # 空体、非法 JSON、非 JSON 对象、reason 之外的多余字段、
+            # reason 非字符串或裁剪后不在 1..256 个 Unicode 码点一律
+            # 400；未知或他租户请求 404（校验全部通过后才查资源）。
+            # pending（含已过期）首次取消 200，保存 status=cancelled、
+            # 首次裁剪原因与 UTC 秒精度 cancelled_at，响应在查询对象
+            # 末尾追加 cancel_reason、cancelled_at，不含消费字段；
+            # consumed 返回 409；已取消的有效重复取消幂等返回首次结果，
+            # 即使原因不同也不改写。取消不可恢复。
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b""
+            if not raw:
+                raise ValidationError("请求体必须为 JSON 对象")
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValidationError(
+                    f"请求体不是合法 JSON: {exc}"
+                ) from exc
+            if not isinstance(data, dict):
+                raise ValidationError("请求体必须为 JSON 对象")
+            extra = sorted(set(data) - {"reason"})
+            if extra:
+                raise ValidationError(f"多余字段: {', '.join(extra)}")
+            reason = None
+            if "reason" in data:
+                reason = data["reason"]
+                if not isinstance(reason, str):
+                    raise ValidationError("字段 reason 必须为字符串")
+                reason = reason.strip()
+                if not 1 <= len(reason) <= 256:
+                    raise ValidationError(
+                        "字段 reason 裁剪后须为 1 到 256 个 Unicode 码点"
+                    )
+            record = store.cancel_presentation_request(
+                tenant, request_id, reason
+            )
             self._send_json(
                 200, self._presentation_request_payload(record)
             )

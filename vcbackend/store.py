@@ -211,6 +211,9 @@ PRESENTATION_REQUEST_POLICY_REASON = "展示请求策略不满足"
 PRESENTATION_REQUEST_MISMATCH_REASON = "展示请求不匹配"
 PRESENTATION_REQUEST_VERIFY_EXPIRED_REASON = "展示请求已过期"
 PRESENTATION_REQUEST_CONSUMED_REASON = "展示请求已消费"
+PRESENTATION_REQUEST_CANCELLED_REASON = "展示请求已取消"
+PRESENTATION_REQUEST_CANCEL_CONFLICT_REASON = "展示请求已消费"
+DEFAULT_PRESENTATION_REQUEST_CANCEL_REASON = "展示请求主动取消"
 
 # 审计动作名
 AUDIT_DID_CREATED = "did.created"
@@ -229,6 +232,9 @@ AUDIT_CREDENTIAL_REVOKED = "credential.revoked"
 AUDIT_PRESENTATION_CREATED = "presentation.created"
 AUDIT_PRESENTATION_CONSUMED = "presentation.consumed"
 AUDIT_PRESENTATION_REQUEST_CREATED = "presentation.request.created"
+AUDIT_PRESENTATION_REQUEST_CANCELLED = (
+    "presentation.request.cancelled"
+)
 AUDIT_TRUST_ANCHOR_REGISTERED = "trust.anchor.registered"
 AUDIT_TRUST_ANCHOR_REVOKED = "trust.anchor.revoked"
 AUDIT_TRUST_ANCHOR_ROTATED = "trust.anchor.rotated"
@@ -4103,6 +4109,8 @@ class VCStore:
             status=row.get("status", "pending"),
             consumed_at=row.get("consumed_at"),
             consumed_presentation_id=row.get("consumed_presentation_id"),
+            cancel_reason=row.get("cancel_reason"),
+            cancelled_at=row.get("cancelled_at"),
         )
 
     def create_presentation_request(
@@ -4171,6 +4179,60 @@ class VCStore:
                 raise NotFoundError(f"展示请求不存在: {request_id}")
             return self._presentation_request_record(row)
 
+    def cancel_presentation_request(
+        self,
+        tenant_id: str,
+        request_id: str,
+        reason: Optional[str] = None,
+    ) -> PresentationRequestRecord:
+        """主动取消本租户展示请求（取消不可恢复）。
+
+        请求不存在（含他租户资源）抛 NotFoundError（HTTP 404）；已
+        consumed 的请求抛 ConflictError（HTTP 409）；已 cancelled 的
+        请求幂等返回首次结果，即使传入不同原因也不改写 cancel_reason
+        与 cancelled_at，不重复记审计。pending（含已过期）请求在同一
+        次原子写内置 status=cancelled、cancel_reason（省略时为
+        “展示请求主动取消”，否则保存首次裁剪后的 1..256 码点原因）与
+        cancelled_at（UTC 秒精度 Z），并追加唯一一条
+        presentation.request.cancelled 审计（resource_type 为
+        presentation_request、resource_id 为请求 ID）；落盘失败回滚
+        状态与审计序号并向上抛出（HTTP 500）。
+        """
+        cancel_reason = (
+            DEFAULT_PRESENTATION_REQUEST_CANCEL_REASON
+            if reason is None
+            else reason
+        )
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            row = (
+                bucket["presentation_requests"].get(request_id)
+                if bucket is not None
+                else None
+            )
+            if row is None:
+                raise NotFoundError(f"展示请求不存在: {request_id}")
+            if row.get("status") == "cancelled":
+                return self._presentation_request_record(row)
+            if row.get("status") == "consumed":
+                raise ConflictError(
+                    PRESENTATION_REQUEST_CANCEL_CONFLICT_REASON
+                )
+            snapshot = self._snapshot_locked()
+            try:
+                row["status"] = "cancelled"
+                row["cancel_reason"] = cancel_reason
+                row["cancelled_at"] = _utc_now()
+                self._append_audit_locked(
+                    tenant_id, AUDIT_PRESENTATION_REQUEST_CANCELLED,
+                    "presentation_request", request_id,
+                )
+                self._save_locked()
+                return self._presentation_request_record(row)
+            except Exception:
+                self._restore_locked(snapshot)
+                raise
+
     def create_presentation_for_request(
         self,
         tenant_id: str,
@@ -4200,6 +4262,10 @@ class VCStore:
             )
             if req is None:
                 raise ValidationError(PRESENTATION_REQUEST_NOT_FOUND_REASON)
+            if req.get("status") == "cancelled":
+                raise ValidationError(
+                    PRESENTATION_REQUEST_CANCELLED_REASON
+                )
             try:
                 req_expires_at = _parse_utc_z(req["expires_at"])
             except (KeyError, TypeError, ValueError):
@@ -4354,6 +4420,11 @@ class VCStore:
                 holder_proof = presentation.get("holder_proof")
                 if not isinstance(holder_proof, str) or not holder_proof:
                     return False, PRESENTATION_REQUEST_MISMATCH_REASON
+
+            # 取消判定先于消费、过期与后续凭证状态/签名校验：绑定通过
+            # 后若请求已取消，固定返回「展示请求已取消」，不消费。
+            if req.get("status") == "cancelled":
+                return False, PRESENTATION_REQUEST_CANCELLED_REASON
 
             # 已消费优先：演示自身已消费沿用「演示已消费」；请求已被
             # 其他演示消费则为「展示请求已消费」。
@@ -4578,6 +4649,8 @@ class VCStore:
             )
             if row_now is None or req_now is None:
                 return False, PRESENTATION_REQUEST_MISMATCH_REASON
+            if req_now.get("status") == "cancelled":
+                return False, PRESENTATION_REQUEST_CANCELLED_REASON
             if row_now.get("consumed"):
                 return False, "演示已消费"
             if req_now.get("status") == "consumed":
