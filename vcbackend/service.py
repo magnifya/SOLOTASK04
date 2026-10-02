@@ -106,7 +106,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/presentations/verify-synced-with-status  同步锚点验真未绑定/持有者绑定演示并合并请求初始状态快照（只读）
   POST /v1/trust/presentations/verify-synced-batch  批量以同步锚点快照验真未绑定演示（只读）
   POST /v1/trust/presentations/verify-synced-batch-with-status  批量同步锚点验真演示并合并批初状态快照（只读）
-  POST /v1/trust/presentations/verify-batch 批量跨系统演示验真（仅未绑定形态，不消费）
+  POST /v1/trust/presentations/verify-batch 批量跨系统演示验真（单凭证与组合混用，不消费）
   POST /v1/trust/presentations/verify-with-status 外部演示验真并合并同步状态（只读）
   POST /v1/trust/presentations/verify-batch-with-status 批量演示验真并合并同步状态（只读）
   POST /v1/trust/proofs/verify            跨系统谓词证明验真（无需登记 DID/凭证/证明，不消费）
@@ -9403,9 +9403,10 @@ def build_handler(store: VCStore) -> type:
         def _post_trust_presentations_verify(self, tenant: str) -> None:
             # 跨系统演示验真：与其他验签端点相同的公开错误协议，任何失败
             # 都返回 200 + {"valid": false, "reason": "<非空中文原因>"}。
-            # 未绑定请求体须恰含 presentation（对象）与 challenge（非空
-            # 字符串）；持有者绑定请求另含非空字符串 source_tenant_id，
-            # 演示对象相应多出 holder_did/holder_key_version/holder_proof。
+            # presentation 可为单凭证演示（未绑定九字段；持有者绑定十二
+            # 字段，请求另含非空 source_tenant_id）或 /v1/presentations/
+            # multi 返回的组合展示（items 一至一百项；未绑定组合禁止
+            # source_tenant_id，绑定组合须随附非空 source_tenant_id）。
             # 非法 JSON/非对象/缺失/多余字段均为请求类原因。只读，不写
             # 凭证、演示、状态、历史或审计。
             try:
@@ -9430,7 +9431,9 @@ def build_handler(store: VCStore) -> type:
                 return
 
             try:
-                valid, reason = store.verify_trust_presentation(tenant, data)
+                valid, reason = store.verify_trust_presentation(
+                    tenant, data, allow_multi=True
+                )
             except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
                 self._send_invalid("验签过程发生内部错误")
                 return
@@ -9998,8 +10001,9 @@ def build_handler(store: VCStore) -> type:
             # 持有者绑定项另须恰含非空 source_tenant_id 且演示多出
             # holder_did/holder_key_version/holder_proof（双锚点双签名，
             # source_tenant_id 作为 holder proof 覆盖的 tenant_id），
-            # 失败不短路。纯只读，不消费、不登记资源，不写状态、历史或
-            # 审计，仅使用当前租户锚点。
+            # 并允许 presentation 为 /v1/presentations/multi 的组合对象
+            # （单凭证与组合可混用），失败不短路。纯只读，不消费、不
+            # 登记资源，不写状态、历史或审计，仅使用当前租户锚点。
             try:
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length) if length > 0 else b""
