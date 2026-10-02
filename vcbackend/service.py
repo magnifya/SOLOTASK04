@@ -9406,6 +9406,12 @@ def build_handler(store: VCStore) -> type:
             # 未绑定请求体须恰含 presentation（对象）与 challenge（非空
             # 字符串）；持有者绑定请求另含非空字符串 source_tenant_id，
             # 演示对象相应多出 holder_did/holder_key_version/holder_proof。
+            # presentation 也接受 /v1/presentations/multi 返回的多凭证
+            # 组合（未绑定四字段/绑定七字段，绑定请求才允许出现
+            # source_tenant_id），按请求结构->组合结构->挑战->逐项签发
+            # 证明->持有者证明->期限->外部停用通告的顺序判定，组合失败
+            # 固定原因为请求非法/组合展示非法/挑战不匹配/锚点不可用/
+            # 签名格式错误/签名校验失败/演示已过期。
             # 非法 JSON/非对象/缺失/多余字段均为请求类原因。只读，不写
             # 凭证、演示、状态、历史或审计。
             try:
@@ -9430,7 +9436,9 @@ def build_handler(store: VCStore) -> type:
                 return
 
             try:
-                valid, reason = store.verify_trust_presentation(tenant, data)
+                valid, reason = store.verify_trust_presentation(
+                    tenant, data, allow_multi=True
+                )
             except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
                 self._send_invalid("验签过程发生内部错误")
                 return
@@ -9998,7 +10006,9 @@ def build_handler(store: VCStore) -> type:
             # 持有者绑定项另须恰含非空 source_tenant_id 且演示多出
             # holder_did/holder_key_version/holder_proof（双锚点双签名，
             # source_tenant_id 作为 holder proof 覆盖的 tenant_id），
-            # 失败不短路。纯只读，不消费、不登记资源，不写状态、历史或
+            # 各项也接受 /v1/presentations/multi 的组合对象（单凭证与
+            # 组合可混用，组合按单项的七段顺序与固定原因判定），失败
+            # 不短路。纯只读，不消费、不登记资源，不写状态、历史或
             # 审计，仅使用当前租户锚点。
             try:
                 length = int(self.headers.get("Content-Length") or 0)
@@ -10036,7 +10046,7 @@ def build_handler(store: VCStore) -> type:
 
             try:
                 ok, reason, results = store.verify_trust_presentations_batch(
-                    tenant, data
+                    tenant, data, allow_multi=True
                 )
             except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
                 self._send_json(

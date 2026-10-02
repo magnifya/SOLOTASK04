@@ -8196,6 +8196,7 @@ class VCStore:
         tenant_id: str,
         data: Any,
         allow_holder_bound: bool = True,
+        allow_multi: bool = False,
     ) -> Tuple[bool, str]:
         """验证未在本租户保存的外部选择性披露演示，返回 (是否有效, 失败原因)。
 
@@ -8210,6 +8211,12 @@ class VCStore:
           仅当 ``allow_holder_bound`` 为真时允许；单项接口与批量接口
           逐项均接受两种形态（未绑定项出现 source_tenant_id 以外的多余
           字段仍失败，绑定项须恰含 source_tenant_id）。
+
+        ``allow_multi`` 为真时（跨系统验真与其批量入口），演示对象若为
+        /v1/presentations/multi 返回的多凭证组合（含 items 字段），转由
+        :meth:`verify_trust_multi_presentation` 按组合规则判定；单凭证
+        形态的既有行为不变。其他入口（消费、状态合并、同步快照等）不
+        接受组合形态，沿用单凭证结构校验拒绝。
 
         校验顺序：请求结构 -> 演示字段与 challenge -> 签发者锚点与签名 ->
         持有者锚点与签名（仅绑定）-> 期限。
@@ -8233,6 +8240,10 @@ class VCStore:
         # 非空字符串 source_tenant_id。
         if not isinstance(data, dict):
             return False, "请求不合法: 请求体必须为 JSON 对象"
+        if allow_multi and isinstance(data.get("presentation"), dict) and (
+            "items" in data["presentation"]
+        ):
+            return self.verify_trust_multi_presentation(tenant_id, data)
         is_holder_bound = (
             allow_holder_bound and "source_tenant_id" in data
         )
@@ -8489,10 +8500,344 @@ class VCStore:
                 return False, deactivation_reason
         return True, ""
 
+    def verify_trust_multi_presentation(
+        self,
+        tenant_id: str,
+        data: Any,
+    ) -> Tuple[bool, str]:
+        """验证未在本租户保存的外部多凭证组合展示，返回 (是否有效, 原因)。
+
+        直接验证 /v1/presentations/multi 返回的组合对象：验证租户只需
+        登记信任锚点，无需保存来源 DID、凭证或展示。判定顺序固定为
+        请求结构 -> 组合结构 -> 挑战 -> 逐项签发证明（锚点 -> 签名格式
+        -> 验签）-> 持有者证明（仅绑定）-> 期限 -> 外部 DID 停用通告
+        （先按项序查签发者，再查持有者）。失败原因固定为：请求非法、
+        组合展示非法、挑战不匹配、锚点不可用、签名格式错误、
+        签名校验失败、演示已过期；停用通告沿用现有原因文案。
+
+        - 未绑定组合请求恰含 presentation、challenge，组合顶层恰为
+          presentation_id/items/challenge/expires_at；持有者绑定组合
+          另恰含非空字符串 source_tenant_id，组合顶层须整体多出
+          holder_did/holder_key_version/holder_proof（三个持有者字段
+          要么全部出现要么全部省略），绑定关系不一致即组合展示非法；
+        - items 限 1..100 项，每项恰为 credential_id、issuer_did、
+          issuer_key_version、disclose、claims、proof 六字段，类型沿用
+          组合生成的公开字段，credential_id 批内不重复；
+        - 各项签发证明与持有者证明均为 ES256/SHA-256，编码与覆盖范围
+          与本地组合生成一致（项证明覆盖含顶层 presentation_id、
+          challenge、expires_at 的八字段；持有者证明覆盖去 proof 的
+          各项与 holder_did/holder_key_version/tenant_id），因此组合
+          标识、统一挑战、期限、披露内容、source_tenant_id 或项序被
+          改动均会被拒绝；
+        - 锚点仅使用验证租户对应 DID 与版本的 active P-256 锚点，
+          缺失、吊销或缺少 vp 用途均判锚点不可用；
+        - expires_at 为 UTC 秒精度 Z，当前时间达到期限即过期。
+
+        纯只读：不登记、不消费、不写状态/历史/审计，绝不向上抛异常；
+        有效期内且锚点与通告状态不变时允许重复验真。
+        """
+        # 1. 请求结构：未绑定恰含 presentation/challenge；绑定另含
+        # 非空字符串 source_tenant_id。
+        if not isinstance(data, dict):
+            return False, "请求非法"
+        bound_request = "source_tenant_id" in data
+        allowed_fields = {"presentation", "challenge"}
+        if bound_request:
+            allowed_fields.add("source_tenant_id")
+        if set(data) != allowed_fields:
+            return False, "请求非法"
+        presentation = data["presentation"]
+        request_challenge = data["challenge"]
+        if not isinstance(presentation, dict):
+            return False, "请求非法"
+        if not isinstance(request_challenge, str) or not request_challenge:
+            return False, "请求非法"
+        source_tenant_id: Optional[str] = None
+        if bound_request:
+            source_value = data["source_tenant_id"]
+            if not isinstance(source_value, str) or not source_value:
+                return False, "请求非法"
+            source_tenant_id = source_value
+
+        # 2. 组合结构：顶层四字段（绑定整体另加三持有者字段），
+        # items 1..100、各项恰为六公开字段、credential_id 不重复、
+        # 版本为非布尔正整数；缺漏、额外字段或类型错误均非法。
+        base_fields = {
+            "presentation_id",
+            "items",
+            "challenge",
+            "expires_at",
+        }
+        holder_fields = {
+            "holder_did",
+            "holder_key_version",
+            "holder_proof",
+        }
+        present_holder_fields = holder_fields & set(presentation)
+        other_holder_fields = sorted(
+            key
+            for key in presentation
+            if key.startswith("holder_") and key not in holder_fields
+        )
+        if other_holder_fields:
+            return False, "组合展示非法"
+        if present_holder_fields not in (set(), holder_fields):
+            return False, "组合展示非法"
+        is_holder_bound = bool(present_holder_fields)
+        if is_holder_bound != bound_request:
+            return False, "组合展示非法"
+        expected_fields = set(base_fields)
+        if is_holder_bound:
+            expected_fields |= holder_fields
+        if set(presentation) != expected_fields:
+            return False, "组合展示非法"
+
+        presentation_id = presentation["presentation_id"]
+        if not isinstance(presentation_id, str) or not presentation_id:
+            return False, "组合展示非法"
+        combo_challenge = presentation["challenge"]
+        if not isinstance(combo_challenge, str) or not combo_challenge:
+            return False, "组合展示非法"
+        expires_value = presentation["expires_at"]
+        if not isinstance(expires_value, str) or not expires_value:
+            return False, "组合展示非法"
+        items = presentation["items"]
+        if not isinstance(items, list) or not 1 <= len(items) <= 100:
+            return False, "组合展示非法"
+
+        item_fields = {
+            "credential_id",
+            "issuer_did",
+            "issuer_key_version",
+            "disclose",
+            "claims",
+            "proof",
+        }
+        normalized_items: List[Dict[str, Any]] = []
+        seen_credential_ids: set = set()
+        for item in items:
+            if not isinstance(item, dict) or set(item) != item_fields:
+                return False, "组合展示非法"
+            credential_id = item["credential_id"]
+            issuer_did = item["issuer_did"]
+            if not isinstance(credential_id, str) or not credential_id:
+                return False, "组合展示非法"
+            if not isinstance(issuer_did, str) or not issuer_did:
+                return False, "组合展示非法"
+            if credential_id in seen_credential_ids:
+                return False, "组合展示非法"
+            seen_credential_ids.add(credential_id)
+            version = item["issuer_key_version"]
+            if (
+                not isinstance(version, int)
+                or isinstance(version, bool)
+                or version < 1
+            ):
+                return False, "组合展示非法"
+            disclose = item["disclose"]
+            if not isinstance(disclose, list) or any(
+                not isinstance(pointer, str) for pointer in disclose
+            ):
+                return False, "组合展示非法"
+            if not isinstance(item["claims"], dict):
+                return False, "组合展示非法"
+            proof = item["proof"]
+            if not isinstance(proof, str) or not proof:
+                return False, "组合展示非法"
+            normalized_items.append(
+                {
+                    "credential_id": credential_id,
+                    "issuer_did": issuer_did,
+                    "issuer_key_version": version,
+                    "disclose": list(disclose),
+                    "claims": item["claims"],
+                    "proof": proof,
+                }
+            )
+
+        holder_did_value: Optional[str] = None
+        holder_version_value: Optional[int] = None
+        holder_proof_value: Optional[str] = None
+        if is_holder_bound:
+            holder_did_value = presentation["holder_did"]
+            if not isinstance(holder_did_value, str) or not holder_did_value:
+                return False, "组合展示非法"
+            holder_version_value = presentation["holder_key_version"]
+            if (
+                not isinstance(holder_version_value, int)
+                or isinstance(holder_version_value, bool)
+                or holder_version_value < 1
+            ):
+                return False, "组合展示非法"
+            holder_proof_value = presentation["holder_proof"]
+            if (
+                not isinstance(holder_proof_value, str)
+                or not holder_proof_value
+            ):
+                return False, "组合展示非法"
+
+        # 3. 挑战：请求 challenge 须等于组合统一 challenge。
+        if request_challenge != combo_challenge:
+            return False, "挑战不匹配"
+
+        # 4. 逐项签发证明：按项序先取验证租户 (issuer_did, 版本) 的
+        # active P-256 锚点（缺失、吊销、无 vp 用途均不可用），再校验
+        # ES256 编码与覆盖范围（与组合生成一致的八字段）。
+        for item in normalized_items:
+            issuer_did = item["issuer_did"]
+            version = item["issuer_key_version"]
+            with self._lock:
+                bucket = self._bucket_locked(tenant_id)
+                anchors = (
+                    bucket["trust_anchors"].get(issuer_did)
+                    if bucket is not None else None
+                )
+                anchor_row = (
+                    anchors.get(str(version))
+                    if anchors is not None else None
+                )
+                public_pem = (
+                    anchor_row.get("public_key", "")
+                    if anchor_row is not None else ""
+                )
+                anchor_status = (
+                    anchor_row.get("status", "active")
+                    if anchor_row is not None else None
+                )
+                uses = (
+                    anchor_row.get("uses")
+                    if anchor_row is not None else None
+                )
+            if anchor_row is None or anchor_status == "revoked":
+                return False, "锚点不可用"
+            if uses is not None and "vp" not in uses:
+                return False, "锚点不可用"
+            try:
+                crypto.validate_public_key_pem(public_pem)
+            except (ValueError, TypeError):
+                return False, "锚点不可用"
+            message = {
+                "presentation_id": presentation_id,
+                "credential_id": item["credential_id"],
+                "issuer_did": issuer_did,
+                "issuer_key_version": version,
+                "disclose": item["disclose"],
+                "claims": item["claims"],
+                "challenge": combo_challenge,
+                "expires_at": expires_value,
+            }
+            try:
+                crypto.verify(message, item["proof"], public_pem)
+            except crypto.MalformedSignature:
+                return False, "签名格式错误"
+            except crypto.InvalidSignature:
+                return False, "签名校验失败"
+            except Exception:  # noqa: BLE001 验签绝不向上抛错
+                return False, "签名校验失败"
+
+        # 5. 持有者证明（仅绑定）：持有者锚点同样须为 active P-256 且
+        # 含 vp 用途；holder_proof 覆盖去 proof 的各项与统一挑战/期限，
+        # 加 holder_did/holder_key_version/tenant_id=source_tenant_id。
+        if is_holder_bound:
+            with self._lock:
+                bucket = self._bucket_locked(tenant_id)
+                holder_anchors = (
+                    bucket["trust_anchors"].get(holder_did_value)
+                    if bucket is not None else None
+                )
+                holder_anchor_row = (
+                    holder_anchors.get(str(holder_version_value))
+                    if holder_anchors is not None else None
+                )
+                holder_public_pem = (
+                    holder_anchor_row.get("public_key", "")
+                    if holder_anchor_row is not None else ""
+                )
+                holder_status = (
+                    holder_anchor_row.get("status", "active")
+                    if holder_anchor_row is not None else None
+                )
+                holder_uses = (
+                    holder_anchor_row.get("uses")
+                    if holder_anchor_row is not None else None
+                )
+            if (
+                holder_anchor_row is None
+                or holder_status == "revoked"
+            ):
+                return False, "锚点不可用"
+            if holder_uses is not None and "vp" not in holder_uses:
+                return False, "锚点不可用"
+            try:
+                crypto.validate_public_key_pem(holder_public_pem)
+            except (ValueError, TypeError):
+                return False, "锚点不可用"
+            holder_message = {
+                "presentation_id": presentation_id,
+                "items": [
+                    {
+                        "presentation_id": presentation_id,
+                        "credential_id": item["credential_id"],
+                        "issuer_did": item["issuer_did"],
+                        "issuer_key_version": item["issuer_key_version"],
+                        "disclose": item["disclose"],
+                        "claims": item["claims"],
+                        "challenge": combo_challenge,
+                        "expires_at": expires_value,
+                    }
+                    for item in normalized_items
+                ],
+                "challenge": combo_challenge,
+                "expires_at": expires_value,
+                "holder_did": holder_did_value,
+                "holder_key_version": holder_version_value,
+                "tenant_id": source_tenant_id,
+            }
+            try:
+                crypto.verify(
+                    holder_message, holder_proof_value, holder_public_pem
+                )
+            except crypto.MalformedSignature:
+                return False, "签名格式错误"
+            except crypto.InvalidSignature:
+                return False, "签名校验失败"
+            except Exception:  # noqa: BLE001 验签绝不向上抛错
+                return False, "签名校验失败"
+
+        # 6. 期限：UTC 秒精度 Z，当前时间达到期限即过期。
+        if not _UTC_Z_SHAPE_RE.match(expires_value):
+            return False, "组合展示非法"
+        try:
+            expires_dt = _parse_utc_z(expires_value)
+        except ValueError:
+            return False, "组合展示非法"
+        if datetime.now(timezone.utc) >= expires_dt:
+            return False, "演示已过期"
+
+        # 7. 外部 DID 停用通告：先按项序查签发者，再查持有者。
+        for item in normalized_items:
+            deactivation_reason = self._external_did_deactivation_reason(
+                tenant_id,
+                item["issuer_did"],
+                EXTERNAL_ISSUER_DID_DEACTIVATED_REASON_PREFIX,
+            )
+            if deactivation_reason is not None:
+                return False, deactivation_reason
+        if is_holder_bound:
+            deactivation_reason = self._external_did_deactivation_reason(
+                tenant_id,
+                holder_did_value,
+                EXTERNAL_HOLDER_DID_DEACTIVATED_REASON_PREFIX,
+            )
+            if deactivation_reason is not None:
+                return False, deactivation_reason
+        return True, ""
+
     def verify_trust_presentations_batch(
         self,
         tenant_id: str,
         data: Any,
+        allow_multi: bool = False,
     ) -> Tuple[bool, str, List[Dict[str, Any]]]:
         """批量验证外部选择性披露演示，返回
         (请求是否合法, 请求级原因, 逐项结果)。
@@ -8513,6 +8858,11 @@ class VCStore:
         tenant_id。成功项 ``{"valid": true}``，失败项
         ``{"valid": false, "reason": ...}``。纯只读：不消费、不登记
         资源，不写状态、历史或审计，仅使用当前租户锚点。
+
+        ``allow_multi`` 为真时（verify-batch 入口）逐项允许
+        /v1/presentations/multi 的多凭证组合形态与单凭证形态混用，
+        组合项按 :meth:`verify_trust_multi_presentation` 的固定原因
+        判定；其他批量入口不接受组合形态。
         """
         if not isinstance(data, dict):
             return False, "请求不合法: 请求体必须为 JSON 对象", []
@@ -8538,7 +8888,10 @@ class VCStore:
         results: List[Dict[str, Any]] = []
         for item in presentations:  # 顺序校验，失败不短路
             valid, reason = self.verify_trust_presentation(
-                tenant_id, item, allow_holder_bound=True
+                tenant_id,
+                item,
+                allow_holder_bound=True,
+                allow_multi=allow_multi,
             )
             if valid:
                 results.append({"valid": True})
