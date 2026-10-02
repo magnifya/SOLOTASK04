@@ -410,7 +410,7 @@ def _parse_pointer(pointer: str, label: str = "disclose") -> Tuple[str, ...]:
 
     仅做语法解析：必须为以 "/" 开头的字符串，按 "/" 分段并对
     "~1"/"~0" 反转义（顺序不可颠倒）；根指针 "" 与数组索引语义在
-    _resolve_pointer 中按业务规则拒绝。label 为报错中的字段名。
+    对应的 resolve 函数中按业务规则拒绝。label 为报错中的字段名。
     """
     if not isinstance(pointer, str):
         raise ValidationError(f"{label} 路径必须为字符串")
@@ -435,16 +435,38 @@ def _parse_pointer(pointer: str, label: str = "disclose") -> Tuple[str, ...]:
     return tokens
 
 
+# RFC6901 数组索引："0" 或无前导零的 ASCII 十进制非负整数；
+# 负数、正号、前导零、"-" 及非 ASCII 数字均不合法。
+_DISLOSE_ARRAY_INDEX_RE = re.compile(r"^(?:0|[1-9][0-9]*)$")
+
+
+def _is_root_tokens(tokens: Any) -> bool:
+    """RFC6901 根指针：空指针 ""（在解析入口拒绝）或 "/"（token 为
+    单个空串，指向文档根本身而非空名属性）。"""
+    return len(tokens) == 1 and tokens[0] == ""
+
+
+def _disclose_array_index(token: str, pointer: str) -> int:
+    """把数组处的 token 严格解析为非负下标，非法形态一律 400。"""
+    if not _DISLOSE_ARRAY_INDEX_RE.fullmatch(token):
+        raise ValidationError(
+            f"disclose 路径含非法数组索引（仅允许 0 或无前导零的非负整数）: "
+            f"{pointer!r}"
+        )
+    return int(token)
+
+
 def _resolve_pointer(
     claims: Dict[str, Any],
     tokens: Tuple[str, ...],
     pointer: str,
     label: str = "disclose",
 ) -> Any:
-    """沿 token 导航 claims 并返回目标值。
+    """沿 token 导航纯对象 claims 并返回目标值（谓词证明专用）。
 
     禁根（空 token）、禁数组索引（任一步进入数组）、键不存在或
-    经过非对象叶子均按越界/未命中拒绝。
+    经过非对象叶子均按越界/未命中拒绝。数组元素选择性披露使用
+    _resolve_disclose_pointer，谓词路径沿用本函数的既有行为。
     """
     if not tokens:
         raise ValidationError(f"{label} 不允许根路径（零披露请传空列表）")
@@ -462,13 +484,50 @@ def _resolve_pointer(
     return current
 
 
+def _resolve_disclose_pointer(
+    claims: Any, tokens: Tuple[str, ...], pointer: str
+) -> Any:
+    """沿 token 导航 claims 并返回目标值（disclose 专用）。
+
+    禁根（空 token）；对象按属性名取值（含数字字符串属性名），
+    缺失属性拒绝；数组仅接受 "0" 或无前导零的 ASCII 十进制非负
+    索引，负数、正号、前导零、非 ASCII 数字与 "-" 均拒绝，索引
+    越界拒绝；经过标量（含 null）继续向下导航拒绝。所选值本身为
+    null 时正常返回，由投影保留。
+    """
+    if not tokens or _is_root_tokens(tokens):
+        raise ValidationError("disclose 不允许根路径（零披露请传空列表）")
+    current: Any = claims
+    for token in tokens:
+        if isinstance(current, list):
+            index = _disclose_array_index(token, pointer)
+            if index >= len(current):
+                raise ValidationError(
+                    f"disclose 路径数组索引越界: {pointer!r}"
+                )
+            current = current[index]
+        elif isinstance(current, dict):
+            if token not in current:
+                raise ValidationError(
+                    f"disclose 路径越界或未命中 claims 属性: {pointer!r}"
+                )
+            current = current[token]
+        else:
+            raise ValidationError(
+                f"disclose 路径穿过非容器值（标量不可继续导航）: {pointer!r}"
+            )
+    return current
+
+
 def _validate_disclose(
     claims: Dict[str, Any], disclose: Any
 ) -> List[Tuple[str, Tuple[str, ...]]]:
     """校验 disclose 列表并返回 (原路径, token 元组) 列表。
 
     - disclose 必须为列表；元素须为以 / 开头的合法 RFC6901 指针字符串；
-    - 路径须命中 claims 属性：禁根、禁数组索引、禁越界；
+    - 路径须命中 claims：禁根；对象按属性名（含数字字符串属性名），
+      数组仅接受 "0" 或无前导零的 ASCII 十进制非负索引且不得越界，
+      穿过标量拒绝，可继续访问嵌套数组与元素内对象；
     - 路径不得重复、不得存在祖先/后代重叠（含已覆盖的深层路径）。
     """
     if not isinstance(disclose, list):
@@ -477,6 +536,8 @@ def _validate_disclose(
     seen_tokens: List[Tuple[str, ...]] = []
     for pointer in disclose:
         tokens = _parse_pointer(pointer)
+        if not tokens or _is_root_tokens(tokens):
+            raise ValidationError("disclose 不允许根路径（零披露请传空列表）")
         if tokens in seen_tokens:
             raise ValidationError(f"disclose 路径重复: {pointer!r}")
         for existing in seen_tokens:
@@ -488,25 +549,106 @@ def _validate_disclose(
                 raise ValidationError(
                     f"disclose 路径存在祖先重叠: 已选路径被 {pointer!r} 覆盖"
                 )
-        _resolve_pointer(claims, tokens, pointer)
+        _resolve_disclose_pointer(claims, tokens, pointer)
         parsed.append((pointer, tokens))
         seen_tokens.append(tokens)
     return parsed
+
+
+def _project_level(
+    source: Any,
+    entries: List[Tuple[str, Tuple[str, ...]]],
+) -> Any:
+    """按 (指针, 相对剩余 token) 列表投影当前层级的源值。
+
+    对象仅保留被选属性；部分披露的数组保持原下标，长度为最大被选
+    下标加一，未选位置填 null；直接选中（剩余 token 为空）的对象
+    或数组整值披露。同一下标/属性的多个选择递归合并。
+    """
+    if isinstance(source, list):
+        selected: Dict[int, List[Tuple[str, Tuple[str, ...]]]] = {}
+        max_index = -1
+        for pointer, tokens in entries:
+            if not tokens:
+                return source
+            index = _disclose_array_index(tokens[0], pointer)
+            if index >= len(source):
+                raise ValidationError(
+                    f"disclose 路径数组索引越界: {pointer!r}"
+                )
+            selected.setdefault(index, []).append(
+                (pointer, tokens[1:])
+            )
+            if index > max_index:
+                max_index = index
+        projected: List[Any] = [None] * (max_index + 1)
+        for index in range(max_index + 1):
+            group = selected.get(index)
+            if group is None:
+                continue
+            leaf = next(
+                (pointer for pointer, tokens in group if not tokens), None
+            )
+            if leaf is not None:
+                projected[index] = source[index]
+            elif not isinstance(source[index], (dict, list)):
+                pointer = group[0][0]
+                raise ValidationError(
+                    f"disclose 路径穿过非容器值（标量不可继续导航）: "
+                    f"{pointer!r}"
+                )
+            else:
+                projected[index] = _project_level(source[index], group)
+        return projected
+    if isinstance(source, dict):
+        projected: Dict[str, Any] = {}
+        selected: Dict[str, List[Tuple[str, Tuple[str, ...]]]] = {}
+        for pointer, tokens in entries:
+            if not tokens:
+                return source
+            selected.setdefault(tokens[0], []).append(
+                (pointer, tokens[1:])
+            )
+        for key, group in selected.items():
+            if key not in source:
+                pointer = group[0][0]
+                raise ValidationError(
+                    f"disclose 路径越界或未命中 claims 属性: {pointer!r}"
+                )
+            value = source[key]
+            only_leaf = next(
+                (pointer for pointer, tokens in group if not tokens), None
+            )
+            if only_leaf is not None:
+                projected[key] = value
+            elif not isinstance(value, (dict, list)):
+                pointer = group[0][0]
+                raise ValidationError(
+                    f"disclose 路径穿过非容器值（标量不可继续导航）: "
+                    f"{pointer!r}"
+                )
+            else:
+                projected[key] = _project_level(value, group)
+        return projected
+    pointer = entries[0][0]
+    raise ValidationError(
+        f"disclose 路径穿过非容器值（标量不可继续导航）: {pointer!r}"
+    )
 
 
 def _project_claims(
     claims: Dict[str, Any],
     parsed: List[Tuple[str, Tuple[str, ...]]],
 ) -> Dict[str, Any]:
-    """按解析后的路径从 claims 提取投影；路径值整体保留（数组作叶子）。"""
-    projection: Dict[str, Any] = {}
-    for pointer, tokens in parsed:
-        value = _resolve_pointer(claims, tokens, pointer)
-        target = projection
-        for key in tokens[:-1]:
-            target = target.setdefault(key, {})
-        target[tokens[-1]] = value
-    return projection
+    """按解析后的路径从 claims 提取投影（支持数组元素选择性披露）。
+
+    路径在 _validate_disclose 中已完成命中与结构校验；此处按相同
+    规则构建投影，任何防御性校验失败同样抛 ValidationError。空选择
+    列表返回空对象（零披露）。
+    """
+    if not parsed:
+        return {}
+    return _project_level(claims, list(parsed))
 
 
 def _validate_request_disclose(disclose: Any) -> List[str]:
@@ -524,7 +666,7 @@ def _validate_request_disclose(disclose: Any) -> List[str]:
     seen_tokens: List[Tuple[str, ...]] = []
     for pointer in disclose:
         tokens = _parse_pointer(pointer)
-        if not tokens:
+        if not tokens or _is_root_tokens(tokens):
             raise ValidationError("disclose 不允许根路径（零披露请传空列表）")
         if tokens in seen_tokens:
             raise ValidationError(f"disclose 路径重复: {pointer!r}")
@@ -578,9 +720,6 @@ def _is_number(value: Any) -> bool:
 # 长度 1..64。
 SCHEMA_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 
-# RFC6901 数组索引："0" 或无前导零的多位十进制数字。
-_JSON_POINTER_ARRAY_INDEX_RE = re.compile(r"^(?:0|[1-9][0-9]*)$")
-
 # claim_types 允许的六类 JSON 值。
 SCHEMA_CLAIM_TYPES: Tuple[str, ...] = (
     "string",
@@ -626,7 +765,7 @@ def _schema_resolve_pointer(
     current: Any = claims
     for token in tokens:
         if isinstance(current, list):
-            if not _JSON_POINTER_ARRAY_INDEX_RE.fullmatch(token):
+            if not _DISLOSE_ARRAY_INDEX_RE.fullmatch(token):
                 return _SCHEMA_POINTER_MISSING
             index = int(token)
             if index >= len(current):
@@ -808,7 +947,8 @@ def _validate_predicates(
 
     - predicates 必须为非空数组；元素为恰含 path/op[, value] 的对象；
     - op 仅支持 exists/eq/gte/lte；exists 禁止 value，其余必须有 value；
-    - path 为相对 claims 的 RFC6901 指针：禁根、禁数组索引、禁越界，
+    - path 为相对 claims 的 RFC6901 指针：禁根、禁数组索引（谓词不
+      支持数组元素路径，数组仅能在 schema 等场景导航）、禁越界，
       不得重复、不得存在祖先/后代重叠；
     - gte/lte 要求谓词 value 与 claims 命中值均为非布尔数字。
     """

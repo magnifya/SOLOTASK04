@@ -3224,9 +3224,10 @@ def build_handler(store: VCStore) -> type:
             # challenge、expires_in、holder_binding（组合级统一字段）。
             # items 须为非空且不超过 100 项的数组；每项恰含非空字符串
             # credential_id 与 disclose，批内 credential_id 不得重复；
-            # disclose 规则同单项 present（RFC6901 claims 叶子：拒根
-            # 路径、越界、重复与嵌套覆盖），语义在 store 内结合凭证
-            # claims 校验。challenge 非空串按码点 ≤256、缺省 32 位小写
+            # disclose 规则同单项 present（RFC6901 claims 路径：拒根、
+            # 数组仅接受 0/无前导零非负索引并支持元素选择性披露、非法
+            # 索引/越界/穿过标量/重复/嵌套覆盖均 400），语义在 store 内
+            # 结合凭证 claims 校验。challenge 非空串按码点 ≤256、缺省 32 位小写
             # hex；expires_in 非布尔整数 1..86400、缺省 300；
             # holder_binding 布尔、缺省 false，绑定时各凭证 subject_did
             # 须一致且为本租户已注册 DID。外层/项结构、挑战、期限、

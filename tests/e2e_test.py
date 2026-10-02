@@ -695,14 +695,33 @@ def main():
                       {"presentation": r, "challenge": r["challenge"]})
         check("零披露 verify valid=true", st == 200 and r == {"valid": True})
 
-        # 23.4 数组整值可披露、数组索引禁止
+        # 23.4 数组整值披露与元素选择性披露
         st, r = _http("POST", f"{base}/v1/credentials/{sd_cid}/present",
                       {"disclose": ["/tags"]})
         check("数组整值披露 -> 201 且投影保留完整数组",
               st == 201 and r.get("claims") == {"tags": ["a", "b"]})
+        st, r = _http("POST", f"{base}/v1/credentials/{sd_cid}/present",
+                      {"disclose": ["/tags/1"]})
+        check("数组元素披露 -> 201 且保留下标占位",
+              st == 201 and r.get("claims") == {"tags": [None, "b"]}
+              and r.get("disclose") == ["/tags/1"])
+        st, arr_vp = _http(
+            "POST", f"{base}/v1/presentations/{r['presentation_id']}/verify",
+            {"presentation": r, "challenge": r["challenge"]})
+        check("数组元素演示验真 valid=true",
+              st == 200 and arr_vp == {"valid": True})
+        for bad_index in ["/tags/-1", "/tags/+0", "/tags/00",
+                          "/tags/-", "/tags/２", "/tags/2"]:
+            stb, rrb = _http(
+                "POST", f"{base}/v1/credentials/{sd_cid}/present",
+                {"disclose": [bad_index]})
+            check(f"非法数组索引 {bad_index} -> 400",
+                  stb == 400 and bool(rrb.get("error")))
+        # 数组路径与对象路径重叠仍 400
         st, rr = _http("POST", f"{base}/v1/credentials/{sd_cid}/present",
-                       {"disclose": ["/tags/0"]})
-        check("数组索引 -> 400", st == 400 and rr.get("error"))
+                       {"disclose": ["/tags", "/tags/0"]})
+        check("数组整值与元素路径重叠 -> 400",
+              st == 400 and rr.get("error"))
 
         # 23.5 RFC6901 转义路径
         st, r = _http("POST", f"{base}/v1/credentials/{sd_cid}/present",

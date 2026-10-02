@@ -126,18 +126,22 @@ def main():
             {"disclose": ["/addr/city", "/age"],
              "challenge": "mixed-挑战", "expires_in": 86400},
             {"disclose": ["/tags"], "holder_binding": True},
+            {"disclose": ["/tags/1", "/tags/0"]},
         ]
         st, r = http("POST", batch_url, {"presentations": items})
         check("批量成功 201", st == 201)
         vps = r.get("presentations")
-        check("返回数量与输入一致", isinstance(vps, list) and len(vps) == 4)
+        check("返回数量与输入一致", isinstance(vps, list) and len(vps) == 5)
 
         # 同序
         check("同序: claims 投影一致",
               vps[0]["claims"] == {"name": "alice"}
               and vps[1]["claims"] == {}
               and vps[2]["claims"] == {"addr": {"city": "SH"}, "age": 30}
-              and vps[3]["claims"] == {"tags": ["a", "b"]})
+              and vps[3]["claims"] == {"tags": ["a", "b"]}
+              and vps[4]["claims"] == {"tags": ["a", "b"]})
+        check("数组元素披露保留下标并合并（与路径次序无关）",
+              vps[4]["disclose"] == ["/tags/1", "/tags/0"])
         # 固定键序（未绑定）
         check("未绑定项键序固定九字段",
               list(vps[0].keys()) == UNBOUND_KEYS
@@ -146,6 +150,8 @@ def main():
         # 绑定项键序
         check("绑定项键序固定十二字段",
               list(vps[3].keys()) == BOUND_KEYS)
+        check("数组元素项仍为未绑定九字段",
+              list(vps[4].keys()) == UNBOUND_KEYS)
         # challenge 默认值为 32 位小写 hex
         import re
         check("缺省 challenge 为 32 位小写 hex",
@@ -165,7 +171,7 @@ def main():
               and vps[3]["holder_key_version"] == 1)
         # presentation_id 唯一
         ids = [vp["presentation_id"] for vp in vps]
-        check("presentation_id 两两不同", len(set(ids)) == 4
+        check("presentation_id 两两不同", len(set(ids)) == 5
               and all(i.startswith("vp_") for i in ids))
 
         # ---------- 2. 外部验签 issuer/holder proof ---------- #
@@ -252,8 +258,13 @@ def main():
         # ---------- 5. store 级非法（整体回滚） ---------- #
         expect_400("根指针 -> 400",
                    {"presentations": [{"disclose": ["/"]}]})
-        expect_400("数组索引 -> 400",
-                   {"presentations": [{"disclose": ["/tags/0"]}]})
+        # 数组元素选择性披露合法；非法索引形态与越界仍 400
+        for bad in ["/tags/-1", "/tags/+0", "/tags/00", "/tags/01",
+                    "/tags/-", "/tags/２", "/tags/2", "/tags/a"]:
+            expect_400(f"非法数组索引 {bad} -> 400",
+                       {"presentations": [{"disclose": [bad]}]})
+        expect_400("穿过数组内标量 -> 400",
+                   {"presentations": [{"disclose": ["/tags/0/x"]}]})
         expect_400("越界 -> 400",
                    {"presentations": [{"disclose": ["/nope"]}]})
         expect_400("重复路径 -> 400",
@@ -321,7 +332,7 @@ def main():
                    and e["tenant_id"] == "default"]
         vp_ids = {vp["presentation_id"] for vp in vps}
         audit_ids = {e["resource_id"] for e in created}
-        check("初始 4 条演示均有审计", vp_ids <= audit_ids)
+        check("初始 5 条演示均有审计", vp_ids <= audit_ids)
 
         # ---------- 9. 重启后可验签、可 verify ---------- #
         proc.terminate()
