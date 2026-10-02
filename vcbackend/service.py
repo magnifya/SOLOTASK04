@@ -110,6 +110,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/presentations/verify-with-status 外部演示验真并合并同步状态（只读）
   POST /v1/trust/presentations/verify-batch-with-status 批量演示验真并合并同步状态（只读）
   POST /v1/trust/proofs/verify            跨系统谓词证明验真（无需登记 DID/凭证/证明，不消费）
+  POST /v1/trust/proofs/consume           跨系统谓词证明验真并一次性消费（防重放，首次落盘并审计）
   POST /v1/trust/proofs/verify-synced     以同步锚点验真外部谓词证明（只读）
   POST /v1/trust/proofs/verify-synced-with-status  同步锚点验真谓词证明并合并请求初始状态快照（只读）
   POST /v1/trust/proofs/verify-synced-batch  批量以同步锚点快照验真外部谓词证明（只读）
@@ -1083,6 +1084,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_proofs_verify_with_status(tenant)
                 elif path == "/v1/trust/proofs/verify-batch-with-status":
                     self._post_trust_proofs_verify_batch_with_status(tenant)
+                elif path == "/v1/trust/proofs/consume":
+                    self._post_trust_proofs_consume(tenant)
                 elif path == "/v1/trust/credentials/verify-batch":
                     self._post_trust_credentials_verify_batch(tenant)
                 elif path == "/v1/trust/credentials/verify-batch-with-status":
@@ -10202,6 +10205,95 @@ def build_handler(store: VCStore) -> type:
             if not valid:
                 payload["reason"] = reason or "验签失败"
             self._send_json(200, payload)
+
+        def _post_trust_proofs_consume(self, tenant: str) -> None:
+            # POST /v1/trust/proofs/consume：验真并一次性消费跨系统
+            # 外部谓词证明（防重放）。
+            # 1) 请求体解析、字段约束与验真规则完全沿用
+            #    /v1/trust/proofs/verify：请求恰含 proof、challenge、
+            #    source_tenant_id，证明九字段、签名覆盖（除 proof 外八
+            #    字段并加入 tenant_id=source_tenant_id 的规范化 JSON）、
+            #    锚点用途、挑战、期限与外部 DID 停用判定及各项失败的
+            #    reason、优先级全部一致；results 含 false 不代表验真
+            #    失败。任何请求缺失、非法 UTF-8/JSON、字段错误或验真
+            #    失败均 HTTP 200 按键序仅返
+            #    {"valid":false,"reason":...}，不写消费标记、不记审计；
+            #    显式空 X-Tenant-ID 在进入前由路由统一判 400，先于请求
+            #    体验真；
+            # 2) 完整验真通过后才判重：按接收租户、
+            #    source_tenant_id、issuer_did、proof_id 的组合唯一消费；
+            #    首次 200 按序恰返 valid、consumption_id、consumed_at
+            #    （valid:true；consumption_id 为完整请求按既有递归键
+            #    排序、紧凑 UTF-8 JSON 规范化后的 SHA-256 小写十六进制
+            #    摘要；consumed_at 为 UTC 秒精度 Z）；同组合重放（证明
+            #    内容可不同）或并发均 200 仅返
+            #    {"valid":false,"reason":"外部证明已消费"}，每组合仅
+            #    一次成功；
+            # 3) 首次消费标记与审计（trust.proof.consumed / trust_proof
+            #    / consumption_id）同一次原子写落盘；重放与验真失败不
+            #    记；落盘失败回滚二者，500 仅返 {"error":"存储失败"}，
+            #    可重试；各接收租户分别使用自身锚点验真，跨重启仍判重。
+            #    仅保存消费所需标识、摘要与时间，不保存证明原文。
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                self._send_invalid("请求体缺失或长度声明非法")
+                return
+            except Exception:  # noqa: BLE001
+                self._send_invalid("请求体读取失败")
+                return
+            if not raw:
+                self._send_invalid("请求体缺失")
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                self._send_invalid("请求体不是合法 UTF-8 文本")
+                return
+            except json.JSONDecodeError:
+                self._send_invalid("请求体不是合法 JSON")
+                return
+
+            try:
+                valid, reason = store.verify_trust_proof(tenant, data)
+            except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
+                self._send_invalid("验签过程发生内部错误")
+                return
+            if not valid:
+                self._send_json(
+                    200, {"valid": False, "reason": reason or "验签失败"}
+                )
+                return
+
+            proof = data["proof"]
+            consumption_id = hashlib.sha256(
+                crypto.canonicalize(data)
+            ).hexdigest()
+            try:
+                consumed, consumed_at = store.consume_trust_proof(
+                    tenant,
+                    data["source_tenant_id"],
+                    proof["issuer_did"],
+                    proof["proof_id"],
+                    consumption_id,
+                )
+            except StorageError:
+                self._send_error(500, "存储失败")
+                return
+            if not consumed:
+                self._send_json(
+                    200, {"valid": False, "reason": "外部证明已消费"}
+                )
+                return
+            self._send_json(
+                200,
+                {
+                    "valid": True,
+                    "consumption_id": consumption_id,
+                    "consumed_at": consumed_at,
+                },
+            )
 
         def _post_trust_proofs_verify_synced(self, tenant: str) -> None:
             # POST /v1/trust/proofs/verify-synced：以同步锚点验真外部
