@@ -15,6 +15,7 @@
   GET  /v1/dids/{did}/keys/revocations    查询 DID 密钥吊销历史（只读）
 GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（只读）
   POST /v1/credentials                    签发凭证（可选 Idempotency-Key 头按租户幂等重试：首次 201，同内容重放 200，异内容 409）
+  POST /v1/credentials/issue-batch        整批原子签发（请求体恰含 items 1..100 项；不支持 Idempotency-Key；整批凭证与审计同一次原子写，成功 201 仅返 results）
   POST /v1/credentials/status-export      凭证状态签名发布（产出可直接提交状态批量同步的签名项，只读）
   GET  /v1/credentials/{credential_id}    查询凭证
   PUT  /v1/credentials/{credential_id}/status   登记 active（首次 201/重复 200）或暂停/恢复 suspended（200）
@@ -825,6 +826,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_audit_manifest_verify_batch(tenant)
                 elif path == "/v1/credentials":
                     self._post_credentials(tenant)
+                elif path == "/v1/credentials/issue-batch":
+                    self._post_issue_credentials_batch(tenant)
                 elif path == "/v1/credential-schemas":
                     self._post_credential_schemas(tenant)
                 elif path.startswith("/v1/credential-schemas/") and path.endswith(
@@ -2210,6 +2213,58 @@ def build_handler(store: VCStore) -> type:
             self._send_json(
                 201 if created else 200,
                 self._credential_issue_payload(record),
+            )
+
+        def _post_issue_credentials_batch(self, tenant: str) -> None:
+            # POST /v1/credentials/issue-batch：整批原子签发。
+            # 本入口不支持幂等：收到 Idempotency-Key 头（即使格式非法
+            # 或重复提供）一律 400；未带该头的成功批次再次提交会生成
+            # 一组全新凭证。单张签发及其幂等重试行为不受影响。
+            if self.headers.get_all("Idempotency-Key"):
+                raise ValidationError(
+                    "issue-batch 不支持 Idempotency-Key"
+                )
+            data = self._read_json()
+            # 先校验租户（路由层）与外层：请求体恰含 items，其值为
+            # 1..100 元素的数组。空体、非法 JSON、非对象、缺 items、
+            # 外层多余字段、items 非数组/空/超限在此拒绝；“项非对象”
+            # 与项内字段一样按其所处位置进入逐项顺序校验（见下）。
+            if set(data) != {"items"}:
+                if "items" not in data:
+                    raise ValidationError("缺少字段: items")
+                extra = ", ".join(sorted(set(data) - {"items"}))
+                raise ValidationError(f"多余字段: {extra}")
+            items = data["items"]
+            if not isinstance(items, list):
+                raise ValidationError("字段 items 必须为数组")
+            if not 1 <= len(items) <= 100:
+                raise ValidationError(
+                    "字段 items 须包含 1 到 100 个请求项"
+                )
+            # 外层形状之后按输入顺序逐项完整校验（含“项非对象”，在其
+            # 所处位置判定），首个失败项决定响应：较早项的 404/409 不
+            # 被较晚项的 400 覆盖。项内字段形状与全部资源级校验在
+            # store 内完成：缺失/多余字段、类型错误、非法有效期、模式
+            # 引用未成对、claims 不满足模式 400；未知/他租户签发者或
+            # 持有人 DID 400；已停用签发者 409；未知/他租户模式 404；
+            # 弃用/吊销模式 409（固定 error，门禁先于 claims）。任一
+            # 失败整批不签发、不审计、不占序号。
+            try:
+                records = store.create_credentials_batch(tenant, items)
+            except SchemaUnavailableError:
+                # 显式引用已弃用/吊销模式版本：统一固定 409 原因。
+                self._send_json(
+                    409, {"error": "credential schema unavailable"}
+                )
+                return
+            self._send_json(
+                201,
+                {
+                    "results": [
+                        self._credential_issue_payload(record)
+                        for record in records
+                    ]
+                },
             )
 
         @staticmethod

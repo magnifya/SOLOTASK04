@@ -2864,23 +2864,24 @@ class VCStore:
         schema_bound = schema_id is not None and schema_version is not None
         return raw_expires_at, schema_bound
 
-    def _issue_credential_locked(
+    def _resolve_issue_context_locked(
         self,
-        tenant_id: str,
         bucket: Dict[str, Any],
         issuer_did: str,
         subject_did: str,
         claims: Dict[str, Any],
-        raw_expires_at: Optional[str],
         schema_id: Any,
         schema_version: Any,
         schema_bound: bool,
-        idempotency: Optional[Tuple[str, str]] = None,
-    ) -> CredentialRecord:
-        """锁内签发：DID/模式校验、签名、写凭证、审计并同一次原子落盘。
+    ) -> Tuple[Dict[str, Any], Optional[str]]:
+        """锁内只读签发前置校验：DID、停用门禁、模式门禁与 claims 约束。
 
-        idempotency 为 (键, 请求内容摘要) 时，键绑定与凭证、首次
-        credential.issued 审计事件一同持久化；落盘失败三者一并回滚。
+        返回 (签发者 DID 行, 模式摘要或 None)。沿用单张签发的校验顺序
+        与错误协议：未知/他租户签发者或持有 DID 抛 ValidationError
+        （400，逐个指明）；已停用签发者抛 ConflictError（409）；模式
+        未知/他租户抛 NotFoundError（404）；引用弃用/吊销版本抛
+        SchemaUnavailableError（409，门禁先于 claims）；claims 不满足
+        模式抛 ValidationError（400）。不做任何写入。
         """
         # 逐个指明不存在的是哪一个 DID（他租户 DID 同样不可见）
         issuer = bucket["dids"].get(issuer_did)
@@ -2920,27 +2921,76 @@ class VCStore:
                 schema_row["required_claims"],
             )
             schema_digest = schema_row["digest"]
+        return issuer, schema_digest
 
+    @staticmethod
+    def _build_credential_body_locked(
+        issuer_did: str,
+        subject_did: str,
+        claims: Dict[str, Any],
+        raw_expires_at: Optional[str],
+        schema_id: Any,
+        schema_version: Any,
+        schema_bound: bool,
+        issuer: Dict[str, Any],
+        schema_digest: Optional[str],
+    ) -> Tuple[str, Dict[str, Any], str]:
+        """构造凭证正文并 ES256 签名：不读不写共享状态。
+
+        返回 (credential_id, body, signature)。调用方须已完成全部前置
+        校验；签名失败原样抛出，由调用方保证尚无任何状态变更。
+        """
+        credential_id = f"vc_{uuid.uuid4().hex}"
+        body: Dict[str, Any] = {
+            "credential_id": credential_id,
+            "issuer_did": issuer_did,
+            "subject_did": subject_did,
+            "claims": claims,
+            "issued_at": _utc_now(),
+            "issuer_key_version": int(issuer.get("key_version", 1)),
+        }
+        # 仅在请求提供时写入：未提供不得注入字段（旧凭证无期限）。
+        if raw_expires_at is not None:
+            body["expires_at"] = raw_expires_at
+        # 模式绑定仅在显式提供时写入，三字段随正文参与签名。
+        if schema_bound:
+            body["schema_id"] = schema_id
+            body["schema_version"] = schema_version
+            body["schema_digest"] = schema_digest
+        signature = crypto.sign(body, issuer["private_key_pem"])
+        return credential_id, body, signature
+
+    def _issue_credential_locked(
+        self,
+        tenant_id: str,
+        bucket: Dict[str, Any],
+        issuer_did: str,
+        subject_did: str,
+        claims: Dict[str, Any],
+        raw_expires_at: Optional[str],
+        schema_id: Any,
+        schema_version: Any,
+        schema_bound: bool,
+        idempotency: Optional[Tuple[str, str]] = None,
+    ) -> CredentialRecord:
+        """锁内签发：DID/模式校验、签名、写凭证、审计并同一次原子落盘。
+
+        idempotency 为 (键, 请求内容摘要) 时，键绑定与凭证、首次
+        credential.issued 审计事件一同持久化；落盘失败三者一并回滚。
+        """
+        issuer, schema_digest = self._resolve_issue_context_locked(
+            bucket, issuer_did, subject_did, claims,
+            schema_id, schema_version, schema_bound,
+        )
         snapshot = self._snapshot_locked()
         try:
-            credential_id = f"vc_{uuid.uuid4().hex}"
-            body: Dict[str, Any] = {
-                "credential_id": credential_id,
-                "issuer_did": issuer_did,
-                "subject_did": subject_did,
-                "claims": claims,
-                "issued_at": _utc_now(),
-                "issuer_key_version": int(issuer.get("key_version", 1)),
-            }
-            # 仅在请求提供时写入：未提供不得注入字段（旧凭证无期限）。
-            if raw_expires_at is not None:
-                body["expires_at"] = raw_expires_at
-            # 模式绑定仅在显式提供时写入，三字段随正文参与签名。
-            if schema_bound:
-                body["schema_id"] = schema_id
-                body["schema_version"] = schema_version
-                body["schema_digest"] = schema_digest
-            signature = crypto.sign(body, issuer["private_key_pem"])
+            credential_id, body, signature = (
+                self._build_credential_body_locked(
+                    issuer_did, subject_did, claims, raw_expires_at,
+                    schema_id, schema_version, schema_bound,
+                    issuer, schema_digest,
+                )
+            )
             bucket["credentials"][credential_id] = {
                 "body": body,
                 "signature": signature,
@@ -3080,6 +3130,158 @@ class VCStore:
                 idempotency=(idempotency_key, request_digest),
             )
             return record, True
+
+    def create_credentials_batch(
+        self,
+        tenant_id: str,
+        raw_items: List[Any],
+    ) -> List[CredentialRecord]:
+        """整批原子签发：按输入顺序逐项完整校验、单次提交、失败整体回滚。
+
+        ``raw_items`` 为已通过外层形状校验（数组且 1..100 项）的原始
+        JSON 项列表；每项的字段形状与语义校验全部在本方法内按输入顺序
+        完成，确保“首个失败项决定响应”：较早项的资源级 404/409 优先于
+        较晚项的字段级 400。每项恰含必填 issuer_did、subject_did、
+        claims 与可选 expires_at、schema_id、schema_version，多余或
+        缺失字段、类型错误、非法有效期、模式引用未成对、claims 不满足
+        模式均抛 ValidationError（400）；未知/他租户签发者或持有人 DID
+        亦抛 ValidationError（400）；已停用签发者抛 ConflictError
+        （409）；未知/他租户模式抛 NotFoundError（404）；弃用/吊销模式
+        抛 SchemaUnavailableError（409，门禁先于 claims 校验）。校验与
+        错误语义逐项与 create_credential 完全一致。
+
+        允许不同签发者/持有人混合，也允许内容相同的重复项，每项生成
+        独立凭证与 credential_id。任一失败项均不产生凭证、审计，也不
+        占用审计序号。
+
+        全部项通过后在同一快照下逐项构造正文并 ES256 签名、写入凭证，
+        按输入顺序各追加一条 credential.issued 审计，仅做一次原子落盘；
+        任一签名或保存失败恢复快照并抛出（HTTP 500），内存态与磁盘均
+        回到批前，已有记录保持原样。results 与输入等长同序，新凭证可
+        直接经原查询、验签、展示与状态接口使用；与单张签发及其他批量
+        并发由同一把锁串行化。
+        """
+        allowed_fields = {
+            "issuer_did", "subject_did", "claims",
+            "expires_at", "schema_id", "schema_version",
+        }
+        with self._lock:
+            bucket = self._ensure_bucket_locked(tenant_id)
+            # 阶段一：按输入顺序逐项做完整的只读校验（字段形状先于本项
+            # 资源校验，项间先到先决），规范化参数并缓存解析上下文；
+            # 首个失败项抛出，整批不做任何写入，不占用审计序号。
+            prepared: List[
+                Tuple[str, str, Dict[str, Any], Optional[str], Any, Any, bool]
+            ] = []
+            contexts: List[Tuple[Dict[str, Any], Optional[str]]] = []
+            for index, item in enumerate(raw_items):
+                prefix = f"items[{index}]"
+                if not isinstance(item, dict):
+                    raise ValidationError(f"{prefix} 必须为 JSON 对象")
+                unknown = sorted(set(item) - allowed_fields)
+                if unknown:
+                    raise ValidationError(
+                        f"{prefix} 多余字段: {', '.join(unknown)}"
+                    )
+                # 字段形状校验逐项沿用单张入口顺序：issuer_did、
+                # subject_did 各自“存在且为非空字符串”，随后 claims
+                # 必须存在且为 JSON 对象；最后 schema_id/schema_version
+                # 必须成对出现或同时省略。
+                issuer_did = item.get("issuer_did")
+                if "issuer_did" not in item:
+                    raise ValidationError(f"{prefix} 缺少字段: issuer_did")
+                if not isinstance(issuer_did, str) or not issuer_did:
+                    raise ValidationError(
+                        f"{prefix} 字段 issuer_did 必须为非空字符串"
+                    )
+                subject_did = item.get("subject_did")
+                if "subject_did" not in item:
+                    raise ValidationError(f"{prefix} 缺少字段: subject_did")
+                if not isinstance(subject_did, str) or not subject_did:
+                    raise ValidationError(
+                        f"{prefix} 字段 subject_did 必须为非空字符串"
+                    )
+                if "claims" not in item:
+                    raise ValidationError(f"{prefix} 缺少字段: claims")
+                claims = item["claims"]
+                if not isinstance(claims, dict):
+                    raise ValidationError(
+                        f"{prefix} 字段 claims 必须为 JSON 对象"
+                    )
+                has_schema_id = "schema_id" in item
+                has_schema_version = "schema_version" in item
+                if has_schema_id != has_schema_version:
+                    raise ValidationError(
+                        f"{prefix} schema_id 与 schema_version "
+                        "必须同时出现或同时省略"
+                    )
+                expires_at = (
+                    item["expires_at"] if "expires_at" in item
+                    else EXPIRES_AT_UNSET
+                )
+                schema_id = item["schema_id"] if has_schema_id else None
+                schema_version = (
+                    item["schema_version"] if has_schema_version else None
+                )
+                # 参数语义（有效期、模式版本类型）与资源前置（DID 存在
+                # 性、停用门禁、模式门禁与 claims 约束）沿用单张入口的
+                # 同一套校验与顺序。
+                raw_expires_at, schema_bound = (
+                    self._validate_credential_issue_args(
+                        issuer_did, subject_did, claims,
+                        expires_at, schema_id, schema_version,
+                    )
+                )
+                context = self._resolve_issue_context_locked(
+                    bucket, issuer_did, subject_did, claims,
+                    schema_id, schema_version, schema_bound,
+                )
+                prepared.append(
+                    (
+                        issuer_did, subject_did, claims, raw_expires_at,
+                        schema_id, schema_version, schema_bound,
+                    )
+                )
+                contexts.append(context)
+
+            # 阶段二：全部前置通过后统一签名、写入并审计，单次原子提交。
+            snapshot = self._snapshot_locked()
+            try:
+                results: List[CredentialRecord] = []
+                for prepared_item, (issuer, schema_digest) in zip(
+                    prepared, contexts
+                ):
+                    (
+                        issuer_did, subject_did, claims, raw_expires_at,
+                        schema_id, schema_version, schema_bound,
+                    ) = prepared_item
+                    credential_id, body, signature = (
+                        self._build_credential_body_locked(
+                            issuer_did, subject_did, claims, raw_expires_at,
+                            schema_id, schema_version, schema_bound,
+                            issuer, schema_digest,
+                        )
+                    )
+                    bucket["credentials"][credential_id] = {
+                        "body": body,
+                        "signature": signature,
+                    }
+                    self._append_audit_locked(
+                        tenant_id, AUDIT_CREDENTIAL_ISSUED,
+                        "credential", credential_id,
+                    )
+                    results.append(
+                        CredentialRecord(
+                            credential_id=credential_id,
+                            body=body,
+                            signature=signature,
+                        )
+                    )
+                self._save_locked()
+            except Exception:
+                self._restore_locked(snapshot)
+                raise
+            return results
 
     def get_credential(
         self, tenant_id: str, credential_id: str
