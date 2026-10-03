@@ -112,6 +112,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/presentations/verify-batch-with-status 批量演示验真并合并同步状态（只读）
   POST /v1/trust/proofs/verify            跨系统谓词证明验真（无需登记 DID/凭证/证明，不消费）
   POST /v1/trust/proofs/consume           跨系统谓词证明一次性消费（防重放，首次落盘并审计）
+  POST /v1/trust/proofs/consume-batch     批量一次性消费外部谓词证明（逐项不短路，批内判重，整批原子落盘）
   POST /v1/trust/proofs/verify-synced     以同步锚点验真外部谓词证明（只读）
   POST /v1/trust/proofs/verify-synced-with-status  同步锚点验真谓词证明并合并请求初始状态快照（只读）
   POST /v1/trust/proofs/verify-synced-batch  批量以同步锚点快照验真外部谓词证明（只读）
@@ -1146,6 +1147,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_trust_proofs_verify(tenant)
                 elif path == "/v1/trust/proofs/consume":
                     self._post_trust_proofs_consume(tenant)
+                elif path == "/v1/trust/proofs/consume-batch":
+                    self._post_trust_proofs_consume_batch(tenant)
                 elif path == "/v1/trust/proofs/verify-synced":
                     self._post_trust_proofs_verify_synced(tenant)
                 elif path == "/v1/trust/proofs/verify-synced-with-status":
@@ -10460,6 +10463,160 @@ def build_handler(store: VCStore) -> type:
                     "consumed_at": consumed_at,
                 },
             )
+
+        @staticmethod
+        def _is_proof_consume_item(item: Any) -> bool:
+            """consume-batch 逐项的外层结构校验：项须恰为单条 consume
+            的请求——恰含 proof、challenge、source_tenant_id，proof 为
+            JSON 对象，challenge 与 source_tenant_id 均为非空字符串。"""
+            if not isinstance(item, dict):
+                return False
+            if set(item) != {"proof", "challenge", "source_tenant_id"}:
+                return False
+            if not isinstance(item["proof"], dict):
+                return False
+            challenge = item["challenge"]
+            if not isinstance(challenge, str) or not challenge:
+                return False
+            source = item["source_tenant_id"]
+            if not isinstance(source, str) or not source:
+                return False
+            return True
+
+        def _post_trust_proofs_consume_batch(self, tenant: str) -> None:
+            # POST /v1/trust/proofs/consume-batch：批量验真并一次性
+            # 消费跨系统外部谓词证明（防重放）。
+            # 1) 请求体须恰为 {"items": [项...]}，数组非空且不超过 100
+            #    项；空体、非法 UTF-8/JSON、非对象、键集错误、items 非
+            #    数组/空/超限均 HTTP 200 按键序恰返
+            #    {"results": [], "reason": "请求非法"}；
+            # 2) 合法批次逐项处理、失败不短路：项须恰为单条 consume 的
+            #    请求（恰含 proof/challenge/source_tenant_id，proof 为
+            #    对象，challenge 与 source_tenant_id 为非空字符串），
+            #    否则该项 {"valid": false, "reason": "请求项非法"}；
+            #    其余复用单条全部验真规则、顺序与 reason，失败项不写
+            #    状态、不记审计、不占消费键；
+            # 3) 验真通过后按租户 (source_tenant_id, issuer_did,
+            #    proof_id) 判重：批内首个未消费项成功，后项、历史或
+            #    并发重放 -> {"valid": false, "reason": "外部证明已
+            #    消费"}；成功项键序 valid、consumption_id、
+            #    consumed_at，取值同单条（consumption_id 为单项请求
+            #    规范化 JSON 的 SHA-256）；顶层 200 仅含与输入等长同
+            #    序的 results；
+            # 4) 本批全部新消费与审计（trust.proof.consumed /
+            #    trust_proof / consumption_id）同锁一次原子落盘；
+            #    失败全回滚，500 仅返 {"error": "存储失败"}，可重试；
+            #    与单条 consume 共享防重放记录，并发每键仅一次成功，
+            #    重启保持。显式空 X-Tenant-ID 由路由统一判 400。
+            def _request_invalid() -> None:
+                self._send_json(
+                    200, {"results": [], "reason": "请求非法"}
+                )
+
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+            except (ValueError, TypeError):
+                _request_invalid()
+                return
+            except Exception:  # noqa: BLE001
+                _request_invalid()
+                return
+            if not raw:
+                _request_invalid()
+                return
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                _request_invalid()
+                return
+            if not isinstance(data, dict) or set(data) != {"items"}:
+                _request_invalid()
+                return
+            items = data["items"]
+            if (
+                not isinstance(items, list)
+                or not items
+                or len(items) > 100
+            ):
+                _request_invalid()
+                return
+
+            results: List[Optional[Dict[str, Any]]] = []
+            # 验真通过、待判重消费的项：(结果下标, source_tenant_id,
+            # issuer_did, proof_id, consumption_id)，消费判定在全部
+            # 验真完成后同锁一次完成。
+            pending: List[Tuple[int, str, str, str, str]] = []
+            for index, item in enumerate(items):  # 顺序处理，失败不短路
+                if not self._is_proof_consume_item(item):
+                    results.append({"valid": False, "reason": "请求项非法"})
+                    continue
+                try:
+                    valid, reason = store.verify_trust_proof(tenant, item)
+                except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
+                    results.append(
+                        {"valid": False, "reason": "验签过程发生内部错误"}
+                    )
+                    continue
+                if not valid:
+                    results.append(
+                        {"valid": False, "reason": reason or "验签失败"}
+                    )
+                    continue
+                proof = item["proof"]
+                consumption_id = hashlib.sha256(
+                    crypto.canonicalize(item)
+                ).hexdigest()
+                pending.append(
+                    (
+                        index,
+                        item["source_tenant_id"],
+                        proof["issuer_did"],
+                        proof["proof_id"],
+                        consumption_id,
+                    )
+                )
+                results.append(None)  # 占位，消费判定后回填
+
+            if pending:
+                try:
+                    outcomes = store.consume_trust_proofs_batch(
+                        tenant,
+                        [
+                            (
+                                source_tenant_id,
+                                issuer_did,
+                                proof_id,
+                                consumption_id,
+                            )
+                            for (
+                                _,
+                                source_tenant_id,
+                                issuer_did,
+                                proof_id,
+                                consumption_id,
+                            ) in pending
+                        ],
+                    )
+                except StorageError:
+                    self._send_error(500, "存储失败")
+                    return
+                for (index, _, _, _, consumption_id), (
+                    consumed,
+                    consumed_at,
+                ) in zip(pending, outcomes):
+                    if consumed:
+                        results[index] = {
+                            "valid": True,
+                            "consumption_id": consumption_id,
+                            "consumed_at": consumed_at,
+                        }
+                    else:
+                        results[index] = {
+                            "valid": False,
+                            "reason": "外部证明已消费",
+                        }
+            self._send_json(200, {"results": results})
 
         def _post_trust_proofs_verify_synced(self, tenant: str) -> None:
             # POST /v1/trust/proofs/verify-synced：以同步锚点验真外部
