@@ -19,6 +19,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/credentials/status-export      凭证状态签名发布（产出可直接提交状态批量同步的签名项，只读）
   GET  /v1/credentials/{credential_id}    查询凭证
   PUT  /v1/credentials/{credential_id}/status   登记 active（首次 201/重复 200）或暂停/恢复 suspended（200）
+  PUT  /v1/credentials/status-batch          整批原子状态变更（items 1..100 项，成功 200 仅返 results）
   GET  /v1/credentials/{credential_id}/status   查询状态（无状态按 active）
   GET  /v1/credentials/{credential_id}/status/history  查询凭证状态历史（只读）
   POST /v1/credentials/{credential_id}/revoke   吊销凭证
@@ -1284,7 +1285,9 @@ def build_handler(store: VCStore) -> type:
                     self._send_error(404, f"无此路径: {path}")
                     return
                 tenant = self._tenant_id()
-                if path.startswith("/v1/credentials/") and path.endswith(
+                if path == "/v1/credentials/status-batch":
+                    self._put_credentials_status_batch(tenant)
+                elif path.startswith("/v1/credentials/") and path.endswith(
                     "/status"
                 ):
                     credential_id = unquote(
@@ -2679,6 +2682,114 @@ def build_handler(store: VCStore) -> type:
             # 均为 200（幂等保持首次 updated_at）。
             self._send_json(
                 201 if created else 200, self._status_payload(record)
+            )
+
+        def _put_credentials_status_batch(self, tenant: str) -> None:
+            # PUT /v1/credentials/status-batch：整批原子状态变更。
+            # 请求体须恰为 {"items": [项...]}，items 为 1..100 个对象；
+            # 每项恰含 credential_id（必填非空字符串，批内不重复）、
+            # status（仅 active/suspended）；suspended 项另须 reason
+            # （字符串且首尾裁剪后 1..256 个 Unicode 码点），active 项
+            # 不接受 reason。空体、非法 JSON、非对象、外层缺/多字段、
+            # items 非数组/空/超限、项缺/多字段或类型错误、credential_id
+            # 缺失/为空/批内重复、status 或 reason 非法均 400 且仅含非空
+            # error。先校验租户与全部请求格式，再按输入顺序检查凭证存在
+            # 性与状态冲突：任一凭证未知或他租户 404，已吊销或同状态不同
+            # 暂停原因 409，首个失败项决定响应，整批失败不落任何变更。
+            # 成功统一 200 仅返 {"results": [...]}，与输入等长同序，每项
+            # 恰含 credential_id、status、updated_at；首次登记、实际暂停
+            # 与恢复各追加一条状态历史，幂等项不追加历史或推进游标，但每
+            # 个成功项（含幂等项）均按输入顺序记 status.updated 审计；全
+            # 部状态、历史、游标与审计同一次原子写，失败 500 整体回滚。
+            data = self._read_json()
+            if set(data) != {"items"}:
+                if "items" not in data:
+                    raise ValidationError("缺少字段: items")
+                extra = ", ".join(sorted(set(data) - {"items"}))
+                raise ValidationError(f"多余字段: {extra}")
+            items = data["items"]
+            if not isinstance(items, list):
+                raise ValidationError("字段 items 必须为数组")
+            if not 1 <= len(items) <= 100:
+                raise ValidationError(
+                    "字段 items 须包含 1 到 100 个请求项"
+                )
+            parsed_items: List[Tuple[str, str, Optional[str]]] = []
+            seen: set = set()
+            for index, item in enumerate(items):
+                prefix = f"items[{index}]"
+                if not isinstance(item, dict):
+                    raise ValidationError(f"{prefix} 必须为 JSON 对象")
+                unknown = sorted(
+                    set(item) - {"credential_id", "status", "reason"}
+                )
+                if unknown:
+                    raise ValidationError(
+                        f"{prefix} 多余字段: {', '.join(unknown)}"
+                    )
+                if "credential_id" not in item:
+                    raise ValidationError(
+                        f"{prefix} 缺少字段: credential_id"
+                    )
+                credential_id = item["credential_id"]
+                if not isinstance(credential_id, str) or not credential_id:
+                    raise ValidationError(
+                        f"{prefix} 字段 credential_id 必须为非空字符串"
+                    )
+                if credential_id in seen:
+                    raise ValidationError(
+                        f"{prefix} credential_id 批内重复: "
+                        f"{credential_id}"
+                    )
+                seen.add(credential_id)
+                if "status" not in item:
+                    raise ValidationError(f"{prefix} 缺少字段: status")
+                status = item["status"]
+                if status == "active":
+                    if "reason" in item:
+                        raise ValidationError(
+                            f"{prefix} 多余字段: reason"
+                        )
+                    parsed_items.append((credential_id, "active", None))
+                elif status == "suspended":
+                    if "reason" not in item:
+                        raise ValidationError(
+                            f"{prefix} 缺少字段: reason"
+                        )
+                    reason = item["reason"]
+                    if not isinstance(reason, str):
+                        raise ValidationError(
+                            f"{prefix} 字段 reason 必须为字符串"
+                        )
+                    reason = reason.strip()
+                    if not reason:
+                        raise ValidationError(
+                            f"{prefix} 字段 reason 裁剪后不能为空"
+                        )
+                    if len(reason) > 256:
+                        raise ValidationError(
+                            f"{prefix} 字段 reason 裁剪后须为 1 到 256 个"
+                            " Unicode 码点"
+                        )
+                    parsed_items.append(
+                        (credential_id, "suspended", reason)
+                    )
+                else:
+                    raise ValidationError(
+                        f"{prefix} 字段 status 非法: "
+                        f"{status!r}（仅支持 active、suspended）"
+                    )
+
+            records = store.set_credential_status_batch(
+                tenant, parsed_items
+            )
+            self._send_json(
+                200,
+                {
+                    "results": [
+                        self._status_payload(record) for record in records
+                    ]
+                },
             )
 
         def _get_credential_status(

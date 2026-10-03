@@ -46,6 +46,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/credentials/issue-batch` | 整批原子签发，是单张签发的**整批原子入口**，请求体恰含 `items`（1–100 项对象）；空体、非法 JSON、非对象、缺少/多余外层字段、`items` 非数组·为空·超过 100 均 400；每项恰含必填 `issuer_did`、`subject_did`（均非空字符串）、`claims`（JSON 对象）与可选 `expires_at`、`schema_id`、`schema_version`，字段与错误语义逐项同单张签发：缺/多字段或类型错误、非法有效期、模式引用未成对、claims 不满足模式均 400，未知或他租户签发者/持有人 DID 400，已停用签发者 409，未知或他租户模式 404，引用 deprecated/revoked 模式统一 409 与 `{"error":"credential schema unavailable"}`（模式门禁先于 claims）；先校验租户与外层，再按输入顺序**逐项完整校验**（较早项的 404/409 不被较晚项的 400 覆盖），首个失败项决定响应，错误整批不签发、不审计、不占审计序号；允许不同签发者/持有人混合及内容相同的重复项，每项独立签名生成独立凭证；成功 201 正文恰含 `results`，与输入等长同序，每项键序同单张签发（`credential_id`、`signature`、`issuer_key_version`）；每张凭证按输入顺序各追加一条现有 `credential.issued` 审计，全部凭证与审计同一次原子写，签名或保存失败 500 且整体回滚、已有记录保持原样，重启后凭证与审计均保留，新凭证可直接经原查询、验签、展示与状态接口使用；显式空 `X-Tenant-ID` 400（缺省 default），他租户查询新凭证 404；本入口收到 `Idempotency-Key` 头一律 400，未带该头的成功批次再次提交生成全新凭证；单张签发及其幂等重试、CLI 与其他入口行为不变 |
 | GET | `/v1/credentials/{credential_id}` | 返回 `credential_id`、`body`、`signature`；不存在 404 |
 | PUT | `/v1/credentials/{credential_id}/status` | 登记/变更状态，请求体必须恰为 `{"status":"active"}` 或 `{"status":"suspended","reason":"原因"}`（reason 裁剪后 1–256 码点，非法 400）；无状态→active 首次 201，active/无状态→suspended 与 suspended→active 为 200，同状态同原因幂等 200（保持首次 `updated_at`），suspended 同状态不同原因 409，已 revoked 任意目标 409；响应恰含 `credential_id`、`status`、`updated_at` |
+| PUT | `/v1/credentials/status-batch` | 整批原子状态变更（同一次请求可暂停部分凭证并恢复其他凭证），请求体恰含 `items`（1–100 项对象，每项恰含非空字符串 `credential_id`（批内不重复）与 `status`（仅 `active`/`suspended`）；`suspended` 项另须 `reason`（裁剪后 1–256 码点），`active` 项不接受 `reason`）；非法 JSON、非对象、外层或项缺/多字段、数量或字段值不合规、批内重复均 400 且仅含非空 `error`；先校验租户与全部请求格式，再按输入顺序逐项检查存在性与状态冲突，首个失败项决定响应（未知或他租户 404，已吊销或同状态不同暂停原因 409），整批失败不留部分变更；成功统一 200 恰返 `{"results":[...]}`，与输入等长同序，每项恰含 `credential_id`、`status`、`updated_at`；首次登记及实际暂停/恢复各追加一条状态历史并推进游标，幂等项不追加历史或推进游标但每个成功项（含幂等项）均按输入顺序记 `status.updated` 审计，历史关联对应审计事件；全部状态、历史、游标与审计同一次原子写，保存失败 500 整体回滚且不占审计序号，重启稳定 |
 | GET | `/v1/credentials/{credential_id}/status` | 返回 `credential_id`、`status`、`updated_at`；历史无状态按 `active` 返回且 `updated_at` 为 `null`；suspended 为暂停状态、revoked 含吊销信息（本响应仅三键）；不存在或他租户 404 |
 | GET | `/v1/credentials/{credential_id}/status/history?limit=&after=` | 只读查询本地凭证状态历史；响应恰含 `credential_id`、`events`、`next_after`，事件恰含 `{status,reason,updated_at,revoked_at,audit_seq,audit_timestamp,cursor}`；首次 active、每次暂停/恢复与首次 revoke 各追加一条（暂停保存原因、恢复 reason/revoked_at 为 null），同状态幂等、重复吊销与失败路径不追加；按 `updated_at`、`cursor` 升序；未知或跨租户凭证 404，有凭证无状态空页；参数规则同其他历史接口，只读不记审计 |
 | POST | `/v1/credentials/{credential_id}/revoke` | 吊销凭证；`reason` 可省略（默认“持证人主动吊销”），否则须为字符串且首尾裁剪后非空；返回 200 与 `credential_id`、`status:"revoked"`、`reason`、`revoked_at`、`updated_at`；不存在 404 |
@@ -348,6 +349,32 @@ python3 -m vcbackend.cli --tenant-id default did-show did:example:<id>  # 显式
     三个键（暂停/恢复均记 `status.updated` 审计；幂等不追加历史）；
   - **revoked 为终态**：已吊销凭证再 PUT 任意状态（active/suspended）
     均 **409**，状态与时间字段保持不变。
+- `PUT /v1/credentials/status-batch`：单张状态接口的**整批原子入口**，
+  同一次请求可暂停部分凭证并恢复其他凭证，不改变单张接口、状态查询、
+  验签与历史接口语义。请求体须恰为 `{"items":[项...]}`：
+  - `items` 为 **1–100** 个对象的数组，每项须恰含 `credential_id`
+    （必填、非空字符串、同批只能出现一次）与 `status`（仅 `active` 或
+    `suspended`）；`suspended` 项另须 `reason`（字符串且首尾裁剪后
+    1–256 个 Unicode 码点，规则同单张），`active` 项不接受 `reason`；
+  - 非法 JSON、非对象正文、外层缺少或多余字段、`items` 不是数组、为空
+    或超过 100、任一项不是对象、缺字段或含多余字段、字段类型或取值
+    非法、`credential_id` 批内重复，均返回 **400** 且响应仅含非空
+    `error`；显式空 `X-Tenant-ID` 同样 **400**；
+  - 先校验租户与全部请求格式，再**按输入顺序**逐项检查凭证存在性与
+    状态冲突，首个失败项决定响应：任一凭证未知或属他租户 **404**，
+    已吊销凭证变更状态或 suspended 同状态不同原因 **409**；所有失败
+    路径整批不产生任何状态、历史、游标或审计变化；
+  - 成功统一 **200** 恰返 `{"results":[...]}`，与输入**等长、同序**，
+    每项恰含 `credential_id`、`status`、`updated_at`（同单张响应）；
+    状态转换语义逐项沿用单张接口：无状态可登记 active 或直接暂停，
+    active 可暂停，suspended 可恢复（恢复后清除暂停原因），同状态同
+    原因幂等并保持首次 `updated_at`；
+  - 首次登记及实际暂停、恢复各追加一条既有状态历史并推进租户内状态
+    游标；幂等项不追加历史、不推进游标，但每个成功项（含幂等项）均
+    按输入顺序记一次 `status.updated` 审计，历史事件关联对应审计；
+  - 全部状态、历史、游标与审计**同一次原子写**落盘，保存失败返回
+    **500** 并整体回滚到批前（审计序号也不占用）；重启后状态与记录
+    保留，新状态可经现有查询、历史、验签与状态签名发布接口观察。
 - `GET .../status` 返回 `credential_id`、`status`、`updated_at`；历史无状态
   凭证按 `active` 返回、`updated_at` 为 `null`；未知凭证或他租户凭证 404。
 - `POST .../revoke`：未知凭证 404。首次请求可省略 `reason`（空请求体或
