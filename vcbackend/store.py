@@ -4657,6 +4657,108 @@ class VCStore:
                 self._restore_locked(snapshot)
                 raise
 
+    def get_presentation_request_history(
+        self,
+        tenant_id: str,
+        request_id: str,
+        after: int = 0,
+        limit: int = 50,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """单请求历史：由本租户审计派生创建/首次取消/首次成功消费事件。
+
+        请求不存在（含他租户资源）抛 NotFoundError（HTTP 404，跨租户
+        不可探测）。事件来源恰为三类审计：
+        - presentation.request.created（resource_type 为
+          presentation_request、resource_id 为请求 ID）-> status
+          pending，reason/presentation_id 为 None；
+        - presentation.request.cancelled（同上定位）-> status
+          cancelled，reason 取请求行保存的首次取消原因；
+        - presentation.consumed（resource_type 为 presentation、
+          resource_id 为请求行 consumed_presentation_id）-> status
+          consumed，presentation_id 为实际演示 ID；消费沿用演示消费
+          审计，不另记请求消费审计。
+        重复取消或消费、验真失败、保存失败、生成演示与自然到期均无对应
+        审计，故不追加历史；旧请求仅返回有对应审计的事件，没有则为空
+        列表，不补造事件。cursor 等于 audit_seq（允许间隔），按 cursor
+        升序返回 cursor 严格大于 after 的至多 limit 条；next_after 为
+        末项 cursor，空页保持 after。纯只读：不修改任何状态、不记
+        审计、不触发落盘。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            row = (
+                bucket["presentation_requests"].get(request_id)
+                if bucket is not None
+                else None
+            )
+            if row is None:
+                raise NotFoundError(f"展示请求不存在: {request_id}")
+            cancel_reason = row.get("cancel_reason")
+            consumed_pid = row.get("consumed_presentation_id")
+            events: List[Dict[str, Any]] = []
+            for audit in self._audit:
+                if audit.get("tenant_id") != tenant_id:
+                    continue
+                action = audit.get("action")
+                resource_type = audit.get("resource_type")
+                resource_id = audit.get("resource_id")
+                if (
+                    action == AUDIT_PRESENTATION_REQUEST_CREATED
+                    and resource_type == "presentation_request"
+                    and resource_id == request_id
+                ):
+                    mapped = (
+                        AUDIT_PRESENTATION_REQUEST_CREATED,
+                        "pending",
+                        None,
+                        None,
+                    )
+                elif (
+                    action == AUDIT_PRESENTATION_REQUEST_CANCELLED
+                    and resource_type == "presentation_request"
+                    and resource_id == request_id
+                ):
+                    mapped = (
+                        AUDIT_PRESENTATION_REQUEST_CANCELLED,
+                        "cancelled",
+                        cancel_reason,
+                        None,
+                    )
+                elif (
+                    action == AUDIT_PRESENTATION_CONSUMED
+                    and resource_type == "presentation"
+                    and consumed_pid is not None
+                    and resource_id == consumed_pid
+                ):
+                    mapped = (
+                        AUDIT_PRESENTATION_CONSUMED,
+                        "consumed",
+                        None,
+                        consumed_pid,
+                    )
+                else:
+                    continue
+                seq = int(audit.get("seq", 0))
+                if seq <= after:
+                    continue
+                events.append(
+                    {
+                        "action": mapped[0],
+                        "status": mapped[1],
+                        "reason": mapped[2],
+                        "presentation_id": mapped[3],
+                        "audit_seq": seq,
+                        "audit_timestamp": int(
+                            audit.get("timestamp", 0)
+                        ),
+                        "cursor": seq,
+                    }
+                )
+                if len(events) >= limit:
+                    break
+            next_after = events[-1]["cursor"] if events else after
+            return events, next_after
+
     def create_presentation_for_request(
         self,
         tenant_id: str,

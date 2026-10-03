@@ -28,6 +28,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/presentation-requests 验证方创建展示请求（challenge/expires_in/disclose/issuer_dids/holder_binding）
   GET  /v1/presentation-requests/{request_id} 查询展示请求（租户隔离，跨租户同 ID 404）
   POST /v1/presentation-requests/{request_id}/cancel 主动取消展示请求（仅 pending，含已过期；consumed 409，幂等返回首次结果）
+  GET  /v1/presentation-requests/{request_id}/history 单请求历史（创建/首次取消/首次成功消费，?limit=&after=，只读）
   POST /v1/credentials/{credential_id}/present-batch 原子批量生成选择性披露演示
   POST /v1/presentations/{presentation_id}/verify  以存储记录为锚校验演示（challenge 模式或 request_id 模式）
   POST /v1/credentials/{credential_id}/prove    生成谓词证明
@@ -1348,13 +1349,33 @@ def build_handler(store: VCStore) -> type:
                 elif path == "/v1/presentation-requests" or (
                     path.startswith("/v1/presentation-requests/")
                 ):
-                    request_id = unquote(
-                        path[len("/v1/presentation-requests/") :]
-                    ) if path.startswith("/v1/presentation-requests/") else ""
-                    if not request_id:
-                        self._send_error(404, f"无此路径: {path}")
+                    if path.startswith("/v1/presentation-requests/") and (
+                        path.endswith("/history")
+                    ):
+                        request_id = unquote(
+                            path[
+                                len("/v1/presentation-requests/")
+                                : -len("/history")
+                            ]
+                        )
+                        if not request_id:
+                            self._send_error(404, f"无此路径: {path}")
+                        else:
+                            self._get_presentation_request_history(
+                                tenant, request_id, parsed.query
+                            )
                     else:
-                        self._get_presentation_request(tenant, request_id)
+                        request_id = unquote(
+                            path[len("/v1/presentation-requests/") :]
+                        ) if path.startswith(
+                            "/v1/presentation-requests/"
+                        ) else ""
+                        if not request_id:
+                            self._send_error(404, f"无此路径: {path}")
+                        else:
+                            self._get_presentation_request(
+                                tenant, request_id
+                            )
                 elif path.startswith("/v1/dids/") and path.endswith(
                     "/document"
                 ):
@@ -3040,6 +3061,57 @@ def build_handler(store: VCStore) -> type:
             record = store.get_presentation_request(tenant, request_id)
             self._send_json(
                 200, self._presentation_request_payload(record)
+            )
+
+        def _get_presentation_request_history(
+            self, tenant: str, request_id: str, query: str
+        ) -> None:
+            # GET /v1/presentation-requests/{request_id}/history：
+            # 单请求历史（只读）。仅接受 limit、after 查询参数（各至多
+            # 一次、非空 ASCII 十进制整数；limit 缺省 50、限 1..200，
+            # after 缺省 0、非负），重复、未知、空值或非法一律 400；
+            # 租户头与参数校验先于资源查询，未知或他租户请求 404。
+            # 成功 200 正文恰含 request_id、events、next_after：事件
+            # 恰含 action、status、reason、presentation_id、audit_seq、
+            # audit_timestamp、cursor，按 cursor 升序；返回 cursor 大于
+            # after 的至多 limit 项，next_after 为末项 cursor，空页
+            # 保持 after。
+            if not request_id:
+                raise ValidationError("路径缺少 request_id")
+            params = parse_qs(query, keep_blank_values=True)
+            unknown = sorted(set(params) - {"limit", "after"})
+            if unknown:
+                raise ValidationError(
+                    f"不支持的查询参数: {', '.join(unknown)}"
+                )
+            limit_values = params.get("limit")
+            if limit_values is not None:
+                if len(limit_values) != 1:
+                    raise ValidationError("查询参数 limit 只能提供一次")
+                limit = _parse_nonneg_int(limit_values[0], "limit")
+                if not 1 <= limit <= 200:
+                    raise ValidationError(
+                        "查询参数 limit 须在 1 到 200 之间"
+                    )
+            else:
+                limit = 50
+            after_values = params.get("after")
+            if after_values is not None:
+                if len(after_values) != 1:
+                    raise ValidationError("查询参数 after 只能提供一次")
+                after = _parse_nonneg_int(after_values[0], "after")
+            else:
+                after = 0
+            events, next_after = store.get_presentation_request_history(
+                tenant, request_id, after=after, limit=limit
+            )
+            self._send_json(
+                200,
+                {
+                    "request_id": request_id,
+                    "events": events,
+                    "next_after": next_after,
+                },
             )
 
         def _post_cancel_presentation_request(
