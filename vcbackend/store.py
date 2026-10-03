@@ -673,8 +673,13 @@ SCHEMA_VALIDATION_FAILED_REASON = "schema validation failed"
 SCHEMA_VERIFY_INVALID_REQUEST_REASON = "请求参数无效"
 # verify-with-schema 按请求模式参数在本租户查不到模式的固定原因。
 SCHEMA_VERIFY_SCHEMA_NOT_FOUND_REASON = "凭证模式不存在"
+# verify-with-schema 随请求提交模式的内容/摘要非法的固定原因。
+SCHEMA_VERIFY_SCHEMA_INVALID_REASON = "凭证模式非法"
 # verify-with-schema 正文模式绑定与请求参数/模式摘要不一致的固定原因。
 SCHEMA_VERIFY_BINDING_MISMATCH_REASON = "凭证模式绑定不一致"
+
+# 随请求提交模式的 digest 字段格式：SHA-256 小写十六进制（64 字符）。
+_SCHEMA_DIGEST_HEX_RE = re.compile(r"[0-9a-f]{64}")
 
 # 模式指针在 claims 中未命中的内部哨兵（不得对外暴露）。
 _SCHEMA_POINTER_MISSING = object()
@@ -8081,32 +8086,44 @@ class VCStore:
     ) -> Tuple[bool, str]:
         """按调用方指定的模式版本验真外部凭证，返回 (是否有效, 失败原因)。
 
-        校验顺序固定：请求与模式参数 -> 凭证基础字段 -> 模式查找 ->
-        模式绑定与 claims -> 锚点 -> 签名格式 -> 密码学验签 -> 有效期 ->
-        外部签发 DID 停用通告。
+        校验顺序固定：请求与模式参数 -> 凭证基础字段 -> 模式查找/提交
+        模式内容 -> 模式绑定与 claims -> 锚点 -> 签名格式 -> 密码学验签
+        -> 有效期 -> 外部签发 DID 停用通告。
         - 请求体须恰含 body（对象）、signature（非空字符串）、schema_id
-          （非空字符串）、schema_version（非布尔正整数）；缺失、多余、
-          非对象或类型错误统一返回“请求参数无效”；
+          （非空字符串）、schema_version（非布尔正整数），可额外包含
+          schema（对象，随请求提交模式）；缺失、多余、非对象或类型错误
+          统一返回“请求参数无效”；
         - 凭证基础字段校验与 /v1/trust/credentials/verify 完全一致
           （credential_id/issuer_did/subject_did/claims/issued_at 必填，
           issuer_key_version 可省略，省略按版本 1 且不注入签名正文）；
-        - 模式按本租户 (body.issuer_did, schema_id, schema_version) 查找，
-          缺失（含他租户同名模式）返回“凭证模式不存在”；
+        - 未提交 schema 时模式按本租户 (body.issuer_did, schema_id,
+          schema_version) 查找，缺失（含他租户同名模式）返回
+          “凭证模式不存在”；
+        - 提交 schema 时只采用提交模式：不回退、不覆盖本地同名版本，
+          不借用其他租户数据，本地同名版本内容不同或已弃用/吊销均不
+          影响。schema 须恰含六字段（schema_id/version/issuer_did/
+          claim_types/required_claims/digest，即模式查询响应格式），
+          内容沿用注册规则（issuer_did 无需对应本地 DID），digest 须
+          为其余五字段规范化 JSON 的 SHA-256 小写十六进制且重算一致，
+          否则返回“凭证模式非法”；
         - body 须含 schema_id/schema_version/schema_digest 且分别等于
-          请求参数与该模式版本的内容摘要，否则“凭证模式绑定不一致”；
-          claims 缺必填路径或已声明路径类型不符返回
-          “schema validation failed”，未声明的额外 claims 保留；
+          请求参数与所采用模式的内容摘要；提交模式时其 schema_id/
+          version 还须等于请求参数、issuer_did 须等于 body.issuer_did，
+          否则“凭证模式绑定不一致”；claims 缺必填路径或已声明路径
+          类型不符返回“schema validation failed”，未声明的额外
+          claims 保留；
         - 锚点、签名格式、验签、有效期、外部停用通告的原因与优先级
           沿用 /v1/trust/credentials/verify；
         - 模式版本 deprecated/revoked 不影响验真：历史外部凭证仍按该
           版本原摘要判定，不追溯失效，也不得借用其他版本摘要。
-        只读：不登记 DID/凭证，不改模式、锚点、状态、历史或审计，
+        只读：不登记 DID/凭证/模式，不改模式、锚点、状态、历史或审计，
         绝不向上抛异常。
         """
         # 1. 请求结构与模式参数：任何非法统一“请求参数无效”。
         if not isinstance(data, dict):
             return False, SCHEMA_VERIFY_INVALID_REQUEST_REASON
-        if set(data) != {"body", "signature", "schema_id", "schema_version"}:
+        base_keys = {"body", "signature", "schema_id", "schema_version"}
+        if set(data) != base_keys and set(data) != base_keys | {"schema"}:
             return False, SCHEMA_VERIFY_INVALID_REQUEST_REASON
         body = data["body"]
         signature = data["signature"]
@@ -8123,6 +8140,9 @@ class VCStore:
             or isinstance(schema_version, bool)
             or schema_version < 1
         ):
+            return False, SCHEMA_VERIFY_INVALID_REQUEST_REASON
+        submitted_schema = data.get("schema")
+        if "schema" in data and not isinstance(submitted_schema, dict):
             return False, SCHEMA_VERIFY_INVALID_REQUEST_REASON
 
         # 2. 凭证基础字段：与 /v1/trust/credentials/verify 相同分类原因。
@@ -8154,12 +8174,67 @@ class VCStore:
             key_version = version_obj
         issuer_did = body["issuer_did"]
 
-        # 3/5. 锁内一次取出模式行与锚点行，判定顺序不变：模式查找 ->
-        # 模式绑定与 claims -> 锚点。
+        # 3a. 提交模式内容：只采用提交模式，纯计算校验（不触本地状态）。
+        # 字段集合、内容规则、摘要格式与重算任一不符均为“凭证模式非法”。
+        schema_claim_types: Optional[Dict[str, str]] = None
+        schema_required_claims: Optional[List[str]] = None
+        schema_digest: Optional[str] = None
+        sub_schema_id = sub_version = sub_issuer_did = None
+        if submitted_schema is not None:
+            if set(submitted_schema) != {
+                "schema_id",
+                "version",
+                "issuer_did",
+                "claim_types",
+                "required_claims",
+                "digest",
+            }:
+                return False, SCHEMA_VERIFY_SCHEMA_INVALID_REASON
+            try:
+                (
+                    sub_schema_id,
+                    sub_version,
+                    sub_issuer_did,
+                    schema_claim_types,
+                    schema_required_claims,
+                ) = _validate_schema_payload(
+                    submitted_schema.get("schema_id"),
+                    submitted_schema.get("version"),
+                    submitted_schema.get("issuer_did"),
+                    submitted_schema.get("claim_types"),
+                    submitted_schema.get("required_claims"),
+                )
+            except ValidationError:
+                return False, SCHEMA_VERIFY_SCHEMA_INVALID_REASON
+            sub_digest = submitted_schema.get("digest")
+            if (
+                not isinstance(sub_digest, str)
+                or not _SCHEMA_DIGEST_HEX_RE.fullmatch(sub_digest)
+            ):
+                return False, SCHEMA_VERIFY_SCHEMA_INVALID_REASON
+            recomputed = schema_content_digest(
+                _schema_payload_dict(
+                    sub_schema_id,
+                    sub_version,
+                    sub_issuer_did,
+                    schema_claim_types,
+                    schema_required_claims,
+                )
+            )
+            if sub_digest != recomputed:
+                return False, SCHEMA_VERIFY_SCHEMA_INVALID_REASON
+            schema_digest = sub_digest
+
+        # 3b/5. 锁内一次取出（未提交模式时的）本地模式行与锚点行，判定
+        # 顺序不变：模式查找 -> 模式绑定与 claims -> 锚点。提交模式时
+        # 绝不读取本地同名版本，也不借用其他租户数据。
         with self._lock:
             bucket = self._bucket_locked(tenant_id)
-            schema_row = self._get_credential_schema_row_locked(
-                bucket, issuer_did, schema_id, schema_version
+            schema_row = (
+                self._get_credential_schema_row_locked(
+                    bucket, issuer_did, schema_id, schema_version
+                )
+                if submitted_schema is None else None
             )
             anchors = (
                 bucket["trust_anchors"].get(issuer_did)
@@ -8173,27 +8248,41 @@ class VCStore:
             status = row.get("status", "active") if row is not None else None
             uses = row.get("uses") if row is not None else None
 
-        # 3. 模式查找：限本租户、同 issuer_did；跨租户同名按不存在。
-        if schema_row is None:
-            return False, SCHEMA_VERIFY_SCHEMA_NOT_FOUND_REASON
+        # 3c. 本地模式查找（仅未提交模式时）：限本租户、同 issuer_did；
+        # 跨租户同名按不存在。
+        if submitted_schema is None:
+            if schema_row is None:
+                return False, SCHEMA_VERIFY_SCHEMA_NOT_FOUND_REASON
+            schema_digest = schema_row["digest"]
+            schema_claim_types = schema_row["claim_types"]
+            schema_required_claims = schema_row["required_claims"]
 
         # 4. 模式绑定与 claims：body 三字段缺一不可，且须分别等于请求
-        # 参数与该版本模式的内容摘要（布尔不等于整数，其他版本摘要不可
-        # 借用）；claims 校验失败固定 “schema validation failed”。
+        # 参数与所采用模式的内容摘要（布尔不等于整数，其他版本摘要不可
+        # 借用）；提交模式时其标识/版本须与外层一致、签发者须与正文
+        # 一致。claims 校验失败固定 “schema validation failed”。
         body_schema_version = body.get("schema_version")
         if (
             body.get("schema_id") != schema_id
             or not isinstance(body_schema_version, int)
             or isinstance(body_schema_version, bool)
             or body_schema_version != schema_version
-            or body.get("schema_digest") != schema_row["digest"]
+            or body.get("schema_digest") != schema_digest
+            or (
+                submitted_schema is not None
+                and (
+                    sub_schema_id != schema_id
+                    or sub_version != schema_version
+                    or sub_issuer_did != issuer_did
+                )
+            )
         ):
             return False, SCHEMA_VERIFY_BINDING_MISMATCH_REASON
         try:
             _validate_claims_against_schema(
                 body["claims"],
-                schema_row["claim_types"],
-                schema_row["required_claims"],
+                schema_claim_types,
+                schema_required_claims,
             )
         except ValidationError:
             return False, SCHEMA_VALIDATION_FAILED_REASON

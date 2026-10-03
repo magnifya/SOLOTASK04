@@ -56,7 +56,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/anchors/snapshot/verify-batch  批量校验锚点快照签名（批初锚点快照、逐项不短路，只读）
   POST /v1/trust/verify                   用 active 锚点公钥验签
   POST /v1/trust/credentials/verify       跨系统凭证验真（无需登记 DID/凭证）
-  POST /v1/trust/credentials/verify-with-schema  按调用方指定模式版本验真外部凭证（只读）
+  POST /v1/trust/credentials/verify-with-schema  按调用方指定模式版本验真外部凭证（只读，可随请求提交模式）
   POST /v1/trust/credentials/verify-synced  以同步锚点验真外部凭证（只读）
   POST /v1/trust/credentials/verify-synced-with-status  同步锚点验真外部凭证并合并请求初始状态快照（只读）
   POST /v1/trust/credentials/verify-synced-batch  批量以同步锚点快照验真外部凭证（只读）
@@ -7131,14 +7131,16 @@ def build_handler(store: VCStore) -> type:
             # POST /v1/trust/credentials/verify-with-schema：跨系统模式
             # 约束验真（只读）。请求体须恰含 body（对象）、signature
             # （非空字符串）、schema_id（非空字符串）、schema_version
-            # （非布尔正整数）；请求缺失、多余、非法 JSON、非对象或
-            # 模式参数类型错误统一 HTTP 200 返回
-            # {"valid":false,"reason":"请求参数无效"}。其余校验顺序
-            # （凭证基础字段 -> 模式查找 -> 模式绑定与 claims -> 锚点 ->
-            # 签名格式 -> 验签 -> 有效期 -> 外部停用通告）与原因见
-            # store.verify_trust_credential_with_schema；成功仅
-            # {"valid":true}。纯只读：不登记 DID/凭证，不改模式、锚点、
-            # 状态、历史或审计。
+            # （非布尔正整数），可额外包含 schema（对象，随请求提交的
+            # 六字段模式：schema_id/version/issuer_did/claim_types/
+            # required_claims/digest）；请求缺失、多余、非法 JSON、
+            # 非对象、模式参数类型错误或 schema 非对象统一 HTTP 200
+            # 返回 {"valid":false,"reason":"请求参数无效"}。其余校验
+            # 顺序（凭证基础字段 -> 模式查找/提交模式内容 -> 模式绑定
+            # 与 claims -> 锚点 -> 签名格式 -> 验签 -> 有效期 -> 外部
+            # 停用通告）与原因见 store.verify_trust_credential_with_
+            # schema；成功仅 {"valid":true}。纯只读：不登记 DID/凭证/
+            # 模式，不改模式、锚点、状态、历史或审计。
             try:
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length) if length > 0 else b""
