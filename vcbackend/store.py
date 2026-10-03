@@ -6676,6 +6676,211 @@ class VCStore:
                 False,
             )
 
+    def set_credential_status_batch(
+        self,
+        tenant_id: str,
+        items: List[Tuple[str, str, Any]],
+    ) -> List[CredentialStatusRecord]:
+        """批量登记/变更凭证状态（active/suspended）：整批校验、单次提交。
+
+        ``items`` 须为已通过服务层请求校验的 1..100 项
+        ``(credential_id, status, reason)``：status 仅 active/suspended，
+        credential_id 非空且批内不重复；active 项 reason 为 REASON_UNSET，
+        suspended 项 reason 为裁剪后 1..256 个 Unicode 码点的字符串。
+
+        - 租户与全部请求格式校验完成后，本方法在同一把锁内按输入顺序
+          逐项检查凭证存在性（未知或他租户抛 NotFoundError）与状态冲突
+          （revoked 终态任意目标、suspended 目标与已存裁剪原因不同均抛
+          ConflictError），首个失败项决定异常，整批不产生任何变化；
+        - 每项语义同单张 set_credential_status：无状态→active 首次登记、
+          无状态/active→suspended 暂停、suspended→active 恢复（清除暂停
+          原因）均追加一条本地凭证状态历史并推进租户内状态游标；同状态
+          幂等（active→active、suspended→suspended 同裁剪原因）保持首次
+          updated_at，不追加历史、不推进游标；
+        - 每个成功项（含幂等项）均按输入顺序记一条 status.updated 审计，
+          追加的历史事件关联对应审计事件的序号与时间；
+        - 全部状态、历史、游标与审计仅做一次原子落盘，落盘失败恢复快照
+          并抛出，内存态与磁盘均回到批前；results 与输入等长同序。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            credentials = (
+                bucket["credentials"] if bucket is not None else {}
+            )
+            # 防御性复核暂停原因形状（服务层已完成全部格式校验，正常
+            # 路径不会触发）；active 项不接受也不使用 reason。
+            final_reasons: List[Optional[str]] = []
+            for _cid, status, reason in items:
+                if status != "suspended":
+                    final_reasons.append(None)
+                    continue
+                if reason is REASON_UNSET:
+                    raise ValidationError("缺少字段: reason")
+                if not isinstance(reason, str):
+                    raise ValidationError("字段 reason 必须为字符串")
+                final_reason = reason.strip()
+                if not final_reason:
+                    raise ValidationError("字段 reason 裁剪后不能为空")
+                if len(final_reason) > MAX_SUSPEND_REASON:
+                    raise ValidationError(
+                        f"字段 reason 裁剪后须为 1 到 {MAX_SUSPEND_REASON} 个"
+                        " Unicode 码点"
+                    )
+                final_reasons.append(final_reason)
+
+            # 按输入顺序逐项检查存在性与状态冲突，首个失败项决定响应：
+            # 未知或他租户凭证 404；revoked 终态任意目标 409；已暂停项
+            # 目标 suspended 但裁剪原因不同 409。失败不写任何内容。
+            recs: List[Dict[str, Any]] = []
+            for (credential_id, status, _reason), final_reason in zip(
+                items, final_reasons
+            ):
+                rec = credentials.get(credential_id)
+                if rec is None:
+                    raise NotFoundError(f"凭证不存在: {credential_id}")
+                current = rec.get("status")
+                if current == "revoked":
+                    raise ConflictError(
+                        f"凭证已吊销，不能变更状态: {credential_id}"
+                    )
+                if (
+                    status == "suspended"
+                    and current == "suspended"
+                    and rec.get("suspend_reason") != final_reason
+                ):
+                    raise ConflictError(
+                        "凭证已暂停且暂停原因不同: "
+                        f"{credential_id}"
+                    )
+                recs.append(rec)
+
+            snapshot = self._snapshot_locked()
+            try:
+                results: List[CredentialStatusRecord] = []
+                for (credential_id, status, _reason), final_reason, rec in (
+                    zip(items, final_reasons, recs)
+                ):
+                    current = rec.get("status")
+                    if status == "active":
+                        if current == "active":
+                            # 同状态幂等：保持首次 updated_at，不追加历史、
+                            # 不推进游标，但仍记一条 status.updated 审计。
+                            self._append_audit_locked(
+                                tenant_id, AUDIT_STATUS_UPDATED,
+                                "credential", credential_id,
+                            )
+                            results.append(
+                                CredentialStatusRecord(
+                                    credential_id=credential_id,
+                                    status="active",
+                                    updated_at=rec.get(
+                                        "status_updated_at"
+                                    ),
+                                )
+                            )
+                            continue
+                        # 无状态首次登记或 suspended→active 恢复：恢复后
+                        # 清除暂停原因，追加 active 历史事件。
+                        now = _utc_now()
+                        rec["status"] = "active"
+                        rec["status_updated_at"] = now
+                        rec["suspend_reason"] = None
+                        event = self._append_audit_locked(
+                            tenant_id, AUDIT_STATUS_UPDATED,
+                            "credential", credential_id,
+                        )
+                        entries = (
+                            self._local_credential_history_entries_locked(
+                                bucket, credential_id
+                            )
+                        )
+                        entries.append(
+                            {
+                                "status": "active",
+                                "reason": None,
+                                "updated_at": now,
+                                "revoked_at": None,
+                                "cursor": (
+                                    self._next_local_credential_status_cursor_locked(
+                                        tenant_id
+                                    )
+                                ),
+                                "audit_seq": int(event["seq"]),
+                                "audit_timestamp": int(event["timestamp"]),
+                            }
+                        )
+                        results.append(
+                            CredentialStatusRecord(
+                                credential_id=credential_id,
+                                status="active",
+                                updated_at=now,
+                            )
+                        )
+                        continue
+
+                    if current == "suspended":
+                        # 同状态同裁剪原因幂等（不同原因已在批初判 409）：
+                        # 保持首次 updated_at，不追加历史、不推进游标，
+                        # 但仍记一条 status.updated 审计。
+                        self._append_audit_locked(
+                            tenant_id, AUDIT_STATUS_UPDATED,
+                            "credential", credential_id,
+                        )
+                        results.append(
+                            CredentialStatusRecord(
+                                credential_id=credential_id,
+                                status="suspended",
+                                updated_at=rec.get("status_updated_at"),
+                                reason=rec.get("suspend_reason"),
+                            )
+                        )
+                        continue
+
+                    # 无状态/active → suspended：状态变更，保存裁剪原因并
+                    # 追加 suspended 历史事件。
+                    now = _utc_now()
+                    rec["status"] = "suspended"
+                    rec["status_updated_at"] = now
+                    rec["suspend_reason"] = final_reason
+                    event = self._append_audit_locked(
+                        tenant_id, AUDIT_STATUS_UPDATED,
+                        "credential", credential_id,
+                    )
+                    entries = (
+                        self._local_credential_history_entries_locked(
+                            bucket, credential_id
+                        )
+                    )
+                    entries.append(
+                        {
+                            "status": "suspended",
+                            "reason": final_reason,
+                            "updated_at": now,
+                            "revoked_at": None,
+                            "cursor": (
+                                self._next_local_credential_status_cursor_locked(
+                                    tenant_id
+                                )
+                            ),
+                            "audit_seq": int(event["seq"]),
+                            "audit_timestamp": int(event["timestamp"]),
+                        }
+                    )
+                    results.append(
+                        CredentialStatusRecord(
+                            credential_id=credential_id,
+                            status="suspended",
+                            updated_at=now,
+                            reason=final_reason,
+                        )
+                    )
+                # 全部确认并处理完毕后一次提交。
+                self._save_locked()
+            except Exception:
+                self._restore_locked(snapshot)
+                raise
+            return results
+
     def get_credential_status(
         self, tenant_id: str, credential_id: str
     ) -> CredentialStatusRecord:
