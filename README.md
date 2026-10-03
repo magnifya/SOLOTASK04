@@ -883,10 +883,12 @@ curl -X POST localhost:8080/v1/presentations/vp_<id>/verify \
   字符串且按 Unicode 码点不超过 256，缺省生成 32 位小写 hex；
   `expires_in` 须为非布尔整数且在 1–86400 之间，缺省 300。
 - `path` 按 RFC 6901 解释（相对凭证 `claims`），规则与选择性披露
-  一致但**不支持数组元素选择**（谓词仍沿用叶子规则）：必须以 `/`
-  开头并命中实际属性、支持 `~0`/`~1` 转义、**禁根路径、禁数组索引**
-  （数组只能整值命中）、越界 400；路径不得重复、不得存在祖先/后代
-  重叠。
+  一致：必须以 `/` 开头并命中实际属性、支持 `~0`/`~1` 转义、
+  **禁根路径**；可穿过对象、数组、嵌套数组与数组元素内的对象，
+  数组下标只接受 `0` 或无前导零的 ASCII 十进制非负整数（负数、
+  正号、前导零、非 ASCII 数字、`-`、越界与经过标量均 400），
+  对象中的数字字符串仍是普通属性名；路径不得重复、不得存在
+  祖先/后代重叠（兄弟元素路径可共存）。
 - `op ∈ {exists, eq, gte, lte}`：`eq` 为 JSON 精确相等（布尔与数字
   不互通，容器递归比较）；`gte`/`lte` 要求谓词 `value` 与 claims
   命中值**均为非布尔数字**，否则 400。
@@ -2021,6 +2023,7 @@ python3 tests/trust_anchor_test.py
 python3 tests/trust_anchor_rotate_test.py
 python3 tests/trust_anchor_history_test.py
 python3 tests/predicate_proof_test.py
+python3 tests/predicate_array_proof_test.py
 python3 tests/holder_binding_test.py
 python3 tests/trust_credential_verify_test.py
 python3 tests/trust_did_document_verify_test.py
@@ -2198,6 +2201,13 @@ tests/trust_anchor_history_test.py 信任锚点生命周期历史（注册/轮�
                                    游标/审计共同回滚、列表/验真/幂等响应不变）
 tests/predicate_proof_test.py      谓词证明（prove 字段/400/404、verify 消费/
                                    过期/篡改/跨租户/并发/审计/重启）
+tests/predicate_array_proof_test.py 谓词证明数组路径（对象/数组/嵌套数组/
+                                   元素内对象穿行、~0/~1 转义、合法与非法
+                                   下标 400、兄弟共存、重复与祖先重叠 400、
+                                   exists 命中 null、eq/gte/lte 数值语义、
+                                   prove-batch 整批 400 不落盘、本地 verify
+                                   重算与消费、重启与轮换后历史密钥验签、
+                                   跨系统验真/消费/批量接受数组路径证明）
 tests/holder_binding_test.py       演示持有者绑定（未绑定兼容、绑定 201 字段/
                                    holder_proof 外部验真/issuer proof 不变、
                                    holder_binding 非布尔 400、未注册 400、

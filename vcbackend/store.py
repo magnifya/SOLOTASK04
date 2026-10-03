@@ -442,26 +442,20 @@ def _resolve_pointer(
     tokens: Tuple[str, ...],
     pointer: str,
     label: str = "disclose",
-    allow_arrays: bool = True,
 ) -> Any:
     """沿 token 导航 claims 并返回目标值。
 
     禁根（空 token）、键不存在或经过非容器叶子均按越界/未命中
-    拒绝。allow_arrays 为 True 时允许进入数组：数组下标只接受
-    RFC6901 的 "0" 或无前导零 ASCII 十进制非负索引，负数、正号、
-    前导零、非 ASCII 数字与 "-" 均非法，越界按未命中拒绝；对象中
-    的数字字符串始终按普通属性名处理。allow_arrays 为 False 时
-    保持谓词证明的叶子规则（任一步进入数组即非法）。
+    拒绝。允许进入数组：数组下标只接受 RFC6901 的 "0" 或无前导零
+    ASCII 十进制非负索引，负数、正号、前导零、非 ASCII 数字与 "-"
+    均非法，越界按未命中拒绝；对象中的数字字符串始终按普通属性名
+    处理。选择性披露与谓词证明共用同一套路径规则。
     """
     if not tokens:
         raise ValidationError(f"{label} 不允许根路径（零披露请传空列表）")
     current: Any = claims
     for token in tokens:
         if isinstance(current, list):
-            if not allow_arrays:
-                raise ValidationError(
-                    f"{label} 路径不允许数组索引: {pointer!r}"
-                )
             if not _JSON_POINTER_ARRAY_INDEX_RE.fullmatch(token):
                 raise ValidationError(
                     f"{label} 数组索引非法（仅接受 0 或无前导零的"
@@ -888,8 +882,9 @@ def _validate_predicates(
 
     - predicates 必须为非空数组；元素为恰含 path/op[, value] 的对象；
     - op 仅支持 exists/eq/gte/lte；exists 禁止 value，其余必须有 value；
-    - path 为相对 claims 的 RFC6901 指针：禁根、禁数组索引、禁越界，
-      不得重复、不得存在祖先/后代重叠；
+    - path 为相对 claims 的 RFC6901 指针：禁根、禁越界，数组只接受
+      合法非负索引（0 或无前导零 ASCII 十进制），不得重复、不得存在
+      祖先/后代重叠；
     - gte/lte 要求谓词 value 与 claims 命中值均为非布尔数字。
     """
     if not isinstance(predicates, list) or not predicates:
@@ -936,7 +931,7 @@ def _validate_predicates(
                 raise ValidationError(
                     f"predicates 路径存在祖先重叠: 已选路径被 {pointer!r} 覆盖"
                 )
-        hit = _resolve_pointer(claims, tokens, pointer, "predicates", allow_arrays=False)
+        hit = _resolve_pointer(claims, tokens, pointer, "predicates")
         if op in ("gte", "lte"):
             if not _is_number(item["value"]):
                 raise ValidationError(
@@ -959,7 +954,7 @@ def _evaluate_predicates(
     results: List[bool] = []
     for item in predicates:
         tokens = _parse_pointer(item["path"], "predicates")
-        hit = _resolve_pointer(claims, tokens, item["path"], "predicates", allow_arrays=False)
+        hit = _resolve_pointer(claims, tokens, item["path"], "predicates")
         op = item["op"]
         if op == "exists":
             results.append(True)
