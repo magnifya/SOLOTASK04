@@ -200,8 +200,10 @@ def main():
             ("路径不以 / 开头", {"predicates": [
                 {"path": "age", "op": "exists"}]}),
             ("根路径", {"predicates": [{"path": "/", "op": "exists"}]}),
-            ("数组索引", {"predicates": [
-                {"path": "/tags/0", "op": "exists"}]}),
+            ("非法数组索引", {"predicates": [
+                {"path": "/tags/01", "op": "exists"}]}),
+            ("数组下标越界", {"predicates": [
+                {"path": "/tags/2", "op": "exists"}]}),
             ("路径越界", {"predicates": [{"path": "/nope", "op": "exists"}]}),
             ("路径重复", {"predicates": [
                 {"path": "/age", "op": "exists"},

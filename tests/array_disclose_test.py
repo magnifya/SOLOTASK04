@@ -5,7 +5,7 @@
 验真：RFC6901 数组索引语法/越界 400、保留下标的 null 填充投影、null
 值保留、多属性合并、嵌套容器、整值披露兼容、disclose 次序无关、篡改
 所选值/占位/数组顺序时验真失败且不消费、合法验真消费一次、重启持久化、
-批量/组合整次 400 不落盘、请求创建只校验语法与重叠、谓词仍禁数组。
+批量/组合整次 400 不落盘、请求创建只校验语法与重叠、谓词证明数组路径。
 """
 
 import json
@@ -422,10 +422,14 @@ def main():
               st == 200 and rv.get("valid") is False
               and rv.get("reason") == "演示已消费")
 
-        # ---------- 14. 谓词证明仍禁数组索引 ---------- #
+        # ---------- 14. 谓词证明同样支持数组索引 ---------- #
         st, r = http("POST", f"{BASE}/v1/credentials/{cid}/prove",
                      {"predicates": [{"path": "/tags/0", "op": "exists"}]})
-        check("谓词数组索引 -> 400", st == 400 and bool(r.get("error")))
+        check("谓词数组索引 -> 201", st == 201
+              and r.get("results") == [True])
+        st, r = http("POST", f"{BASE}/v1/credentials/{cid}/prove",
+                     {"predicates": [{"path": "/tags/01", "op": "exists"}]})
+        check("谓词非法数组索引 -> 400", st == 400 and bool(r.get("error")))
         st, r = http("POST", f"{BASE}/v1/credentials/{cid}/prove",
                      {"predicates": [{"path": "/tags", "op": "exists"}]})
         check("谓词数组整值路径仍可用", st == 201)
