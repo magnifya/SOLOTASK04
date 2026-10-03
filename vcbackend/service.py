@@ -7131,13 +7131,20 @@ def build_handler(store: VCStore) -> type:
             # POST /v1/trust/credentials/verify-with-schema：跨系统模式
             # 约束验真（只读）。请求体须恰含 body（对象）、signature
             # （非空字符串）、schema_id（非空字符串）、schema_version
-            # （非布尔正整数）；请求缺失、多余、非法 JSON、非对象或
-            # 模式参数类型错误统一 HTTP 200 返回
-            # {"valid":false,"reason":"请求参数无效"}。其余校验顺序
-            # （凭证基础字段 -> 模式查找 -> 模式绑定与 claims -> 锚点 ->
-            # 签名格式 -> 验签 -> 有效期 -> 外部停用通告）与原因见
-            # store.verify_trust_credential_with_schema；成功仅
-            # {"valid":true}。纯只读：不登记 DID/凭证，不改模式、锚点、
+            # （非布尔正整数），可额外包含 schema（对象，模式查询响应的
+            # 六字段格式：schema_id/version/issuer_did/claim_types/
+            # required_claims/digest）；请求缺失、多余、非法 JSON、非
+            # 对象、schema 非对象或模式参数类型错误统一 HTTP 200 返回
+            # {"valid":false,"reason":"请求参数无效"}。省略 schema 时按
+            # 本租户本地模式验真；提供时仅采用提交模式（不回退或覆盖本
+            # 地同名版本、不借用他租户数据，本地同名模式的内容差异或
+            # deprecated/revoked 不影响结论），其内容沿用注册规则但
+            # issuer_did 无需本地 DID，digest 须为原五字段规范化 JSON
+            # 的 SHA-256 小写 hex 且重算一致，否则“凭证模式非法”。
+            # 其余校验顺序（凭证基础字段 -> 模式 -> 模式绑定与 claims ->
+            # 锚点 -> 签名格式 -> 验签 -> 有效期 -> 外部停用通告）与原因
+            # 见 store.verify_trust_credential_with_schema；成功仅
+            # {"valid":true}。纯只读：不登记 DID/凭证/模式，不改锚点、
             # 状态、历史或审计。
             try:
                 length = int(self.headers.get("Content-Length") or 0)
