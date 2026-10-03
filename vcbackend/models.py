@@ -304,6 +304,29 @@ class PresentationRequestRecord:
 
 
 @dataclass
+class PresentationRequestHistoryEvent:
+    """展示请求历史中的一条事件（只读历史查询用）。
+
+    由对应审计事件派生（不另存历史）：创建对应
+    presentation.request.created（status=pending），首次取消对应
+    presentation.request.cancelled（status=cancelled、reason 为保存的
+    首次取消原因），request_id 模式首次成功消费对应演示消费审计
+    presentation.consumed（status=consumed、presentation_id 为实际演示
+    ID）。reason 仅取消事件非 None，presentation_id 仅消费事件非 None。
+    audit_seq/audit_timestamp 为对应审计的序号与整数 Unix 秒；cursor
+    等于 audit_seq（允许间隔），事件按 cursor 升序。
+    """
+
+    action: str
+    status: str
+    reason: Optional[str]
+    presentation_id: Optional[str]
+    audit_seq: int
+    audit_timestamp: int
+    cursor: int
+
+
+@dataclass
 class MultiPresentationItem:
     """多凭证组合展示中的单个凭证投影项。
 

@@ -67,6 +67,7 @@ from .models import (
     PredicateProofRecord,
     PresentationRecord,
     PresentationRequestRecord,
+    PresentationRequestHistoryEvent,
     PresentationSyncReceiptConsumptionEvent,
     ReceiptConsumptionEvent,
     TrustPresentationConsumptionEvent,
@@ -4656,6 +4657,91 @@ class VCStore:
             except Exception:
                 self._restore_locked(snapshot)
                 raise
+
+    def list_presentation_request_history(
+        self,
+        tenant_id: str,
+        request_id: str,
+        after: int = 0,
+        limit: int = 50,
+    ) -> Tuple[List[PresentationRequestHistoryEvent], int]:
+        """只读查询某展示请求的生命周期历史（创建/首次取消/首次消费）。
+
+        - 请求在本租户不存在（含他租户）抛 NotFoundError（HTTP 404）；
+        - 事件由本租户审计日志派生，不另存历史、不补造事件：创建对应
+          presentation.request.created（resource_type 为
+          presentation_request、resource_id 为请求 ID），首次取消对应
+          presentation.request.cancelled（reason 取请求行保存的首次
+          原因），request_id 模式首次成功消费对应演示消费审计
+          presentation.consumed（resource_type 为 presentation、
+          resource_id 为请求行保存的 consumed_presentation_id），不另
+          记请求消费审计；重复取消/消费、验真失败、保存失败、生成演示
+          与自然到期均无对应审计，自然不出现；
+        - 事件按 cursor（等于审计 seq，允许间隔）升序；after 排除
+          cursor 不大于其值的事件，至多返回 limit 项；next_after 为
+          本页末项 cursor，空页保持 after；
+        - 旧请求仅有对应审计的事件出现在结果中，没有则返回空页。
+        纯只读：不修改任何状态、不记审计、不触发落盘。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            row = (
+                bucket["presentation_requests"].get(request_id)
+                if bucket is not None
+                else None
+            )
+            if row is None:
+                raise NotFoundError(f"展示请求不存在: {request_id}")
+            cancel_reason = row.get("cancel_reason")
+            consumed_pid = row.get("consumed_presentation_id")
+            picked: List[PresentationRequestHistoryEvent] = []
+            for event in self._audit:
+                if len(picked) >= limit:
+                    break
+                if event.get("tenant_id") != tenant_id:
+                    continue
+                seq = int(event.get("seq", 0))
+                if seq <= after:
+                    continue
+                action = event.get("action")
+                resource_type = event.get("resource_type")
+                resource_id = event.get("resource_id")
+                mapped: Optional[Tuple[str, Optional[str], Optional[str]]]
+                if (
+                    action == AUDIT_PRESENTATION_REQUEST_CREATED
+                    and resource_type == "presentation_request"
+                    and resource_id == request_id
+                ):
+                    mapped = ("pending", None, None)
+                elif (
+                    action == AUDIT_PRESENTATION_REQUEST_CANCELLED
+                    and resource_type == "presentation_request"
+                    and resource_id == request_id
+                ):
+                    mapped = ("cancelled", cancel_reason, None)
+                elif (
+                    action == AUDIT_PRESENTATION_CONSUMED
+                    and resource_type == "presentation"
+                    and consumed_pid is not None
+                    and resource_id == consumed_pid
+                ):
+                    mapped = ("consumed", None, consumed_pid)
+                else:
+                    continue
+                status, reason, presentation_id = mapped
+                picked.append(
+                    PresentationRequestHistoryEvent(
+                        action=action,
+                        status=status,
+                        reason=reason,
+                        presentation_id=presentation_id,
+                        audit_seq=seq,
+                        audit_timestamp=int(event.get("timestamp", 0)),
+                        cursor=seq,
+                    )
+                )
+            next_after = picked[-1].cursor if picked else after
+            return picked, next_after
 
     def create_presentation_for_request(
         self,
