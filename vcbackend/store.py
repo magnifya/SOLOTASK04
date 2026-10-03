@@ -14735,6 +14735,76 @@ class VCStore:
                 raise StorageError("存储失败") from exc
             return True, consumed_at
 
+    def consume_trust_proofs_batch(
+        self,
+        tenant_id: str,
+        keys: List[Tuple[str, str, str, str]],
+    ) -> List[Tuple[bool, Optional[str]]]:
+        """批量一次性消费跨系统外部谓词证明（防重放），与输入等长同序。
+
+        调用方须先对每项完成证明验真（/v1/trust/proofs/verify 全部
+        规则通过）。keys 每项为 (source_tenant_id, issuer_did,
+        proof_id, consumption_id)。本方法在锁内按输入顺序原子判定并
+        标记：
+        - 同键（含历史记录与批内前项）已消费：该项返回 (False, None)，
+          不写消费标记、不记审计；
+        - 首次消费：记录 consumed_at（UTC 秒精度 Z）并追加一条
+          trust.proof.consumed 审计（resource_type 为 trust_proof、
+          resource_id 为 consumption_id），该项返回 (True, consumed_at)；
+        - 本批全部新消费标记与审计在同一次原子写落盘；落盘失败回滚内存
+          中的全部消费标记与审计事件，抛 StorageError（可重试）；
+        - 与单条 consume 并发时每键仅一次成功，跨重启保留。
+
+        仅保存消费所需标识、摘要与时间，不保存证明原文。
+        """
+        with self._lock:
+            snapshot = self._snapshot_locked()
+            outcomes: List[Tuple[bool, Optional[str]]] = []
+            dirty = False
+            try:
+                for (
+                    source_tenant_id,
+                    issuer_did,
+                    proof_id,
+                    consumption_id,
+                ) in keys:
+                    bucket = self._bucket_locked(tenant_id)
+                    by_source = (
+                        bucket["consumed_trust_proofs"].get(source_tenant_id)
+                        if bucket is not None
+                        else None
+                    )
+                    by_issuer = (
+                        by_source.get(issuer_did)
+                        if by_source is not None
+                        else None
+                    )
+                    if by_issuer is not None and proof_id in by_issuer:
+                        outcomes.append((False, None))
+                        continue
+                    bucket = self._ensure_bucket_locked(tenant_id)
+                    consumed_at = _utc_now()
+                    bucket["consumed_trust_proofs"].setdefault(
+                        source_tenant_id, {}
+                    ).setdefault(issuer_did, {})[proof_id] = {
+                        "consumption_id": consumption_id,
+                        "consumed_at": consumed_at,
+                    }
+                    self._append_audit_locked(
+                        tenant_id,
+                        AUDIT_TRUST_PROOF_CONSUMED,
+                        "trust_proof",
+                        consumption_id,
+                    )
+                    outcomes.append((True, consumed_at))
+                    dirty = True
+                if dirty:
+                    self._save_locked()
+            except Exception as exc:
+                self._restore_locked(snapshot)
+                raise StorageError("存储失败") from exc
+            return outcomes
+
     def list_trust_presentation_consumptions(
         self,
         tenant_id: str,

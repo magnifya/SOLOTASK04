@@ -1402,6 +1402,32 @@ curl -X POST localhost:8080/v1/proofs/zp_<id>/verify \
   次原子写落盘，落盘失败回滚二者并 **500** 仅返
   `{"error":"存储失败"}`，可重试；租户隔离、重启仍判重；仅保存消费
   标识、摘要与时间，不保存证明原文，既有验真接口保持只读。
+- `POST /v1/trust/proofs/consume-batch` 为批量一次性消费版本：请求体
+  必须恰为 `{"items":[项...]}`，数组非空且不超过 100 项，每项沿用
+  单条 consume 的 `proof`、`challenge`、`source_tenant_id` 请求约定；
+  空体、非法 UTF-8 或 JSON、非对象、外层缺少或多余字段、`items` 非
+  数组、为空或超限，统一 HTTP 200 按键序恰返
+  `{"results":[],"reason":"请求非法"}`；显式空 `X-Tenant-ID` 仍返回
+  400。合法批次返回 HTTP 200，正文仅含与输入等长同序的 `results`，
+  逐项处理且失败不短路：项非对象、字段缺少或多余、`proof` 非对象、
+  `challenge` 或 `source_tenant_id` 不是非空字符串时，该项仅返
+  `{"valid":false,"reason":"请求项非法"}`；其他验真失败仅返
+  `{"valid":false,"reason":…}`，`reason` 与单条完全一致（合法证明的
+  `results` 含 `false` 也可消费，不要求本地登记 DID、凭证或证明）。
+  仅验真通过的项按接收租户内
+  `(source_tenant_id, issuer_did, proof_id)` 组合判重，历史重放与批
+  内后续重复均仅返
+  `{"valid":false,"reason":"外部证明已消费"}`，无效项不占键。成功项
+  仅含 `valid`、`consumption_id`（**单项请求**规范化 JSON 字节的
+  SHA-256 小写 64 位 hex）、`consumed_at`（UTC 秒精度 Z），失败项
+  仅含 `valid`、`reason`。本批全部新消费记录与每项的
+  `trust.proof.consumed` 审计（`resource_type` 为 `trust_proof`、
+  `resource_id` 为 `consumption_id`，可经 `GET /v1/audit` 追溯）同
+  锁一次原子落盘；存储失败统一 **500** 仅返
+  `{"error":"存储失败"}`，本批新增记录与审计全部不生效且可重试，已
+  有数据不变。单条与批量共享防重放记录：不同接收租户、不同消费键互
+  不影响，重启仍判重，并发（含单条）同键仅一次成功。仅保存消费标
+  识、摘要与时间，不保存证明原文。
 - `POST /v1/trust/credentials/verify-batch` 为批量版本，逐项规则与单项
   验真完全一致（字段、锚点、签名与原因分类）：
   - 请求体必须**恰为** `{"credentials":[项...]}`；`credentials` 须为
