@@ -136,6 +136,11 @@ CREDENTIAL_EXPIRED_REASON = "凭证已过期"
 # 凭证暂停时验签类端点返回的统一中文原因前缀
 CREDENTIAL_SUSPENDED_REASON_PREFIX = "凭证已暂停："
 
+# 谓词证明持有者绑定校验失败的统一中文原因（本地验证：持有者字段
+# 缺失/类型错误/与存储或凭证主体不符、未绑定记录附加绑定字段、历史
+# 公钥不可用、holder_proof 验签失败、持有者停用或所用密钥版本吊销）
+HOLDER_BINDING_FAIL_REASON = "持有者绑定校验失败"
+
 # 暂停原因首尾裁剪后允许的最大 Unicode 码点长度
 MAX_SUSPEND_REASON = 256
 
@@ -5915,6 +5920,13 @@ class VCStore:
             challenge=row["challenge"],
             expires_at=row["expires_at"],
             proof=row["proof"],
+            holder_did=row.get("holder_did"),
+            holder_key_version=(
+                int(row["holder_key_version"])
+                if row.get("holder_key_version") is not None
+                else None
+            ),
+            holder_proof=row.get("holder_proof"),
         )
 
     def create_proof(
@@ -5924,6 +5936,7 @@ class VCStore:
         predicates: Any,
         challenge: Optional[str] = None,
         expires_in: Optional[int] = None,
+        holder_binding: bool = False,
     ) -> PredicateProofRecord:
         """对本租户已签发凭证生成谓词证明并持久化，记审计。
 
@@ -5935,7 +5948,16 @@ class VCStore:
         - results 为与 predicates 同序的布尔求值结果；
         - proof 为 ES256 签名，覆盖除 proof 外字段（含 tenant_id）按
           key 升序规范化 JSON，使用凭证 issuer_key_version（旧凭证缺省
-          按 1）对应的历史私钥；
+          按 1）对应的历史私钥；issuer proof 覆盖范围不随持有者绑定改变；
+        - holder_binding 为 True 时，先完成全部既有校验，再要求凭证
+          subject_did 属于当前租户且活动：未知或跨租户抛 ValidationError
+          （400），已停用抛 ConflictError（409），持有者当前私钥不可用
+          或当前密钥版本已吊销抛 ValidationError（400），均不生成证明、
+          不记审计。绑定证明额外写入 holder_did（即 subject_did）、
+          holder_key_version（持有者当前密钥版本）与 holder_proof（持有
+          者当前私钥对“去掉 proof、holder_proof 后的完整证明对象 +
+          tenant_id”规范化 JSON 的 ES256 签名）。未绑定（缺省 False）
+          不注入任何 holder_* 字段，与旧流程完全兼容；
         - proof_id 为 zp_ 加 32 位小写 hex；成功记 proof.created。
         """
         if challenge is None:
@@ -5949,7 +5971,7 @@ class VCStore:
             # 快照恢复，保持调用方可见的租户桶对象引用稳定。
             row = self._build_proof_row_locked(
                 tenant_id, bucket, credential_id, predicates,
-                challenge, expires_at,
+                challenge, expires_at, holder_binding,
             )
             snapshot = self._snapshot_locked()
             try:
@@ -5973,6 +5995,7 @@ class VCStore:
         predicates: Any,
         challenge: str,
         expires_at: str,
+        holder_binding: bool = False,
     ) -> Dict[str, Any]:
         """在锁内完成单项谓词证明的全部校验与签名，返回待落盘证明行。
 
@@ -5981,8 +6004,11 @@ class VCStore:
         predicates 非法（非非空数组、元素字段/op/路径/数值问题、路径
         重复或祖先重叠）抛 ValidationError；签发者 DID 已停用或凭证已
         暂停抛 ConflictError；历史私钥缺失或签发密钥版本已吊销抛
-        ValidationError。调用方负责把返回行写入 proofs 并与审计事件同次
-        原子落盘。
+        ValidationError。holder_binding 为 True 时，在上述既有校验全部
+        通过后再做持有者校验：凭证 subject_did 未知或非本租户已注册
+        DID、持有者当前私钥缺失或当前密钥版本已吊销抛 ValidationError，
+        持有者 DID 已停用抛 ConflictError，均不返回行。调用方负责把返回
+        行写入 proofs 并与审计事件同次原子落盘。
         """
         cred = (
             bucket["credentials"].get(credential_id)
@@ -6033,6 +6059,51 @@ class VCStore:
                 f"凭证已暂停，不能生成谓词证明: {credential_id}"
             )
 
+        # 持有者绑定：既有校验全部通过后，subject_did 须为本租户活动
+        # DID，使用其当前密钥版本私钥签名；未绑定不查询、不注入任何
+        # holder_* 字段。
+        holder_did: Optional[str] = None
+        holder_key_version: Optional[int] = None
+        holder_private_pem: Optional[str] = None
+        if holder_binding:
+            holder_did = stored_body.get("subject_did")
+            if not isinstance(holder_did, str) or not holder_did:
+                raise ValidationError(
+                    "凭证缺少合法 subject_did，无法进行持有者绑定"
+                )
+            holder_rec = bucket["dids"].get(holder_did)
+            if holder_rec is None:
+                raise ValidationError(
+                    f"subject_did 不是本租户已注册 DID: {holder_did}"
+                )
+            # 持有者已停用：409，不生成证明、不记审计。
+            if self._is_did_deactivated_locked(holder_rec):
+                raise ConflictError(
+                    "持有者 DID 已停用，不能生成持有者绑定谓词证明: "
+                    f"{holder_did}"
+                )
+            holder_key_version = int(holder_rec.get("key_version", 1))
+            holder_private_pem = self._private_key_for_version_locked(
+                bucket, holder_did, holder_key_version
+            )
+            if not holder_private_pem:
+                raise ValidationError(
+                    "持有者当前密钥不可用: 持有者 "
+                    f"{holder_did} 密钥版本 {holder_key_version} 的私钥不存在"
+                )
+            # 绑定的持有者密钥版本已吊销：拒绝生成，400 且不留记录。
+            holder_entry = self._key_history_entry_by_version_locked(
+                bucket, holder_did, holder_key_version
+            )
+            if (
+                holder_entry is not None
+                and holder_entry.get("status") == "revoked"
+            ):
+                raise ValidationError(
+                    "持有者密钥版本已吊销，不能生成持有者绑定谓词证明: "
+                    f"{holder_did}#{holder_key_version}"
+                )
+
         proof_id = f"zp_{uuid.uuid4().hex}"
         unsigned: Dict[str, Any] = {
             "proof_id": proof_id,
@@ -6048,6 +6119,19 @@ class VCStore:
         proof = crypto.sign(unsigned, private_pem)
         row = dict(unsigned)
         row["proof"] = proof
+        if holder_binding:
+            # holder_proof 覆盖去掉 proof、holder_proof 后的完整证明
+            # 对象（含 holder_did/holder_key_version）及 tenant_id；
+            # issuer proof 覆盖范围保持不变。
+            holder_payload = dict(unsigned)
+            holder_payload["holder_did"] = holder_did
+            holder_payload["holder_key_version"] = holder_key_version
+            holder_proof = crypto.sign(
+                holder_payload, holder_private_pem
+            )
+            row["holder_did"] = holder_did
+            row["holder_key_version"] = holder_key_version
+            row["holder_proof"] = holder_proof
         return row
 
     def create_proofs_batch(
@@ -6092,7 +6176,9 @@ class VCStore:
             # 阶段二（400 优先）：先把所有项的谓词结构、路径、运算和
             # 取值全部校验并求值，再检查凭证与签发者资源状态；任一项
             # 非法整体失败，不进入状态判定，也不写入任何记录/审计。
-            prepared: List[Tuple[str, str, List[Dict[str, Any]], List[bool]]] = []
+            prepared: List[
+                Tuple[str, str, List[Dict[str, Any]], List[bool], bool]
+            ] = []
             for item in items:
                 challenge = item.get("challenge")
                 if challenge is None:
@@ -6106,7 +6192,13 @@ class VCStore:
                 )
                 results = _evaluate_predicates(claims, validated)
                 prepared.append(
-                    (challenge, expires_at, validated, results)
+                    (
+                        challenge,
+                        expires_at,
+                        validated,
+                        results,
+                        bool(item.get("holder_binding", False)),
+                    )
                 )
 
             # 阶段三：全部项校验通过后才检查资源状态，顺序与单项
@@ -6144,9 +6236,64 @@ class VCStore:
                     f"凭证已暂停，不能生成谓词证明: {credential_id}"
                 )
 
+            # 阶段三b：仅对请求持有者绑定的项做持有者资源状态校验，
+            # 规则与单项 prove 完全一致——subject_did 未知或非本租户
+            # DID、持有者当前私钥缺失或当前密钥版本吊销 400，持有者
+            # 已停用 409；按 items 顺序首错即整体失败。
+            holder_params: List[Optional[Tuple[str, int, str]]] = []
+            for _challenge, _expires_at, _validated, _results, binding in prepared:
+                if not binding:
+                    holder_params.append(None)
+                    continue
+                holder_did = stored_body.get("subject_did")
+                if not isinstance(holder_did, str) or not holder_did:
+                    raise ValidationError(
+                        "凭证缺少合法 subject_did，无法进行持有者绑定"
+                    )
+                holder_rec = bucket["dids"].get(holder_did)
+                if holder_rec is None:
+                    raise ValidationError(
+                        f"subject_did 不是本租户已注册 DID: {holder_did}"
+                    )
+                if self._is_did_deactivated_locked(holder_rec):
+                    raise ConflictError(
+                        "持有者 DID 已停用，不能生成持有者绑定谓词证明: "
+                        f"{holder_did}"
+                    )
+                holder_key_version = int(holder_rec.get("key_version", 1))
+                holder_private_pem = self._private_key_for_version_locked(
+                    bucket, holder_did, holder_key_version
+                )
+                if not holder_private_pem:
+                    raise ValidationError(
+                        "持有者当前密钥不可用: 持有者 "
+                        f"{holder_did} 密钥版本 "
+                        f"{holder_key_version} 的私钥不存在"
+                    )
+                holder_entry = self._key_history_entry_by_version_locked(
+                    bucket, holder_did, holder_key_version
+                )
+                if (
+                    holder_entry is not None
+                    and holder_entry.get("status") == "revoked"
+                ):
+                    raise ValidationError(
+                        "持有者密钥版本已吊销，不能生成持有者绑定谓词证明: "
+                        f"{holder_did}#{holder_key_version}"
+                    )
+                holder_params.append(
+                    (holder_did, holder_key_version, holder_private_pem)
+                )
+
             # 阶段四：纯签名构建行，不改变任何状态。
             built: List[Dict[str, Any]] = []
-            for challenge, expires_at, validated, results in prepared:
+            for (
+                challenge,
+                expires_at,
+                validated,
+                results,
+                binding,
+            ), holder_param in zip(prepared, holder_params):
                 proof_id = f"zp_{uuid.uuid4().hex}"
                 unsigned: Dict[str, Any] = {
                     "proof_id": proof_id,
@@ -6162,6 +6309,21 @@ class VCStore:
                 proof = crypto.sign(unsigned, private_pem)
                 row = dict(unsigned)
                 row["proof"] = proof
+                if binding:
+                    # 与单项 prove 同构：holder_proof 覆盖去掉 proof、
+                    # holder_proof 后的完整证明对象及 tenant_id。
+                    assert holder_param is not None
+                    holder_did, holder_key_version, holder_private_pem = (
+                        holder_param
+                    )
+                    holder_payload = dict(unsigned)
+                    holder_payload["holder_did"] = holder_did
+                    holder_payload["holder_key_version"] = holder_key_version
+                    row["holder_did"] = holder_did
+                    row["holder_key_version"] = holder_key_version
+                    row["holder_proof"] = crypto.sign(
+                        holder_payload, holder_private_pem
+                    )
                 built.append(row)
             # 全部项校验与签名通过后才统一写入并记审计、落盘；记录与
             # 审计同次原子提交，落盘失败整体回滚。
@@ -6191,12 +6353,21 @@ class VCStore:
 
         校验顺序：请求 -> 资源 ID -> 绑定（字段集合与各锚定字段、
         请求 challenge、证明 challenge 与 proof 覆盖的存储 challenge
-        三者一致）-> 已消费（优先于过期）-> 过期（当前时间 >=
+        三者一致；绑定证明另锚定 holder_did/holder_key_version/
+        holder_proof 字段）-> 已消费（优先于过期）-> 过期（当前时间 >=
         expires_at）-> 按存储凭证 claims 与存储 predicates 重算
-        results 并核对 -> proof 格式与签名。验签成功后在消费锁内
-        复查已消费/到期：复查到期即返回“证明已过期”，不消费、不记
-        审计；签发密钥吊销、签发 DID 停用、凭证过期/暂停/已吊销均在
-        验签与锚定成功后按序拒绝（证明自身过期优先于暂停与吊销），
+        results 并核对 -> issuer proof 格式与签名。issuer proof 通过后
+        按序复查签发密钥吊销、签发者 DID 停用，随后进行持有者绑定
+        校验（holder_did 与存储及凭证 subject_did 一致、持有者为本
+        租户 DID、历史公钥可用、holder_proof 验签、持有者未停用、所用
+        密钥版本未吊销），再判定凭证有效期/暂停/吊销。持有者字段缺失、
+        类型错误、与存储或凭证主体不符、未绑定记录附加绑定字段、历史
+        公钥不可用、holder_proof 验签失败、持有者已停用或所用版本吊销
+        一律返回“持有者绑定校验失败”，位于签发者校验之后、凭证有效期
+        及状态判定之前；较早的既有失败优先。任何持有者失败均不消费、
+        不记审计。验签成功后在消费锁内复查已消费/到期/签发与持有者
+        状态/凭证状态：复查到期即返回“证明已过期”，不消费、不记审计；
+        消费提交时持有者已停用或密钥已吊销按同一持有者原因拒绝；
         已吊销返回“凭证已吊销：<首次原因>”，同样不消费、不记审计；
         未到期并发验证仅一次成功，成功时原子标记已消费并记一次
         proof.consumed（同一次原子写，失败回滚），跨重启保留。
@@ -6205,6 +6376,11 @@ class VCStore:
         if not isinstance(proof, dict):
             return False, "请求不合法: 字段 proof 必须为 JSON 对象"
 
+        holder_fields = {
+            "holder_did",
+            "holder_key_version",
+            "holder_proof",
+        }
         with self._lock:
             bucket = self._bucket_locked(tenant_id)
             row = (
@@ -6217,6 +6393,8 @@ class VCStore:
             if challenge is CHALLENGE_UNSET:
                 return False, "请求缺少字段: challenge"
 
+            # 绑定证明按存储记录是否含 holder_did 判定。
+            is_holder_bound = "holder_did" in row
             expected_keys = {
                 "proof_id",
                 "credential_id",
@@ -6228,7 +6406,21 @@ class VCStore:
                 "expires_at",
                 "proof",
             }
-            if set(proof) != expected_keys:
+            submitted_keys = set(proof)
+            if is_holder_bound:
+                # 绑定证明删掉任一持有者字段 -> 持有者绑定校验失败；
+                # 持有者字段齐全但有其他多余/缺失字段时，沿用既有字段
+                # 集合锚定原因（较早的既有失败优先）。
+                if holder_fields - submitted_keys:
+                    return False, HOLDER_BINDING_FAIL_REASON
+                if submitted_keys != expected_keys | holder_fields:
+                    return False, (
+                        "锚定校验失败: proof 字段集合与存储记录不一致"
+                    )
+            elif submitted_keys & holder_fields:
+                # 未绑定记录附加任一持有者字段 -> 持有者绑定校验失败。
+                return False, HOLDER_BINDING_FAIL_REASON
+            elif submitted_keys != expected_keys:
                 return False, (
                     "锚定校验失败: proof 字段集合与存储记录不一致"
                 )
@@ -6259,6 +6451,22 @@ class VCStore:
                 proof.get("predicates"), row.get("predicates", [])
             ):
                 return False, "锚定校验失败: predicates 与存储记录不一致"
+
+            # 持有者字段与存储记录逐一锚定；holder_proof 须为非空字符串。
+            if is_holder_bound:
+                if proof.get("holder_did") != row.get("holder_did"):
+                    return False, HOLDER_BINDING_FAIL_REASON
+                stored_holder_version = row.get("holder_key_version")
+                holder_version_obj = proof.get("holder_key_version")
+                if (
+                    not isinstance(holder_version_obj, int)
+                    or isinstance(holder_version_obj, bool)
+                    or holder_version_obj != stored_holder_version
+                ):
+                    return False, HOLDER_BINDING_FAIL_REASON
+                holder_proof = proof.get("holder_proof")
+                if not isinstance(holder_proof, str) or not holder_proof:
+                    return False, HOLDER_BINDING_FAIL_REASON
 
             # 请求 challenge、证明 challenge 与 proof 覆盖的存储
             # challenge 三者必须一致
@@ -6326,6 +6534,41 @@ class VCStore:
                 else None
             )
 
+            # 持有者绑定：在锁内收集持有者锚定与状态数据；具体签名与
+            # 状态判定位于签发者校验之后、凭证有效期之前。
+            holder_did_value: Optional[str] = None
+            holder_version_value: Optional[int] = None
+            holder_public_pem: Optional[str] = None
+            holder_key_revoked = False
+            holder_did_deactivated = False
+            subject_did_mismatch = False
+            holder_missing = False
+            if is_holder_bound:
+                holder_did_value = row.get("holder_did")
+                subject_did = cred["body"].get("subject_did")
+                if holder_did_value != subject_did:
+                    subject_did_mismatch = True
+                holder_rec = bucket["dids"].get(holder_did_value)
+                if holder_rec is None:
+                    holder_missing = True
+                else:
+                    holder_did_deactivated = (
+                        self._is_did_deactivated_locked(holder_rec)
+                    )
+                holder_version_value = int(
+                    row.get("holder_key_version", 0)
+                )
+                holder_public_pem = self._public_key_for_version_locked(
+                    bucket, holder_did_value, holder_version_value
+                )
+                holder_entry = self._key_history_entry_by_version_locked(
+                    bucket, holder_did_value, holder_version_value
+                )
+                holder_key_revoked = (
+                    holder_entry is not None
+                    and holder_entry.get("status") == "revoked"
+                )
+
         # 按存储的 predicates 从存储凭证 claims 重算结果并核对
         stored_predicates = list(row.get("predicates", []))
         try:
@@ -6386,6 +6629,33 @@ class VCStore:
             )
             return False, f"{DID_DEACTIVATED_REASON_PREFIX}{saved_reason}"
 
+        # 持有者绑定校验（位于签发者校验之后、凭证有效期及状态判定
+        # 之前）：任何失败统一原因、不消费、不记审计。
+        if is_holder_bound:
+            if subject_did_mismatch or holder_missing:
+                return False, HOLDER_BINDING_FAIL_REASON
+            if not holder_public_pem:
+                return False, HOLDER_BINDING_FAIL_REASON
+            try:
+                crypto.validate_public_key_pem(holder_public_pem)
+            except (ValueError, TypeError):
+                return False, HOLDER_BINDING_FAIL_REASON
+            # holder_proof 覆盖去掉 proof、holder_proof 后的完整证明
+            # 对象（与 issuer proof 覆盖对象同构，另含 holder_did、
+            # holder_key_version；tenant_id 已在 issuer 覆盖对象中）。
+            holder_unsigned = dict(unsigned)
+            holder_unsigned["holder_did"] = holder_did_value
+            holder_unsigned["holder_key_version"] = holder_version_value
+            try:
+                crypto.verify(
+                    holder_unsigned, holder_proof, holder_public_pem
+                )
+            except Exception:  # noqa: BLE001 格式/验签失败统一原因
+                return False, HOLDER_BINDING_FAIL_REASON
+            # 持有者已停用或签名所用密钥版本已吊销：同一原因拒绝。
+            if holder_did_deactivated or holder_key_revoked:
+                return False, HOLDER_BINDING_FAIL_REASON
+
         # 绑定与签名均成功后检查凭证有效期：凭证已到期直接拒绝，不消费、
         # 不记消费审计（自身绑定/签名失败仍优先返回原分类原因）。
         if _is_expired(credential_expires_at):
@@ -6445,6 +6715,27 @@ class VCStore:
                 return False, (
                     f"{DID_DEACTIVATED_REASON_PREFIX}{saved_reason}"
                 )
+            # 锁内复查持有者状态（防锁外验签期间被停用或密钥被吊销的
+            # 竞态）：按同一持有者原因拒绝，不消费、不记审计，并发仍
+            # 仅一次成功。
+            if is_holder_bound and holder_did_value is not None:
+                holder_row_now = bucket["dids"].get(holder_did_value)
+                if holder_row_now is None or self._is_did_deactivated_locked(
+                    holder_row_now
+                ):
+                    return False, HOLDER_BINDING_FAIL_REASON
+                holder_entry_now = (
+                    self._key_history_entry_by_version_locked(
+                        bucket,
+                        holder_did_value,
+                        holder_version_value,
+                    )
+                )
+                if (
+                    holder_entry_now is not None
+                    and holder_entry_now.get("status") == "revoked"
+                ):
+                    return False, HOLDER_BINDING_FAIL_REASON
             cred = bucket["credentials"].get(credential_id)
             if cred is not None and _is_expired(cred["body"].get("expires_at")):
                 return False, CREDENTIAL_EXPIRED_REASON

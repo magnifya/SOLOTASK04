@@ -59,9 +59,9 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/credentials/{credential_id}/present-batch` | 原子批量生成选择性披露演示，请求体须恰为 `{"presentations":[项...]}`，数组非空且不超过 50 项；每项恰含 `disclose` 及可选 `challenge`、`expires_in`、`holder_binding`，规则同单项 present（challenge 非空串≤256 码点、缺省 32 位小写 hex；`expires_in` 非布尔整数 1–86400、缺省 300；`holder_binding` 布尔、缺省 false，绑定时 subject_did 须本租户已注册 DID）；disclose 按 RFC6901 命中 claims，支持数组元素选择（索引为 0 或无前导零 ASCII 十进制非负整数，负数/正号/前导零/非 ASCII 数字/`-` 非法），禁根/越界/穿标量/重复/祖先重叠，部分披露数组按最大下标+1 保留下标、空位填 null，`[]` 零披露；外层或任一项非法 400（非空中文原因）且整批不写入、不记审计，未知凭证 404；成功 201 返回 `{"presentations":[...]}`，与输入等长、同序，项键序固定为 `presentation_id`、`credential_id`、`issuer_did`、`issuer_key_version`、`disclose`、`claims`、`challenge`、`expires_at`、`proof`（绑定项末尾加 `holder_did`、`holder_key_version`、`holder_proof`）；全部记录与每条演示的审计事件同一次原子提交，失败整体回滚，ES256 签名与单项一致、重启可验签 |
 | POST | `/v1/presentations/multi` | 多凭证原子组合展示，请求体恰为 `{"items":[项...]}` 加可选组合级 `challenge`、`expires_in`、`holder_binding`；items 非空且不超过 100 项，每项恰含非空字符串 `credential_id` 与 `disclose`，批内 credential_id 不重复；disclose 沿用 RFC6901 规则（拒根路径、非法/越界数组索引、穿标量、重复、祖先/后代嵌套覆盖，支持数组元素选择与 null 占位投影，`[]` 零披露）；challenge 非空串≤256 码点、缺省 32 位小写 hex；`expires_in` 非布尔整数 1–86400、缺省 300；`holder_binding` 仅布尔、缺省 false，绑定时各凭证 subject_did 须一致且为本租户已注册 DID；items 为空/超 100/重复、字段、披露、挑战、期限、holder_binding 或 subject_did 错误统一 400，未知或跨租户凭证 404，签发者停用/凭证暂停 409，失败不落盘不记审计；成功 201，`presentation_id` 为 `mvp_` 加 32 位小写 hex，响应含凭证投影、各凭证签发证明、统一 challenge、expires_at（项键序 `credential_id`、`issuer_did`、`issuer_key_version`、`disclose`、`claims`、`proof`），绑定时另含 `holder_did`、`holder_key_version`、`holder_proof`（持有者当前私钥对整个组合加 tenant_id 的单次 ES256 签名），输出只含所选 claim |
 | POST | `/v1/presentations/{presentation_id}/verify` | 校验演示，支持两种模式：①challenge 模式（行为不变），新演示（含 `mvp_` 多凭证组合展示）请求体恰为 `{"presentation":对象,"challenge":串}`（旧演示恰为 `{"presentation":对象}`）；②request_id 模式，请求体恰为 `{"presentation":对象,"request_id":非空串}`，不接受 challenge（绑定/非绑定均使用请求 challenge）并执行请求策略（disclose 全等、issuer_dids 白名单、holder_binding 与本租户已注册持有人），未知 presentation_id（含跨租户）404；**任何语义失败一律 HTTP 200**，成功 `{"valid":true}`，失败附非空中文 `reason`；request_id 模式在保留展示存在性与请求绑定校验的前提下，绑定通过后请求已取消即返回 `{"valid":false,"reason":"展示请求已取消"}`，该判定先于过期与后续凭证校验（适用于绑定与非绑定展示）且不消费演示或请求；其余固定 reason 按策略不满足、不匹配、过期、已消费依次为 `展示请求策略不满足`、`展示请求不匹配`、`展示请求已过期`、`展示请求已消费`，演示重复消费沿用 `展示已消费`，凭证/密钥状态原因沿用现有文案；组合展示全部凭证的签发锚定、密钥版本、投影、签发证明、统一 challenge、有效期、可选持有人签名与当前状态通过才有效；request_id 模式仅首次完整验证成功时在同一次原子写把演示与请求同时置为已消费（记 presentation.consumed、`presentation.consumed_presentation_id`），失败均不消费请求，重复验证 reason 为展示已消费；challenge 模式组合消费语义不变 |
-| POST | `/v1/credentials/{credential_id}/prove` | 生成谓词证明，请求体恰为 `{"predicates":[项...]}` 加可选 `challenge`、`expires_in`；成功 201 返回证明对象；字段问题 400、未知凭证 404 |
-| POST | `/v1/credentials/{credential_id}/prove-batch` | 原子批量生成谓词证明，请求体须恰为 `{"items":[项...]}`，数组非空且不超过 50 项；每项恰含 `predicates` 及可选 `challenge`、`expires_in`，谓词结构/路径/运算、挑战与有效期规则全同单项 prove（challenge 非空串≤256 码点、缺省逐项独立生成 32 位小写 hex；`expires_in` 非布尔整数 1–86400、缺省逐项独立取 300）；单条项内路径禁重复与祖先/后代重叠，不同项互不约束；空体、非法 JSON、非对象、外层缺 `items`、非数组/空/超 50、多余字段或任一项字段、类型、谓词值、challenge、expires_in 非法均 400（非空中文原因），全部项请求级校验通过后才查凭证，未知/跨租户凭证 404，随后把所有项的谓词结构、路径、运算与取值对照凭证 claims 全部校验完（任一项非法仍 400），再依次检查签发 DID 停用 409、签发密钥吊销 400、凭证暂停 409，任一失败均不留证明或审计；成功 201 仅返回 `{"proofs":[...]}`，与输入等长、同序，每项就是单项 prove 的成功对象（`results` 按该项谓词在凭证 claims 上的计算结果排列）；全部证明记录与每条 `proof.created` 审计同一次原子提交，任一失败或落盘失败整体回滚、审计序号不前进（落盘失败 500 非空 error）；各证明 `proof_id` 独立，重启后仍可经既有 `/v1/proofs/{id}/verify` 验真，挑战、过期与一次性消费行为不变 |
-| POST | `/v1/proofs/{proof_id}/verify` | 校验谓词证明，请求体恰为 `{"proof":对象,"challenge":串}`；**任何失败一律 HTTP 200**，成功 `{"valid":true}`，失败附非空中文 `reason` |
+| POST | `/v1/credentials/{credential_id}/prove` | 生成谓词证明，请求体恰为 `{"predicates":[项...]}` 加可选 `challenge`、`expires_in`、`holder_binding`；省略或 `holder_binding:false` 成功 201 返回九字段证明对象（与旧流程完全兼容），`holder_binding` 非布尔 400、未知凭证 404；`holder_binding:true` 先完成全部既有校验，再要求凭证 `subject_did` 属于当前租户且活动（未知/跨租户 400、已停用 409），持有者当前私钥不可用或当前密钥版本已吊销 400，均不生成证明或审计；成功 201 在原九字段上追加 `holder_did`（凭证主体）、`holder_key_version`（生成时当前版本）、`holder_proof`（该版本持有者私钥对去掉 `proof`、`holder_proof` 的完整证明对象加 `tenant_id` 的 ES256 裸 R||S 无填充 base64url 签名），issuer proof 覆盖范围不变；绑定信息随证明保存，重启与正常轮换后按记录的历史公钥验证 |
+| POST | `/v1/credentials/{credential_id}/prove-batch` | 原子批量生成谓词证明，请求体须恰为 `{"items":[项...]}`，数组非空且不超过 50 项；每项恰含 `predicates` 及可选 `challenge`、`expires_in`、`holder_binding`，谓词结构/路径/运算、挑战、有效期与持有者绑定规则全同单项 prove（challenge 非空串≤256 码点、缺省逐项独立生成 32 位小写 hex；`expires_in` 非布尔整数 1–86400、缺省逐项独立取 300；`holder_binding` 布尔、缺省 false，允许批次混合绑定与未绑定证明）；单条项内路径禁重复与祖先/后代重叠，不同项互不约束；空体、非法 JSON、非对象、外层缺 `items`、非数组/空/超 50、多余字段或任一项字段、类型、谓词值、challenge、expires_in、holder_binding 非法均 400（非空中文原因），全部项请求级校验通过后才查凭证，未知/跨租户凭证 404，随后把所有项的谓词结构、路径、运算与取值对照凭证 claims 全部校验完（任一项非法仍 400），再依次检查签发 DID 停用 409、签发密钥吊销 400、凭证暂停 409，随后对绑定项检查持有者 subject 未知/跨租户或密钥不可用/吊销 400、持有者停用 409，任一失败均不留证明或审计；成功 201 仅返回 `{"proofs":[...]}`，与输入等长、同序，每项就是单项 prove 的成功对象（未绑定九字段、绑定十二字段，`results` 按该项谓词在凭证 claims 上的计算结果排列）；全部证明记录与每条 `proof.created` 审计同一次原子提交，任一失败或生成保存失败整体回滚、审计序号不前进（保存失败 500 非空 error）；各证明 `proof_id` 独立，重启后仍可经既有 `/v1/proofs/{id}/verify` 验真，挑战、过期与一次性消费行为不变 |
+| POST | `/v1/proofs/{proof_id}/verify` | 校验谓词证明，请求体恰为 `{"proof":对象,"challenge":串}`；**任何失败一律 HTTP 200**，成功 `{"valid":true}`，失败附非空中文 `reason`；绑定证明（存储记录含 `holder_did`）请求对象须恰为十二字段（九字段加 `holder_did`、`holder_key_version`、`holder_proof`），未绑定记录恰为九字段——绑定证明删除持有者字段后按未绑定证明提交、或未绑定记录附加任何持有者字段均失败；持有者字段缺失、类型错误、与存储或凭证主体不符、持有者历史公钥不可用、`holder_proof` 验签失败、持有者已停用或所用密钥版本已吊销，均返回 `{"valid":false,"reason":"持有者绑定校验失败"}`，且不消费、不记审计；新增持有者签名与状态检查位于签发者校验之后、凭证有效期及状态判定之前，较早的既有失败优先；消费提交时锁内复查持有者停用/密钥吊销，按同一原因拒绝，并发仍仅一次成功；谓词求值、挑战、期限、旧记录、租户隔离及审计语义保持兼容；跨系统外部信任证明接口仍按九字段协议处理，不接收绑定证明，其他公开入口行为不变 |
 | POST | `/v1/trust/anchors` | 注册信任锚点，请求体 `{"did","public_key","key_version","uses"?}`（非空字符串、P-256 PEM、非布尔正整数；`uses` 可选，须为非空无重复字符串数组，取值限且按规范序 `generic`、`vc`、`vp`、`proof`、`did`、`status`、`deactivation`，省略为全用途）；返回 201 与 `did`、`public_key`、`key_version`、`status:"active"`、`updated_at:null` |
 | POST | `/v1/trust/anchors/{did}/rotate` | 带前置版本校验的密钥轮换，请求体须恰含 `from_key_version`（非布尔正整数）、`public_key`（P-256 PEM）；目标版本为 `from_key_version+1` 并继承前置 `uses`；新建 201、同前置同 PEM 幂等重试 200，响应字段同 GET 元素 |
 | GET | `/v1/trust/anchors/{did}` | 返回该 DID 的全部锚点版本数组（按 `key_version` 升序）；未知 DID 404 |
@@ -531,8 +531,13 @@ curl "localhost:8080/v1/credentials/vc_<id>/status/history?limit=50&after=0"
     “持有者密钥已吊销：…”；**已消费（“演示已消费”）与演示自身过期
     （“演示已过期”）优先**于密钥吊销；密钥吊销失败**不消费**，并在
     消费锁内复查以防竞态。
-  - 谓词证明 verify：验签成功后查**签发密钥**版本，已吊销返回
-    “签发密钥已吊销：…”，失败不消费。
+  - 谓词证明 verify：按 **issuer proof 验签 → 签发密钥 → 签发者 DID
+    停用 → holder proof 验签 → 持有者停用/持有者密钥 → 凭证有效期/
+    暂停/吊销**顺序，签发密钥版本已吊销返回“签发密钥已吊销：…”；
+    绑定证明的持有者签名失败、持有者已停用或所用持有者密钥版本已吊销
+    统一返回“持有者绑定校验失败”；**已消费（“证明已消费”）与证明
+    自身过期（“证明已过期”）优先**于后续状态判定；持有者相关失败
+    **不消费**，并在消费锁内复查以防竞态。
   - 以上判定均在密码学验签成功之后：签名/锚定失败仍优先返回各自原因。
 - `present`/`prove`/`prove-batch` 生成时若凭证的签发密钥版本已吊销，或持有者绑定版本
   已吊销，返回 **400** 且**不留任何记录/审计**。
@@ -877,12 +882,16 @@ curl -X POST localhost:8080/v1/presentations/vp_<id>/verify \
 ### 谓词证明
 
 - `POST /v1/credentials/{credential_id}/prove` 请求体必须**恰为**
-  `{"predicates":[项...]}` 加可选 `challenge`、`expires_in`：
-  `predicates` 须为**非空数组**，每项恰含 `path`、`op` 与可选
-  `value`（`exists` **禁止** `value`，其余 op 必须提供）；缺字段、
-  多余字段、类型非法一律 400；未知凭证 404。`challenge` 须为非空
-  字符串且按 Unicode 码点不超过 256，缺省生成 32 位小写 hex；
+  `{"predicates":[项...]}` 加可选 `challenge`、`expires_in`、
+  `holder_binding`：`predicates` 须为**非空数组**，每项恰含 `path`、
+  `op` 与可选 `value`（`exists` **禁止** `value`，其余 op 必须提供）；
+  缺字段、多余字段、类型非法一律 400；未知凭证 404。`challenge` 须为
+  非空字符串且按 Unicode 码点不超过 256，缺省生成 32 位小写 hex；
   `expires_in` 须为非布尔整数且在 1–86400 之间，缺省 300。
+  `holder_binding` 必须为**布尔**，缺省 `false`；为 `true` 时先完成
+  全部既有校验，再要求凭证 `subject_did` 属于当前租户且活动：未知或
+  跨租户返回 **400**、已停用返回 **409**，持有者当前私钥不可用或
+  当前密钥版本已吊销返回 **400**，均不生成证明或审计。
 - `path` 按 RFC 6901 解释（相对凭证 `claims`），规则与选择性披露
   一致（**支持数组元素选择**）：必须以 `/` 开头并命中实际属性、
   支持 `~0`/`~1` 转义、**禁根路径**；进入数组时下标只接受 `0` 或
@@ -894,25 +903,52 @@ curl -X POST localhost:8080/v1/presentations/vp_<id>/verify \
 - `op ∈ {exists, eq, gte, lte}`：`eq` 为 JSON 精确相等（布尔与数字
   不互通，容器递归比较）；`gte`/`lte` 要求谓词 `value` 与 claims
   命中值**均为非布尔数字**，否则 400。
-- 成功返回 201，字段恰为：`proof_id`（`zp_` 加 32 位小写 hex）、
-  `credential_id`、`issuer_did`、`issuer_key_version`、`predicates`
-  （原样回显）、`results`（与 `predicates` **同序的布尔数组**）、
-  `challenge`、`expires_at`、`proof`。
-- `proof` 为 **ES256**、无填充 base64url 的裸 `R||S` 签名，覆盖
-  除 `proof` 外上述字段**加 `tenant_id`** 按 key 升序的规范化 JSON，
-  使用凭证 `issuer_key_version` 对应的历史私钥；证明记录随状态文件
-  持久化（`proofs`），重启后仍可验签。
+- 成功返回 201，未绑定（省略/`false`）字段恰为九字段：`proof_id`
+  （`zp_` 加 32 位小写 hex）、`credential_id`、`issuer_did`、
+  `issuer_key_version`、`predicates`（原样回显）、`results`（与
+  `predicates` **同序的布尔数组**）、`challenge`、`expires_at`、
+  `proof`，与旧流程**完全兼容**。`holder_binding:true` 时在原对象上
+  **额外**返回 `holder_did`（凭证主体，即 `subject_did`）、
+  `holder_key_version`（生成时持有者的**当前**密钥版本）、
+  `holder_proof`（持有者签名，见下），不回传原始 claims 或私钥。
+- `proof`（issuer proof）为 **ES256**、无填充 base64url 的裸 `R||S`
+  签名，覆盖除 `proof` 外上述字段**加 `tenant_id`** 按 key 升序的
+  规范化 JSON，使用凭证 `issuer_key_version` 对应的历史私钥；
+  **issuer proof 覆盖范围不随持有者绑定改变**（不含任何 `holder_*`
+  字段），签发者轮换密钥后旧证明仍可用历史公钥验真。证明记录随状态
+  文件持久化（`proofs`），重启后仍可验签。
+- `holder_proof` 为持有者第二签名：同为 **ES256** 裸 `R||S` 无填充
+  base64url，覆盖**去掉 `proof`、`holder_proof` 后的完整证明对象**
+  （与 issuer proof 覆盖对象同构，另含 `holder_did`、
+  `holder_key_version` 与 `tenant_id`），按 key 升序规范化 JSON（紧凑
+  序列化、UTF-8）签名；私钥为生成时持有者 `holder_key_version` 的
+  当前私钥。绑定信息（holder DID、版本与签名）随证明记录持久化在
+  `proofs` 中：**重启或持有者密钥轮换后**，verify 按记录的
+  `holder_key_version` 从持有者公钥历史中取**历史公钥**验签，结论不变。
 - `POST /v1/proofs/{proof_id}/verify` 采用与演示 verify 相同的公开
   错误协议：**任何失败都返回 HTTP 200** 与
   `{"valid":false,"reason":"<非空中文原因>"}`，成功返回
   `{"valid":true}`（无其他字段）。请求体须恰为
   `{"proof":对象,"challenge":串}`。校验顺序：请求 -> 资源 ID ->
-  绑定（字段集合与各锚定字段、请求/证明/存储 challenge 三者一致）
-  -> 已消费（`证明已消费`，优先于过期）-> 过期（`证明已过期`）->
-  按存储凭证 `claims` 与存储 `predicates` **重算 results** 并核对 ->
-  `proof` 格式与签名。验签成功后在消费锁内复查已消费/到期再标记
-  已消费：**失败不消费**，未到期并发验证仅一次成功并记一次
+  绑定（字段集合与各锚定字段、请求/证明/存储 challenge 三者一致；
+  绑定证明另锚定三个持有者字段）-> 已消费（`证明已消费`，优先于
+  过期）-> 过期（`证明已过期`）-> 按存储凭证 `claims` 与存储
+  `predicates` **重算 results** 并核对 -> issuer `proof` 格式与签名
+  -> 签发密钥吊销/签发者 DID 停用 -> **持有者绑定校验**（仅绑定
+  证明，位于签发者校验之后、凭证有效期及状态判定之前）-> 凭证有效
+  期/暂停/吊销。**绑定证明删掉持有者字段后按未绑定证明提交、未绑定
+  记录附加持有者字段均不能通过**；持有者字段缺失、类型错误、与存储
+  或凭证主体不符、历史公钥不可用、签名失败、持有者停用或所用版本
+  吊销，统一返回 `持有者绑定校验失败`，且**不消费、不记审计**；较早
+  的既有失败优先。验签成功后在消费锁内复查已消费/到期/签发与持有者
+  状态再标记已消费：消费提交时持有者已停用或密钥已吊销按同一原因
+  拒绝，**失败不消费**，未到期并发验证仅一次成功并记一次
   `proof.consumed`，消费记录跨重启保留。
+- `prove-batch` 允许批次混合绑定与未绑定证明，结果与请求等长、同序；
+  任一项失败整批不写入证明与审计（生成保存失败 500，消费侧失败沿用
+  200 失败协议）。跨系统外部信任证明接口（`/v1/trust/proofs/*`）仍
+  按现有九字段协议处理，**不接收绑定证明**；谓词求值、挑战、期限、
+  旧记录、租户隔离及审计语义保持兼容，其他公开入口行为不变。
 - 审计：创建记 `proof.created`、成功消费记 `proof.consumed`，
   `resource_type` 均为 `predicate_proof`、`resource_id` 为
   `proof_id`；失败与只读路径不记审计。
