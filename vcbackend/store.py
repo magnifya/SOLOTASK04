@@ -133,6 +133,21 @@ DID_DEACTIVATED_REASON_PREFIX = "签发DID已停用："
 # 凭证（及其演示/谓词证明/外部凭证）到期时的统一中文原因
 CREDENTIAL_EXPIRED_REASON = "凭证已过期"
 
+# 外部凭证验真合并同步状态时，max_status_age 状态时效参数非法的统一原因
+STATUS_AGE_PARAM_INVALID_REASON = "状态时效参数非法"
+
+# active 同步状态声明时间超前于验真时刻的统一原因
+EXTERNAL_CREDENTIAL_STATUS_CLOCK_AHEAD_REASON = "外部凭证状态时间超前"
+
+# active 同步状态年龄超过 max_status_age 的统一原因
+EXTERNAL_CREDENTIAL_STATUS_STALE_REASON = "外部凭证状态已过期"
+
+# max_status_age 允许的取值上限（秒，含边界）
+MAX_STATUS_AGE_LIMIT = 86400
+
+# 哨兵：请求最外层显式提供了 max_status_age 但取值非法
+STATUS_AGE_INVALID = object()
+
 # 凭证暂停时验签类端点返回的统一中文原因前缀
 CREDENTIAL_SUSPENDED_REASON_PREFIX = "凭证已暂停："
 
@@ -301,6 +316,23 @@ def _parse_utc_z(text: str) -> datetime:
     return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(
         tzinfo=timezone.utc
     )
+
+
+def _extract_max_status_age(value: Any) -> Any:
+    """校验外部凭证验真最外层 max_status_age 取值。
+
+    仅接受 0..:data:`MAX_STATUS_AGE_LIMIT`（含边界）的非布尔整数；合法
+    返回该 int，非法（显式 None、布尔、浮点、字符串等其他类型或越界）
+    返回哨兵 :data:`STATUS_AGE_INVALID`。
+    """
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < 0
+        or value > MAX_STATUS_AGE_LIMIT
+    ):
+        return STATUS_AGE_INVALID
+    return int(value)
 
 
 # 轮换证明记录的字段（即持久化与对外输出的固定键序）。
@@ -7936,6 +7968,12 @@ class VCStore:
         self,
         tenant_id: str,
         data: Any,
+        *,
+        now: Optional[datetime] = None,
+        anchor_snapshot: Optional[
+            Dict[str, Dict[str, Dict[str, Any]]]
+        ] = None,
+        notice_snapshot: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> Tuple[bool, str]:
         """验证未在本租户签发或存储的外部凭证，返回 (是否有效, 失败原因)。
 
@@ -7953,6 +7991,12 @@ class VCStore:
         - 原验真成功后按当前租户查 issuer_did 外部停用通告，命中返回
           “外部签发DID已停用：<reason>”，仅他租户有通告不影响结论。
         只读：不登记 DID/凭证，不写凭证、状态或审计，绝不向上抛异常。
+
+        ``now`` 给定时（aware datetime），凭证有效期判定以该时刻为准，
+        供启用状态时效限制的批次全项共用同一开始时刻；省略时沿用当前
+        UTC 时刻。``anchor_snapshot``/``notice_snapshot`` 为批初原子快照
+        时，锚点与停用通告直接取快照而不再持锁读取；省略时沿用实时持锁
+        查询（既有行为）。
         """
         # 1. 请求结构
         if not isinstance(data, dict):
@@ -7999,20 +8043,25 @@ class VCStore:
             key_version = version_obj
         issuer_did = body["issuer_did"]
 
-        # 3. 锚点：本租户 (issuer_did, 版本)，仅 active 的 P-256 公钥
-        with self._lock:
-            bucket = self._bucket_locked(tenant_id)
-            anchors = (
-                bucket["trust_anchors"].get(issuer_did)
-                if bucket is not None else None
-            )
-            row = (
-                anchors.get(str(key_version))
-                if anchors is not None else None
-            )
-            public_pem = row.get("public_key", "") if row is not None else ""
-            status = row.get("status", "active") if row is not None else None
-            uses = row.get("uses") if row is not None else None
+        # 3. 锚点：本租户 (issuer_did, 版本)，仅 active 的 P-256 公钥。
+        # 传入批初快照时直接取快照，保证整批锚点状态同一时刻一致。
+        if anchor_snapshot is not None:
+            anchors = anchor_snapshot.get(issuer_did)
+            row = anchors.get(str(key_version)) if anchors is not None else None
+        else:
+            with self._lock:
+                bucket = self._bucket_locked(tenant_id)
+                anchors = (
+                    bucket["trust_anchors"].get(issuer_did)
+                    if bucket is not None else None
+                )
+                row = (
+                    anchors.get(str(key_version))
+                    if anchors is not None else None
+                )
+        public_pem = row.get("public_key", "") if row is not None else ""
+        status = row.get("status", "active") if row is not None else None
+        uses = row.get("uses") if row is not None else None
         if row is None:
             return False, (
                 f"锚点不存在: {issuer_did}#{key_version}"
@@ -8062,15 +8111,31 @@ class VCStore:
                     "凭证字段 expires_at 必须为 UTC 秒精度 Z 格式"
                     "（YYYY-MM-DDTHH:MM:SSZ）"
                 )
-            if datetime.now(timezone.utc) >= expires_dt:
+            check_now = now if now is not None else datetime.now(timezone.utc)
+            if check_now >= expires_dt:
                 return False, CREDENTIAL_EXPIRED_REASON
 
         # 7. 原验真成功后、合并凭证状态前查本租户 issuer_did 外部停用
         #    通告：命中返回“外部签发DID已停用：<reason>”；无通告或仅他
-        #    租户有通告维持原结论。只读，不写状态、不记审计。
-        deactivation_reason = self._external_did_deactivation_reason(
-            tenant_id, issuer_did, EXTERNAL_ISSUER_DID_DEACTIVATED_REASON_PREFIX
-        )
+        #    租户有通告维持原结论。只读，不写状态、不记审计。传入批初
+        #    快照时直接取快照，保证整批停用判定取自同一时刻。
+        if notice_snapshot is not None:
+            notice_row = notice_snapshot.get(issuer_did)
+            if notice_row is not None:
+                notice = self._deactivation_notice_record(
+                    issuer_did, notice_row
+                )
+                deactivation_reason = (
+                    f"{EXTERNAL_ISSUER_DID_DEACTIVATED_REASON_PREFIX}"
+                    f"{notice.reason}"
+                )
+            else:
+                deactivation_reason = None
+        else:
+            deactivation_reason = self._external_did_deactivation_reason(
+                tenant_id, issuer_did,
+                EXTERNAL_ISSUER_DID_DEACTIVATED_REASON_PREFIX,
+            )
         if deactivation_reason is not None:
             return False, deactivation_reason
         return True, ""
@@ -8765,37 +8830,157 @@ class VCStore:
         保持既有优先级与中文原因分类；签名覆盖请求提交的完整 ``body``，
         省略 ``issuer_key_version`` 时按版本 1 且不注入正文。
 
+        请求最外层可选 ``max_status_age``：可接受的同步状态年龄秒数，仅
+        接受 0..86400 的非布尔整数；显式 null、布尔、浮点、字符串等其他
+        类型及越界值一律非法，**先于凭证校验**返回
+        ``(False, "状态时效参数非法")``；省略时保持既有行为。凭证项
+        （body/signature）协议不变，不接受逐项覆盖。
+
         验签通过后按当前租户 ``(issuer_did, credential_id)`` 双键只读
         查询 ``credential_status_sync`` 同步记录：
           - 未同步（含属他租户）：``(False, "外部凭证状态未同步")``；
-          - active：``(True, "")``；
+          - active：省略限制时 ``(True, "")``；启用限制时以本次验真开始
+            时刻的 UTC 整数秒减去签发方声明的 ``updated_at`` 计算年龄，
+            年龄为负返回“外部凭证状态时间超前”，大于 max_status_age 返回
+            “外部凭证状态已过期”，0..上限（含边界）返回 ``(True, "")``；
           - revoked：``(False, "外部凭证已吊销：<保存的 reason>")``，
-            保存记录无 reason 时用“未知原因”；
+            保存记录无 reason 时用“未知原因”；启用限制时即使陈旧或超前
+            仍返回本原因为；
           - suspended：``(False, "外部凭证已暂停：<保存的 reason>")``；
           - unknown：``(False, "外部凭证状态未知")``。
 
-        纯只读：不创建凭证、不修改本地状态、不写同步记录、不记审计。
+        纯只读：不创建凭证、不修改本地状态、不写同步记录、不记审计；
+        重启后按持久化 updated_at 与新的判定时刻重新计算。
         """
-        valid, reason = self.verify_trust_credential(tenant_id, data)
+        age = None
+        verify_data = data
+        if isinstance(data, dict) and "max_status_age" in data:
+            age = _extract_max_status_age(data["max_status_age"])
+            if age is STATUS_AGE_INVALID:
+                return False, STATUS_AGE_PARAM_INVALID_REASON
+            # 凭证项协议仍恰为 body/signature；剥离最外层时效参数后
+            # 复用既有请求结构校验（多余字段等仍返回“请求…”原因）。
+            verify_data = {
+                key: value
+                for key, value in data.items()
+                if key != "max_status_age"
+            }
+        if age is None:
+            return self._verify_credential_status_merged(
+                tenant_id, verify_data, None, None, None, None
+            )
+        # 启用限制：在验真正文开始前取定 UTC 整数秒，并在同一次持锁中
+        # 原子取得本租户锚点、停用通告与同步状态快照；凭证有效期与状态
+        # 年龄共用该时刻，期间的同步/锚点吊销/用途收紧只影响后续请求。
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        anchor_snapshot, notice_snapshot, sync_snapshot = (
+            self._credential_verify_snapshots_locked(tenant_id)
+        )
+        return self._verify_credential_status_merged(
+            tenant_id,
+            verify_data,
+            age,
+            now,
+            anchor_snapshot,
+            notice_snapshot,
+            sync_snapshot,
+        )
+
+    def _credential_verify_snapshots_locked(
+        self, tenant_id: str
+    ) -> Tuple[
+        Dict[str, Dict[str, Dict[str, Any]]],
+        Dict[str, Dict[str, Any]],
+        Dict[str, Dict[str, Dict[str, Any]]],
+    ]:
+        """批初一次持锁原子复制本租户锚点、外部 DID 停用通告与凭证状态
+        同步记录三份只读快照，供启用状态时效限制的整批评定共用同一时刻
+        的状态。纯只读，不写任何状态。"""
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            anchor_snapshot: Dict[str, Dict[str, Dict[str, Any]]] = {}
+            notice_snapshot: Dict[str, Dict[str, Any]] = {}
+            sync_snapshot: Dict[str, Dict[str, Dict[str, Any]]] = {}
+            if bucket is not None:
+                for issuer, versions in bucket.get(
+                    "trust_anchors", {}
+                ).items():
+                    anchor_snapshot[issuer] = {
+                        version: dict(row) for version, row in versions.items()
+                    }
+                for did, row in bucket.get(
+                    "did_deactivation_notices", {}
+                ).items():
+                    notice_snapshot[did] = dict(row)
+                for issuer, creds in bucket.get(
+                    "credential_status_sync", {}
+                ).items():
+                    sync_snapshot[issuer] = {
+                        credential_id: dict(row)
+                        for credential_id, row in creds.items()
+                    }
+        return anchor_snapshot, notice_snapshot, sync_snapshot
+
+    def _verify_credential_status_merged(
+        self,
+        tenant_id: str,
+        data: Any,
+        max_status_age: Optional[int],
+        now: Optional[datetime],
+        anchor_snapshot: Optional[
+            Dict[str, Dict[str, Dict[str, Any]]]
+        ],
+        notice_snapshot: Optional[Dict[str, Dict[str, Any]]],
+        sync_snapshot: Optional[
+            Dict[str, Dict[str, Dict[str, Any]]]
+        ] = None,
+    ) -> Tuple[bool, str]:
+        """先完成外部凭证全部验真规则，再只读合并本租户同步状态。
+
+        ``max_status_age`` 为 None 时沿用既有合并行为（active 即成功）；
+        给定时仅对 active 按 ``now`` 与签发方 ``updated_at`` 做时效判定。
+        快照参数给定时锚点/停用通告/同步状态均取自批初同一时刻快照。"""
+        valid, reason = self.verify_trust_credential(
+            tenant_id,
+            data,
+            now=now,
+            anchor_snapshot=anchor_snapshot,
+            notice_snapshot=notice_snapshot,
+        )
         if not valid:
             return False, reason
 
         body = data["body"]
         issuer_did = body["issuer_did"]
         credential_id = body["credential_id"]
-        with self._lock:
-            bucket = self._bucket_locked(tenant_id)
-            row = None
-            if bucket is not None:
-                row = (
-                    bucket.get("credential_status_sync", {})
-                    .get(issuer_did, {})
-                    .get(credential_id)
-                )
+        if sync_snapshot is not None:
+            row = sync_snapshot.get(issuer_did, {}).get(credential_id)
+        else:
+            with self._lock:
+                bucket = self._bucket_locked(tenant_id)
+                row = None
+                if bucket is not None:
+                    row = (
+                        bucket.get("credential_status_sync", {})
+                        .get(issuer_did, {})
+                        .get(credential_id)
+                    )
         if row is None:
             return False, "外部凭证状态未同步"
         status = row.get("status")
         if status == "active":
+            if max_status_age is None:
+                return True, ""
+            # 仅 active 检查签发方声明的 updated_at：以验真开始时刻的
+            # UTC 整数秒相减，不使用接收/审计/重放时间刷新。
+            updated_dt = _parse_utc_z(row["updated_at"])
+            age = int(now.timestamp()) - int(updated_dt.timestamp())  # type: ignore[union-attr]
+            if age < 0:
+                return False, (
+                    EXTERNAL_CREDENTIAL_STATUS_CLOCK_AHEAD_REASON
+                )
+            if age > max_status_age:
+                return False, EXTERNAL_CREDENTIAL_STATUS_STALE_REASON
             return True, ""
         if status == "revoked":
             saved_reason = row.get("reason")
@@ -8868,27 +9053,51 @@ class VCStore:
         """批量验证外部凭证并合并本租户同步状态，返回
         (请求是否合法, 请求级原因, 逐项结果)。
 
-        请求级结构与 :meth:`verify_trust_credentials_batch` 完全一致：
-        请求体须恰为 ``{"credentials": [项...]}``，数组非空且不超过 100
-        项；不合法时返回 ``(False, "请求...", [])``，由调用方回
-        ``{"results": [], "reason": ...}``。
+        请求级结构与 :meth:`verify_trust_credentials_batch` 一致，额外允许
+        最外层可选 ``max_status_age``：请求体须恰为
+        ``{"credentials": [项...]}`` 或
+        ``{"credentials": [项...], "max_status_age": <非布尔整数 0..86400>}``，
+        数组非空且不超过 100 项；结构不合法返回 ``(False, "请求...", [])``。
+
+        ``max_status_age`` 显式提供但非法（显式 null、布尔、浮点、字符串
+        等其他类型，或越界）时**先于一切凭证校验**返回
+        ``(False, "状态时效参数非法", [])``，由调用方回
+        ``{"results": [], "reason": "状态时效参数非法"}``。该参数对全部项
+        统一生效；凭证项字段保持原协议（恰含 body/signature），不接受逐项
+        覆盖（项内出现该字段按“请求含多余字段”拒绝）。
 
         请求级合法时逐项复用 :meth:`verify_trust_credential_with_status`
         （与单项验真一致的字段、锚点、签名、expires_at 规则，验签通过后
         只读合并本租户 ``(issuer_did, credential_id)`` 同步状态），按输入
         顺序收集结果，失败不短路：成功项 ``{"valid": true}``，失败项
-        ``{"valid": false, "reason": ...}``。只读，不写凭证、状态、同步
-        记录、历史或审计。
+        ``{"valid": false, "reason": ...}``。
+
+        启用限制时整批在批初取定同一 UTC 整数秒，并在同一次持锁中原子取
+        得本租户锚点、停用通告与同步状态快照：所有项的凭证有效期、锚点/
+        用途、停用通告与同步状态（含 active 年龄）判定共用该时刻与快照，
+        批内的同步、锚点吊销或用途收紧只影响后续请求。省略参数时各项沿用
+        实时只读查询的既有行为。只读，不写凭证、状态、同步记录、历史或
+        审计。
         """
         if not isinstance(data, dict):
             return False, "请求不合法: 请求体必须为 JSON 对象", []
-        if set(data) != {"credentials"}:
+        # 时效参数先于凭证结构与凭证项校验：显式非法立即按统一原因拒绝
+        # 整批（results 为空），不读取或校验任何凭证项。
+        age: Optional[int] = None
+        if "max_status_age" in data:
+            age = _extract_max_status_age(data["max_status_age"])
+            if age is STATUS_AGE_INVALID:
+                return False, STATUS_AGE_PARAM_INVALID_REASON, []
+        allowed_fields = {"credentials"}
+        if age is not None:
+            allowed_fields.add("max_status_age")
+        if set(data) != allowed_fields:
             missing = [f for f in ("credentials",) if f not in data]
             if missing:
                 return False, (
                     f"请求缺少字段: {', '.join(missing)}"
                 ), []
-            extra = sorted(set(data) - {"credentials"})
+            extra = sorted(set(data) - allowed_fields)
             return False, f"请求含多余字段: {', '.join(extra)}", []
         credentials = data["credentials"]
         if not isinstance(credentials, list):
@@ -8900,10 +9109,38 @@ class VCStore:
                 f"请求不合法: credentials 数组不能超过 100 项（当前 {len(credentials)} 项）"
             ), []
 
+        if age is None:
+            # 省略时效参数：完全沿用既有行为（各项实时只读查询）。批量项
+            # 协议不接受逐项时效参数：直接走合并判定（不做最外层参数抽取），
+            # 项内出现 max_status_age 由凭证验真返回“请求含多余字段”。
+            results = []
+            for item in credentials:  # 顺序校验，失败不短路
+                valid, reason = self._verify_credential_status_merged(
+                    tenant_id, item, None, None, None, None
+                )
+                if valid:
+                    results.append({"valid": True})
+                else:
+                    results.append(
+                        {"valid": False, "reason": reason or "验签失败"}
+                    )
+            return True, "", results
+
+        # 启用限制：批初同一时刻 + 同一份原子快照，全项共用。
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        anchor_snapshot, notice_snapshot, sync_snapshot = (
+            self._credential_verify_snapshots_locked(tenant_id)
+        )
         results = []
         for item in credentials:  # 顺序校验，失败不短路
-            valid, reason = self.verify_trust_credential_with_status(
-                tenant_id, item
+            valid, reason = self._verify_credential_status_merged(
+                tenant_id,
+                item,
+                age,
+                now,
+                anchor_snapshot,
+                notice_snapshot,
+                sync_snapshot,
             )
             if valid:
                 results.append({"valid": True})

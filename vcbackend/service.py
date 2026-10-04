@@ -11431,12 +11431,17 @@ def build_handler(store: VCStore) -> type:
         ) -> None:
             # 批量外部凭证验真并合并本租户同步状态：与 verify-batch 相同的
             # 公开错误协议，任何失败都返回 HTTP 200。请求体须恰为
-            # {"credentials": [项...]}，数组非空且不超过 100 项；请求体非法
-            # （含非法 JSON、空数组、超过上限）时返回
-            # {"results": [], "reason": "请求..."}。请求级合法时逐项复用
-            # verify-with-status 规则（验真 + 只读合并同步状态），按输入
-            # 顺序返回 {"results": [...]}，失败不短路。只读，不写凭证、
-            # 状态、同步记录、历史或审计。
+            # {"credentials": [项...]}，或额外携带最外层可选
+            # max_status_age（非布尔整数 0..86400）；数组非空且不超过 100
+            # 项；请求体非法（含非法 JSON、空数组、超过上限）时返回
+            # {"results": [], "reason": "请求..."}。max_status_age 显式
+            # null、其他类型或越界时先于凭证校验返回
+            # {"results": [], "reason": "状态时效参数非法"}。请求级合法时
+            # 逐项复用 verify-with-status 规则（验真 + 只读合并同步状态），
+            # 时效参数对全部项统一生效、不接受逐项覆盖；启用限制时全项按
+            # 批初同一 UTC 时刻与同一份本租户快照判定，按输入顺序返回
+            # {"results": [...]}，失败不短路。只读，不写凭证、状态、同步
+            # 记录、历史或审计。
             try:
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length) if length > 0 else b""
@@ -11494,9 +11499,15 @@ def build_handler(store: VCStore) -> type:
         ) -> None:
             # 外部凭证验真并合并状态判定：公开错误协议，任何失败都返回
             # 200 + {"valid": false, "reason": "<非空中文原因>"}。
-            # 请求体须恰含 body（对象）与 signature（非空字符串），解析
-            # 规则与 /v1/trust/credentials/verify 完全一致；验真通过后
-            # 由 store 只读查询本租户同步状态。纯只读，不写状态、不记审计。
+            # 请求体须恰含 body（对象）与 signature（非空字符串），可额外
+            # 携带最外层 max_status_age（非布尔整数 0..86400）：显式 null、
+            # 其他类型或越界先于凭证校验返回
+            # {"valid": false, "reason": "状态时效参数非法"}。解析规则与
+            # /v1/trust/credentials/verify 完全一致（凭证项不含时效参数，
+            # 仅最外层接受）；验真通过后由 store 只读查询本租户同步状态，
+            # 启用限制时仅 active 按验真开始 UTC 时刻与签发方 updated_at
+            # 计算年龄（超前/过期分别返回固定中文原因）。纯只读，不写
+            # 状态、不记审计。
             try:
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length) if length > 0 else b""

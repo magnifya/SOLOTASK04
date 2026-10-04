@@ -123,8 +123,8 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/trust/proofs/verify-with-status` | 外部谓词证明验真并合并同步状态（只读）：请求体与验真规则同 `/v1/trust/proofs/verify`；**任何验真失败均 HTTP 200** 返回 `valid:false` 与中文 `reason`；验真通过后按本租户 `(issuer_did, credential_id)` 查同步记录：未同步 `valid:false`/“外部凭证状态未同步”，active 仅 `{"valid":true}`，revoked 为“外部凭证已吊销：<reason>”（无 reason 用“未知原因”），suspended 为“外部凭证已暂停：<reason>”，unknown 为“外部凭证状态未知”；不消费、不登记资源、不写状态/历史/审计 |
 | POST | `/v1/trust/proofs/verify-batch-with-status` | 批量外部谓词证明验真并合并同步状态（只读）：请求体恰为 `{"proofs":[项...]}`，数组非空且不超过 100 项；请求级非法（缺失、非法 JSON、非对象、字段缺失或多余、proofs 非数组、空数组或超限）统一 HTTP 200 返回 `{"results":[],"reason":"请求..."}`；合法批次逐项复用 `/v1/trust/proofs/verify-with-status` 规则（含同步状态合并），按输入顺序不短路返回 `{"results":[...]}`，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`；不消费、不登记资源、不写状态/历史/审计 |
 | POST | `/v1/trust/credentials/verify-batch` | 批量跨系统凭证验真：请求体恰为 `{"credentials":[项...]}`，数组非空且不超过 100 项，每项规则与单项验真一致；**任何失败均 HTTP 200**，返回 `{"results":[...]}`（长度与顺序与输入一致，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`，不短路）；请求体非法、空数组或超上限时返回 `{"results":[],"reason":"请求..."}` |
-| POST | `/v1/trust/credentials/verify-with-status` | 外部凭证验真并合并同步状态（只读）：请求体与验真规则同 `/v1/trust/credentials/verify`；**任何验真/过期失败均 HTTP 200** 返回 `valid:false` 与中文 `reason`；验签通过后按本租户 `(issuer_did, credential_id)` 查同步记录：未同步 `valid:false`/“外部凭证状态未同步”，active 仅 `{"valid":true}`，revoked 为“外部凭证已吊销：<reason>”（无 reason 用“未知原因”），suspended 为“外部凭证已暂停：<reason>”，unknown 为“外部凭证状态未知”；不创建凭证、不改状态、不写同步记录或审计 |
-| POST | `/v1/trust/credentials/verify-batch-with-status` | 批量外部凭证验真并合并同步状态（只读）：请求体恰为 `{"credentials":[项...]}`，数组非空且不超过 100 项；请求级非法（缺失、非法 JSON、非对象、字段缺失或多余、credentials 非数组、空数组或超限）统一 HTTP 200 返回 `{"results":[],"reason":"请求..."}`；合法批次逐项复用 `/v1/trust/credentials/verify-with-status` 规则（含同步状态合并），按输入顺序不短路返回 `{"results":[...]}`，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`；不写凭证、状态、历史或审计 |
+| POST | `/v1/trust/credentials/verify-with-status` | 外部凭证验真并合并同步状态（只读）：请求体与验真规则同 `/v1/trust/credentials/verify`，最外层可选 `max_status_age`（非布尔整数 0–86400 秒）；显式 null、其他类型或越界先于凭证校验 **HTTP 200** 返回 `valid:false`/“状态时效参数非法”；**任何验真/过期失败均 HTTP 200** 返回 `valid:false` 与中文 `reason`；验签通过后按本租户 `(issuer_did, credential_id)` 查同步记录：未同步 `valid:false`/“外部凭证状态未同步”，active 省略限制时仅 `{"valid":true}`、启用限制时按验真开始 UTC 秒减签发方 `updated_at` 计算年龄（负为“外部凭证状态时间超前”，大于上限为“外部凭证状态已过期”，0 至上限含边界成功），revoked 为“外部凭证已吊销：<reason>”（无 reason 用“未知原因”，陈旧或超前不改变结论），suspended 为“外部凭证已暂停：<reason>”，unknown 为“外部凭证状态未知”；不创建凭证、不改状态、不写同步记录或审计 |
+| POST | `/v1/trust/credentials/verify-batch-with-status` | 批量外部凭证验真并合并同步状态（只读）：请求体恰为 `{"credentials":[项...]}` 或额外携带最外层 `max_status_age`（非布尔整数 0–86400，对全部项统一生效、不接受逐项覆盖），数组非空且不超过 100 项；请求级非法（缺失、非法 JSON、非对象、字段缺失或多余、credentials 非数组、空数组或超限）统一 HTTP 200 返回 `{"results":[],"reason":"请求..."}`；`max_status_age` 非法先于凭证校验返回 `{"results":[],"reason":"状态时效参数非法"}`；启用限制时全项按批初同一 UTC 时刻与同一份本租户锚点/停用通告/同步状态快照判定；合法批次逐项复用 `/v1/trust/credentials/verify-with-status` 规则（含同步状态合并与时效判定），按输入顺序不短路返回 `{"results":[...]}`，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`；不写凭证、状态、历史或审计 |
 | POST | `/v1/trust/credentials/import` | 导入并持久化外部凭证：请求体须恰含 `body`、`signature`，`body` 规则同 `/v1/trust/credentials/verify`（必含 `credential_id`/`issuer_did`/`subject_did`/`claims`/`issued_at`，可省略 `issuer_key_version`）；请求/字段非法 400 仅 `{error}`；锚点缺失/非 active、签名格式错、验签失败、凭证过期均 HTTP 200 `{"valid":false,"reason":...}`（非空中文）且不写入；首次按 `tenant+issuer_did+credential_id` 保存 201，键序 `imported,issuer_did,credential_id,body,signature` 且 `imported:true`；相同内容重放 200 返回原响应，不同内容 409 仅 `{error}` |
 | GET | `/v1/trust/credentials/imported/{credential_id}?issuer_did=...` | 读取已导入的外部凭证原文；`issuer_did` 须唯一非空，缺失/重复/空值 400；未导入、跨租户或 `issuer_did` 不匹配 404；成功 200 键序 `issuer_did,credential_id,body,signature`；纯只读、不记审计，重启后可读 |
 | POST | `/v1/trust/credentials/imported/{credential_id}/verify?issuer_did=...` | 重启后重新验证已落盘凭证；请求体须恰为 `{}`，`issuer_did` 须唯一非空，缺失/重复/空值、非法 JSON、非对象或请求体不恰为 `{}` 均 400；未导入、错配或跨租户 404；取存储 body/signature 原文（`issuer_key_version` 缺省按 1）以同 DID/版本 active 锚点做 ES256 验签；锚点缺失或吊销、签名格式错、验签失败、凭证过期均 HTTP 200 返回 `{"valid":false,"reason":...}`（原因恰为“锚点不可用”/“签名格式错误”/“签名校验失败”/“凭证已过期”），成功仅 `{"valid":true}`；纯只读、不写记录/状态/历史/审计，重启及锚点吊销后结论稳定 |
@@ -1452,39 +1452,59 @@ curl -X POST localhost:8080/v1/proofs/zp_<id>/verify \
     400 与跨租户锚点隔离。
 - `POST /v1/trust/credentials/verify-with-status` 合并**外部凭证验真与
   状态判定**，供依赖方一次调用得到最终结论：
-  - 请求体**恰为** `{"body":对象,"signature":非空字符串}`；`body` 字段
-    类型、扩展字段、ES256 规范化 JSON 签名（覆盖提交的完整 `body`）、
-    `issuer_key_version` 省略按 1 且不注入正文、`expires_at` 规则与
-    校验优先级，全部沿用 `/v1/trust/credentials/verify`。请求、凭证、
-    锚点、签名格式、签名校验或过期失败，均 **HTTP 200** 返回
+  - 请求体**恰为** `{"body":对象,"signature":非空字符串}`，可额外携带最
+    外层 `max_status_age`；`body` 字段类型、扩展字段、ES256 规范化 JSON
+    签名（覆盖提交的完整 `body`）、`issuer_key_version` 省略按 1 且不注
+    入正文、`expires_at` 规则与校验优先级，全部沿用
+    `/v1/trust/credentials/verify`。请求、凭证、锚点、签名格式、签名校验
+    或过期失败，均 **HTTP 200** 返回
     `{"valid":false,"reason":...}`，保持既有的分类措辞与优先级。
+  - 可选 `max_status_age` 为可接受的同步状态年龄秒数：仅接受 **0–86400**
+    的**非布尔整数**；显式 `null`、布尔、浮点、字符串等其他类型及越界值
+    一律非法，且**先于凭证校验**返回
+    `{"valid":false,"reason":"状态时效参数非法"}`；省略时保持既有行为。
   - 验签通过后按**当前租户**的 `(issuer_did, credential_id)` 双键查询
     外部凭证状态同步记录（含他租户未同步在内的未命中不可探测）：
     - **未同步**：`{"valid":false,"reason":"外部凭证状态未同步"}`；
-    - **active**：仅 `{"valid":true}`；
+    - **active**：省略 `max_status_age` 时仅 `{"valid":true}`；启用限制时
+      以**本次验真开始时刻**的 UTC 整数秒减去签发方声明的 `updated_at`
+      计算年龄（不使用接收、审计或重放时间刷新）：年龄为负返回
+      `{"valid":false,"reason":"外部凭证状态时间超前"}`；年龄大于
+      `max_status_age` 返回
+      `{"valid":false,"reason":"外部凭证状态已过期"}`；年龄在零与上限之间
+      **且包含边界**仅返回 `{"valid":true}`；
     - **revoked**：`{"valid":false,
       "reason":"外部凭证已吊销：<保存的 reason>"}`；同步记录无
-      `reason` 时使用“未知原因”；
+      `reason` 时使用“未知原因”；启用限制时即使状态陈旧或超前仍返回本
+      原因；
     - **suspended**：`{"valid":false,
       "reason":"外部凭证已暂停：<保存的 reason>"}`；
     - **unknown**：`{"valid":false,"reason":"外部凭证状态未知"}`。
   - **纯只读**：不创建凭证、不修改本地凭证状态、不写同步记录或历史、
     不记审计；遵守 `X-Tenant-ID` 缺省 `default`、显式空值 **400** 与
-    租户隔离，结论随状态文件**跨重启持久化**。既有验真、同步与历史
-    查询接口协议保持不变。
+    租户隔离，重启后继续按持久化 `updated_at` 与新的判定时刻重新计算。
+    既有验真、同步与历史查询接口协议保持不变。
 - `POST /v1/trust/credentials/verify-batch-with-status` 批量合并**外部
   凭证验真与本租户同步状态**，一次调用得到整批最终结论：
-  - 请求体**恰为** `{"credentials":[项...]}`，数组须为 **1–100 项**；
-    外层缺失、非法 JSON、非对象、字段缺失或多余、`credentials` 非数组、
-    空数组或超限，统一 **HTTP 200** 返回
+  - 请求体**恰为** `{"credentials":[项...]}`，或额外携带最外层
+    `max_status_age`（0–86400 的非布尔整数，**对全部项统一生效**；凭证
+    项字段保持原协议，**不接受逐项覆盖**）；数组须为 **1–100 项**；外层
+    缺失、非法 JSON、非对象、字段缺失或多余、`credentials` 非数组、空数组
+    或超限，统一 **HTTP 200** 返回
     `{"results":[],"reason":"请求…"}`。
+  - `max_status_age` 显式 `null`、其他类型或越界时**先于一切凭证校验**
+    返回 `{"results":[],"reason":"状态时效参数非法"}`（即使凭证数组为空
+    或内容非法）。
   - 请求级合法时按输入**顺序逐项处理、失败不短路**：每项恰含 `body`
     对象与非空 `signature`，项级结构或类型错误只写入对应结果
-    （`valid:false` + “请求”前缀原因），不清空整批；`body` 字段错误
-    沿用“凭证”分类，其余验真规则（版本省略按 1、扩展字段参与 ES256
-    规范化签名、`expires_at` 与校验优先级）与状态合并约定（未同步 /
-    active / revoked / suspended / unknown）全部沿用
-    `/v1/trust/credentials/verify-with-status`。
+    （`valid:false` + “请求”前缀原因，项内出现 `max_status_age` 按请求
+    多余字段拒绝），不清空整批；`body` 字段错误沿用“凭证”分类，其余验真
+    规则（版本省略按 1、扩展字段参与 ES256 规范化签名、`expires_at` 与
+    校验优先级）与状态合并约定（未同步 / active / revoked / suspended /
+    unknown）全部沿用 `/v1/trust/credentials/verify-with-status`。
+  - 启用限制时，整批以**批初同一时刻**的本租户锚点、外部 DID 停用通告与
+    同步状态快照判定，凭证有效期与所有状态时间检查共用该时刻；期间发生的
+    同步、锚点吊销或用途收紧只影响后续请求。
   - 返回 `{"results":[...]}`：长度与顺序与输入一致，成功项
     `{"valid":true}`（不含 `reason`），失败项
     `{"valid":false,"reason":"…"}`（非空中文原因）。

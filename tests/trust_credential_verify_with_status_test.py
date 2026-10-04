@@ -238,11 +238,95 @@ def main():
         check("扩展字段随验真通过且 active",
               st == 200 and r == {"valid": True})
 
+        # ---- 可选 max_status_age 状态时效限制 ----
+        check("同步 active 10 秒前 -> 201",
+              sync("vc_age_fresh", "active",
+                   updated_at=utc_z(timedelta(seconds=-10)))[0] == 201)
+        check("同步 active 90 秒前 -> 201",
+              sync("vc_age_stale", "active",
+                   updated_at=utc_z(timedelta(seconds=-90)))[0] == 201)
+        check("同步 active 超前 30 秒 -> 201",
+              sync("vc_age_ahead", "active",
+                   updated_at=utc_z(timedelta(seconds=30)))[0] == 201)
+        check("同步陈旧 revoked -> 201",
+              sync("vc_age_rev", "revoked", reason="陈旧吊销",
+                   updated_at=utc_z(timedelta(days=-30)))[0] == 201)
+        check("同步陈旧 unknown -> 201",
+              sync("vc_age_unk", "unknown",
+                   updated_at=utc_z(timedelta(days=-30)))[0] == 201)
+
+        def call_age(cid, age):
+            body = make_body(cid)
+            return _http("POST", f"{base}{path}",
+                         {"body": body,
+                          "signature": crypto.sign(body, priv1),
+                          "max_status_age": age}, headers=T1)
+
+        st, r = call_age("vc_age_fresh", 60)
+        check("时效内 active valid:true", st == 200 and r == {"valid": True})
+        # 边界 age=0 且 max=0：updated_at 与判定须落在同一秒，同步后立刻
+        # 判定，若跨秒则重取当前秒同步后重试。
+        zero_ok = False
+        for _ in range(3):
+            stamp = utc_z(timedelta(seconds=0))
+            sync_st, _ = sync("vc_age_zero", "active", updated_at=stamp)
+            if sync_st not in (200, 201):
+                break
+            st, r = call_age("vc_age_zero", 0)
+            if st == 200 and r == {"valid": True} and stamp == utc_z(
+                timedelta(seconds=0)
+            ):
+                zero_ok = True
+                break
+        check("年龄 0 上限 0 含边界 valid:true", zero_ok)
+        st, r = call_age("vc_age_fresh", 86400)
+        check("上限 86400 合法且有效",
+              st == 200 and r == {"valid": True})
+        st, r = call_age("vc_age_stale", 60)
+        check("超龄 active -> 外部凭证状态已过期",
+              st == 200 and r == {
+                  "valid": False, "reason": "外部凭证状态已过期"})
+        st, r = call_age("vc_age_fresh", 0)
+        check("年龄 10 上限 0 -> 已过期",
+              st == 200 and r == {
+                  "valid": False, "reason": "外部凭证状态已过期"})
+        st, r = call_age("vc_age_ahead", 60)
+        check("超前 active -> 外部凭证状态时间超前",
+              st == 200 and r == {
+                  "valid": False, "reason": "外部凭证状态时间超前"})
+        st, r = call_age("vc_age_rev", 60)
+        check("陈旧 revoked 即使超龄仍返回吊销原因",
+              st == 200 and r == {
+                  "valid": False, "reason": "外部凭证已吊销：陈旧吊销"})
+        st, r = call_age("vc_age_unk", 60)
+        check("陈旧 unknown 即使超龄仍返回未知",
+              st == 200 and r == {
+                  "valid": False, "reason": "外部凭证状态未知"})
+        st, r = call_age("vc_nosync", 60)
+        check("启用限制未同步仍返回未同步",
+              st == 200 and r == {
+                  "valid": False, "reason": "外部凭证状态未同步"})
+        # 省略参数保留既有行为：陈旧 active 仍成功
+        st, r = call(make_body("vc_age_stale"))
+        check("省略参数时陈旧 active 仍成功",
+              st == 200 and r == {"valid": True})
+        # 非法取值：显式 null、布尔、浮点、字符串、越界，先于凭证校验
+        for bad in (None, True, False, -1, 86401, 60.0, "60", [], {}):
+            st, r = _http("POST", f"{base}{path}",
+                          {"body": {}, "signature": "",
+                           "max_status_age": bad}, headers=T1)
+            check(f"非法 max_status_age {bad!r} 先于凭证校验",
+                  st == 200 and r == {
+                      "valid": False, "reason": "状态时效参数非法"})
+
         # 只读：不新增审计、不改变同步记录
         _, before = _http("GET", f"{base}/v1/audit?limit=200&after=0",
                           headers=T1)
         for cid in ("vc_active", "vc_nosync", "vc_rev", "vc_unk"):
             call(make_body(cid))
+        for cid in ("vc_age_fresh", "vc_age_stale", "vc_age_ahead",
+                    "vc_age_rev", "vc_age_unk"):
+            call_age(cid, 60)
         _, after_pages = _http("GET", f"{base}/v1/audit?limit=200&after=0",
                                headers=T1)
         check("只读：不新增审计",
@@ -285,6 +369,22 @@ def main():
                       headers=T1)
         check("重启后 active 结论持久化",
               st == 200 and r == {"valid": True})
+        # 重启后启用限制：仍按持久化 updated_at 与新的判定时刻计算年龄。
+        body_fresh = make_body("vc_age_fresh")
+        st, r = _http("POST", f"{base2}{path}",
+                      {"body": body_fresh,
+                       "signature": crypto.sign(body_fresh, priv1),
+                       "max_status_age": 86400}, headers=T1)
+        check("重启后时效内 active 有效",
+              st == 200 and r == {"valid": True})
+        body_stale = make_body("vc_age_stale")
+        st, r = _http("POST", f"{base2}{path}",
+                      {"body": body_stale,
+                       "signature": crypto.sign(body_stale, priv1),
+                       "max_status_age": 60}, headers=T1)
+        check("重启后陈旧 active 按新时刻判过期",
+              st == 200 and r == {
+                  "valid": False, "reason": "外部凭证状态已过期"})
     finally:
         proc.terminate()
         proc.wait(timeout=10)

@@ -151,6 +151,26 @@ def main():
               sync("vc_rev_nr", "revoked")[0] == 201)
         check("同步 unknown -> 201",
               sync("vc_unk", "unknown")[0] == 201)
+        check("同步 active 10 秒前 -> 201",
+              sync("vc_age_fresh", "active",
+                   updated_at=utc_z(timedelta(seconds=-10)))[0] == 201)
+        check("同步 active 当前秒 -> 201",
+              sync("vc_age_zero", "active",
+                   updated_at=utc_z(timedelta(seconds=0)))[0] in (200, 201))
+        check("同步 active 90 秒前 -> 201",
+              sync("vc_age_stale", "active",
+                   updated_at=utc_z(timedelta(seconds=-90)))[0] == 201)
+        check("同步 active 超前 30 秒 -> 201",
+              sync("vc_age_ahead", "active",
+                   updated_at=utc_z(timedelta(seconds=30)))[0] == 201)
+        check("同步陈旧 suspended -> 201",
+              sync("vc_age_sus", "suspended", reason="暂停中",
+                   updated_at=utc_z(timedelta(days=-30)))[0] == 201)
+
+        def call_age(items, age, headers=T1):
+            return _http("POST", f"{base}{path}",
+                         {"credentials": items, "max_status_age": age},
+                         headers=headers)
 
         # ---- 请求级错误：一律 200 + {"results": [], "reason": "请求..."} ----
         def check_req_err(name, st, r):
@@ -272,10 +292,97 @@ def main():
               st == 200
               and r["results"][0].get("reason", "").startswith("锚点不存在"))
 
+        # ---- 最外层可选 max_status_age：对全部项统一生效 ----
+        age_items = [
+            item(make_body("vc_age_fresh")),   # 0 年龄约 10 秒
+            item(make_body("vc_age_zero")),    # 1 年龄约 0 秒
+            item(make_body("vc_age_stale")),   # 2 年龄约 90 秒
+            item(make_body("vc_age_ahead")),   # 3 超前约 30 秒
+            item(make_body("vc_age_sus")),     # 4 陈旧 suspended
+            item(make_body("vc_rev")),         # 5 陈旧 revoked
+            item(make_body("vc_nosync")),      # 6 未同步
+            item(make_body("vc_active",
+                           expires_at=utc_z(timedelta(hours=-1)))),  # 7 过期
+            "not-an-object",                                    # 8 项非法
+        ]
+        st, r = call_age(age_items, 60)
+        ok = st == 200 and len(r.get("results", [])) == len(age_items) \
+            and "reason" not in r
+        check("时效批次等长同序、失败不短路", ok)
+        res = r.get("results", [])
+        check("时效内 active valid:true", res[0] == {"valid": True})
+        check("年龄 0 含边界 valid:true", res[1] == {"valid": True})
+        check("超龄 active -> 已过期",
+              res[2] == {"valid": False, "reason": "外部凭证状态已过期"})
+        check("超前 active -> 时间超前",
+              res[3] == {"valid": False,
+                         "reason": "外部凭证状态时间超前"})
+        check("陈旧 suspended 仍返回暂停原因",
+              res[4] == {"valid": False,
+                         "reason": "外部凭证已暂停：暂停中"})
+        check("陈旧 revoked 仍返回吊销原因",
+              res[5] == {"valid": False,
+                         "reason": "外部凭证已吊销：持证人违规"})
+        check("启用限制未同步仍返回未同步",
+              res[6] == {"valid": False, "reason": "外部凭证状态未同步"})
+        check("凭证过期优先于时效判定",
+              res[7] == {"valid": False, "reason": "凭证已过期"})
+        check("项非法仍返回请求前缀",
+              res[8].get("valid") is False
+              and res[8].get("reason", "").startswith("请求"))
+        # 边界值 0 与 86400
+        zero_ok = False
+        for _ in range(3):
+            stamp = utc_z(timedelta(seconds=0))
+            sync("vc_age_zero", "active", updated_at=stamp)
+            st, r = call_age([item(make_body("vc_age_zero"))], 0)
+            if st == 200 and r.get("results") == [{"valid": True}] and stamp == (
+                utc_z(timedelta(seconds=0))
+            ):
+                zero_ok = True
+                break
+        check("上限 0 接受年龄 0", zero_ok)
+        st, r = call_age([item(make_body("vc_age_fresh"))], 86400)
+        check("上限 86400 合法且有效",
+              st == 200 and r.get("results") == [{"valid": True}])
+        # 省略参数保留既有行为：陈旧 active 仍成功
+        st, r = call([item(make_body("vc_age_stale"))])
+        check("省略参数陈旧 active 仍成功",
+              st == 200 and r.get("results") == [{"valid": True}])
+        # 非法取值：先于一切凭证校验（哪怕 credentials 为空数组）
+        for bad in (None, True, False, -1, 86401, 60.0, "60", [], {}):
+            st, r = _http("POST", f"{base}{path}",
+                          {"credentials": [], "max_status_age": bad},
+                          headers=T1)
+            check(f"非法 max_status_age {bad!r} 先于凭证校验",
+                  st == 200 and r == {
+                      "results": [], "reason": "状态时效参数非法"})
+        # 凭证项不接受逐项覆盖：项内出现该字段按请求多余字段拒绝
+        override = dict(item(make_body("vc_age_fresh")), max_status_age=60)
+        st, r = call([override])
+        check("逐项 max_status_age 按多余字段拒绝",
+              st == 200 and r["results"][0].get("valid") is False
+              and r["results"][0].get("reason", "")
+              == "请求含多余字段: max_status_age")
+        # 最外层多余字段仍按请求级错误
+        st, r = _http("POST", f"{base}{path}",
+                      {"credentials": [item(make_body("vc_age_fresh"))],
+                       "max_status_age": 60, "extra": 1}, headers=T1)
+        check("启用限制时其他外层多余字段拒绝",
+              st == 200 and r.get("results") == []
+              and isinstance(r.get("reason"), str)
+              and r["reason"].startswith("请求含多余字段"))
+        # 跨租户启用限制：无锚点，且他租户同步状态视为未同步
+        st, r = call_age([item(make_body("vc_age_fresh"))], 60, headers=T2)
+        check("他租户启用限制 -> 锚点不存在",
+              st == 200
+              and r["results"][0].get("reason", "").startswith("锚点不存在"))
+
         # 只读：不新增审计、不改变同步记录
         _, before = _http("GET", f"{base}/v1/audit?limit=200&after=0",
                           headers=T1)
         call(items)
+        call_age(age_items, 60)
         _, after_pages = _http("GET", f"{base}/v1/audit?limit=200&after=0",
                                headers=T1)
         check("只读：不新增审计",
@@ -316,6 +423,21 @@ def main():
               st == 200 and r.get("results") == [
                   {"valid": True},
                   {"valid": False, "reason": "外部凭证已吊销：持证人违规"},
+              ])
+        # 重启后启用限制：按持久化 updated_at 与新的判定时刻计算。
+        age_items_restart = [
+            {"body": make_body("vc_age_fresh"),
+             "signature": crypto.sign(make_body("vc_age_fresh"), priv1)},
+            {"body": make_body("vc_age_stale"),
+             "signature": crypto.sign(make_body("vc_age_stale"), priv1)},
+        ]
+        st, r = _http("POST", f"{base2}{path}",
+                      {"credentials": age_items_restart,
+                       "max_status_age": 60}, headers=T1)
+        check("重启后时效判定按新时刻计算",
+              st == 200 and r.get("results") == [
+                  {"valid": True},
+                  {"valid": False, "reason": "外部凭证状态已过期"},
               ])
     finally:
         proc.terminate()
