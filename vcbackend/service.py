@@ -115,6 +115,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/trust/proofs/verify            跨系统谓词证明验真（无需登记 DID/凭证/证明，不消费）
   POST /v1/trust/proofs/consume           跨系统谓词证明一次性消费（防重放，首次落盘并审计）
   POST /v1/trust/proofs/consume-batch     批量一次性消费外部谓词证明（逐项不短路，批内判重，整批原子落盘）
+  GET  /v1/trust/proofs/consumptions      查询外部谓词证明消费历史（只读）
   POST /v1/trust/proofs/verify-synced     以同步锚点验真外部谓词证明（只读）
   POST /v1/trust/proofs/verify-synced-with-status  同步锚点验真谓词证明并合并请求初始状态快照（只读）
   POST /v1/trust/proofs/verify-synced-batch  批量以同步锚点快照验真外部谓词证明（只读）
@@ -1570,6 +1571,10 @@ def build_handler(store: VCStore) -> type:
                     )
                 elif path == "/v1/trust/presentations/consumptions":
                     self._get_trust_presentation_consumptions(
+                        tenant, parsed.query
+                    )
+                elif path == "/v1/trust/proofs/consumptions":
+                    self._get_trust_proof_consumptions(
                         tenant, parsed.query
                     )
                 elif (
@@ -8000,6 +8005,94 @@ def build_handler(store: VCStore) -> type:
                             "receipt_id": event.receipt_id,
                             "verifier_did": event.verifier_did,
                             "nonce": event.nonce,
+                            "consumed_at": event.consumed_at,
+                        }
+                        for event in events
+                    ],
+                    "next_after": next_after,
+                },
+            )
+
+        def _get_trust_proof_consumptions(
+            self, tenant: str, query: str
+        ) -> None:
+            # GET /v1/trust/proofs/consumptions：只读查询本租户跨系统
+            # 外部谓词证明的消费历史。
+            # 查询参数仅允许 limit、after、source_tenant_id、
+            # issuer_did，且均只能出现一次：
+            # - limit 缺省 50，须为 1..200 的非空 ASCII 十进制整数；
+            # - after 缺省 0，须为非空非负 ASCII 十进制整数；
+            # - source_tenant_id、issuer_did 可省略，提供时须为非空字
+            #   符串，按解码后原字符串精确匹配，同时提供取交集。
+            # 未知参数、重复参数、空值、非法数字或越界 limit 一律 400
+            # 且仅返 {"error":"请求非法"}；显式空 X-Tenant-ID 由路由
+            # 统一判 400。
+            # 先按筛选参数过滤，再按 cursor > after 升序取前 limit
+            # 项。200 键序恰为 events、next_after；事件键序恰为
+            # cursor、consumption_id、source_tenant_id、issuer_did、
+            # proof_id、consumed_at（cursor 为正整数，其余五值为字符
+            # 串，consumed_at 为 UTC 秒精度 Z）；空页 next_after 保持
+            # after。无任何事件也返回 200 空数组。纯只读：不写状态、
+            # 不记审计、不触发落盘。
+            try:
+                params = parse_qs(query, keep_blank_values=True)
+                allowed = {
+                    "limit",
+                    "after",
+                    "source_tenant_id",
+                    "issuer_did",
+                }
+                if set(params) - allowed:
+                    raise ValidationError("未知查询参数")
+
+                def _single(name: str) -> Optional[str]:
+                    values = params.get(name)
+                    if values is None:
+                        return None
+                    if len(values) != 1:
+                        raise ValidationError("查询参数重复")
+                    return values[0]
+
+                limit_raw = _single("limit")
+                if limit_raw is not None:
+                    limit = _parse_nonneg_int(limit_raw, "limit")
+                    if not 1 <= limit <= 200:
+                        raise ValidationError("limit 越界")
+                else:
+                    limit = 50
+
+                after_raw = _single("after")
+                if after_raw is not None:
+                    after = _parse_nonneg_int(after_raw, "after")
+                else:
+                    after = 0
+
+                source_tenant_id = _single("source_tenant_id")
+                if source_tenant_id is not None and not source_tenant_id:
+                    raise ValidationError("source_tenant_id 为空")
+                issuer_did = _single("issuer_did")
+                if issuer_did is not None and not issuer_did:
+                    raise ValidationError("issuer_did 为空")
+            except ValidationError:
+                raise ValidationError("请求非法")
+
+            events, next_after = store.list_trust_proof_consumptions(
+                tenant,
+                after,
+                limit,
+                source_tenant_id=source_tenant_id,
+                issuer_did=issuer_did,
+            )
+            self._send_json(
+                200,
+                {
+                    "events": [
+                        {
+                            "cursor": event.cursor,
+                            "consumption_id": event.consumption_id,
+                            "source_tenant_id": event.source_tenant_id,
+                            "issuer_did": event.issuer_did,
+                            "proof_id": event.proof_id,
                             "consumed_at": event.consumed_at,
                         }
                         for event in events

@@ -645,6 +645,28 @@ class TrustPresentationConsumptionEvent:
 
 
 @dataclass
+class TrustProofConsumptionEvent:
+    """跨系统外部谓词证明消费历史中的一条事件（只读消费历史查询用）。
+
+    仅首次成功消费外部谓词证明时产生（消费标记与
+    trust.proof.consumed 审计在同一次原子写中落盘），重放、验真失败
+    与落盘失败均不产生。consumption_id 为消费请求规范化 JSON 字节的
+    SHA-256 小写 64 位 hex；source_tenant_id/issuer_did/proof_id 为该
+    消费的唯一键；consumed_at 为首次消费时间（UTC ISO8601 秒精度
+    Z）。cursor 取首次成功消费对应 trust.proof.consumed 审计事件的
+    seq（存储内全局连续正整数，跨租户共享，故租户内递增但不一定连
+    续），重启后稳定不变。
+    """
+
+    cursor: int
+    consumption_id: str
+    source_tenant_id: str
+    issuer_did: str
+    proof_id: str
+    consumed_at: str
+
+
+@dataclass
 class ImportedCredentialRecord:
     """一条已导入的外部凭证（按租户与 issuer_did#credential_id 双键隔离）。
 
