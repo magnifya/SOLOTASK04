@@ -376,7 +376,14 @@ class PredicateProofRecord:
     相对 claims 的 RFC6901 指针）；results 为与 predicates 同序的布尔
     结果；challenge/expires_at 为防重放字段；proof 为覆盖除 proof 外
     字段（含 tenant_id）规范化 JSON 的 ES256 签名（base64url 无填充），
-    使用凭证签发时 issuer_key_version 对应的历史私钥。
+    使用凭证签发时 issuer_key_version 对应的历史私钥，其覆盖范围不随
+    持有者绑定改变。
+
+    可选持有者绑定（holder_binding=true 时写入并持久化）：holder_did
+    为持有者（即凭证 subject_did）；holder_key_version 为生成绑定时持
+    有者的当前密钥版本；holder_proof 为持有者私钥对（去掉 proof、
+    holder_proof 后的完整证明响应对象 + tenant_id）的 ES256 裸 R||S
+    无填充 base64url 签名。未绑定证明三者均为 None，响应保持九字段。
     """
 
     proof_id: str
@@ -388,6 +395,9 @@ class PredicateProofRecord:
     challenge: str
     expires_at: str
     proof: str
+    holder_did: Optional[str] = None
+    holder_key_version: Optional[int] = None
+    holder_proof: Optional[str] = None
 
 
 @dataclass

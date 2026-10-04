@@ -3691,15 +3691,20 @@ def build_handler(store: VCStore) -> type:
         # ------------------------------------------------------------ #
         def _post_prove(self, tenant: str, credential_id: str) -> None:
             # 请求体必须恰为 {"predicates": [...]} 加可选 challenge、
-            # expires_in：缺失/空 predicates、元素字段或 op 非法、路径
-            # 重复或祖先重叠、多余字段一律 400；未知凭证 404。
-            # challenge 须为非空字符串且按 Unicode 码点不超过 256，
+            # expires_in、holder_binding：缺失/空 predicates、元素字段或
+            # op 非法、路径重复或祖先重叠、多余字段一律 400；未知凭证
+            # 404。challenge 须为非空字符串且按 Unicode 码点不超过 256，
             # 缺省生成 32 位小写 hex；expires_in 须为非布尔整数且
-            # 在 1..86400 之间，缺省 300。成功 201 返回证明记录。
+            # 在 1..86400 之间，缺省 300。holder_binding 须为布尔，缺省
+            # false：省略或 false 成功响应保持九字段；true 时在既有校验
+            # 通过后追加持有者绑定三字段。成功 201 返回证明记录。
             data = self._read_json()
             if "predicates" not in data:
                 raise ValidationError("缺少字段: predicates")
-            extra = sorted(set(data) - {"predicates", "challenge", "expires_in"})
+            extra = sorted(
+                set(data)
+                - {"predicates", "challenge", "expires_in", "holder_binding"}
+            )
             if extra:
                 raise ValidationError(f"多余字段: {', '.join(extra)}")
             challenge = None
@@ -3722,18 +3727,27 @@ def build_handler(store: VCStore) -> type:
                     raise ValidationError(
                         "字段 expires_in 须在 1 到 86400 之间"
                     )
+            holder_binding = False
+            if "holder_binding" in data:
+                holder_binding = data["holder_binding"]
+                if not isinstance(holder_binding, bool):
+                    raise ValidationError("字段 holder_binding 必须为布尔值")
             record = store.create_proof(
                 tenant,
                 credential_id,
                 data["predicates"],
                 challenge=challenge,
                 expires_in=expires_in,
+                holder_binding=holder_binding,
             )
             self._send_json(201, self._proof_payload(record))
 
         @staticmethod
         def _proof_payload(record: Any) -> Dict[str, Any]:
-            return {
+            # 未绑定证明恰为九字段；绑定证明在同一对象上追加
+            # holder_did/holder_key_version/holder_proof，不回传原始
+            # claims 或任何私钥。
+            payload = {
                 "proof_id": record.proof_id,
                 "credential_id": record.credential_id,
                 "issuer_did": record.issuer_did,
@@ -3744,6 +3758,11 @@ def build_handler(store: VCStore) -> type:
                 "expires_at": record.expires_at,
                 "proof": record.proof,
             }
+            if record.holder_did is not None:
+                payload["holder_did"] = record.holder_did
+                payload["holder_key_version"] = record.holder_key_version
+                payload["holder_proof"] = record.holder_proof
+            return payload
 
         @staticmethod
         def _validate_prove_item(
@@ -3752,11 +3771,13 @@ def build_handler(store: VCStore) -> type:
             """校验单个谓词证明生成项，返回透传给 store 的关键字参数。
 
             规则与单项 prove 的请求级校验完全一致：项须为对象，恰含
-            predicates 及可选 challenge、expires_in；challenge 为非空
-            字符串且按 Unicode 码点不超过 256；expires_in 为非布尔整数
-            且在 1..86400。predicates 的结构、路径、运算与数值语义在
-            store 内结合凭证 claims 校验，与单项 prove 完全一致。
-            index 为从 0 起的项序号，错误信息带从 1 起的中文项号。
+            predicates 及可选 challenge、expires_in、holder_binding；
+            challenge 为非空字符串且按 Unicode 码点不超过 256；
+            expires_in 为非布尔整数且在 1..86400；holder_binding 为
+            布尔，缺省 false，批次允许混合绑定与未绑定证明。predicates
+            的结构、路径、运算与数值语义在 store 内结合凭证 claims 校验，
+            与单项 prove 完全一致。index 为从 0 起的项序号，错误信息带
+            从 1 起的中文项号。
             """
             where = f"第 {index + 1} 项"
             if not isinstance(item, dict):
@@ -3764,7 +3785,13 @@ def build_handler(store: VCStore) -> type:
             if "predicates" not in item:
                 raise ValidationError(f"{where}缺少字段: predicates")
             extra = sorted(
-                set(item) - {"predicates", "challenge", "expires_in"}
+                set(item)
+                - {
+                    "predicates",
+                    "challenge",
+                    "expires_in",
+                    "holder_binding",
+                }
             )
             if extra:
                 raise ValidationError(
@@ -3795,6 +3822,13 @@ def build_handler(store: VCStore) -> type:
                         f"{where}字段 expires_in 须在 1 到 86400 之间"
                     )
                 kwargs["expires_in"] = expires_in
+            if "holder_binding" in item:
+                holder_binding = item["holder_binding"]
+                if not isinstance(holder_binding, bool):
+                    raise ValidationError(
+                        f"{where}字段 holder_binding 必须为布尔值"
+                    )
+                kwargs["holder_binding"] = holder_binding
             return kwargs
 
         def _post_prove_batch(
@@ -3802,16 +3836,19 @@ def build_handler(store: VCStore) -> type:
         ) -> None:
             # 批量谓词证明：请求体须恰为 {"items": [项...]}，数组非空
             # 且不超过 50 项。外层缺失/非数组/空/超限、项非对象、缺
-            # predicates 或多余字段、challenge/expires_in 类型或范围非法
-            # 一律 400 且不写入任何记录；所有项的请求级校验全部通过后
-            # 才查凭证：路径凭证未知（含他租户）404；其后按签发 DID
-            # 停用 409、签发密钥吊销 400、凭证暂停 409 的顺序拒绝，
-            # 均不留证明或审计；项内 predicates 语义（结构/路径/运算/
-            # 数值、重复与祖先重叠）由 store 逐项校验，任一失败整体
-            # 回滚。成功 201 仅返回 {"proofs": [...]}，与输入等长、同序，
-            # 每项键序与单项 prove 完全一致；缺省 challenge 与有效期逐项
-            # 独立生成。全部证明记录与每条 proof.created 审计同一次原子
-            # 提交，落盘失败 500 且不留下部分记录，审计序号不前进。
+            # predicates 或多余字段、challenge/expires_in 类型或范围非法、
+            # holder_binding 非布尔一律 400 且不写入任何记录；所有项的
+            # 请求级校验全部通过后才查凭证：路径凭证未知（含他租户）404；
+            # 其后按签发 DID 停用 409、签发密钥吊销 400、持有者绑定项的
+            # subject 未注册/跨租户 400 与持有者停用 409/当前密钥不可用
+            # 或吊销 400、凭证暂停 409 的顺序拒绝，均不留证明或审计；
+            # 项内 predicates 语义（结构/路径/运算/数值、重复与祖先重叠）
+            # 由 store 逐项校验，任一项失败整批回滚（绑定与未绑定可混合）。
+            # 成功 201 仅返回 {"proofs": [...]}，与输入等长、同序，每项
+            # 键序与单项 prove 完全一致（未绑定九字段、绑定十二字段）；
+            # 缺省 challenge 与有效期逐项独立生成。全部证明记录与每条
+            # proof.created 审计同一次原子提交，生成保存失败 500 且不留
+            # 下部分记录，审计序号不前进。
             data = self._read_json()
             if "items" not in data:
                 raise ValidationError("缺少字段: items")
