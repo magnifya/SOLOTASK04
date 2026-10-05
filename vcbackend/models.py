@@ -234,6 +234,31 @@ class CredentialStatusRecord:
 
 
 @dataclass
+class CredentialListItem:
+    """GET /v1/credentials 列表项：本租户凭证元数据（不含正文与签名）。
+
+    cursor 为租户内持久递增正整数（仅成功签发分配）；expires_at 为
+    None 表示无期限；schema_id/schema_version 为 None 表示未绑定模式；
+    未登记状态按 active，此时 status_updated_at/status_reason/
+    revoked_at 均为 None。
+    """
+
+    cursor: int
+    credential_id: str
+    issuer_did: str
+    subject_did: str
+    issued_at: str
+    expires_at: Optional[str]
+    issuer_key_version: int
+    status: str
+    status_updated_at: Optional[str]
+    status_reason: Optional[str]
+    revoked_at: Optional[str]
+    schema_id: Optional[str]
+    schema_version: Optional[int]
+
+
+@dataclass
 class PresentationRecord:
     """一条选择性披露演示记录。
 

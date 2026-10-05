@@ -20,6 +20,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/credentials                    签发凭证（可选 Idempotency-Key 头按租户幂等重试：首次 201，同内容重放 200，异内容 409）
   POST /v1/credentials/issue-batch        整批原子签发（请求体恰含 items 1..100 项；不支持 Idempotency-Key；整批凭证与审计同一次原子写，成功 201 仅返 results）
   POST /v1/credentials/status-export      凭证状态签名发布（产出可直接提交状态批量同步的签名项，只读）
+  GET  /v1/credentials                    按游标分页列出本租户凭证元数据（?limit=&after=&issuer_did=&subject_did=&status=&schema_id=&schema_version=，只读，不含 claims/签名/私钥）
   GET  /v1/credentials/{credential_id}    查询凭证
   PUT  /v1/credentials/{credential_id}/status   登记 active（首次 201/重复 200）或暂停/恢复 suspended（200）
   PUT  /v1/credentials/status-batch             整批原子登记/暂停/恢复（请求体恰含 items 1..100 项；成功 200 仅返 results）
@@ -1491,6 +1492,8 @@ def build_handler(store: VCStore) -> type:
                         self._get_credential_schema(
                             tenant, schema_suffix, parsed.query
                         )
+                elif path == "/v1/credentials":
+                    self._list_credentials(tenant, parsed.query)
                 elif path.startswith("/v1/credentials/") and path.endswith(
                     "/status/history"
                 ):
@@ -2794,6 +2797,123 @@ def build_handler(store: VCStore) -> type:
                     "credential_id": record.credential_id,
                     "body": record.body,
                     "signature": record.signature,
+                },
+            )
+
+        def _list_credentials(self, tenant: str, query: str) -> None:
+            # GET /v1/credentials?limit=&after=&issuer_did=&subject_did=
+            # &status=&schema_id=&schema_version=：只读分页列出本租户
+            # 凭证元数据。响应恰含 credentials 与 next_after；每项恰含
+            # cursor、credential_id、issuer_did、subject_did、issued_at、
+            # expires_at、issuer_key_version、status、status_updated_at、
+            # status_reason、revoked_at、schema_id、schema_version，不含
+            # claims、签名与私钥。查询参数仅限上述七个，各至多一次；
+            # limit 缺省 50 且限 1..200，after 缺省 0，二者仅接受
+            # ASCII 十进制；status 仅 active/suspended/revoked；
+            # schema_id 与 schema_version 必须成对且版本为正整数。
+            # 未知、重复、空值、数字格式非法、越界或成对错误均 400。
+            # 结果按 cursor 升序取 after 后至多 limit 项，next_after
+            # 为末项 cursor，空页保持 after；未知或他租户筛选值返回
+            # 空结果。纯只读：不记审计、不改变任何状态。
+            params = parse_qs(query, keep_blank_values=True)
+            allowed = {
+                "limit", "after", "issuer_did", "subject_did",
+                "status", "schema_id", "schema_version",
+            }
+            unknown = sorted(set(params) - allowed)
+            if unknown:
+                raise ValidationError(
+                    f"不支持的查询参数: {', '.join(unknown)}"
+                )
+
+            def _single(name: str) -> Optional[str]:
+                values = params.get(name)
+                if values is None:
+                    return None
+                if len(values) != 1:
+                    raise ValidationError(
+                        f"查询参数 {name} 只能提供一次"
+                    )
+                return values[0]
+
+            limit_raw = _single("limit")
+            if limit_raw is not None:
+                limit = _parse_nonneg_int(limit_raw, "limit")
+                if not 1 <= limit <= 200:
+                    raise ValidationError(
+                        "查询参数 limit 须在 1 到 200 之间"
+                    )
+            else:
+                limit = 50
+
+            after_raw = _single("after")
+            after = (
+                _parse_nonneg_int(after_raw, "after")
+                if after_raw is not None
+                else 0
+            )
+
+            issuer_did = _single("issuer_did")
+            if issuer_did is not None and not issuer_did:
+                raise ValidationError("查询参数 issuer_did 不能为空")
+            subject_did = _single("subject_did")
+            if subject_did is not None and not subject_did:
+                raise ValidationError("查询参数 subject_did 不能为空")
+
+            status = _single("status")
+            if status is not None and status not in (
+                "active", "suspended", "revoked"
+            ):
+                raise ValidationError(
+                    "查询参数 status 仅支持 active、suspended、revoked"
+                )
+
+            schema_id = _single("schema_id")
+            schema_version_raw = _single("schema_version")
+            if (schema_id is None) != (schema_version_raw is None):
+                raise ValidationError(
+                    "查询参数 schema_id 与 schema_version 必须同时提供"
+                )
+            schema_version: Optional[int] = None
+            if schema_id is not None:
+                if not schema_id:
+                    raise ValidationError("查询参数 schema_id 不能为空")
+                schema_version = _parse_positive_int(
+                    schema_version_raw, "schema_version"
+                )
+
+            items, next_after = store.list_credentials(
+                tenant,
+                after=after,
+                limit=limit,
+                issuer_did=issuer_did,
+                subject_did=subject_did,
+                status=status,
+                schema_id=schema_id,
+                schema_version=schema_version,
+            )
+            self._send_json(
+                200,
+                {
+                    "credentials": [
+                        {
+                            "cursor": item.cursor,
+                            "credential_id": item.credential_id,
+                            "issuer_did": item.issuer_did,
+                            "subject_did": item.subject_did,
+                            "issued_at": item.issued_at,
+                            "expires_at": item.expires_at,
+                            "issuer_key_version": item.issuer_key_version,
+                            "status": item.status,
+                            "status_updated_at": item.status_updated_at,
+                            "status_reason": item.status_reason,
+                            "revoked_at": item.revoked_at,
+                            "schema_id": item.schema_id,
+                            "schema_version": item.schema_version,
+                        }
+                        for item in items
+                    ],
+                    "next_after": next_after,
                 },
             )
 
