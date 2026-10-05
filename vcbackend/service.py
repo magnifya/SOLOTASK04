@@ -2,6 +2,7 @@
 
 路由：
   POST /v1/dids                           注册 DID
+  POST /v1/dids/register-batch            整批原子注册 DID（请求体恰含 items 1..100 项；成功 201 仅返 results）
   GET  /v1/dids/{did}                     查询 DID
   POST /v1/dids/{did}/deactivate          停用 DID（首次/幂等均 200）
   GET  /v1/dids/{did}/status              查询 DID 生命周期状态（只读）
@@ -816,6 +817,7 @@ def build_handler(store: VCStore) -> type:
                         "/receipt/consume-batch",
                         "/v1/trust/credentials/imported/verify-batch",
                         "/v1/audit/manifest/verify-batch",
+                        "/v1/dids/register-batch",
                     )
                     and self.headers.get("X-Tenant-ID") == ""
                 ):
@@ -823,6 +825,8 @@ def build_handler(store: VCStore) -> type:
                 tenant = self._tenant_id()
                 if path == "/v1/dids":
                     self._post_dids(tenant)
+                elif path == "/v1/dids/register-batch":
+                    self._post_dids_register_batch(tenant)
                 elif path == "/v1/dids/rotation-proofs/verify":
                     self._post_rotation_proofs_verify(tenant)
                 elif path == "/v1/audit/manifest/verify":
@@ -1724,6 +1728,43 @@ def build_handler(store: VCStore) -> type:
                 tenant, data["method"], data["public_key"], key_mode=key_mode
             )
             self._send_json(201, self._did_payload(record))
+
+        def _post_dids_register_batch(self, tenant: str) -> None:
+            # POST /v1/dids/register-batch：整批原子注册 DID。
+            # 请求体恰含 items（1..100 项数组）；空体、非法 JSON、非
+            # 对象、缺 items、外层多余字段、items 非数组/空/超限、项
+            # 非对象或字段集合/类型非法，一律 400 且仅
+            # {"error":"请求非法"}；同一批内句柄重复 409 且仅
+            # {"error":"批内句柄重复"}。显式空 X-Tenant-ID 由路由统一
+            # 判 400（{"error":"请求非法"}），缺省 default、按租户隔离。
+            # 成功 201 仅返 {"results":[...]}，与输入等长同序，每项字
+            # 段同 POST /v1/dids；落盘失败整批回滚，500 仅
+            # {"error":"存储失败"}。单项入口行为不受影响。
+            try:
+                data = self._read_json()
+                if set(data) != {"items"}:
+                    raise ValidationError("请求非法")
+                items = data["items"]
+                if not isinstance(items, list):
+                    raise ValidationError("请求非法")
+                if not 1 <= len(items) <= 100:
+                    raise ValidationError("请求非法")
+            except (ValidationError, ValueError):
+                # ValueError：JSON 内超长十进制整数触发位数上限。
+                raise ValidationError("请求非法")
+            try:
+                records = store.create_dids_batch(tenant, items)
+            except StorageError:
+                self._send_error(500, "存储失败")
+                return
+            self._send_json(
+                201,
+                {
+                    "results": [
+                        self._did_payload(record) for record in records
+                    ]
+                },
+            )
 
         def _get_did(self, tenant: str, did: str) -> None:
             record = store.get_did(tenant, did)

@@ -25,6 +25,7 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/v1/dids` | 注册 DID，请求体 `{"method","public_key","key_mode"?}`，返回 201 与 `did`、`public_key`、`key_mode`、`key_handle`、`key_version` |
+| POST | `/v1/dids/register-batch` | 整批原子注册 DID；请求体恰含 `items`（1–100 项，每项同单项注册的 `method`、`public_key` 及可选 `key_mode`）；成功 201 仅返 `{"results":[...]}`（与输入等长同序，每项字段同单项注册）；已登记句柄按单项幂等规则返回原 DID，批内句柄重复 409 `{"error":"批内句柄重复"}`，请求非法 400 `{"error":"请求非法"}`，落盘失败整批回滚并 500 `{"error":"存储失败"}` |
 | GET | `/v1/dids/{did}` | 返回 `did`、`public_key`、`key_mode`、`key_handle`、`key_version`、`created_at`；不存在 404 |
 | POST | `/v1/dids/{did}/deactivate` | 停用 DID；空体或 `{}` 省略 `reason`（默认“DID 主动停用”），非空须恰含 `reason`（裁剪后非空字符串，非法 400）；未知或他租户 DID 404；首次 200 返回 `did`、`status:"deactivated"`、`reason`、`updated_at`，重复忽略 `reason`（含非法值）并幂等返回首次结果 |
 | GET | `/v1/dids/{did}/status` | 只读 DID 生命周期状态；200 恰返 `{did,status,reason,updated_at}`，活动为 `active`/`null`/`null`，停用后为首次原因与 UTC 秒精度 Z 时间；未知或他租户 404 |
