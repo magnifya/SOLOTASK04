@@ -247,6 +247,7 @@ DEFAULT_SCHEMA_DEPRECATE_REASON = "模式版本已弃用"
 DEFAULT_SCHEMA_REVOKE_REASON = "模式版本已吊销"
 
 AUDIT_KEY_ROTATED = "key.rotated"
+AUDIT_KEY_BACKUP_EXPORTED = "did.key.backup.exported"
 AUDIT_STATUS_UPDATED = "status.updated"
 AUDIT_CREDENTIAL_REVOKED = "credential.revoked"
 AUDIT_PRESENTATION_CREATED = "presentation.created"
@@ -2599,6 +2600,105 @@ class VCStore:
         - 成功记 key.rotated。
         """
         handle = _validate_key_handle(key_handle, "key_handle")
+        return self._advance_key(tenant_id, did, handle, None)
+
+    def export_key_backup(
+        self, tenant_id: str, did: str, passphrase: str
+    ) -> Dict[str, Any]:
+        """导出 DID 当前版本私钥的口令加密备份（自描述九字段对象）。
+
+        - DID 不存在（含他租户资源）抛 NotFoundError；已停用抛 ConflictError；
+        - 密文绑定租户、DID、当前版本与句柄；备份对象仅含密文，不出私钥；
+        - 成功在同一次原子写中追加 did.key.backup.exported 审计，
+          失败整体回滚、无任何副作用。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            rec = bucket["dids"].get(did) if bucket is not None else None
+            if rec is None:
+                raise NotFoundError(f"DID 不存在: {did}")
+            if rec.get("status") == "deactivated":
+                raise ConflictError(f"DID 已停用，不能备份密钥: {did}")
+            version = int(rec.get("key_version", 1))
+            priv_pem = self._private_key_for_version_locked(
+                bucket, did, version
+            )
+            if not priv_pem:
+                # 正常不会发生：迁移保证每个版本私钥可用。
+                raise StorageError(
+                    f"DID {did} 当前版本 {version} 私钥不可用，无法备份"
+                )
+            snapshot = self._snapshot_locked()
+            try:
+                backup = crypto.export_key_backup(
+                    passphrase,
+                    priv_pem,
+                    tenant=tenant_id,
+                    did=did,
+                    key_version=version,
+                    key_handle=rec.get("key_handle", ""),
+                )
+                self._append_audit_locked(
+                    tenant_id, AUDIT_KEY_BACKUP_EXPORTED, "did", did
+                )
+                self._save_locked()
+                return backup
+            except Exception:
+                self._restore_locked(snapshot)
+                raise
+
+    def restore_key(
+        self,
+        tenant_id: str,
+        did: str,
+        key_handle: str,
+        backup: Dict[str, Any],
+        passphrase: str,
+    ) -> DIDRecord:
+        """从口令加密备份恢复私钥：以当前版本加一创建新版本。
+
+        - DID 不存在（含他租户资源）抛 NotFoundError；已停用抛 ConflictError；
+        - key_handle 沿用轮换的非空、非 PEM 校验；本租户任一版本已使用该
+          句柄抛 ConflictError("key_handle 已被使用")；
+        - 备份固定参数不符、绑定不符、口令错误、解密或认证失败、内容被
+          篡改统一抛 ValidationError("备份无效")；
+        - 成功与轮换一样原子落盘：新版本、密钥历史、轮换证明、游标与
+          key.rotated 审计同一次写入，失败整体回滚。
+        """
+        handle = _validate_key_handle(key_handle, "key_handle")
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            rec = bucket["dids"].get(did) if bucket is not None else None
+            if rec is None:
+                raise NotFoundError(f"DID 不存在: {did}")
+            if rec.get("status") == "deactivated":
+                raise ConflictError(f"DID 已停用，不能恢复密钥: {did}")
+        try:
+            priv_pem = crypto.import_key_backup(
+                passphrase, backup, tenant=tenant_id, did=did
+            )
+        except crypto.InvalidKeyBackup as exc:
+            raise ValidationError("备份无效") from exc
+        return self._advance_key(
+            tenant_id, did, handle, priv_pem, handle_in_use_conflict=True
+        )
+
+    def _advance_key(
+        self,
+        tenant_id: str,
+        did: str,
+        handle: str,
+        private_pem: Optional[str],
+        handle_in_use_conflict: bool = False,
+    ) -> DIDRecord:
+        """把 DID 推进到下一密钥版本（轮换生成新钥 / 恢复用备份私钥）。
+
+        新版本、密钥历史、生命周期事件、轮换证明、游标与 key.rotated
+        审计同一次原子落盘；任一步失败随快照整体回滚。
+        handle_in_use_conflict 为 True 时句柄冲突抛
+        ConflictError("key_handle 已被使用")（恢复语义，HTTP 409），
+        否则抛 ValidationError（轮换语义，HTTP 400）。
+        """
         with self._lock:
             bucket = self._bucket_locked(tenant_id)
             rec = bucket["dids"].get(did) if bucket is not None else None
@@ -2607,11 +2707,17 @@ class VCStore:
             if rec.get("status") == "deactivated":
                 raise ConflictError(f"DID 已停用，不能轮换密钥: {did}")
             if self._handle_in_use_locked(bucket, handle):
+                if handle_in_use_conflict:
+                    raise ConflictError("key_handle 已被使用")
                 raise ValidationError(f"key_handle 已被使用: {handle}")
 
             snapshot = self._snapshot_locked()
             try:
-                priv_pem = crypto.generate_private_key_pem()
+                priv_pem = (
+                    private_pem
+                    if private_pem is not None
+                    else crypto.generate_private_key_pem()
+                )
                 pub_pem = crypto.public_key_pem_from_private(priv_pem).strip()
                 new_version = int(rec.get("key_version", 1)) + 1
                 # 捕获轮换前版本（旧钥）信息，供轮换证明 from_* 与旧钥签名。

@@ -9,6 +9,8 @@
   GET  /v1/dids/{did}/history             查询 DID 注册与停用历史（只读）
   GET  /v1/dids/{did}/document            查询 DID 文档（历史公钥，只读）
   POST /v1/dids/{did}/keys/rotate         轮换 DID 密钥（成功时原子追加可独立验证的轮换证明）
+  POST /v1/dids/{did}/keys/backup         导出当前版本私钥的口令加密备份（成功追加 did.key.backup.exported 审计）
+  POST /v1/dids/{did}/keys/restore        从口令加密备份恢复私钥（当前版本加一，与轮换同一原子写）
   GET  /v1/dids/{did}/keys/rotations      查询 DID 密钥轮换可验证证明（?limit=&after=，只读）
   POST /v1/dids/rotation-proofs/verify    跨系统自包含验证轮换证明链（只读，不依赖本地状态）
   POST /v1/dids/{did}/keys/{ver}/revoke   吊销 DID 旧密钥版本
@@ -210,6 +212,35 @@ def _json_dumps(payload: Any) -> bytes:
 
 # 签发幂等键：1-64 个 ASCII 字母/数字/下划线/连字符，键值区分大小写
 _IDEMPOTENCY_KEY_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+# 密钥备份口令：8 至 256 个 Unicode 码点的非空字符串
+_BACKUP_PASSPHRASE_MIN = 8
+_BACKUP_PASSPHRASE_MAX = 256
+
+# 备份对象恰含的字段（与 crypto.BACKUP_FIELDS 一致）
+_BACKUP_FIELDS = frozenset(crypto.BACKUP_FIELDS)
+
+# key_handle 沿用轮换校验：非空且不是 PEM 文本
+_PEM_MARKER = "-----BEGIN"
+
+
+def _validate_backup_passphrase(value: Any) -> str:
+    """校验备份口令：8 至 256 个 Unicode 码点的字符串，否则抛 请求非法。"""
+    if not isinstance(value, str) or not (
+        _BACKUP_PASSPHRASE_MIN <= len(value) <= _BACKUP_PASSPHRASE_MAX
+    ):
+        raise ValidationError("请求非法")
+    return value
+
+
+def _validate_backup_key_handle(value: Any) -> str:
+    """校验恢复句柄（沿用轮换的非空、非 PEM 规则），否则抛 请求非法。"""
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError("请求非法")
+    handle = value.strip()
+    if _PEM_MARKER in handle:
+        raise ValidationError("请求非法")
+    return handle
 
 
 def _canonical_json_number(value: Any) -> str:
@@ -859,6 +890,20 @@ def build_handler(store: VCStore) -> type:
                         path[len("/v1/dids/") : -len("/keys/rotate")]
                     )
                     self._post_rotate_key(tenant, did)
+                elif path.startswith("/v1/dids/") and path.endswith(
+                    "/keys/backup"
+                ):
+                    did = unquote(
+                        path[len("/v1/dids/") : -len("/keys/backup")]
+                    )
+                    self._post_backup_key(tenant, did)
+                elif path.startswith("/v1/dids/") and path.endswith(
+                    "/keys/restore"
+                ):
+                    did = unquote(
+                        path[len("/v1/dids/") : -len("/keys/restore")]
+                    )
+                    self._post_restore_key(tenant, did)
                 elif path.startswith("/v1/dids/") and "/keys/" in path and path.endswith(
                     "/revoke"
                 ):
@@ -2123,6 +2168,79 @@ def build_handler(store: VCStore) -> type:
             data = self._read_json()
             self._require_fields(data, ("key_handle",))
             record = store.rotate_key(tenant, did, data["key_handle"])
+            self._send_json(200, self._did_payload(record))
+
+        def _read_exact_json(self, fields: Tuple[str, ...]) -> Dict[str, Any]:
+            """读取请求体并要求恰含指定字段；空体、非法 JSON、非对象、
+            字段缺失或多余一律抛 ValidationError("请求非法")。"""
+            try:
+                data = self._read_json()
+            except ValueError:
+                # ValidationError（非法 JSON/非对象）及 JSON 超长整数的
+                # ValueError 均属请求结构非法。
+                raise ValidationError("请求非法") from None
+            if set(data) != set(fields):
+                raise ValidationError("请求非法")
+            return data
+
+        def _post_backup_key(self, tenant: str, did: str) -> None:
+            # POST /v1/dids/{did}/keys/backup：导出当前版本私钥的口令
+            # 加密备份。请求体恰含 passphrase（8..256 个 Unicode 码点的
+            # 非空字符串）；空体、非法 JSON、字段缺失、多余或类型错误
+            # 统一 400 {"error":"请求非法"}；未知或跨租户 DID 404；停用
+            # DID 409。成功 200 恰含 did、key_version、key_handle、kdf、
+            # kdf_iterations、salt、cipher、nonce、ciphertext；kdf 固定
+            # PBKDF2-HMAC-SHA256、迭代 310000，cipher 固定 AES-256-GCM，
+            # salt/nonce 为 16/12 字节随机值的无填充 base64url，密文含
+            # 认证标签并绑定租户、DID、版本、句柄。私钥绝不出现在响应、
+            # 审计或查询；成功追加 did.key.backup.exported 审计，失败无
+            # 副作用。
+            if not did:
+                raise ValidationError("路径缺少 did")
+            data = self._read_exact_json(("passphrase",))
+            passphrase = _validate_backup_passphrase(data["passphrase"])
+            backup = store.export_key_backup(tenant, did, passphrase)
+            self._send_json(200, backup)
+
+        def _post_restore_key(self, tenant: str, did: str) -> None:
+            # POST /v1/dids/{did}/keys/restore：从口令加密备份恢复私钥。
+            # 请求体恰含 backup、passphrase、key_handle；backup 必须是
+            # 备份接口产出的九字段对象且无未知字段，口令与句柄校验同
+            # 备份/轮换。请求结构错误 400 {"error":"请求非法"}；备份绑定
+            # 不符、口令错误、解密或认证失败、内容被篡改统一
+            # 400 {"error":"备份无效"}；未知或跨租户 DID 404；停用 DID
+            # 409；本租户任一版本已使用该句柄
+            # 409 {"error":"key_handle 已被使用"}。通过后以当前版本加一
+            # 创建新版本并导出 P-256 公钥，响应字段与轮换相同；恢复、
+            # 密钥历史、轮换证明、游标和 key.rotated 审计同一次原子落盘，
+            # 失败整体回滚。
+            if not did:
+                raise ValidationError("路径缺少 did")
+            data = self._read_exact_json(
+                ("backup", "passphrase", "key_handle")
+            )
+            passphrase = _validate_backup_passphrase(data["passphrase"])
+            key_handle = _validate_backup_key_handle(data["key_handle"])
+            backup = data["backup"]
+            if not isinstance(backup, dict) or set(backup) != _BACKUP_FIELDS:
+                raise ValidationError("请求非法")
+            if not (
+                isinstance(backup["did"], str)
+                and isinstance(backup["key_version"], int)
+                and not isinstance(backup["key_version"], bool)
+                and isinstance(backup["key_handle"], str)
+                and isinstance(backup["kdf"], str)
+                and isinstance(backup["kdf_iterations"], int)
+                and not isinstance(backup["kdf_iterations"], bool)
+                and isinstance(backup["salt"], str)
+                and isinstance(backup["cipher"], str)
+                and isinstance(backup["nonce"], str)
+                and isinstance(backup["ciphertext"], str)
+            ):
+                raise ValidationError("请求非法")
+            record = store.restore_key(
+                tenant, did, key_handle, backup, passphrase
+            )
             self._send_json(200, self._did_payload(record))
 
         def _post_rotation_proofs_verify(self, tenant: str) -> None:
