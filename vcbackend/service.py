@@ -2,6 +2,8 @@
 
 路由：
   POST /v1/dids                           注册 DID
+  POST /v1/dids/register-batch            整批原子注册 DID（请求体恰含 items 1..100 项；成功 201 仅返 results）
+  POST /v1/dids/register-batch            整批原子注册 DID（请求体恰含 items 1..100 项；成功 201 仅返 results）
   GET  /v1/dids/{did}                     查询 DID
   POST /v1/dids/{did}/deactivate          停用 DID（首次/幂等均 200）
   GET  /v1/dids/{did}/status              查询 DID 生命周期状态（只读）
@@ -816,6 +818,7 @@ def build_handler(store: VCStore) -> type:
                         "/receipt/consume-batch",
                         "/v1/trust/credentials/imported/verify-batch",
                         "/v1/audit/manifest/verify-batch",
+                        "/v1/dids/register-batch",
                     )
                     and self.headers.get("X-Tenant-ID") == ""
                 ):
@@ -823,6 +826,8 @@ def build_handler(store: VCStore) -> type:
                 tenant = self._tenant_id()
                 if path == "/v1/dids":
                     self._post_dids(tenant)
+                elif path == "/v1/dids/register-batch":
+                    self._post_dids_register_batch(tenant)
                 elif path == "/v1/dids/rotation-proofs/verify":
                     self._post_rotation_proofs_verify(tenant)
                 elif path == "/v1/audit/manifest/verify":
@@ -1724,6 +1729,45 @@ def build_handler(store: VCStore) -> type:
                 tenant, data["method"], data["public_key"], key_mode=key_mode
             )
             self._send_json(201, self._did_payload(record))
+
+        def _post_dids_register_batch(self, tenant: str) -> None:
+            # POST /v1/dids/register-batch：整批原子注册 DID。
+            # 请求体恰含 items（1..100 个对象）；每项恰含必填 method、
+            # public_key 与可选 key_mode（缺省 server，其余取值非法），
+            # 语义与 POST /v1/dids 一致。外层字段缺失或多余、JSON 非对象、
+            # items 类型或数量不符、项形状或字段非法一律 400 且恰含
+            # {"error":"请求非法"}，并在任何写入前按输入顺序完成校验；
+            # 批内句柄重复 409 且恰含 {"error":"批内句柄重复"}。已在本
+            # 租户登记的句柄按单项入口幂等规则返回既有 DID。成功 201 仅
+            # 返 {"results":[...]}，与输入等长同序，每项字段与单项入口
+            # 一致；DID、审计、游标与状态文件同一次原子提交，请求错误
+            # 整批无副作用；保存异常 500 且恰含 {"error":"存储失败"}，
+            # 整批完全回滚。
+            try:
+                data = self._read_json()
+            except ValidationError:
+                raise ValidationError("请求非法")
+            if set(data) != {"items"}:
+                raise ValidationError("请求非法")
+            items = data["items"]
+            if not isinstance(items, list) or not 1 <= len(items) <= 100:
+                raise ValidationError("请求非法")
+            try:
+                records = store.create_dids_batch(tenant, items)
+            except ValidationError:
+                self._send_error(400, "请求非法")
+                return
+            except StorageError:
+                self._send_error(500, "存储失败")
+                return
+            self._send_json(
+                201,
+                {
+                    "results": [
+                        self._did_payload(record) for record in records
+                    ]
+                },
+            )
 
         def _get_did(self, tenant: str, did: str) -> None:
             record = store.get_did(tenant, did)

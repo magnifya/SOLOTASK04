@@ -2158,6 +2158,160 @@ class VCStore:
                 self._restore_locked(snapshot)
                 raise
 
+    def create_dids_batch(
+        self,
+        tenant_id: str,
+        raw_items: List[Any],
+    ) -> List[DIDRecord]:
+        """整批原子注册 DID：按输入顺序逐项校验、单次提交、失败整体回滚。
+
+        ``raw_items`` 为已通过外层形状校验（数组且 1..100 项）的原始
+        JSON 项列表；每项恰含必填 method、public_key 与可选 key_mode
+        （缺省 "server"，其余取值非法），字段缺失/多余、项非对象、类型
+        或格式非法均抛 ValidationError（HTTP 400，统一“请求非法”），
+        逐项语义与 create_did 完全一致。同一批内（规范化后）句柄重复抛
+        ConflictError（HTTP 409，“批内句柄重复”）。全部校验在任何写入
+        之前按输入顺序完成，失败整批无副作用、不占审计序号。
+
+        已在本租户登记的句柄按单项入口的幂等规则返回既有 DID 并同样各记
+        一条 did.created 审计；新项生成版本一的服务端 P-256 密钥，追加
+        did.created 审计、DID 历史与密钥生命周期 active 事件。批内审计
+        按输入顺序追加；DID、审计、游标与状态文件仅做一次原子落盘，任一
+        生成或保存失败恢复快照并抛 StorageError（HTTP 500），内存态与
+        磁盘均回到批前。results 与输入等长同序；句柄按租户隔离，不同
+        租户同句柄各自独立。
+        """
+        allowed_fields = {"method", "public_key", "key_mode"}
+        with self._lock:
+            bucket = self._ensure_bucket_locked(tenant_id)
+            # 阶段一：按输入顺序逐项完整校验（字段形状与语义），并做批内
+            # 句柄判重；首个失败项抛出，整批不做任何写入。
+            prepared: List[Tuple[str, str]] = []
+            seen_handles: set = set()
+            for index, item in enumerate(raw_items):
+                prefix = f"items[{index}]"
+                if not isinstance(item, dict):
+                    raise ValidationError(f"{prefix} 必须为 JSON 对象")
+                unknown = sorted(set(item) - allowed_fields)
+                if unknown:
+                    raise ValidationError(
+                        f"{prefix} 多余字段: {', '.join(unknown)}"
+                    )
+                if "method" not in item:
+                    raise ValidationError(f"{prefix} 缺少字段: method")
+                if "public_key" not in item:
+                    raise ValidationError(f"{prefix} 缺少字段: public_key")
+                method = item["method"]
+                if not isinstance(method, str) or not method:
+                    raise ValidationError(
+                        f"{prefix} 缺少字段或字段为空: method"
+                    )
+                if not _METHOD_RE.match(method):
+                    raise ValidationError(
+                        f"{prefix} method 非法: {method!r}"
+                        "（需为小写字母开头的小写字母数字/_-串）"
+                    )
+                key_mode = item.get("key_mode", "server")
+                if key_mode != "server":
+                    raise ValidationError(
+                        f"{prefix} key_mode 非法: {key_mode!r}"
+                        "（目前仅支持 server）"
+                    )
+                handle = _validate_key_handle(item["public_key"], "public_key")
+                if handle in seen_handles:
+                    raise ConflictError("批内句柄重复")
+                seen_handles.add(handle)
+                prepared.append((method, handle))
+
+            # 阶段二：全部校验通过后统一写入并审计，单次原子提交。
+            snapshot = self._snapshot_locked()
+            try:
+                results: List[DIDRecord] = []
+                for method, handle in prepared:
+                    existing = self._find_did_by_handle_locked(bucket, handle)
+                    if existing is not None:
+                        # 幂等命中：与单项入口一致，每次仍记 did.created。
+                        self._append_audit_locked(
+                            tenant_id, AUDIT_DID_CREATED, "did", existing.did
+                        )
+                        results.append(existing)
+                        continue
+
+                    priv_pem = crypto.generate_private_key_pem()
+                    registered_pub = crypto.public_key_pem_from_private(
+                        priv_pem
+                    ).strip()
+                    did = f"did:{method}:{uuid.uuid4().hex}"
+                    audit_event = self._append_audit_locked(
+                        tenant_id, AUDIT_DID_CREATED, "did", did
+                    )
+                    # 生命周期事件的 updated_at 与审计 timestamp 严格同秒。
+                    created_at = _utc_z_from_unix(audit_event["timestamp"])
+                    bucket["dids"][did] = {
+                        "method": method,
+                        "public_key": registered_pub,
+                        "submitted_public_key": handle,
+                        "created_at": created_at,
+                        "private_key_pem": priv_pem,
+                        "key_mode": "server",
+                        "key_handle": handle,
+                        "key_version": 1,
+                        "key_history": [
+                            {
+                                "version": 1,
+                                "key_handle": handle,
+                                "public_key": registered_pub,
+                                "private_key_pem": priv_pem,
+                            }
+                        ],
+                    }
+                    lifecycle_entries = (
+                        bucket.setdefault("key_lifecycle", {}).setdefault(
+                            did, []
+                        )
+                    )
+                    lifecycle_entries.append(
+                        {
+                            "key_version": 1,
+                            "key_handle": handle,
+                            "public_key": registered_pub,
+                            "action": AUDIT_DID_CREATED,
+                            "status": "active",
+                            "updated_at": created_at,
+                            "cursor": (
+                                self._next_key_lifecycle_cursor_locked(
+                                    tenant_id
+                                )
+                            ),
+                            "audit_seq": audit_event["seq"],
+                            "audit_timestamp": audit_event["timestamp"],
+                        }
+                    )
+                    did_history_entries = (
+                        bucket.setdefault("did_history", {}).setdefault(
+                            did, []
+                        )
+                    )
+                    did_history_entries.append(
+                        {
+                            "action": AUDIT_DID_CREATED,
+                            "status": "active",
+                            "reason": None,
+                            "updated_at": created_at,
+                            "cursor": (
+                                self._next_did_history_cursor_locked(tenant_id)
+                            ),
+                            "audit_seq": audit_event["seq"],
+                            "audit_timestamp": audit_event["timestamp"],
+                        }
+                    )
+                    results.append(self._did_record(did, bucket["dids"][did]))
+                self._save_locked()
+            except Exception as exc:
+                self._restore_locked(snapshot)
+                raise StorageError("存储失败") from exc
+            return results
+
     def _find_did_by_handle_locked(
         self, bucket: Dict[str, Any], handle: str
     ) -> Optional[DIDRecord]:
