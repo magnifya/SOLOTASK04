@@ -247,6 +247,7 @@ DEFAULT_SCHEMA_DEPRECATE_REASON = "模式版本已弃用"
 DEFAULT_SCHEMA_REVOKE_REASON = "模式版本已吊销"
 
 AUDIT_KEY_ROTATED = "key.rotated"
+AUDIT_DID_KEY_BACKUP_EXPORTED = "did.key.backup.exported"
 AUDIT_STATUS_UPDATED = "status.updated"
 AUDIT_CREDENTIAL_REVOKED = "credential.revoked"
 AUDIT_PRESENTATION_CREATED = "presentation.created"
@@ -2612,90 +2613,246 @@ class VCStore:
             snapshot = self._snapshot_locked()
             try:
                 priv_pem = crypto.generate_private_key_pem()
-                pub_pem = crypto.public_key_pem_from_private(priv_pem).strip()
-                new_version = int(rec.get("key_version", 1)) + 1
-                # 捕获轮换前版本（旧钥）信息，供轮换证明 from_* 与旧钥签名。
-                from_version = new_version - 1
-                from_handle = rec.get("key_handle", "")
-                from_pub_pem = rec.get("public_key", "")
-                from_priv_pem = rec.get("private_key_pem")
-                audit_event = self._append_audit_locked(
-                    tenant_id, AUDIT_KEY_ROTATED, "did", did
+                return self._apply_new_key_version_locked(
+                    tenant_id, bucket, did, rec, handle, priv_pem
                 )
-                # 生命周期事件的 updated_at 取轮换成功时刻，与审计同秒。
-                rotated_at = _utc_z_from_unix(audit_event["timestamp"])
-                history: List[Dict[str, Any]] = rec.setdefault("key_history", [])
-                history.append(
-                    {
-                        "version": new_version,
-                        "key_handle": handle,
-                        "public_key": pub_pem,
-                        "private_key_pem": priv_pem,
-                    }
-                )
-                rec["key_version"] = new_version
-                rec["key_handle"] = handle
-                rec["public_key"] = pub_pem
-                rec["private_key_pem"] = priv_pem
-                lifecycle_entries = (
-                    bucket.setdefault("key_lifecycle", {}).setdefault(did, [])
-                )
-                lifecycle_entries.append(
-                    {
-                        "key_version": new_version,
-                        "key_handle": handle,
-                        "public_key": pub_pem,
-                        "action": AUDIT_KEY_ROTATED,
-                        "status": "active",
-                        "updated_at": rotated_at,
-                        "cursor": (
-                            self._next_key_lifecycle_cursor_locked(tenant_id)
-                        ),
-                        "audit_seq": audit_event["seq"],
-                        "audit_timestamp": audit_event["timestamp"],
-                    }
-                )
-                # 可独立验证的轮换证明：与新版本、生命周期事件、审计在同一
-                # 次原子写中追加；首条 previous_proof_digest 为 None，后续
-                # 取上一条 proof_digest 形成哈希链。旧、新私钥分别对去掉
-                # 三个 proof 字段的记录做 ES256；proof_digest 对不含自身
-                # 而含两个 proof 的记录求 SHA-256 小写 hex。旧版本（升级
-                # 前已存在的轮换）不补造。任一步失败随快照整体回滚。
-                proof_entries = (
-                    bucket.setdefault("key_rotation_proofs", {})
-                    .setdefault(did, [])
-                )
-                previous_digest = (
-                    proof_entries[-1]["proof_digest"] if proof_entries else None
-                )
-                proof_row: Dict[str, Any] = {
-                    "did": did,
-                    "from_key_version": from_version,
-                    "to_key_version": new_version,
-                    "from_key_handle": from_handle,
-                    "to_key_handle": handle,
-                    "from_public_key": from_pub_pem,
-                    "to_public_key": pub_pem,
-                    "rotated_at": rotated_at,
-                    "previous_proof_digest": previous_digest,
-                }
-                if not isinstance(from_priv_pem, str) or not from_priv_pem:
-                    # 正常不会发生：迁移保证每个版本私钥可用。
+            except Exception:
+                self._restore_locked(snapshot)
+                raise
+
+    def _apply_new_key_version_locked(
+        self,
+        tenant_id: str,
+        bucket: Dict[str, Any],
+        did: str,
+        rec: Dict[str, Any],
+        handle: str,
+        priv_pem: str,
+    ) -> DIDRecord:
+        """锁内把给定私钥登记为当前版本+1 的新版本并原子落盘。
+
+        密钥历史、密钥生命周期事件（key.rotated）、可独立验证的轮换
+        证明与 key.rotated 审计在同一次原子写中追加；任一步失败由调用
+        方按快照整体回滚。轮换与备份恢复共用本逻辑。
+        """
+        pub_pem = crypto.public_key_pem_from_private(priv_pem).strip()
+        new_version = int(rec.get("key_version", 1)) + 1
+        # 捕获轮换前版本（旧钥）信息，供轮换证明 from_* 与旧钥签名。
+        from_version = new_version - 1
+        from_handle = rec.get("key_handle", "")
+        from_pub_pem = rec.get("public_key", "")
+        from_priv_pem = rec.get("private_key_pem")
+        audit_event = self._append_audit_locked(
+            tenant_id, AUDIT_KEY_ROTATED, "did", did
+        )
+        # 生命周期事件的 updated_at 取轮换成功时刻，与审计同秒。
+        rotated_at = _utc_z_from_unix(audit_event["timestamp"])
+        history: List[Dict[str, Any]] = rec.setdefault("key_history", [])
+        history.append(
+            {
+                "version": new_version,
+                "key_handle": handle,
+                "public_key": pub_pem,
+                "private_key_pem": priv_pem,
+            }
+        )
+        rec["key_version"] = new_version
+        rec["key_handle"] = handle
+        rec["public_key"] = pub_pem
+        rec["private_key_pem"] = priv_pem
+        lifecycle_entries = (
+            bucket.setdefault("key_lifecycle", {}).setdefault(did, [])
+        )
+        lifecycle_entries.append(
+            {
+                "key_version": new_version,
+                "key_handle": handle,
+                "public_key": pub_pem,
+                "action": AUDIT_KEY_ROTATED,
+                "status": "active",
+                "updated_at": rotated_at,
+                "cursor": (
+                    self._next_key_lifecycle_cursor_locked(tenant_id)
+                ),
+                "audit_seq": audit_event["seq"],
+                "audit_timestamp": audit_event["timestamp"],
+            }
+        )
+        # 可独立验证的轮换证明：与新版本、生命周期事件、审计在同一
+        # 次原子写中追加；首条 previous_proof_digest 为 None，后续
+        # 取上一条 proof_digest 形成哈希链。旧、新私钥分别对去掉
+        # 三个 proof 字段的记录做 ES256；proof_digest 对不含自身
+        # 而含两个 proof 的记录求 SHA-256 小写 hex。旧版本（升级
+        # 前已存在的轮换）不补造。任一步失败随快照整体回滚。
+        proof_entries = (
+            bucket.setdefault("key_rotation_proofs", {})
+            .setdefault(did, [])
+        )
+        previous_digest = (
+            proof_entries[-1]["proof_digest"] if proof_entries else None
+        )
+        proof_row: Dict[str, Any] = {
+            "did": did,
+            "from_key_version": from_version,
+            "to_key_version": new_version,
+            "from_key_handle": from_handle,
+            "to_key_handle": handle,
+            "from_public_key": from_pub_pem,
+            "to_public_key": pub_pem,
+            "rotated_at": rotated_at,
+            "previous_proof_digest": previous_digest,
+        }
+        if not isinstance(from_priv_pem, str) or not from_priv_pem:
+            # 正常不会发生：迁移保证每个版本私钥可用。
+            raise StorageError(
+                f"DID {did} 旧版本 {from_version} 私钥不可用，"
+                "无法生成轮换证明"
+            )
+        signed_payload = _rotation_proof_signed_payload(proof_row)
+        proof_row["from_proof"] = crypto.sign(
+            signed_payload, from_priv_pem
+        )
+        proof_row["to_proof"] = crypto.sign(signed_payload, priv_pem)
+        proof_row["proof_digest"] = _rotation_proof_digest(proof_row)
+        proof_entries.append(
+            {field: proof_row[field] for field in ROTATION_PROOF_FIELDS}
+        )
+        self._save_locked()
+        return self._did_record(did, rec)
+
+    # ------------------------------------------------------------------ #
+    # 私钥口令加密备份与恢复
+    # ------------------------------------------------------------------ #
+    def export_key_backup(
+        self, tenant_id: str, did: str, passphrase: str
+    ) -> Dict[str, Any]:
+        """导出 DID 当前版本私钥的口令加密备份（PBKDF2 + AES-256-GCM）。
+
+        - DID 不存在（含他租户资源）抛 NotFoundError（HTTP 404）；
+          DID 已停用抛 ConflictError（HTTP 409）；
+        - 密文经 GCM 附加认证数据绑定租户、DID、当前版本与句柄；
+        - 成功追加 did.key.backup.exported 审计并与之一同原子落盘，
+          失败整体回滚、无副作用；
+        - 返回对象恰含 did、key_version、key_handle、kdf、
+          kdf_iterations、salt、cipher、nonce、ciphertext，绝不包含
+          私钥明文。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            rec = bucket["dids"].get(did) if bucket is not None else None
+            if rec is None:
+                raise NotFoundError(f"DID 不存在: {did}")
+            if rec.get("status") == "deactivated":
+                raise ConflictError(f"DID 已停用，不能备份密钥: {did}")
+            snapshot = self._snapshot_locked()
+            try:
+                key_version = int(rec.get("key_version", 1))
+                handle = rec.get("key_handle", "")
+                priv_pem = rec.get("private_key_pem")
+                if not isinstance(priv_pem, str) or not priv_pem:
                     raise StorageError(
-                        f"DID {did} 旧版本 {from_version} 私钥不可用，"
-                        "无法生成轮换证明"
+                        f"DID {did} 当前版本私钥不可用，无法备份"
                     )
-                signed_payload = _rotation_proof_signed_payload(proof_row)
-                proof_row["from_proof"] = crypto.sign(
-                    signed_payload, from_priv_pem
+                aad = crypto.backup_aad(tenant_id, did, key_version, handle)
+                salt, nonce, ciphertext = crypto.encrypt_key_backup(
+                    passphrase, priv_pem.encode("utf-8"), aad
                 )
-                proof_row["to_proof"] = crypto.sign(signed_payload, priv_pem)
-                proof_row["proof_digest"] = _rotation_proof_digest(proof_row)
-                proof_entries.append(
-                    {field: proof_row[field] for field in ROTATION_PROOF_FIELDS}
+                self._append_audit_locked(
+                    tenant_id, AUDIT_DID_KEY_BACKUP_EXPORTED, "did", did
                 )
                 self._save_locked()
-                return self._did_record(did, rec)
+                return {
+                    "did": did,
+                    "key_version": key_version,
+                    "key_handle": handle,
+                    "kdf": crypto.BACKUP_KDF,
+                    "kdf_iterations": crypto.BACKUP_KDF_ITERATIONS,
+                    "salt": salt,
+                    "cipher": crypto.BACKUP_CIPHER,
+                    "nonce": nonce,
+                    "ciphertext": ciphertext,
+                }
+            except Exception:
+                self._restore_locked(snapshot)
+                raise
+
+    @staticmethod
+    def _decrypt_key_backup(
+        tenant_id: str, did: str, backup: Dict[str, Any], passphrase: str
+    ) -> str:
+        """校验备份绑定并解密出 P-256 私钥 PEM；任何失败抛 备份无效。"""
+        invalid = ValidationError("备份无效")
+        if (
+            backup.get("did") != did
+            or backup.get("kdf") != crypto.BACKUP_KDF
+            or backup.get("kdf_iterations") != crypto.BACKUP_KDF_ITERATIONS
+            or backup.get("cipher") != crypto.BACKUP_CIPHER
+        ):
+            raise invalid
+        key_version = backup.get("key_version")
+        key_handle = backup.get("key_handle")
+        if (
+            not isinstance(key_version, int)
+            or isinstance(key_version, bool)
+            or key_version < 1
+            or not isinstance(key_handle, str)
+            or not key_handle
+        ):
+            raise invalid
+        aad = crypto.backup_aad(tenant_id, did, key_version, key_handle)
+        try:
+            plaintext = crypto.decrypt_key_backup(
+                passphrase,
+                backup.get("salt"),
+                backup.get("nonce"),
+                backup.get("ciphertext"),
+                aad,
+            )
+            priv_pem = plaintext.decode("utf-8")
+            # 内容必须为合法 P-256 私钥（同时导出公钥以确认可恢复）。
+            crypto.public_key_pem_from_private(priv_pem)
+        except Exception:
+            raise invalid
+        return priv_pem
+
+    def restore_key(
+        self,
+        tenant_id: str,
+        did: str,
+        key_handle: str,
+        backup: Dict[str, Any],
+        passphrase: str,
+    ) -> DIDRecord:
+        """从口令加密备份恢复私钥：以当前版本加一创建新版本。
+
+        - DID 不存在（含他租户资源）抛 NotFoundError（HTTP 404）；
+          DID 已停用抛 ConflictError（HTTP 409）；
+        - key_handle 校验与轮换一致（非空、非 PEM）；本租户任一版本
+          已使用该句柄抛 ConflictError（HTTP 409）；
+        - 备份绑定不符、口令错误、解密/认证失败或内容被篡改一律抛
+          ValidationError("备份无效")（HTTP 400）；
+        - 恢复产生的新版本、密钥历史、生命周期事件、轮换证明与
+          key.rotated 审计同一次原子落盘，失败整体回滚；旧版本签名、
+          吊销状态与既有凭证验签结论不变。
+        """
+        handle = _validate_key_handle(key_handle, "key_handle")
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            rec = bucket["dids"].get(did) if bucket is not None else None
+            if rec is None:
+                raise NotFoundError(f"DID 不存在: {did}")
+            if rec.get("status") == "deactivated":
+                raise ConflictError(f"DID 已停用，不能恢复密钥: {did}")
+            if self._handle_in_use_locked(bucket, handle):
+                raise ConflictError("key_handle 已被使用")
+            priv_pem = self._decrypt_key_backup(
+                tenant_id, did, backup, passphrase
+            )
+            snapshot = self._snapshot_locked()
+            try:
+                return self._apply_new_key_version_locked(
+                    tenant_id, bucket, did, rec, handle, priv_pem
+                )
             except Exception:
                 self._restore_locked(snapshot)
                 raise

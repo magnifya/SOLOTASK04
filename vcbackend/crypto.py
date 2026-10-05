@@ -7,8 +7,9 @@ ES256 即 ECDSA over P-256 与 SHA-256。签名以 JWS 约定编码：
 
 import base64
 import json
+import os
 import re
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
@@ -17,11 +18,23 @@ from cryptography.hazmat.primitives.asymmetric.utils import (
     decode_dss_signature,
     encode_dss_signature,
 )
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 __all__ = [
     "InvalidSignature",
     "MalformedSignature",
+    "BACKUP_CIPHER",
+    "BACKUP_KDF",
+    "BACKUP_KDF_ITERATIONS",
+    "BACKUP_NONCE_BYTES",
+    "BACKUP_SALT_BYTES",
+    "backup_aad",
     "canonicalize",
+    "decode_backup_field",
+    "decrypt_key_backup",
+    "derive_backup_key",
+    "encrypt_key_backup",
     "generate_private_key_pem",
     "public_key_pem_from_private",
     "validate_public_key_pem",
@@ -167,3 +180,97 @@ def verify(body: Dict[str, Any], signature_b64: str, public_pem: str) -> None:
     s = int.from_bytes(raw[32:], "big")
     der = encode_dss_signature(r, s)
     public_key.verify(der, canonicalize(body), ec.ECDSA(hashes.SHA256()))
+
+
+# --------------------------------------------------------------------- #
+# DID 私钥口令加密备份
+#
+# PBKDF2-HMAC-SHA256（310000 迭代）从口令派生 256 位密钥，AES-256-GCM
+# 加密（密文尾部含 16 字节认证标签），GCM 附加认证数据（AAD）绑定
+# 租户、DID、密钥版本与句柄；salt 16 字节、nonce 12 字节随机生成，
+# 序列化均为无填充 base64url。
+# --------------------------------------------------------------------- #
+BACKUP_KDF = "PBKDF2-HMAC-SHA256"
+BACKUP_KDF_ITERATIONS = 310000
+BACKUP_CIPHER = "AES-256-GCM"
+BACKUP_SALT_BYTES = 16
+BACKUP_NONCE_BYTES = 12
+
+# 无填充 base64url 的严格形状（不含填充符与字母表外字符）
+_B64URL_UNPADDED_RE = re.compile(r"[A-Za-z0-9_-]*")
+
+
+def backup_aad(
+    tenant_id: str, did: str, key_version: int, key_handle: str
+) -> bytes:
+    """备份密文的 GCM 附加认证数据：规范化 JSON 绑定租户/DID/版本/句柄。"""
+    return canonicalize(
+        {
+            "tenant": tenant_id,
+            "did": did,
+            "key_version": key_version,
+            "key_handle": key_handle,
+        }
+    )
+
+
+def decode_backup_field(text: Any, expected_len: int = 0) -> bytes:
+    """严格解码无填充 base64url 备份字段。
+
+    非字符串、含填充或字母表外字符、无填充重编码不一致，或解码长度
+    与 expected_len（>0 时）不符，一律抛 ValueError。
+    """
+    if not isinstance(text, str) or not _B64URL_UNPADDED_RE.fullmatch(text):
+        raise ValueError("备份字段不是无填充 base64url 编码")
+    try:
+        raw = _b64url_decode(text)
+    except Exception as exc:  # noqa: BLE001 解码失败均属编码非法
+        raise ValueError("备份字段不是合法 base64url 编码") from exc
+    if _b64url(raw) != text:
+        raise ValueError("备份字段不是规范的无填充 base64url 编码")
+    if expected_len > 0 and len(raw) != expected_len:
+        raise ValueError("备份字段解码长度非法")
+    return raw
+
+
+def derive_backup_key(passphrase: str, salt: bytes) -> bytes:
+    """PBKDF2-HMAC-SHA256（310000 迭代）从口令派生 32 字节加密密钥。"""
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=BACKUP_KDF_ITERATIONS,
+    )
+    return kdf.derive(passphrase.encode("utf-8"))
+
+
+def encrypt_key_backup(
+    passphrase: str, plaintext: bytes, aad: bytes
+) -> Tuple[str, str, str]:
+    """加密备份明文，返回 (salt, nonce, ciphertext) 的无填充 base64url。
+
+    密文尾部含 16 字节 GCM 认证标签；salt 16 字节、nonce 12 字节随机。
+    """
+    salt = os.urandom(BACKUP_SALT_BYTES)
+    nonce = os.urandom(BACKUP_NONCE_BYTES)
+    key = derive_backup_key(passphrase, salt)
+    ciphertext = AESGCM(key).encrypt(nonce, plaintext, aad)
+    return _b64url(salt), _b64url(nonce), _b64url(ciphertext)
+
+
+def decrypt_key_backup(
+    passphrase: str,
+    salt_b64: Any,
+    nonce_b64: Any,
+    ciphertext_b64: Any,
+    aad: bytes,
+) -> bytes:
+    """解密备份密文；编码非法、口令错误或认证失败一律抛 ValueError。"""
+    salt = decode_backup_field(salt_b64, BACKUP_SALT_BYTES)
+    nonce = decode_backup_field(nonce_b64, BACKUP_NONCE_BYTES)
+    ciphertext = decode_backup_field(ciphertext_b64)
+    key = derive_backup_key(passphrase, salt)
+    try:
+        return AESGCM(key).decrypt(nonce, ciphertext, aad)
+    except Exception as exc:  # noqa: BLE001 认证/解密失败统一对外
+        raise ValueError("备份解密或认证失败") from exc

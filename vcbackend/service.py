@@ -9,6 +9,8 @@
   GET  /v1/dids/{did}/history             查询 DID 注册与停用历史（只读）
   GET  /v1/dids/{did}/document            查询 DID 文档（历史公钥，只读）
   POST /v1/dids/{did}/keys/rotate         轮换 DID 密钥（成功时原子追加可独立验证的轮换证明）
+  POST /v1/dids/{did}/keys/backup         导出当前版本私钥的口令加密备份（绑定租户/DID/版本/句柄）
+  POST /v1/dids/{did}/keys/restore        从口令加密备份恢复私钥为新版本（与轮换证明/审计原子落盘）
   GET  /v1/dids/{did}/keys/rotations      查询 DID 密钥轮换可验证证明（?limit=&after=，只读）
   POST /v1/dids/rotation-proofs/verify    跨系统自包含验证轮换证明链（只读，不依赖本地状态）
   POST /v1/dids/{did}/keys/{ver}/revoke   吊销 DID 旧密钥版本
@@ -210,6 +212,32 @@ def _json_dumps(payload: Any) -> bytes:
 
 # 签发幂等键：1-64 个 ASCII 字母/数字/下划线/连字符，键值区分大小写
 _IDEMPOTENCY_KEY_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+# 密钥备份对象（/keys/backup 响应与 /keys/restore 请求中 backup 字段）
+# 的恰含字段集合。
+_BACKUP_OBJECT_FIELDS = frozenset(
+    {
+        "did",
+        "key_version",
+        "key_handle",
+        "kdf",
+        "kdf_iterations",
+        "salt",
+        "cipher",
+        "nonce",
+        "ciphertext",
+    }
+)
+_BACKUP_OBJECT_STR_FIELDS = (
+    "did",
+    "key_handle",
+    "kdf",
+    "salt",
+    "cipher",
+    "nonce",
+    "ciphertext",
+)
+_BACKUP_OBJECT_INT_FIELDS = ("key_version", "kdf_iterations")
 
 
 def _canonical_json_number(value: Any) -> str:
@@ -859,6 +887,20 @@ def build_handler(store: VCStore) -> type:
                         path[len("/v1/dids/") : -len("/keys/rotate")]
                     )
                     self._post_rotate_key(tenant, did)
+                elif path.startswith("/v1/dids/") and path.endswith(
+                    "/keys/backup"
+                ):
+                    did = unquote(
+                        path[len("/v1/dids/") : -len("/keys/backup")]
+                    )
+                    self._post_key_backup(tenant, did)
+                elif path.startswith("/v1/dids/") and path.endswith(
+                    "/keys/restore"
+                ):
+                    did = unquote(
+                        path[len("/v1/dids/") : -len("/keys/restore")]
+                    )
+                    self._post_key_restore(tenant, did)
                 elif path.startswith("/v1/dids/") and "/keys/" in path and path.endswith(
                     "/revoke"
                 ):
@@ -2123,6 +2165,80 @@ def build_handler(store: VCStore) -> type:
             data = self._read_json()
             self._require_fields(data, ("key_handle",))
             record = store.rotate_key(tenant, did, data["key_handle"])
+            self._send_json(200, self._did_payload(record))
+
+        def _read_json_as_invalid(self) -> Dict[str, Any]:
+            """读取请求体；空体、非法 JSON、非对象统一 400 请求非法。"""
+            try:
+                return self._read_json()
+            except ValidationError:
+                raise ValidationError("请求非法")
+
+        @staticmethod
+        def _backup_passphrase(value: Any) -> str:
+            """备份口令：8 至 256 个 Unicode 码点的非空字符串。"""
+            if not isinstance(value, str) or not 8 <= len(value) <= 256:
+                raise ValidationError("请求非法")
+            return value
+
+        def _post_key_backup(self, tenant: str, did: str) -> None:
+            # POST /v1/dids/{did}/keys/backup：导出当前版本私钥的口令
+            # 加密备份。请求体恰含 passphrase（8..256 个 Unicode 码点
+            # 的非空字符串）；空体、非法 JSON、字段缺失/多余/类型错误
+            # 一律 400 {"error":"请求非法"}；未知或跨租户 DID 404，停
+            # 用 DID 409。成功 200 恰含 did、key_version、key_handle、
+            # kdf、kdf_iterations、salt、cipher、nonce、ciphertext：
+            # kdf 固定 PBKDF2-HMAC-SHA256、迭代 310000，cipher 固定
+            # AES-256-GCM，salt/nonce 为 16/12 字节随机值的无填充
+            # base64url，密文含认证标签并绑定租户、DID、版本、句柄。
+            # 私钥绝不出现在响应、审计或查询；成功追加
+            # did.key.backup.exported 审计，失败无副作用。
+            data = self._read_json_as_invalid()
+            if set(data) != {"passphrase"}:
+                raise ValidationError("请求非法")
+            passphrase = self._backup_passphrase(data["passphrase"])
+            backup = store.export_key_backup(tenant, did, passphrase)
+            self._send_json(200, backup)
+
+        def _post_key_restore(self, tenant: str, did: str) -> None:
+            # POST /v1/dids/{did}/keys/restore：从口令加密备份恢复私钥，
+            # 以当前版本加一创建新版本。请求体恰含 backup、passphrase、
+            # key_handle；backup 必须为备份对象且无未知字段，口令同上，
+            # 句柄沿用轮换的非空、非 PEM 校验。请求结构错误 400
+            # {"error":"请求非法"}；备份绑定不符、口令错误、解密/认证
+            # 失败或内容被篡改统一 400 {"error":"备份无效"}；未知或跨
+            # 租户 DID 404；停用 DID 409；本租户任一版本已使用该句柄
+            # 409 {"error":"key_handle 已被使用"}。成功 200 响应字段与
+            # /keys/rotate 相同；新版本、密钥历史、轮换证明、游标与
+            # key.rotated 审计同一次原子落盘，失败整体回滚。
+            data = self._read_json_as_invalid()
+            if set(data) != {"backup", "passphrase", "key_handle"}:
+                raise ValidationError("请求非法")
+            passphrase = self._backup_passphrase(data["passphrase"])
+            key_handle = data["key_handle"]
+            if (
+                not isinstance(key_handle, str)
+                or not key_handle.strip()
+                or "-----BEGIN" in key_handle
+            ):
+                raise ValidationError("请求非法")
+            backup = data["backup"]
+            if not isinstance(backup, dict) or (
+                set(backup) != _BACKUP_OBJECT_FIELDS
+            ):
+                raise ValidationError("请求非法")
+            if any(
+                not isinstance(backup[field], str)
+                for field in _BACKUP_OBJECT_STR_FIELDS
+            ) or any(
+                not isinstance(backup[field], int)
+                or isinstance(backup[field], bool)
+                for field in _BACKUP_OBJECT_INT_FIELDS
+            ):
+                raise ValidationError("请求非法")
+            record = store.restore_key(
+                tenant, did, key_handle, backup, passphrase
+            )
             self._send_json(200, self._did_payload(record))
 
         def _post_rotation_proofs_verify(self, tenant: str) -> None:
