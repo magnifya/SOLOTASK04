@@ -234,6 +234,33 @@ class CredentialStatusRecord:
 
 
 @dataclass
+class CredentialListRecord:
+    """本租户凭证检索列表中的一项（只读检索查询用）。
+
+    仅含元数据，绝不含 claims、signature 与私钥。cursor 为租户内持久化
+    正整数，仅成功签发时分配（批量按输入顺序），失败、回滚与重复幂等
+    不消耗游标；旧记录缺少游标时加载按 (issued_at, credential_id) 稳定
+    补齐，不改写正文或签名。未登记状态按 active 处理，此时
+    status_updated_at/status_reason/revoked_at 均为 None；无期限或未
+    绑定模式的凭证 expires_at/schema_id/schema_version 为 None。
+    """
+
+    cursor: int
+    credential_id: str
+    issuer_did: str
+    subject_did: str
+    issued_at: Optional[str]
+    expires_at: Optional[str]
+    issuer_key_version: Optional[int]
+    status: str
+    status_updated_at: Optional[str]
+    status_reason: Optional[str]
+    revoked_at: Optional[str]
+    schema_id: Optional[str]
+    schema_version: Optional[int]
+
+
+@dataclass
 class PresentationRecord:
     """一条选择性披露演示记录。
 

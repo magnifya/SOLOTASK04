@@ -42,6 +42,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from . import crypto
 from .models import (
     AuditEvent,
+    CredentialListRecord,
     CredentialRecord,
     CredentialSchemaRecord,
     CredentialSchemaStatusRecord,
@@ -1486,6 +1487,22 @@ class VCStore:
                 self._presentation_sync_receipt_consumption_cursors[
                     tenant_id
                 ] = max_cursor
+        # 凭证检索游标：按租户各自维护的持久化正整数（tenant_id ->
+        # cursor），同一租户内全部已签发凭证共享该游标空间，仅成功签发
+        # 时分配；与其他历史游标空间相互独立。旧状态文件无该字段时，从
+        # 各租户已有凭证行的最大 cursor 推导。
+        raw_credential_cursors = data.get("credential_cursors", {})
+        self._credential_cursors: Dict[str, int] = {
+            str(tenant_id): int(cursor)
+            for tenant_id, cursor in raw_credential_cursors.items()
+            if int(cursor) > 0
+        } if isinstance(raw_credential_cursors, dict) else {}
+        for tenant_id, bucket in self._tenants.items():
+            max_cursor = self._credential_cursors.get(tenant_id, 0)
+            for rec in bucket.get("credentials", {}).values():
+                max_cursor = max(max_cursor, int(rec.get("cursor") or 0))
+            if max_cursor:
+                self._credential_cursors[tenant_id] = max_cursor
         # 同步回执事件：按 (租户, signer_did) 分桶，每个签名者保存其来源
         # 导出游标空间内的事件行（按来源 cursor 升序），供续页/重放时做
         # 同位内容比对；另以租户全局 synced_receipts 索引 (verifier_did,
@@ -1728,6 +1745,9 @@ class VCStore:
         # 事件的，按 (consumed_at, verifier_did, nonce) 升序稳定补录
         # （内存态），使用独立游标空间；重启后 cursor 稳定。
         self._backfill_presentation_sync_receipt_consumption_events_locked()
+        # 旧状态文件中缺少游标的凭证记录，按 (issued_at, credential_id)
+        # 升序稳定补游标（内存态，不改写正文或签名）；重启后 cursor 稳定。
+        self._backfill_credential_cursors_locked()
 
     def _save_locked(self) -> None:
         directory = os.path.dirname(os.path.abspath(self.path))
@@ -1765,6 +1785,7 @@ class VCStore:
             "presentation_sync_receipt_consumption_cursors": (
                 self._presentation_sync_receipt_consumption_cursors
             ),
+            "credential_cursors": self._credential_cursors,
             "receipt_sync_checkpoints": self._receipt_sync_checkpoints,
             "credential_status_receipt_sync_checkpoints": (
                 self._credential_status_receipt_sync_checkpoints
@@ -1801,6 +1822,7 @@ class VCStore:
                 self._credential_status_receipt_consumption_cursors,
                 self._credential_status_sync_receipt_consumption_cursors,
                 self._presentation_sync_receipt_consumption_cursors,
+                self._credential_cursors,
                 self._receipt_sync_checkpoints,
                 self._credential_status_receipt_sync_checkpoints,
                 self._presentation_sync_checkpoints,
@@ -1827,6 +1849,7 @@ class VCStore:
             credential_status_receipt_consumption_cursors,
             credential_status_sync_receipt_consumption_cursors,
             presentation_sync_receipt_consumption_cursors,
+            credential_cursors,
             receipt_sync_checkpoints,
             credential_status_receipt_sync_checkpoints,
             presentation_sync_checkpoints,
@@ -1861,6 +1884,7 @@ class VCStore:
         self._presentation_sync_receipt_consumption_cursors = (
             presentation_sync_receipt_consumption_cursors
         )
+        self._credential_cursors = credential_cursors
         self._receipt_sync_checkpoints = receipt_sync_checkpoints
         self._credential_status_receipt_sync_checkpoints = (
             credential_status_receipt_sync_checkpoints
@@ -3287,6 +3311,9 @@ class VCStore:
             bucket["credentials"][credential_id] = {
                 "body": body,
                 "signature": signature,
+                # 检索游标随成功签发分配，与凭证、审计同一次原子写落盘；
+                # 落盘失败随快照一并回滚，不消耗游标。
+                "cursor": self._next_credential_cursor_locked(tenant_id),
             }
             if idempotency is not None:
                 idem_key, request_digest = idempotency
@@ -3558,6 +3585,11 @@ class VCStore:
                     bucket["credentials"][credential_id] = {
                         "body": body,
                         "signature": signature,
+                        # 批量按输入顺序分配检索游标；任一失败整体回滚，
+                        # 不消耗游标。
+                        "cursor": self._next_credential_cursor_locked(
+                            tenant_id
+                        ),
                     }
                     self._append_audit_locked(
                         tenant_id, AUDIT_CREDENTIAL_ISSUED,
@@ -3593,6 +3625,152 @@ class VCStore:
                 body=rec["body"],
                 signature=rec["signature"],
             )
+
+    # ------------------------------------------------------------------ #
+    # 凭证检索游标与只读列表
+    # ------------------------------------------------------------------ #
+    def _next_credential_cursor_locked(self, tenant_id: str) -> int:
+        """分配租户内下一个持久化凭证检索游标（正整数，递增）。
+
+        与各类历史/消费游标空间相互独立：同一租户内全部已签发凭证共享
+        本游标空间，仅成功签发时分配；失败、回滚与重复幂等不消耗游标。
+        """
+        cursor = self._credential_cursors.get(tenant_id, 0) + 1
+        self._credential_cursors[tenant_id] = cursor
+        return cursor
+
+    def _backfill_credential_cursors_locked(self) -> None:
+        """加载迁移：为缺游标的旧凭证记录补检索游标（内存态）。
+
+        对每个租户按 (issued_at, credential_id) 稳定顺序遍历缺少 cursor
+        的凭证记录，在该租户既有最大游标之后接续分配。仅在行上补 cursor
+        字段，不改写正文或签名；仅在内存中补录：随下一次任意原子写一并
+        落盘，若此后无写操作则重启时按相同顺序重建，cursor 稳定。
+        """
+        for tenant_id in sorted(self._tenants):
+            bucket = self._tenants[tenant_id]
+            credentials = bucket.get("credentials", {})
+            missing = [
+                credential_id
+                for credential_id, rec in credentials.items()
+                if rec.get("cursor") is None
+            ]
+            if not missing:
+                continue
+            missing.sort(
+                key=lambda credential_id: (
+                    (credentials[credential_id].get("body") or {}).get(
+                        "issued_at"
+                    )
+                    or "",
+                    credential_id,
+                )
+            )
+            for credential_id in missing:
+                credentials[credential_id]["cursor"] = (
+                    self._next_credential_cursor_locked(tenant_id)
+                )
+
+    def list_credentials(
+        self,
+        tenant_id: str,
+        after: int = 0,
+        limit: int = 50,
+        issuer_did: Optional[str] = None,
+        subject_did: Optional[str] = None,
+        status: Optional[str] = None,
+        schema_id: Optional[str] = None,
+        schema_version: Optional[int] = None,
+    ) -> Tuple[List[CredentialListRecord], int]:
+        """只读检索本租户凭证元数据，按页返回。
+
+        - 各筛选条件（issuer_did/subject_did/status/schema_id/
+          schema_version）给定时在本租户当前快照上过滤，省略则不限；
+          未知或他租户筛选值自然得到空结果（不抛错）；
+        - 未登记状态的凭证按 active 处理，status_updated_at/
+          status_reason/revoked_at 均为 None；
+        - 再按 cursor > after 升序取至多 limit 项；
+        - next_after 为本页末项 cursor，空页保持 after。
+        纯只读：不修改任何状态、不记审计、不触发落盘。无凭证的租户
+        返回空页（不抛 404）。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            candidates: List[Tuple[int, str, Dict[str, Any]]] = []
+            if bucket is not None:
+                for credential_id, rec in bucket.get(
+                    "credentials", {}
+                ).items():
+                    cursor = rec.get("cursor")
+                    if cursor is None:
+                        # 加载迁移已保证存在；防御性跳过异常数据。
+                        continue
+                    cursor = int(cursor)
+                    if cursor <= after:
+                        continue
+                    body = rec.get("body") or {}
+                    if (
+                        issuer_did is not None
+                        and body.get("issuer_did") != issuer_did
+                    ):
+                        continue
+                    if (
+                        subject_did is not None
+                        and body.get("subject_did") != subject_did
+                    ):
+                        continue
+                    if (
+                        schema_id is not None
+                        and body.get("schema_id") != schema_id
+                    ):
+                        continue
+                    if (
+                        schema_version is not None
+                        and body.get("schema_version") != schema_version
+                    ):
+                        continue
+                    resolved_status = rec.get("status") or "active"
+                    if status is not None and resolved_status != status:
+                        continue
+                    candidates.append((cursor, credential_id, rec))
+            candidates.sort(key=lambda item: item[0])
+            picked: List[CredentialListRecord] = []
+            for cursor, credential_id, rec in candidates[:limit]:
+                body = rec.get("body") or {}
+                registered = rec.get("status")
+                resolved_status = registered or "active"
+                if resolved_status == "suspended":
+                    status_reason = rec.get("suspend_reason")
+                    revoked_at = None
+                elif resolved_status == "revoked":
+                    status_reason = rec.get("revoke_reason")
+                    revoked_at = rec.get("revoked_at")
+                else:
+                    status_reason = None
+                    revoked_at = None
+                picked.append(
+                    CredentialListRecord(
+                        cursor=cursor,
+                        credential_id=credential_id,
+                        issuer_did=body.get("issuer_did"),
+                        subject_did=body.get("subject_did"),
+                        issued_at=body.get("issued_at"),
+                        expires_at=body.get("expires_at"),
+                        issuer_key_version=body.get("issuer_key_version"),
+                        status=resolved_status,
+                        status_updated_at=(
+                            rec.get("status_updated_at")
+                            if registered is not None
+                            else None
+                        ),
+                        status_reason=status_reason,
+                        revoked_at=revoked_at,
+                        schema_id=body.get("schema_id"),
+                        schema_version=body.get("schema_version"),
+                    )
+                )
+            next_after = picked[-1].cursor if picked else after
+            return picked, next_after
 
     # ------------------------------------------------------------------ #
     # 凭证模式（约束）注册
