@@ -207,6 +207,28 @@ class CredentialSchemaHistoryEvent:
 
 
 @dataclass
+class CredentialSchemaCatalogItem:
+    """GET /v1/credential-schemas 目录项：本租户可见的一个模式版本。
+
+    cursor 为该模式版本注册事件在租户模式历史游标空间中的游标（注册即
+    分配、跨重启稳定）；内容六字段与单条模式读取结果一致；status 反映
+    当前生命周期（未登记按 active），active 时 reason/updated_at 均为
+    None，deprecated/revoked 时为首次变更的原因与 UTC 秒精度 Z 时间。
+    """
+
+    cursor: int
+    schema_id: str
+    version: int
+    issuer_did: str
+    claim_types: Dict[str, str]
+    required_claims: List[str]
+    digest: str
+    status: str
+    reason: Optional[str]
+    updated_at: Optional[str]
+
+
+@dataclass
 class CredentialRecord:
     """一条已签发凭证：正文与其 ES256 签名。"""
 

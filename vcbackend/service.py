@@ -21,6 +21,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/credentials/issue-batch        整批原子签发（请求体恰含 items 1..100 项；不支持 Idempotency-Key；整批凭证与审计同一次原子写，成功 201 仅返 results）
   POST /v1/credentials/status-export      凭证状态签名发布（产出可直接提交状态批量同步的签名项，只读）
   GET  /v1/credentials                    按游标分页列出本租户凭证元数据（?limit=&after=&issuer_did=&subject_did=&status=&schema_id=&schema_version=，只读，不含 claims/签名/私钥）
+  GET  /v1/credential-schemas             只读模式发现目录（?issuer_did=&schema_id=&status=&limit=&after=，按注册游标升序分页，纯只读快照，不新增历史/游标/审计/落盘）
   GET  /v1/credentials/{credential_id}    查询凭证
   PUT  /v1/credentials/{credential_id}/status   登记 active（首次 201/重复 200）或暂停/恢复 suspended（200）
   PUT  /v1/credentials/status-batch             整批原子登记/暂停/恢复（请求体恰含 items 1..100 项；成功 200 仅返 results）
@@ -1400,7 +1401,10 @@ def build_handler(store: VCStore) -> type:
                 # 仅 /v1 路由受租户头约束
                 if (
                     path
-                    == "/v1/trust/presentation-sync/receipt/consumptions"
+                    in (
+                        "/v1/trust/presentation-sync/receipt/consumptions",
+                        "/v1/credential-schemas",
+                    )
                     and self.headers.get("X-Tenant-ID") == ""
                 ):
                     raise ValidationError("请求非法")
@@ -1474,6 +1478,8 @@ def build_handler(store: VCStore) -> type:
                     self._get_did_history(tenant, did, parsed.query)
                 elif path.startswith("/v1/dids/"):
                     self._get_did(tenant, unquote(path[len("/v1/dids/") :]))
+                elif path == "/v1/credential-schemas":
+                    self._list_credential_schemas(tenant, parsed.query)
                 elif path.startswith("/v1/credential-schemas/"):
                     schema_suffix = path[len("/v1/credential-schemas/") :]
                     if schema_suffix.endswith("/status"):
@@ -2499,6 +2505,106 @@ def build_handler(store: VCStore) -> type:
             )
             self._send_json(
                 201 if created else 200, self._schema_payload(record)
+            )
+
+        def _list_credential_schemas(self, tenant: str, query: str) -> None:
+            # GET /v1/credential-schemas：租户内只读模式发现目录。查询
+            # 参数仅允许 issuer_did、schema_id、status、limit、after，
+            # 各至多一次。issuer_did 提供时须为非空字符串；schema_id
+            # 沿用现有的小写标识格式；status 仅 active/deprecated/
+            # revoked；limit 缺省 50、须为 1..200 的 ASCII 十进制整数；
+            # after 缺省 0、须为非负 ASCII 十进制整数。未知/重复参数、
+            # 空值、空白、符号、Unicode 数字、格式或范围错误以及显式空
+            # X-Tenant-ID 一律 400 且仅含 {"error": "请求非法"}。未提供
+            # 过滤条件时列出全部状态；issuer_did/schema_id 不存在、属于
+            # 其他租户或 status 无匹配均返回空结果（存在性不可探测）。
+            # 200 恰含 schemas、next_after；schemas 按注册游标升序分页，
+            # 每项恰含 cursor、schema_id、version、issuer_did、
+            # claim_types、required_claims、digest、status、reason、
+            # updated_at；cursor 即该模式历史中注册事件游标，after 排除
+            # 不大于它的项，next_after 取本页末项 cursor，空页保持
+            # after。纯只读：一次原子快照完成，不新增历史/游标/审计、不
+            # 触发落盘；租户间完全隔离，跨重启分页稳定。
+            def invalid() -> None:
+                raise ValidationError("请求非法")
+
+            params = parse_qs(query, keep_blank_values=True)
+            allowed = {"issuer_did", "schema_id", "status", "limit", "after"}
+            if set(params) - allowed:
+                invalid()
+
+            def _single(name: str) -> Optional[str]:
+                values = params.get(name)
+                if values is None:
+                    return None
+                if len(values) != 1:
+                    invalid()
+                return values[0]
+
+            issuer_did = _single("issuer_did")
+            if issuer_did is not None and not issuer_did.strip():
+                invalid()
+
+            schema_id = _single("schema_id")
+            if schema_id is not None and (
+                not schema_id or not SCHEMA_ID_RE.fullmatch(schema_id)
+            ):
+                invalid()
+
+            status = _single("status")
+            if status is not None and status not in (
+                "active", "deprecated", "revoked"
+            ):
+                invalid()
+
+            limit_raw = _single("limit")
+            if limit_raw is not None:
+                try:
+                    limit = _parse_nonneg_int(limit_raw, "limit")
+                except ValidationError:
+                    invalid()
+                if not 1 <= limit <= 200:
+                    invalid()
+            else:
+                limit = 50
+
+            after_raw = _single("after")
+            if after_raw is not None:
+                try:
+                    after = _parse_nonneg_int(after_raw, "after")
+                except ValidationError:
+                    invalid()
+            else:
+                after = 0
+
+            items, next_after = store.list_credential_schemas(
+                tenant,
+                after=after,
+                limit=limit,
+                issuer_did=issuer_did,
+                schema_id=schema_id,
+                status=status,
+            )
+            self._send_json(
+                200,
+                {
+                    "schemas": [
+                        {
+                            "cursor": item.cursor,
+                            "schema_id": item.schema_id,
+                            "version": item.version,
+                            "issuer_did": item.issuer_did,
+                            "claim_types": item.claim_types,
+                            "required_claims": item.required_claims,
+                            "digest": item.digest,
+                            "status": item.status,
+                            "reason": item.reason,
+                            "updated_at": item.updated_at,
+                        }
+                        for item in items
+                    ],
+                    "next_after": next_after,
+                },
             )
 
         def _get_credential_schema(

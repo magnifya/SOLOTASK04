@@ -47,6 +47,7 @@ from .models import (
     CredentialSchemaRecord,
     CredentialSchemaStatusRecord,
     CredentialSchemaHistoryEvent,
+    CredentialSchemaCatalogItem,
     CredentialStatusRecord,
     CredentialStatusSyncRecord,
     CredentialStatusHistoryEvent,
@@ -4107,6 +4108,90 @@ class VCStore:
                 )
             next_after = picked[-1].cursor if picked else after
             return picked, next_after
+
+    def list_credential_schemas(
+        self,
+        tenant_id: str,
+        after: int = 0,
+        limit: int = 50,
+        issuer_did: Optional[str] = None,
+        schema_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> Tuple[List[CredentialSchemaCatalogItem], int]:
+        """只读分页列出本租户可见的凭证模式版本目录，按注册游标升序。
+
+        在同一把锁内对本租户当前快照筛选：
+        - 每项 cursor 取该 (issuer_did, schema_id, version) 模式历史中
+          注册事件的游标，与 GET .../history 的注册事件游标一致；注册
+          游标取自租户内跨 issuer/schema/version 共享且单调递增的同一
+          游标空间，故天然唯一且跨重启稳定；
+        - after 排除注册游标不大于其值的版本，至多返回 limit 项；
+        - issuer_did/schema_id 精确匹配，status 按当前生命周期（未登记
+          按 active）匹配；未提供筛选条件时列出全部状态。未知或他租户
+          的筛选值自然得到空结果（存在性不可探测）。
+        next_after 为本页末项 cursor，空页保持 after。纯只读：不写任何
+        状态、不新增历史/游标、不记审计、不触发落盘；租户间完全隔离。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            if bucket is None:
+                return [], after
+            schemas_root = bucket.get("credential_schemas", {})
+            history_root = bucket.get("credential_schema_history", {})
+            matched: List[Tuple[int, Dict[str, Any]]] = []
+            for row_issuer, by_schema in schemas_root.items():
+                if issuer_did is not None and row_issuer != issuer_did:
+                    continue
+                for row_schema, by_version in by_schema.items():
+                    if schema_id is not None and row_schema != schema_id:
+                        continue
+                    for version_key, row in by_version.items():
+                        current_status = (
+                            self._schema_lifecycle_status_locked(row)
+                        )
+                        if status is not None and current_status != status:
+                            continue
+                        # 目录分页游标即注册事件游标：历史中恰有一条
+                        # registered 事件（加载时已为旧数据稳定补录）。
+                        entries = (
+                            history_root.get(row_issuer, {})
+                            .get(row_schema, {})
+                            .get(version_key, [])
+                        )
+                        registered_cursor: Optional[int] = None
+                        for event in entries:
+                            if (
+                                event.get("action")
+                                == AUDIT_CREDENTIAL_SCHEMA_REGISTERED
+                            ):
+                                registered_cursor = int(event["cursor"])
+                                break
+                        if registered_cursor is None:
+                            # 无注册事件的行不应存在；跳过而不泄露存在性。
+                            continue
+                        if registered_cursor <= after:
+                            continue
+                        matched.append((registered_cursor, row))
+            matched.sort(key=lambda item: item[0])
+
+            items: List[CredentialSchemaCatalogItem] = []
+            for cursor, row in matched[:limit]:
+                items.append(
+                    CredentialSchemaCatalogItem(
+                        cursor=cursor,
+                        schema_id=row["schema_id"],
+                        version=int(row["version"]),
+                        issuer_did=row["issuer_did"],
+                        claim_types=dict(row["claim_types"]),
+                        required_claims=list(row["required_claims"]),
+                        digest=row["digest"],
+                        status=self._schema_lifecycle_status_locked(row),
+                        reason=row.get("status_reason"),
+                        updated_at=row.get("status_updated_at"),
+                    )
+                )
+            next_after = items[-1].cursor if items else after
+            return items, next_after
 
     def _backfill_credential_schema_history_locked(self) -> None:
         """加载迁移：为旧状态文件补齐模式版本生命周期历史（内存态）。
