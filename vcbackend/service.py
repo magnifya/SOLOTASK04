@@ -11186,8 +11186,11 @@ def build_handler(store: VCStore) -> type:
             # 跨系统谓词证明验真：与其他验签端点相同的公开错误协议，任何
             # 失败都返回 200 + {"valid": false, "reason": "<非空中文原因>"}。
             # 请求体须恰含 proof（对象）、challenge（非空字符串）与
-            # source_tenant_id（非空字符串）；非法 JSON/非对象/缺失/多余
-            # 字段均为请求类原因。只读，不消费、不写证明/状态/历史或审计。
+            # source_tenant_id（非空字符串），另允许可选布尔
+            # holder_binding：缺省或 false 保持九字段协议，true 要求
+            # prove 返回的十二字段持有者绑定对象；非法 JSON/非对象/缺失/
+            # 多余字段均为请求类原因。只读，不消费、不写证明/状态/历史或
+            # 审计。
             try:
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length) if length > 0 else b""
@@ -11210,7 +11213,9 @@ def build_handler(store: VCStore) -> type:
                 return
 
             try:
-                valid, reason = store.verify_trust_proof(tenant, data)
+                valid, reason = store.verify_trust_proof(
+                    tenant, data, allow_holder_binding=True
+                )
             except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
                 self._send_invalid("验签过程发生内部错误")
                 return
@@ -11771,7 +11776,8 @@ def build_handler(store: VCStore) -> type:
             # 且不超过 100 项；请求体非法（含非法 JSON、空数组、超过上限）
             # 时返回 {"results": [], "reason": "请求..."}。请求级合法时
             # 返回 {"results": [...]}，长度与顺序与输入一致，逐项复用单项
-            # 验真规则，失败不短路。只读，不消费、不写任何状态、不记审计。
+            # 验真规则（每项同样接受可选布尔 holder_binding 的持有者绑定
+            # 形态），失败不短路。只读，不消费、不写任何状态、不记审计。
             try:
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length) if length > 0 else b""
@@ -11808,7 +11814,7 @@ def build_handler(store: VCStore) -> type:
 
             try:
                 ok, reason, results = store.verify_trust_proofs_batch(
-                    tenant, data
+                    tenant, data, allow_holder_binding=True
                 )
             except Exception:  # noqa: BLE001 验签失败绝不暴露内部细节
                 self._send_json(

@@ -11107,41 +11107,64 @@ class VCStore:
         self,
         tenant_id: str,
         data: Any,
+        allow_holder_binding: bool = False,
     ) -> Tuple[bool, str]:
         """验证未在本租户保存的外部谓词证明，返回 (是否有效, 失败原因)。
 
         请求体须恰含 proof（对象）、challenge（非空字符串）与
-        source_tenant_id（非空字符串）。proof 须恰为 prove 响应九字段：
+        source_tenant_id（非空字符串）。``allow_holder_binding`` 为真时
+        （跨系统验真及其批量入口）另允许可选布尔 holder_binding：缺省或
+        false 保持九字段协议；true 要求证明为 prove 返回的十二字段绑定
+        对象（九字段外加 holder_did、holder_key_version、holder_proof），
+        holder_binding 非布尔返回“请求参数无效”，绑定模式字段集不是
+        十二字段或持有者字段类型非法返回“持有者绑定格式错误”；未绑定
+        证明出现 holder_* 字段仍按多余字段失败。proof 九字段为
         proof_id、credential_id、issuer_did（非空字符串）、
         issuer_key_version（非布尔正整数）、predicates、results、
-        challenge/expires_at/proof（非空字符串）。results 与 predicates
-        等长且仅含布尔；请求 challenge 须等于证明对象 challenge。
-        predicates 项须恰含 path、op 及可选 value；op 限
+        challenge/expires_at/proof（非空字符串）；holder_did、
+        holder_proof 须非空字符串，holder_key_version 须为非布尔正整数。
+        results 与 predicates 等长且仅含布尔；请求 challenge 须等于证明
+        对象 challenge。predicates 项须恰含 path、op 及可选 value；op 限
         exists/eq/gte/lte，exists 禁 value，其余必填 value，gte/lte 的
         value 为非布尔数字；path 须以 / 开头、RFC6901 转义合法且无重复
         或祖先重叠（不校验 claims 命中、数组路径或命中值类型，也不重算
         results）。
 
-        校验顺序：请求 -> 证明字段与挑战 -> 锚点 -> 签名格式 ->
-        ES256 验签（覆盖除 proof 外八字段并加入
-        tenant_id=source_tenant_id 的规范化 JSON）-> 期限。锚点按当前
-        租户 (issuer_did, issuer_key_version) 查找，仅 active 的 P-256
-        公钥可用。expires_at 须为 UTC 秒精度 Z 格式，到期返回
-        “证明已过期”。原验真成功后按当前租户查 issuer_did 外部停用
-        通告，命中返回“外部签发DID已停用：<reason>”，仅他租户有通告
-        不影响结论。只读：不消费、不登记任何资源、不写状态/历史/审计，
-        绝不向上抛异常。
+        校验顺序：请求 -> 证明结构 -> 挑战 -> 签发者锚点/签名 ->
+        持有者锚点/签名（仅绑定）-> 期限 -> 签发者停用 -> 持有者停用
+        （仅绑定）。签发者签名覆盖去掉 proof 及 holder_* 后的对象，
+        持有者签名覆盖去掉 proof、holder_proof 且保留持有者字段的对象；
+        两者均追加 tenant_id=source_tenant_id 后按规范化 JSON 做 ES256
+        验签。双方锚点均按当前租户 (DID, 精确版本) 查找，仅 active 的
+        P-256 公钥可用，且须允许 proof 用途（未设用途视为全用途）；
+        持有者锚点缺失、吊销、用途不符或公钥不可用统一返回
+        “持有者锚点不可用”，持有者签名编码错误与验签失败分别返回
+        “持有者签名格式错误”“持有者签名校验失败”。expires_at 须为
+        UTC 秒精度 Z 格式，到期返回“证明已过期”。原验真成功后按当前
+        租户查 issuer_did 外部停用通告，命中返回“外部签发DID已停用：
+        <reason>”；绑定模式再查 holder_did，命中返回“外部持有者DID
+        已停用：<reason>”；仅他租户有通告不影响结论。只读：不消费、
+        不登记任何资源、不写状态/历史/审计，绝不向上抛异常。
         """
-        # 1. 请求结构：恰含 proof、challenge、source_tenant_id。
+        # 1. 请求结构：恰含 proof、challenge、source_tenant_id；
+        #    allow_holder_binding 时另允许可选布尔 holder_binding。
         if not isinstance(data, dict):
             return False, "请求不合法: 请求体必须为 JSON 对象"
         request_fields = {"proof", "challenge", "source_tenant_id"}
-        if set(data) != request_fields:
-            missing = sorted(request_fields - set(data))
-            if missing:
-                return False, f"请求缺少字段: {', '.join(missing)}"
-            extra = sorted(set(data) - request_fields)
+        allowed_fields = set(request_fields)
+        if allow_holder_binding:
+            allowed_fields.add("holder_binding")
+        missing = sorted(request_fields - set(data))
+        if missing:
+            return False, f"请求缺少字段: {', '.join(missing)}"
+        extra = sorted(set(data) - allowed_fields)
+        if extra:
             return False, f"请求含多余字段: {', '.join(extra)}"
+        holder_binding = False
+        if allow_holder_binding and "holder_binding" in data:
+            holder_binding = data["holder_binding"]
+            if not isinstance(holder_binding, bool):
+                return False, "请求参数无效"
         proof = data["proof"]
         request_challenge = data["challenge"]
         source_tenant_id = data["source_tenant_id"]
@@ -11154,7 +11177,9 @@ class VCStore:
                 "请求不合法: 字段 source_tenant_id 必须为非空字符串"
             )
 
-        # 2. 证明字段与挑战。
+        # 2. 证明字段与挑战：未绑定恰为九字段（出现 holder_* 仍按多余
+        #    字段失败）；绑定恰为十二字段，字段集不符或持有者字段类型
+        #    非法统一返回“持有者绑定格式错误”。
         required_fields = {
             "proof_id",
             "credential_id",
@@ -11166,7 +11191,15 @@ class VCStore:
             "expires_at",
             "proof",
         }
+        if holder_binding:
+            required_fields |= {
+                "holder_did",
+                "holder_key_version",
+                "holder_proof",
+            }
         if set(proof) != required_fields:
+            if holder_binding:
+                return False, "持有者绑定格式错误"
             missing = sorted(required_fields - set(proof))
             if missing:
                 return False, f"证明缺少字段: {', '.join(missing)}"
@@ -11250,6 +11283,26 @@ class VCStore:
             value = proof[field]
             if not isinstance(value, str) or not value:
                 return False, f"证明字段 {field} 必须为非空字符串"
+        holder_did_value: Optional[str] = None
+        holder_version_value: Optional[int] = None
+        holder_proof_value: Optional[str] = None
+        if holder_binding:
+            holder_did_value = proof["holder_did"]
+            if not isinstance(holder_did_value, str) or not holder_did_value:
+                return False, "持有者绑定格式错误"
+            holder_version_value = proof["holder_key_version"]
+            if (
+                not isinstance(holder_version_value, int)
+                or isinstance(holder_version_value, bool)
+                or holder_version_value < 1
+            ):
+                return False, "持有者绑定格式错误"
+            holder_proof_value = proof["holder_proof"]
+            if (
+                not isinstance(holder_proof_value, str)
+                or not holder_proof_value
+            ):
+                return False, "持有者绑定格式错误"
         if request_challenge != proof["challenge"]:
             return False, "挑战不匹配: 请求 challenge 与证明 challenge 不一致"
 
@@ -11282,10 +11335,16 @@ class VCStore:
                 f"锚点公钥不可用: {issuer_did}#{key_version} 不是合法 P-256 公钥"
             )
 
-        # 4/5. 签名格式与密码学验签：覆盖除 proof 外八字段，并加入
-        # tenant_id=source_tenant_id 后按规范化 JSON 验签。
+        # 4/5. 签名格式与密码学验签：覆盖去掉 proof 及全部 holder_*
+        # 字段后的对象（未绑定证明本就不含 holder_*，即去掉 proof 的
+        # 全部字段），并加入 tenant_id=source_tenant_id 后按规范化
+        # JSON 验签。
         signature = proof["proof"]
-        message = {k: v for k, v in proof.items() if k != "proof"}
+        message = {
+            k: v
+            for k, v in proof.items()
+            if k != "proof" and not k.startswith("holder_")
+        }
         message["tenant_id"] = source_tenant_id
         try:
             crypto.verify(message, signature, public_pem)
@@ -11295,6 +11354,66 @@ class VCStore:
             return False, "签名校验失败，证明内容或签名可能被改动"
         except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露内部细节
             return False, "签名校验失败: 验签过程发生内部错误"
+
+        # 5b. 持有者绑定：持有者锚点按本租户 (holder_did,
+        #     holder_key_version) 精确版本查找，仅 active 且允许 proof
+        #     用途（未设用途视为全用途）的 P-256 公钥可用；缺失、吊销、
+        #     用途不符或公钥不可用统一返回“持有者锚点不可用”。
+        #     holder_proof 覆盖去掉 proof、holder_proof 且保留持有者
+        #     字段的对象，加入 tenant_id=source_tenant_id 后规范化验签。
+        #     跨租户只用验证租户锚点，不访问来源租户任何数据。
+        if holder_binding:
+            with self._lock:
+                bucket = self._bucket_locked(tenant_id)
+                holder_anchors = (
+                    bucket["trust_anchors"].get(holder_did_value)
+                    if bucket is not None else None
+                )
+                holder_row = (
+                    holder_anchors.get(str(holder_version_value))
+                    if holder_anchors is not None else None
+                )
+                holder_public_pem = (
+                    holder_row.get("public_key", "")
+                    if holder_row is not None else ""
+                )
+                holder_status = (
+                    holder_row.get("status", "active")
+                    if holder_row is not None else None
+                )
+                holder_uses = (
+                    holder_row.get("uses")
+                    if holder_row is not None else None
+                )
+            if (
+                holder_row is None
+                or holder_status == "revoked"
+                or (
+                    holder_uses is not None
+                    and "proof" not in holder_uses
+                )
+            ):
+                return False, "持有者锚点不可用"
+            try:
+                crypto.validate_public_key_pem(holder_public_pem)
+            except (ValueError, TypeError):
+                return False, "持有者锚点不可用"
+            holder_message = {
+                k: v
+                for k, v in proof.items()
+                if k not in ("proof", "holder_proof")
+            }
+            holder_message["tenant_id"] = source_tenant_id
+            try:
+                crypto.verify(
+                    holder_message, holder_proof_value, holder_public_pem
+                )
+            except crypto.MalformedSignature:
+                return False, "持有者签名格式错误"
+            except crypto.InvalidSignature:
+                return False, "持有者签名校验失败"
+            except Exception:  # noqa: BLE001 验签绝不向上抛错
+                return False, "签名校验失败: 验签过程发生内部错误"
 
         # 6. 期限：expires_at 须为 UTC 秒精度 Z 格式；当前时间达到它即
         # 过期。只读，不消费、不写任何状态、不记审计。
@@ -11314,14 +11433,24 @@ class VCStore:
         if datetime.now(timezone.utc) >= expires_dt:
             return False, "证明已过期"
 
-        # 7. 原验真成功后、合并凭证状态前查本租户 issuer_did 外部停用
-        #    通告：命中返回“外部签发DID已停用：<reason>”；无通告或仅他
-        #    租户有通告维持原结论。只读，不写状态、不记审计。
+        # 7. 原验真成功后查本租户外部 DID 停用通告：先查签发者
+        #    issuer_did，命中返回“外部签发DID已停用：<reason>”；持有者
+        #    绑定证明再查 holder_did，命中返回“外部持有者DID已停用：
+        #    <reason>”。无通告或仅他租户有通告维持原结论。只读，不写
+        #    状态、不记审计。
         deactivation_reason = self._external_did_deactivation_reason(
             tenant_id, issuer_did, EXTERNAL_ISSUER_DID_DEACTIVATED_REASON_PREFIX
         )
         if deactivation_reason is not None:
             return False, deactivation_reason
+        if holder_binding:
+            deactivation_reason = self._external_did_deactivation_reason(
+                tenant_id,
+                holder_did_value,
+                EXTERNAL_HOLDER_DID_DEACTIVATED_REASON_PREFIX,
+            )
+            if deactivation_reason is not None:
+                return False, deactivation_reason
         return True, ""
 
     def verify_trust_proof_synced(
@@ -11782,6 +11911,7 @@ class VCStore:
         self,
         tenant_id: str,
         data: Any,
+        allow_holder_binding: bool = False,
     ) -> Tuple[bool, str, List[Dict[str, Any]]]:
         """批量验证外部谓词证明，返回 (请求是否合法, 请求级原因, 逐项结果)。
 
@@ -11791,8 +11921,10 @@ class VCStore:
         ``{"results": [], "reason": ...}``。
 
         请求级合法时逐项复用 :meth:`verify_trust_proof`（与单项接口完全
-        一致的请求、证明字段、挑战、锚点、签名与期限规则），按输入顺序
-        收集结果，失败不短路：成功项 ``{"valid": true}``，失败项
+        一致的请求、证明字段、挑战、锚点、签名与期限规则；
+        ``allow_holder_binding`` 为真时逐项同样接受可选布尔
+        holder_binding 的持有者绑定形态），按输入顺序收集结果，失败不
+        短路：成功项 ``{"valid": true}``，失败项
         ``{"valid": false, "reason": ...}``。只读，不消费、不登记任何
         资源、不写状态/历史/审计。
         """
@@ -11818,7 +11950,9 @@ class VCStore:
 
         results: List[Dict[str, Any]] = []
         for item in proofs:  # 顺序校验，失败不短路
-            valid, reason = self.verify_trust_proof(tenant_id, item)
+            valid, reason = self.verify_trust_proof(
+                tenant_id, item, allow_holder_binding=allow_holder_binding
+            )
             if valid:
                 results.append({"valid": True})
             else:

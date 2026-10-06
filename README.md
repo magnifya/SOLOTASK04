@@ -115,14 +115,14 @@ python3 -m vcbackend.cli serve --host 127.0.0.1 --port 8080
 | POST | `/v1/trust/presentations/verify-synced-batch` | 批量以同步锚点快照验真未绑定外部演示（只读）：请求体恰含 `signer_did`（非空字符串）、`at`（非布尔非负整数）、`presentations`（1–100 项数组）；空体、非法 JSON、非对象、键集或类型错误、空数组或超限均 **400** 且仅 `{"error":"请求非法"}`；来源未同步或跨租户 **404** 仅 `{"error":"同步来源不存在"}`，`at` 超过同步检查点 **409** 仅 `{"error":"同步游标冲突"}`，先于项校验；合法时 **200** 仅返 `{"results":[...]}`，逐项不短路、等长同序：项须恰含 `presentation`（对象）与非空 `challenge`，否则该项 `{"valid":false,"reason":"请求项非法"}`；合法项沿用单条 `verify-synced` 的未绑定九字段、`holder_*` 禁令、签名覆盖及“演示→挑战→锚点→格式→验签→期限”顺序，按该来源 `cursor<=at` 的 `(DID,版本)` 末项验真，锚点缺失、非 active 或 `uses` 无 `vp` 为“同步锚点不可用”，格式、验签、过期依次为“签名格式错误”“签名校验失败”“演示已过期”；成功项仅 `{"valid":true}`，失败项键序 `valid`、`reason`；纯只读：不改同步页、检查点、锚点、演示、状态或审计，重启一致；租户头缺省 `default`、显式空 400 并隔离 |
 | POST | `/v1/trust/presentations/verify-synced-batch-with-status` | 批量以同步锚点快照验真未绑定外部演示并合并批初本租户状态快照（只读）：请求级协议与 `verify-synced-batch` 完全一致，请求体恰含 `signer_did`（非空字符串）、`at`（非布尔非负整数）、`presentations`（1–100 项数组）；空体、非法 JSON、非对象、键集或类型错误、空数组或超限均 **400** 且仅 `{"error":"请求非法"}`；来源未同步或跨租户 **404** 仅 `{"error":"同步来源不存在"}`，`at` 超过同步检查点 **409** 仅 `{"error":"同步游标冲突"}`，均先于逐项校验；合法时 **200** 仅返 `{"results":[...]}`，逐项不短路、等长同序：项须恰含 `presentation`（对象）与非空 `challenge`，否则该项 `{"valid":false,"reason":"请求项非法"}`；合法项沿用 `verify-synced-batch` 的 `holder_*` 禁令、挑战、`cursor<=at` 末锚点、proof 覆盖、签名、期限、顺序及原因；验真通过后按演示的 `(issuer_did, credential_id)` 查批初原子读取的本租户状态快照：未同步、revoked、suspended、unknown 分别返“外部凭证状态未同步”“外部凭证已吊销：<reason>”（空原因用“未知原因”）“外部凭证已暂停：<reason>”“外部凭证状态未知”，active 成功；成功项仅 `{"valid":true}`，失败项键序 `valid`、`reason`；纯只读：不写状态或审计；租户头缺省 `default`、显式空 400 并隔离 |
 | POST | `/v1/trust/presentations/verify-batch` | 批量跨系统演示验真：请求体恰为 `{"presentations":[项...]}`，数组非空且不超过 100 项；每项可复用单项未绑定形态（恰含 `presentation` 对象与非空 `challenge`，演示不得含任何 `holder_*` 字段）或持有者绑定形态（另恰含非空 `source_tenant_id`，演示恰为九字段加 `holder_did`、`holder_key_version`、`holder_proof`，双锚点双签名，`source_tenant_id` 作为 holder proof 覆盖的 `tenant_id`），各项的 `presentation` 也接受 `/v1/presentations/multi` 的多凭证组合对象，单凭证与组合可混用（组合的结构、顺序、锚点、签名与七种固定 `reason` 同单项 verify）；**任何失败均 HTTP 200**，返回 `{"results":[...]}`（长度与顺序与输入一致，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`，不短路）；请求级非法（缺失、非法 JSON、非对象、字段缺失或多余、presentations 非数组、空数组或超限）返回 `{"results":[],"reason":"请求..."}`，外层协议不变；纯只读、不消费、不审计 |
-| POST | `/v1/trust/proofs/verify` | 跨系统谓词证明验真：验证未在本租户保存的外部谓词证明，原本地 `/v1/proofs/{id}/verify` 不变；请求体须恰含 `proof`、`challenge`、`source_tenant_id`（后两项为非空字符串），proof 恰为 prove 九字段；**任何失败均 HTTP 200** 返回 `valid:false` 与分类中文 reason，成功仅 `{"valid":true}`；只读、不消费、不审计 |
+| POST | `/v1/trust/proofs/verify` | 跨系统谓词证明验真：验证未在本租户保存的外部谓词证明，原本地 `/v1/proofs/{id}/verify` 不变；请求体须恰含 `proof`、`challenge`、`source_tenant_id`（后两项为非空字符串）及可选布尔 `holder_binding`（缺省或 `false` 保持九字段协议，非布尔返回“请求参数无效”）；`holder_binding:true` 时 proof 须为 prove 返回的十二字段绑定对象（九字段外加 `holder_did`、`holder_key_version`、`holder_proof`），字段集不符或持有者字段类型非法返回“持有者绑定格式错误”，未绑定证明出现 `holder_*` 仍按多余字段失败；issuer 签名覆盖去掉 `proof` 及 `holder_*` 后的对象，`holder_proof` 覆盖去掉 `proof`、`holder_proof` 且保留持有者字段的对象，两者均追加 `tenant_id=source_tenant_id` 后按规范化 JSON 做 ES256 验签；双方锚点均取本租户对应 DID 精确版本的 active P-256 公钥且须允许 `proof` 用途（未设用途为全用途），持有者锚点缺失/吊销/用途不符/公钥不可用统一返回“持有者锚点不可用”，持有者签名编码错误与验签失败分别为“持有者签名格式错误”“持有者签名校验失败”；判定顺序为请求→证明结构→挑战→签发者锚点/签名→持有者锚点/签名→期限→签发者停用→持有者停用（“外部持有者DID已停用：<同步原因>”）；**任何失败均 HTTP 200** 返回 `valid:false` 与分类中文 reason，成功仅 `{"valid":true}`；只读、不消费、不审计 |
 | POST | `/v1/trust/proofs/consume` | 验真并一次性消费跨系统外部谓词证明（防重放）：请求与字段约束及验真规则同 `/v1/trust/proofs/verify`——恰含 `proof`、`challenge`、`source_tenant_id`，证明九字段、谓词、results、锚点用途、挑战、期限与外部 DID 停用判定、校验顺序与 `reason` 全部一致；显式空租户头 **400**；任何验真失败均 **200** 按键序仅返 `{"valid":false,"reason":...}` 且不写入；验真成功后按租户以 `(source_tenant_id, issuer_did, proof_id)` 为唯一键消费：首次 **200** 按序恰返 `valid:true`、`consumption_id`、`consumed_at`（`consumption_id` 为完整请求规范化 JSON 字节的 SHA-256 小写 64 位 hex，`consumed_at` 为 UTC 秒精度 Z），同键重复或并发均 **200** 仅返 `{"valid":false,"reason":"外部证明已消费"}`，每键仅一次成功；首次消费与审计（`trust.proof.consumed` / `trust_proof` / `consumption_id`）同一次原子落盘，重放与验真失败不记；落盘失败回滚，**500** 仅返 `{"error":"存储失败"}`，可重试；租户隔离，重启仍判重；仅保存消费标识、摘要与时间，不保存证明原文 |
 | POST | `/v1/trust/proofs/consume-batch` | 批量验真并一次性消费跨系统外部谓词证明（防重放）：请求体恰为 `{"items":[项...]}`，数组 1–100 项，每项沿用单条 consume 的 `proof`、`challenge`、`source_tenant_id` 请求约定；空体、非法 UTF-8/JSON、非对象、外层缺少或多余字段、`items` 非数组、为空或超限均 **200** 仅返 `{"results":[],"reason":"请求非法"}`；合法批次 **200** 仅返与输入等长同序的 `results`，逐项处理、失败不短路：项非对象、字段缺少或多余、`proof` 非对象、`challenge` 或 `source_tenant_id` 不是非空字符串时该项仅 `{"valid":false,"reason":"请求项非法"}`，其余验真失败仅 `{"valid":false,"reason":...}`（reason 同单条）；仅验真通过的项按接收租户内 `(source_tenant_id, issuer_did, proof_id)` 判重，历史重放与批内后续重复均 `{"valid":false,"reason":"外部证明已消费"}`，无效项不占键；成功项仅 `valid`、`consumption_id`、`consumed_at`，取值同单条；本批全部新消费记录与 `trust.proof.consumed` 审计同锁一次原子落盘，存储失败 **500** 仅返 `{"error":"存储失败"}`，本批新增全部不生效且可重试；与单条 consume 共享防重放记录，重启仍判重，并发同键仅一次成功；显式空租户头 **400**，租户间互不影响 |
 | GET | `/v1/trust/proofs/consumptions?limit=&after=&source_tenant_id=&issuer_did=` | 只读查询本接收租户外部谓词证明消费历史（来源租户与签发 DID 无须在本地注册，`source_tenant_id` 仅为筛选条件，不能切换接收租户或读取其他租户数据）：查询参数仅允许 `limit`、`after`、`source_tenant_id`、`issuer_did` 且不得重复（未知、空值、符号、Unicode 数字、越界、重复均 **400** 且仅返 `{"error":"请求非法"}`）；`limit` 缺省 50、限 1–200 的 ASCII 十进制，`after` 缺省 0、须为非负 ASCII 十进制；两个筛选参数可省略，提供时须非空并按解码后原串精确匹配，同时提供取交集；成功 **200** 按键序恰返 `events`、`next_after`，事件按键序恰含 `cursor`、`consumption_id`、`source_tenant_id`、`issuer_did`、`proof_id`、`consumed_at`（`cursor` 为正整数，其余为字符串，`consumed_at` 为 UTC 秒精度 Z，与首次成功消费一致）；`cursor` 取首次成功消费对应 `trust.proof.consumed` 审计的 `seq`，允许不连续；先筛选，再取 `cursor>after` 的前 `limit` 项并按 `cursor` 升序，空页 `next_after=after`，否则为末项 `cursor`；单条与批量消费的成功项均可查（批内成功项顺序与原审计一致），重放、验真或落盘失败不产生事件，升级前已有的成功消费同样可查；历史反映消费时的事实，证明事后过期或锚点吊销不隐藏记录；响应不含证明原文、谓词、结果或挑战值；纯只读、不写数据或审计；租户头缺省 `default`、显式空值 400 并隔离，重启后字段与游标稳定 |
 | POST | `/v1/trust/proofs/verify-synced` | 以同步锚点验真外部谓词证明（只读）：请求体恰含 `signer_did`（非空字符串）、`at`（非布尔非负整数）、`proof`（对象）、`challenge`（非空字符串）、`source_tenant_id`（非空字符串）；空体、非法 JSON、非对象、键集或类型错误均 **400** 且仅 `{"error":非空中文}`；`signer_did` 未同步或跨租户 **404**、`at` 超过同步检查点 **409**，同形仅 `{error}`；证明九字段、谓词、results、`challenge`、`expires_at` 及“请求→证明→挑战→锚点→签名格式→验签→期限”顺序沿用 `/v1/trust/proofs/verify`；取该来源 `cursor<=at` 的已同步事件，以 `(issuer_did,版本)` 最后事件为锚点，缺失、非 active 或 `uses` 无 `proof` 均 **200** 按键序恰返 `{"valid":false,"reason":"同步锚点不可用"}`；proof 须为 ES256、64 字节裸 `R||S` 无填充 base64url，覆盖证明除 proof 外八字段并加入 `tenant_id=source_tenant_id` 的规范化 JSON，格式错、验签错、到期同形依次返“签名格式错误”“签名校验失败”“证明已过期”，较早错误优先；成功仅 `{"valid":true}`；纯只读：不改同步页、检查点、锚点、证明、状态或审计，重启一致；租户头缺省 `default`、显式空 400 并隔离 |
 | POST | `/v1/trust/proofs/verify-synced-batch` | 批量以同步锚点快照验真外部谓词证明（只读）：请求体恰含 `signer_did`（非空字符串）、`at`（非布尔非负整数）、`proofs`（1–100 项数组）；空体、非法 JSON、非对象、键集或类型错误、空数组或超限均 **400** 且仅 `{"error":"请求非法"}`；来源未同步或跨租户 **404** 仅 `{"error":"同步来源不存在"}`，`at` 超过同步检查点 **409** 仅 `{"error":"同步游标冲突"}`，先于项校验；合法时 **200** 仅返 `{"results":[...]}`，逐项不短路、等长同序：项须恰含 `proof`（对象）、非空 `challenge`、非空 `source_tenant_id`，否则该项 `{"valid":false,"reason":"请求项非法"}`；合法项沿用单条 `verify-synced` 的证明九字段、谓词/results、RFC6901 路径、挑战、签名覆盖（除 proof 外八字段加 `tenant_id=source_tenant_id`）及“证明→挑战→锚点→格式→验签→期限”顺序，按该来源 `cursor<=at` 的 `(DID,版本)` 末项验真，锚点缺失、非 active 或 `uses` 无 `proof` 为“同步锚点不可用”，格式、验签、过期依次为“签名格式错误”“签名校验失败”“证明已过期”，较早错误优先；成功项仅 `{"valid":true}`，失败项键序 `valid`、`reason`；纯只读：不改同步页、检查点、锚点、证明、状态或审计，重启一致；租户头缺省 `default`、显式空 400 并隔离 |
 | POST | `/v1/trust/proofs/verify-synced-batch-with-status` | 批量以同步锚点快照验真外部谓词证明并合并批初本租户状态快照（只读）：请求级协议与 `verify-synced-batch` 完全一致，请求体恰含 `signer_did`（非空字符串）、`at`（非布尔非负整数）、`proofs`（1–100 项数组）；空体、非法 JSON、非对象、键集或类型错误、空数组或超限均 **400** 且仅 `{"error":"请求非法"}`；来源未同步或跨租户 **404** 仅 `{"error":"同步来源不存在"}`，`at` 超过同步检查点 **409** 仅 `{"error":"同步游标冲突"}`，均先于逐项校验；合法时 **200** 仅返 `{"results":[...]}`，逐项不短路、等长同序：项须恰含 `proof`（对象）、非空 `challenge`、非空 `source_tenant_id`，否则该项 `{"valid":false,"reason":"请求项非法"}`；合法项沿用 `verify-synced-batch` 的证明九字段、谓词/results、RFC6901 路径、挑战、`cursor<=at` 末锚点、签名覆盖、签名、期限、顺序及原因；验真通过后按证明的 `(issuer_did, credential_id)` 查批初原子读取的本租户状态快照：未同步、revoked、suspended、unknown 分别返“外部凭证状态未同步”“外部凭证已吊销：<reason>”（空或缺失 reason 用“未知原因”）“外部凭证已暂停：<reason>”“外部凭证状态未知”，active 成功；成功项仅 `{"valid":true}`，失败项键序 `valid`、`reason`；纯只读：不写同步页、检查点、锚点、证明、状态、历史或审计；租户头缺省 `default`、显式空 400 并隔离，重启一致 |
-| POST | `/v1/trust/proofs/verify-batch` | 批量跨系统谓词证明验真：请求体恰为 `{"proofs":[项...]}`，数组非空且不超过 100 项，每项规则与单项验真一致；**任何失败均 HTTP 200**，返回 `{"results":[...]}`（长度与顺序与输入一致，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`，不短路）；请求体非法、空数组或超上限时返回 `{"results":[],"reason":"请求..."}`；只读、不消费、不审计 |
+| POST | `/v1/trust/proofs/verify-batch` | 批量跨系统谓词证明验真：请求体恰为 `{"proofs":[项...]}`，数组非空且不超过 100 项，每项规则与单项验真一致（每项同样接受可选布尔 `holder_binding` 的持有者绑定形态）；**任何失败均 HTTP 200**，返回 `{"results":[...]}`（长度与顺序与输入一致，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`，不短路）；请求体非法、空数组或超上限时返回 `{"results":[],"reason":"请求..."}`；只读、不消费、不审计 |
 | POST | `/v1/trust/proofs/verify-with-status` | 外部谓词证明验真并合并同步状态（只读）：请求体与验真规则同 `/v1/trust/proofs/verify`；**任何验真失败均 HTTP 200** 返回 `valid:false` 与中文 `reason`；验真通过后按本租户 `(issuer_did, credential_id)` 查同步记录：未同步 `valid:false`/“外部凭证状态未同步”，active 仅 `{"valid":true}`，revoked 为“外部凭证已吊销：<reason>”（无 reason 用“未知原因”），suspended 为“外部凭证已暂停：<reason>”，unknown 为“外部凭证状态未知”；不消费、不登记资源、不写状态/历史/审计 |
 | POST | `/v1/trust/proofs/verify-batch-with-status` | 批量外部谓词证明验真并合并同步状态（只读）：请求体恰为 `{"proofs":[项...]}`，数组非空且不超过 100 项；请求级非法（缺失、非法 JSON、非对象、字段缺失或多余、proofs 非数组、空数组或超限）统一 HTTP 200 返回 `{"results":[],"reason":"请求..."}`；合法批次逐项复用 `/v1/trust/proofs/verify-with-status` 规则（含同步状态合并），按输入顺序不短路返回 `{"results":[...]}`，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`；不消费、不登记资源、不写状态/历史/审计 |
 | POST | `/v1/trust/credentials/verify-batch` | 批量跨系统凭证验真：请求体恰为 `{"credentials":[项...]}`，数组非空且不超过 100 项，每项规则与单项验真一致；**任何失败均 HTTP 200**，返回 `{"results":[...]}`（长度与顺序与输入一致，成功 `{"valid":true}`、失败 `{"valid":false,"reason":...}`，不短路）；请求体非法、空数组或超上限时返回 `{"results":[],"reason":"请求..."}` |
@@ -1415,15 +1415,20 @@ curl -X POST localhost:8080/v1/proofs/zp_<id>/verify \
   各自使用本租户锚点，重启后结论一致。原本地
   `POST /v1/proofs/{proof_id}/verify` 协议保持不变。
   - 请求体必须**恰含** `proof`（JSON 对象）、`challenge`（非空字符串）、
-    `source_tenant_id`（非空字符串）；缺失、多余字段、请求体缺失/非法
-    JSON/非对象一律按请求错误返回 HTTP 200 +
-    `{"valid":false,"reason":"请求…"}`。
+    `source_tenant_id`（非空字符串），另允许可选布尔 `holder_binding`
+    （缺省或 `false` 保持九字段协议；非布尔返回“请求参数无效”）；
+    缺失、多余字段、请求体缺失/非法 JSON/非对象一律按请求错误返回
+    HTTP 200 + `{"valid":false,"reason":"请求…"}`。
   - `proof` 必须**恰为** prove 响应九字段：`proof_id`、`credential_id`、
     `issuer_did`（均为非空字符串）、`issuer_key_version`（非布尔正整数）、
     `predicates`（非空数组）、`results`（数组）、`challenge`、
     `expires_at`、`proof`（均为非空字符串）；缺字段、多余字段或类型非法
-    返回前缀“证明”的原因。请求 `challenge` 必须等于证明对象的
-    `challenge`，不一致返回前缀“挑战”的原因。
+    返回前缀“证明”的原因。`holder_binding:true` 时 proof 须**恰为**
+    prove 返回的十二字段绑定对象（九字段外加 `holder_did`、
+    `holder_proof` 非空字符串与 `holder_key_version` 非布尔正整数），
+    字段集不符或持有者字段类型非法返回“持有者绑定格式错误”；未绑定
+    证明出现 `holder_*` 仍按多余字段失败。请求 `challenge` 必须等于
+    证明对象的 `challenge`，不一致返回前缀“挑战”的原因。
   - `results` 必须与 `predicates` **等长且仅含布尔值**；**不按 claims
     重算 results**（即使结果与谓词语义相反，签名合法即通过）。
   - `predicates` 每项须**恰含** `path`、`op` 及可选 `value`：
@@ -1432,14 +1437,24 @@ curl -X POST localhost:8080/v1/proofs/zp_<id>/verify \
     `/` 开头、RFC 6901 转义合法（`~0`/`~1`），且路径**不得重复、不得有
     祖先/后代重叠**；此处**不校验 claims 命中、不判数组索引路径、不校验
     命中值类型**。
-  - 校验顺序：请求结构 → 证明字段与挑战 → 锚点 → 签名格式 →
-    密码学验签 → 期限。锚点按**当前租户** `(issuer_did,
-    issuer_key_version)` 查找，仅 `active` 的 P-256 公钥可用：缺失返回
-    前缀“锚点”的原因，已吊销返回前缀“锚点”的吊销原因。
+  - 校验顺序：请求结构 → 证明字段与挑战 → 签发者锚点与签名 →
+    持有者锚点与签名（仅绑定）→ 期限 → 签发者停用 → 持有者停用
+    （仅绑定）。锚点按**当前租户** `(issuer_did, issuer_key_version)`
+    查找，仅 `active` 的 P-256 公钥可用：缺失返回前缀“锚点”的原因，
+    已吊销返回前缀“锚点”的吊销原因。
   - 签名为 **ES256/SHA-256**，64 字节裸 `R||S` 的无填充 base64url，覆盖
-    证明对象中**除 `proof` 外八字段**并加入
+    证明对象中**去掉 `proof` 及全部 `holder_*` 字段后的对象**并加入
     **`tenant_id=source_tenant_id`** 后的递归排序紧凑 JSON；编码非法返回
     前缀“签名格式错误”，验签失败返回前缀“签名校验失败”。
+  - 持有者绑定（`holder_binding:true`）：持有者锚点按本租户
+    `(holder_did, holder_key_version)` 精确版本查找，仅 `active` 且允许
+    `proof` 用途（未设用途视为全用途）的 P-256 公钥可用，缺失、吊销、
+    用途不符或公钥不可用统一返回“持有者锚点不可用”；`holder_proof`
+    同为 ES256，覆盖**去掉 `proof`、`holder_proof` 且保留持有者字段**
+    的对象并加入 `tenant_id=source_tenant_id`，编码错误与验签失败分别
+    返回“持有者签名格式错误”“持有者签名校验失败”；原验真成功后先查
+    签发者停用通告，绑定模式再查持有者停用通告，命中返回
+    “外部持有者DID已停用：<本租户已同步原因>”。
   - `expires_at` 必须为 UTC 秒精度 Z 格式 `YYYY-MM-DDTHH:MM:SSZ`
     （非法返回前缀“证明”的原因）；当前时间达到它时返回
     `{"valid":false,"reason":"证明已过期"}`。签名等先置失败仍优先返回
