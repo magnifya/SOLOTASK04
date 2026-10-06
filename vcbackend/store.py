@@ -47,6 +47,7 @@ from .models import (
     CredentialSchemaRecord,
     CredentialSchemaStatusRecord,
     CredentialSchemaHistoryEvent,
+    CredentialSchemaListItem,
     CredentialStatusRecord,
     CredentialStatusSyncRecord,
     CredentialStatusHistoryEvent,
@@ -4107,6 +4108,91 @@ class VCStore:
                 )
             next_after = picked[-1].cursor if picked else after
             return picked, next_after
+
+    def list_credential_schemas(
+        self,
+        tenant_id: str,
+        after: int = 0,
+        limit: int = 50,
+        issuer_did: Optional[str] = None,
+        schema_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> Tuple[List[CredentialSchemaListItem], int]:
+        """只读分页列出本租户可见的凭证模式目录，按注册游标升序。
+
+        在同一把锁内对当前快照筛选：每项 cursor 取该模式版本历史中的
+        注册事件游标，严格大于 after 才入选；issuer_did/schema_id 精确
+        匹配、status 匹配当前生命周期（未登记按 active）；未知或他租
+        户的筛选值自然得到空结果（存在性不可探测）。至多返回 limit
+        项；next_after 为本页末项 cursor，空页保持 after。纯只读：
+        不写状态、不追加历史/游标、不记审计、不触发落盘。
+        """
+        with self._lock:
+            bucket = self._bucket_locked(tenant_id)
+            schemas = (
+                bucket.get("credential_schemas", {})
+                if bucket is not None
+                else {}
+            )
+            history_root = (
+                bucket.get("credential_schema_history", {})
+                if bucket is not None
+                else {}
+            )
+            matched: List[Tuple[int, Dict[str, Any]]] = []
+            for row_issuer, by_schema in schemas.items():
+                if issuer_did is not None and row_issuer != issuer_did:
+                    continue
+                for row_schema_id, by_version in by_schema.items():
+                    if schema_id is not None and row_schema_id != schema_id:
+                        continue
+                    history_by_schema = (
+                        history_root.get(row_issuer, {}).get(row_schema_id, {})
+                    )
+                    for version_key, row in by_version.items():
+                        effective_status = (
+                            self._schema_lifecycle_status_locked(row)
+                        )
+                        if status is not None and effective_status != status:
+                            continue
+                        # 目录游标与历史中的注册事件游标一致：注册与
+                        # 加载补录均保证该事件存在。
+                        cursor = self._schema_registration_cursor_locked(
+                            history_by_schema.get(version_key, [])
+                        )
+                        if cursor is None or cursor <= after:
+                            continue
+                        matched.append((cursor, row))
+            matched.sort(key=lambda item: item[0])
+
+            items: List[CredentialSchemaListItem] = []
+            for cursor, row in matched[:limit]:
+                items.append(
+                    CredentialSchemaListItem(
+                        cursor=cursor,
+                        schema_id=row["schema_id"],
+                        version=int(row["version"]),
+                        issuer_did=row["issuer_did"],
+                        claim_types=dict(row["claim_types"]),
+                        required_claims=list(row["required_claims"]),
+                        digest=row["digest"],
+                        status=self._schema_lifecycle_status_locked(row),
+                        reason=row.get("status_reason"),
+                        updated_at=row.get("status_updated_at"),
+                    )
+                )
+            next_after = items[-1].cursor if items else after
+            return items, next_after
+
+    @staticmethod
+    def _schema_registration_cursor_locked(
+        entries: List[Dict[str, Any]]
+    ) -> Optional[int]:
+        """取模式版本历史中注册事件的游标；无事件时返回 None。"""
+        for event in entries:
+            if event.get("action") == AUDIT_CREDENTIAL_SCHEMA_REGISTERED:
+                return int(event.get("cursor", 0))
+        return None
 
     def _backfill_credential_schema_history_locked(self) -> None:
         """加载迁移：为旧状态文件补齐模式版本生命周期历史（内存态）。

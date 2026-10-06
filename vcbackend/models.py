@@ -188,6 +188,28 @@ class CredentialSchemaStatusRecord:
 
 
 @dataclass
+class CredentialSchemaListItem:
+    """GET /v1/credential-schemas 列表项：本租户模式目录条目。
+
+    cursor 为该模式版本历史中注册事件的游标（租户内跨 issuer/schema/
+    version 共享递增，独立于其他历史游标空间）；status 为当前生命周期
+    （active/deprecated/revoked），active 时 reason/updated_at 均为
+    None；内容字段与单项模式读取一致。
+    """
+
+    cursor: int
+    schema_id: str
+    version: int
+    issuer_did: str
+    claim_types: Dict[str, str]
+    required_claims: List[str]
+    digest: str
+    status: str
+    reason: Optional[str]
+    updated_at: Optional[str]
+
+
+@dataclass
 class CredentialSchemaHistoryEvent:
     """模式版本生命周期历史中的一条事件（注册/弃用/吊销）。
 

@@ -21,6 +21,7 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   POST /v1/credentials/issue-batch        整批原子签发（请求体恰含 items 1..100 项；不支持 Idempotency-Key；整批凭证与审计同一次原子写，成功 201 仅返 results）
   POST /v1/credentials/status-export      凭证状态签名发布（产出可直接提交状态批量同步的签名项，只读）
   GET  /v1/credentials                    按游标分页列出本租户凭证元数据（?limit=&after=&issuer_did=&subject_did=&status=&schema_id=&schema_version=，只读，不含 claims/签名/私钥）
+  GET  /v1/credential-schemas             按注册游标分页列出本租户模式目录（?issuer_did=&schema_id=&status=&limit=&after=，只读）
   GET  /v1/credentials/{credential_id}    查询凭证
   PUT  /v1/credentials/{credential_id}/status   登记 active（首次 201/重复 200）或暂停/恢复 suspended（200）
   PUT  /v1/credentials/status-batch             整批原子登记/暂停/恢复（请求体恰含 items 1..100 项；成功 200 仅返 results）
@@ -1398,9 +1399,15 @@ def build_handler(store: VCStore) -> type:
                     self._send_error(404, f"无此路径: {path}")
                     return
                 # 仅 /v1 路由受租户头约束
+                # 模式目录与回执消费查询协议：显式空 X-Tenant-ID 一律
+                # 400 且仅 {"error": "请求非法"}（区别于其余入口的
+                # “X-Tenant-ID 不能为空”）。
                 if (
                     path
-                    == "/v1/trust/presentation-sync/receipt/consumptions"
+                    in (
+                        "/v1/credential-schemas",
+                        "/v1/trust/presentation-sync/receipt/consumptions",
+                    )
                     and self.headers.get("X-Tenant-ID") == ""
                 ):
                     raise ValidationError("请求非法")
@@ -1474,6 +1481,8 @@ def build_handler(store: VCStore) -> type:
                     self._get_did_history(tenant, did, parsed.query)
                 elif path.startswith("/v1/dids/"):
                     self._get_did(tenant, unquote(path[len("/v1/dids/") :]))
+                elif path == "/v1/credential-schemas":
+                    self._list_credential_schemas(tenant, parsed.query)
                 elif path.startswith("/v1/credential-schemas/"):
                     schema_suffix = path[len("/v1/credential-schemas/") :]
                     if schema_suffix.endswith("/status"):
@@ -2499,6 +2508,109 @@ def build_handler(store: VCStore) -> type:
             )
             self._send_json(
                 201 if created else 200, self._schema_payload(record)
+            )
+
+        def _list_credential_schemas(
+            self, tenant: str, query: str
+        ) -> None:
+            # GET /v1/credential-schemas?issuer_did=&schema_id=&status=
+            # &limit=&after=：只读分页列出本租户可见的模式目录。查询参数
+            # 仅限上述五个且各至多一次；issuer_did 提供时须非空，
+            # schema_id 沿用小写标识格式，status 仅 active/deprecated/
+            # revoked；limit 缺省 50、限 1..200，after 缺省 0、须非负，
+            # 二者仅接受 ASCII 十进制。未知/重复参数、空值、空白、符
+            # 号、Unicode 数字、格式或范围错误统一 400 且仅
+            # {"error": "请求非法"}。未提供过滤条件时列出全部状态；未
+            # 知或他租户的 issuer_did/schema_id 与无匹配的 status 返回
+            # 空结果（存在性不可探测）。响应恰含 schemas 与
+            # next_after；每项恰含 cursor、schema_id、version、
+            # issuer_did、claim_types、required_claims、digest、
+            # status、reason、updated_at，cursor 与该模式历史中的注册
+            # 事件游标一致，active 的 reason/updated_at 为 null；按
+            # cursor 升序取 after 后至多 limit 项，next_after 为末项
+            # cursor，空页保持 after。纯只读：不记审计、不改变任何状
+            # 态、不触发落盘。
+            params = parse_qs(query, keep_blank_values=True)
+            allowed = {"issuer_did", "schema_id", "status", "limit", "after"}
+            if set(params) - allowed:
+                raise ValidationError("请求非法")
+
+            def _single(name: str) -> Optional[str]:
+                values = params.get(name)
+                if values is None:
+                    return None
+                if len(values) != 1:
+                    raise ValidationError("请求非法")
+                return values[0]
+
+            issuer_did = _single("issuer_did")
+            if issuer_did is not None and not issuer_did:
+                raise ValidationError("请求非法")
+
+            schema_id = _single("schema_id")
+            if schema_id is not None and (
+                not schema_id or not SCHEMA_ID_RE.fullmatch(schema_id)
+            ):
+                raise ValidationError("请求非法")
+
+            status = _single("status")
+            if status is not None and status not in (
+                "active", "deprecated", "revoked"
+            ):
+                raise ValidationError("请求非法")
+
+            limit_raw = _single("limit")
+            if limit_raw is not None:
+                if (
+                    not limit_raw
+                    or any(ch < "0" or ch > "9" for ch in limit_raw)
+                ):
+                    raise ValidationError("请求非法")
+                limit = int(limit_raw)
+                if not 1 <= limit <= 200:
+                    raise ValidationError("请求非法")
+            else:
+                limit = 50
+
+            after_raw = _single("after")
+            if after_raw is not None:
+                if (
+                    not after_raw
+                    or any(ch < "0" or ch > "9" for ch in after_raw)
+                ):
+                    raise ValidationError("请求非法")
+                after = int(after_raw)
+            else:
+                after = 0
+
+            items, next_after = store.list_credential_schemas(
+                tenant,
+                after=after,
+                limit=limit,
+                issuer_did=issuer_did,
+                schema_id=schema_id,
+                status=status,
+            )
+            self._send_json(
+                200,
+                {
+                    "schemas": [
+                        {
+                            "cursor": item.cursor,
+                            "schema_id": item.schema_id,
+                            "version": item.version,
+                            "issuer_did": item.issuer_did,
+                            "claim_types": item.claim_types,
+                            "required_claims": item.required_claims,
+                            "digest": item.digest,
+                            "status": item.status,
+                            "reason": item.reason,
+                            "updated_at": item.updated_at,
+                        }
+                        for item in items
+                    ],
+                    "next_after": next_after,
+                },
             )
 
         def _get_credential_schema(
