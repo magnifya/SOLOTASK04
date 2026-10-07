@@ -2038,6 +2038,58 @@ class VCStore:
                     )
             return picked
 
+    def export_audit_events(
+        self,
+        tenant_id: str,
+        after: int = 0,
+        limit: int = 1000,
+        snapshot: Optional[int] = None,
+    ) -> Tuple[List[AuditEvent], int, int]:
+        """只读快照导出本租户审计事件（跨系统 NDJSON 导出用）。
+
+        在同一把锁内原子完成快照判定与事件读取：
+        - snapshot 缺省取请求时全局最大审计序号（无事件为 0），显式
+          提供时须不超过该值，否则 ValidationError；
+        - after 不得大于生效 snapshot，否则 ValidationError；
+        - 取本租户 after < seq <= snapshot 按 seq 升序至多 limit 条；
+        - 返回 (事件列表, 生效快照, next_after)；next_after 为本页
+          末条 seq，空页保持 after。
+        纯只读：不修改任何状态、不记审计、不触发落盘。
+        """
+        with self._lock:
+            if snapshot is None:
+                effective_snapshot = self._audit_seq
+            elif snapshot > self._audit_seq:
+                raise ValidationError(
+                    "查询参数 snapshot 不得超过当前最大审计序号"
+                )
+            else:
+                effective_snapshot = snapshot
+            if after > effective_snapshot:
+                raise ValidationError(
+                    "查询参数 after 不得大于 snapshot"
+                )
+            picked: List[AuditEvent] = []
+            for event in self._audit:
+                seq = int(event.get("seq", 0))
+                if seq > effective_snapshot:
+                    break
+                if len(picked) >= limit:
+                    break
+                if event.get("tenant_id") == tenant_id and seq > after:
+                    picked.append(
+                        AuditEvent(
+                            seq=seq,
+                            timestamp=int(event["timestamp"]),
+                            tenant_id=event["tenant_id"],
+                            action=event["action"],
+                            resource_type=event["resource_type"],
+                            resource_id=event["resource_id"],
+                        )
+                    )
+            next_after = picked[-1].seq if picked else after
+            return picked, effective_snapshot, next_after
+
     def get_audit_manifest_signer(
         self,
         tenant_id: str,

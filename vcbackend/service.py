@@ -160,6 +160,9 @@ GET  /v1/dids/{did}/keys/history        查询 DID 密钥生命周期历史（�
   GET  /v1/audit/manifest                 生成 snapshot 前审计记录的签名清单（只读）
   POST /v1/audit/manifest/verify          校验审计签名清单（只读，不查审计原文）
   POST /v1/audit/manifest/verify-batch    批量校验审计签名清单（只读，不查审计原文）
+  GET  /v1/audit/export                   跨系统审计快照确定性 NDJSON 导出（快照续传，只读）
+  GET  /v1/audit/export/manifest          审计快照导出清单（签名摘要，只读）
+  POST /v1/audit/export/manifest/verify   校验审计快照导出清单与 NDJSON 内容（只读）
 
 多租户：所有 /v1 请求取 X-Tenant-ID 头，缺省为 "default"；显式
 提供时须非空，否则 400。DID、凭证、演示、key_handle 均按租户隔离，
@@ -374,6 +377,36 @@ def _presentation_consumption_ndjson_bytes(events: Any) -> bytes:
     return "".join(
         json.dumps(
             _presentation_consumption_event_obj(event),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        + "\n"
+        for event in events
+    ).encode("utf-8")
+
+
+def _audit_export_event_obj(event: Any) -> Dict[str, Any]:
+    return {
+        "seq": event.seq,
+        "timestamp": event.timestamp,
+        "tenant_id": event.tenant_id,
+        "action": event.action,
+        "resource_type": event.resource_type,
+        "resource_id": event.resource_id,
+    }
+
+
+def _audit_export_ndjson_bytes(events: Any) -> bytes:
+    """按审计快照导出端点的确定性规则将事件编码为 NDJSON 字节。
+
+    每行键序固定为 seq、timestamp、tenant_id、action、resource_type、
+    resource_id，UTF-8 紧凑 JSON、非 ASCII 不转义、LF 结行（末行亦有
+    LF）、无 BOM；空列表为零字节。digest 与导出内容必须共用本函数以
+    保证字节一致。
+    """
+    return "".join(
+        json.dumps(
+            _audit_export_event_obj(event),
             ensure_ascii=False,
             separators=(",", ":"),
         )
@@ -850,6 +883,7 @@ def build_handler(store: VCStore) -> type:
                         "/receipt/consume-batch",
                         "/v1/trust/credentials/imported/verify-batch",
                         "/v1/audit/manifest/verify-batch",
+                        "/v1/audit/export/manifest/verify",
                         "/v1/dids/register-batch",
                     )
                     and self.headers.get("X-Tenant-ID") == ""
@@ -866,6 +900,8 @@ def build_handler(store: VCStore) -> type:
                     self._post_audit_manifest_verify(tenant)
                 elif path == "/v1/audit/manifest/verify-batch":
                     self._post_audit_manifest_verify_batch(tenant)
+                elif path == "/v1/audit/export/manifest/verify":
+                    self._post_audit_export_manifest_verify(tenant)
                 elif path == "/v1/credentials":
                     self._post_credentials(tenant)
                 elif path == "/v1/credentials/issue-batch":
@@ -1404,6 +1440,8 @@ def build_handler(store: VCStore) -> type:
                     in (
                         "/v1/trust/presentation-sync/receipt/consumptions",
                         "/v1/credential-schemas",
+                        "/v1/audit/export",
+                        "/v1/audit/export/manifest",
                     )
                     and self.headers.get("X-Tenant-ID") == ""
                 ):
@@ -1413,6 +1451,10 @@ def build_handler(store: VCStore) -> type:
                     self._get_audit(tenant, parsed.query)
                 elif path == "/v1/audit/manifest":
                     self._get_audit_manifest(tenant, parsed.query)
+                elif path == "/v1/audit/export":
+                    self._get_audit_export(tenant, parsed.query)
+                elif path == "/v1/audit/export/manifest":
+                    self._get_audit_export_manifest(tenant, parsed.query)
                 elif path == "/v1/presentation-requests" or (
                     path.startswith("/v1/presentation-requests/")
                 ):
@@ -14716,6 +14758,428 @@ def build_handler(store: VCStore) -> type:
                 else:
                     results.append({"valid": False, "reason": reason})
             self._send_json(200, {"results": results})
+
+        def _get_audit_export(self, tenant: str, query: str) -> None:
+            # GET /v1/audit/export：确定性 NDJSON 跨系统导出本租户审计
+            # 事件快照，支持快照续传。查询参数仅允许 snapshot、after、
+            # limit，且均只能出现一次：
+            # - limit 缺省 1000，须为 1..10000 的非空 ASCII 十进制整数；
+            # - after 缺省 0，须为非负 ASCII 十进制整数；
+            # - snapshot 缺省为请求开始时原子读取的全局最大审计序号
+            #   （无事件为 0），显式提供时须为非负 ASCII 十进制整数且
+            #   不超过当时最大值；
+            # - after 不得大于生效 snapshot。
+            # 空值、重复参数、未知参数、格式或范围非法（含显式空
+            # X-Tenant-ID 与超长十进制数字串）一律 400 且恰返
+            # {"error":"请求非法"}，绝不 500。取本租户 after < seq <=
+            # snapshot 按 seq 升序的前 limit 条。成功 200，类型
+            # application/x-ndjson; charset=utf-8；响应头
+            # X-Snapshot-Seq 为生效快照、X-Next-After 为末行 seq
+            # （空页保持 after）。每行键序 seq、timestamp、tenant_id、
+            # action、resource_type、resource_id，UTF-8 紧凑 JSON、
+            # 非 ASCII 不转义、LF 结行（末行亦有 LF）、无 BOM，空页
+            # 零字节。同一 snapshot 续页天然排除快照后新事件，跨重启
+            # 字节一致。纯只读：不改状态、游标或审计。
+            try:
+                params = parse_qs(query, keep_blank_values=True)
+                allowed = {"snapshot", "after", "limit"}
+                if set(params) - allowed:
+                    raise ValidationError("未知查询参数")
+
+                def _single(name: str) -> Optional[str]:
+                    values = params.get(name)
+                    if values is None:
+                        return None
+                    if len(values) != 1:
+                        raise ValidationError("查询参数重复")
+                    return values[0]
+
+                limit_raw = _single("limit")
+                if limit_raw is not None:
+                    limit = _parse_nonneg_int(limit_raw, "limit")
+                    if not 1 <= limit <= 10000:
+                        raise ValidationError("limit 越界")
+                else:
+                    limit = 1000
+
+                after_raw = _single("after")
+                after = (
+                    _parse_nonneg_int(after_raw, "after")
+                    if after_raw is not None
+                    else 0
+                )
+
+                snapshot_raw = _single("snapshot")
+                snapshot: Optional[int] = (
+                    _parse_nonneg_int(snapshot_raw, "snapshot")
+                    if snapshot_raw is not None
+                    else None
+                )
+
+                events, snapshot_seq, next_after = store.export_audit_events(
+                    tenant, after, limit, snapshot=snapshot
+                )
+            except (ValidationError, ValueError):
+                # ValueError：超长十进制数字串触发 int() 位数上限。
+                raise ValidationError("请求非法")
+            body = _audit_export_ndjson_bytes(events)
+            self.send_response(200)
+            self.send_header(
+                "Content-Type", "application/x-ndjson; charset=utf-8"
+            )
+            self.send_header("X-Snapshot-Seq", str(snapshot_seq))
+            self.send_header("X-Next-After", str(next_after))
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+
+        def _parse_audit_export_manifest_query(
+            self, query: str
+        ) -> Dict[str, Any]:
+            # 审计快照导出清单查询参数：export 三参数（snapshot/after/
+            # limit）加 signer_did，其中 snapshot、signer_did 必填，各
+            # 参数只能出现一次。任何空值、重复、未知参数、格式或范围
+            # 非法——含超长十进制数字串（触发 int() 位数上限的
+            # ValueError）——一律收敛为 ValidationError("请求非法")
+            # （HTTP 400 且仅 {"error":"请求非法"}，绝不 500）。
+            # filters 仅 after、limit 两键，值为生效整数（含缺省值）。
+            try:
+                params = parse_qs(query, keep_blank_values=True)
+                allowed = {"snapshot", "signer_did", "after", "limit"}
+                if set(params) - allowed:
+                    raise ValidationError("未知查询参数")
+
+                def _single(name: str) -> Optional[str]:
+                    values = params.get(name)
+                    if values is None:
+                        return None
+                    if len(values) != 1:
+                        raise ValidationError("查询参数重复")
+                    return values[0]
+
+                snapshot_raw = _single("snapshot")
+                if snapshot_raw is None:
+                    raise ValidationError("snapshot 必填")
+                snapshot = _parse_nonneg_int(snapshot_raw, "snapshot")
+
+                signer_did = _single("signer_did")
+                if signer_did is None or not signer_did:
+                    raise ValidationError("signer_did 必填且非空")
+
+                after_raw = _single("after")
+                after = (
+                    _parse_nonneg_int(after_raw, "after")
+                    if after_raw is not None
+                    else 0
+                )
+
+                limit_raw = _single("limit")
+                if limit_raw is not None:
+                    limit = _parse_nonneg_int(limit_raw, "limit")
+                    if not 1 <= limit <= 10000:
+                        raise ValidationError("limit 越界")
+                else:
+                    limit = 1000
+            except (ValidationError, ValueError):
+                raise ValidationError("请求非法")
+
+            return {
+                "snapshot": snapshot,
+                "after": after,
+                "limit": limit,
+                "signer_did": signer_did,
+                "filters": {"after": after, "limit": limit},
+            }
+
+        def _get_audit_export_manifest(
+            self, tenant: str, query: str
+        ) -> None:
+            # GET /v1/audit/export/manifest：对一次审计快照确定性导出
+            # （与 export 同 snapshot/after/limit，snapshot 必填）生成
+            # 签名摘要清单。参数非法/snapshot 越界等一切 400 仅
+            # {"error":"请求非法"}（含超长十进制数字，绝不 500）；签名
+            # DID 须为本租户活动本地 DID：未知（含他租户）404、已停用
+            # 409（400 判定优先）。200 键序 snapshot、filters、count、
+            # alg、digest、signer_did、key_version、signature；filters
+            # 键序 after、limit，值为生效整数；count 为本页非负整数
+            # 行数；alg 恒为 SHA-256；digest 为同 snapshot/after/limit
+            # 下审计快照 NDJSON export 原始字节的 64 位小写 hex
+            # SHA-256；signature 由签名 DID 当前私钥对前七键规范化
+            # JSON 做 ES256 裸 R||S 无填充 base64url 签名。纯只读、
+            # 不审计。
+            args = self._parse_audit_export_manifest_query(query)
+
+            # 先做快照越界校验（400 优先于签名 DID 的 404/409）。
+            try:
+                events, effective_snapshot, _ = store.export_audit_events(
+                    tenant,
+                    args["after"],
+                    args["limit"],
+                    snapshot=args["snapshot"],
+                )
+            except ValidationError:
+                raise ValidationError("请求非法")
+
+            # 签名 DID 须为本租户活动本地 DID：未知 404、停用 409。
+            signer_did = args["signer_did"]
+            key_version, private_pem = store.get_audit_manifest_signer(
+                tenant, signer_did
+            )
+
+            ndjson_bytes = _audit_export_ndjson_bytes(events)
+            digest = hashlib.sha256(ndjson_bytes).hexdigest()
+            signed = {
+                "snapshot": effective_snapshot,
+                "filters": args["filters"],
+                "count": len(events),
+                "alg": "SHA-256",
+                "digest": digest,
+                "signer_did": signer_did,
+                "key_version": key_version,
+            }
+            signature = crypto.sign(signed, private_pem)
+            manifest = dict(signed)
+            manifest["signature"] = signature
+            self._send_json(200, manifest)
+
+        def _audit_export_manifest_is_well_formed(
+            self, manifest: Any
+        ) -> bool:
+            # 审计快照导出清单结构校验（阶段一“清单非法”）：顶层恰含
+            # 八键且类型/取值合法；filters 恰含 after、limit 两键且值
+            # 为生效整数（after 非负、limit 为 1..10000 的正整数）。
+            if not isinstance(manifest, dict):
+                return False
+            expected = {
+                "snapshot",
+                "filters",
+                "count",
+                "alg",
+                "digest",
+                "signer_did",
+                "key_version",
+                "signature",
+            }
+            if set(manifest) != expected:
+                return False
+
+            def _is_nonneg_int(value: Any) -> bool:
+                return (
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value >= 0
+                )
+
+            def _is_positive_int(value: Any) -> bool:
+                return (
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value >= 1
+                )
+
+            if not _is_nonneg_int(manifest["snapshot"]):
+                return False
+            if not _is_nonneg_int(manifest["count"]):
+                return False
+            if manifest["alg"] != "SHA-256":
+                return False
+            if not (
+                isinstance(manifest["digest"], str)
+                and _SHA256_HEX_RE.fullmatch(manifest["digest"])
+            ):
+                return False
+            if (
+                not isinstance(manifest["signer_did"], str)
+                or not manifest["signer_did"]
+            ):
+                return False
+            if not _is_positive_int(manifest["key_version"]):
+                return False
+            if (
+                not isinstance(manifest["signature"], str)
+                or not manifest["signature"]
+            ):
+                return False
+
+            filters = manifest["filters"]
+            if not isinstance(filters, dict):
+                return False
+            if set(filters) != {"after", "limit"}:
+                return False
+            if not _is_nonneg_int(filters["after"]):
+                return False
+            limit = filters["limit"]
+            if not (_is_positive_int(limit) and 1 <= limit <= 10000):
+                return False
+            return True
+
+        def _parse_audit_export_ndjson(
+            self, ndjson: str, after: int, snapshot: int
+        ) -> Optional[List[Dict[str, Any]]]:
+            """解析审计快照导出页 NDJSON：合法返回事件行列表，非法 None。
+
+            规则与 export 正文一致：每行恰为以 LF 结行的 UTF-8 紧凑
+            JSON（末行亦有 LF、无 CR、无 BOM、无空行），行对象恰含且
+            按键序为 seq、timestamp、tenant_id、action、resource_type、
+            resource_id；seq 为非布尔正整数，timestamp 为非布尔整数，
+            其余四字段为非空字符串；行内 seq 严格递增且满足
+            after < seq <= snapshot。空串为零行的合法页。
+            """
+            if not ndjson:
+                return []
+            if not ndjson.endswith("\n") or "\r" in ndjson:
+                return None
+            events: List[Dict[str, Any]] = []
+            prev_seq = after
+            for line in ndjson.split("\n")[:-1]:
+                if not line:
+                    return None
+                try:
+                    row = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    return None
+                if not isinstance(row, dict):
+                    return None
+                if list(row.keys()) != [
+                    "seq",
+                    "timestamp",
+                    "tenant_id",
+                    "action",
+                    "resource_type",
+                    "resource_id",
+                ]:
+                    return None
+                seq = row["seq"]
+                if (
+                    not isinstance(seq, int)
+                    or isinstance(seq, bool)
+                    or seq <= after
+                    or seq > snapshot
+                    or seq <= prev_seq
+                ):
+                    return None
+                timestamp = row["timestamp"]
+                if not isinstance(timestamp, int) or isinstance(
+                    timestamp, bool
+                ):
+                    return None
+                for field in (
+                    "tenant_id",
+                    "action",
+                    "resource_type",
+                    "resource_id",
+                ):
+                    if not isinstance(row[field], str) or not row[field]:
+                        return None
+                prev_seq = seq
+                events.append(row)
+            return events
+
+        def _post_audit_export_manifest_verify(self, tenant: str) -> None:
+            # POST /v1/audit/export/manifest/verify：校验一次审计快照
+            # 导出清单与其 NDJSON 内容。请求体恰为 {"manifest": 对象,
+            # "ndjson": 字符串}；外层错误（非法 JSON/非对象/缺漏或多余
+            # 字段/manifest 非对象/ndjson 非字符串/超长十进制整数）一律
+            # 400 且仅 {"error":"请求非法"}。外层合法后任何失败均
+            # HTTP 200，按序返回 {"valid":false,"reason":...}：清单非法
+            # -> 锚点不可用（本租户同 did/版本且含 generic 用途的
+            # active 锚点）-> 签名格式错误 -> 签名校验失败 -> 导出内容
+            # 不匹配（行数、六字段行结构、游标范围与 UTF-8 SHA-256
+            # 摘要）。成功仅 {"valid":true}。纯只读、租户隔离、不记
+            # 审计，结论跨重启稳定。
+            try:
+                data = self._read_json()
+                if set(data) != {"manifest", "ndjson"}:
+                    raise ValidationError(
+                        "请求体字段须恰为 manifest、ndjson"
+                    )
+                manifest = data["manifest"]
+                ndjson = data["ndjson"]
+                if not isinstance(manifest, dict):
+                    raise ValidationError("manifest 必须为 JSON 对象")
+                if not isinstance(ndjson, str):
+                    raise ValidationError("ndjson 必须为字符串")
+            except (ValidationError, ValueError):
+                # ValueError：JSON 内超长十进制整数触发位数上限。
+                raise ValidationError("请求非法")
+
+            reason = self._verify_audit_export_manifest_item(
+                tenant, manifest, ndjson
+            )
+            if reason is not None:
+                self._send_json(200, {"valid": False, "reason": reason})
+                return
+            self._send_json(200, {"valid": True})
+
+        def _verify_audit_export_manifest_item(
+            self, tenant: str, manifest: Any, ndjson: str
+        ) -> Optional[str]:
+            # 单项审计快照导出清单验真：按序返回失败原因（清单非法 ->
+            # 锚点不可用 -> 签名格式错误 -> 签名校验失败 -> 导出内容
+            # 不匹配），成功返回 None。锚点须为本租户同 did/版本
+            # active 且含 generic 用途。纯只读：不查本地审计原文、不
+            # 写状态或审计。
+            # 阶段一：清单结构
+            if not self._audit_export_manifest_is_well_formed(manifest):
+                return "清单非法"
+
+            signer_did = manifest["signer_did"]
+            key_version = manifest["key_version"]
+
+            # 阶段二：本租户同 did/版本且含 generic 用途的 active 锚点
+            public_pem = store.get_active_trust_anchor_public_key(
+                tenant, signer_did, key_version, required_use="generic"
+            )
+            if public_pem is None:
+                return "锚点不可用"
+            try:
+                crypto.validate_public_key_pem(public_pem)
+            except (ValueError, TypeError):
+                return "锚点不可用"
+
+            signed = {
+                "snapshot": manifest["snapshot"],
+                "filters": manifest["filters"],
+                "count": manifest["count"],
+                "alg": manifest["alg"],
+                "digest": manifest["digest"],
+                "signer_did": signer_did,
+                "key_version": key_version,
+            }
+            signature = manifest["signature"]
+
+            # 阶段三：签名格式
+            try:
+                crypto.validate_signature_format_strict(signature)
+            except crypto.MalformedSignature:
+                return "签名格式错误"
+
+            # 阶段四：密码学验签
+            try:
+                crypto.verify(signed, signature, public_pem)
+            except crypto.MalformedSignature:
+                return "签名格式错误"
+            except crypto.InvalidSignature:
+                return "签名校验失败"
+            except Exception:  # noqa: BLE001 验签绝不向上抛错或泄露细节
+                return "签名校验失败"
+
+            # 阶段五：导出内容——行数、六字段行结构、游标范围与摘要
+            try:
+                raw = ndjson.encode("utf-8")
+            except UnicodeEncodeError:
+                return "导出内容不匹配"
+            if hashlib.sha256(raw).hexdigest() != manifest["digest"]:
+                return "导出内容不匹配"
+            events = self._parse_audit_export_ndjson(
+                ndjson,
+                manifest["filters"]["after"],
+                manifest["snapshot"],
+            )
+            if events is None or len(events) != manifest["count"]:
+                return "导出内容不匹配"
+            return None
 
     return Handler
 
